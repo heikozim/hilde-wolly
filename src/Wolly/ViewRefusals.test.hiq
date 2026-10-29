@@ -1,0 +1,329 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Checks: ViewCompile
+--
+-- Every refusal test of Hilde's suite 045-template, its templates copied
+-- unchanged into templates/view/refused (from the Hilde this release
+-- builds with), loaded by the engine: what @template refuses for a reason
+-- of the text, the engine refuses with the same code, file, line and
+-- words.  What @template refuses for a reason of the data's type (002,
+-- 003, 004, 025) is an error of the render, with the file and line.  The
+-- path of 010 is refused with the same code; the words name the directory
+-- of the templates instead of the module's.  011 (the module does not
+-- import Standard.Template) and 039 (a page lent to a task) have no
+-- counterpart at run time.  Written from the table by a script, one test a
+-- case.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory
+);
+import Standard.Text (
+    equal,
+    startsWith
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    renderView
+);
+
+module body Wolly.ViewRefusals.Test is
+    -- The data of the record Page of the tests of suite 045.
+    constant pageData: Span[Nat8, Static] := "{\"title\": \"T\", \"motto\": null, \"items\": [1, 2]}";
+
+    generic [C: Region]
+    function directoryOf(id: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "view-refused-");
+        writeString(&!out, id);
+        return finalize(out);
+    end;
+
+    function written(id: Span[Nat8, Static], name: Span[Nat8, Static], text: Span[Nat8, Static]): Bool is
+        let directory: String := directoryOf(id);
+        let made: Bool := createDirectory(asSpan(&directory));
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&directory));
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        destroyString(directory);
+        let path: String := finalize(out);
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                destroyString(path);
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                destroyString(path);
+                return false;
+        end case;
+    end;
+
+    -- The engine of the case's directory renders entry with the data of
+    -- Page and must give the error expected: exactly, or beginning with it.
+    function refused(id: Span[Nat8, Static], entry: Span[Nat8, Static], expected: Span[Nat8, Static], exact: Bool,
+        message: Span[Nat8, Static]): Unit is
+        var engine: ViewEngine := makeViewEngine();
+        let directory: String := directoryOf(id);
+        addDirectory(&!engine, asSpan(&directory));
+        destroyString(directory);
+        case readViewJson(pageData) of
+            when Left(left as failure: String) do
+                destroyString(failure);
+                assertTrue(false, "the data of Page is read");
+            when Right(right as data: ViewData) do
+                var out: StringBuilder := makeStringBuilder();
+                let result: Either[String, Unit] := renderView(&!engine, entry, &data, &!out);
+                destroyString(finalize(out));
+                destroyViewData(data);
+                case result of
+                    when Left(left as failure: String) do
+                        var same: Bool := startsWith(asSpan(&failure), expected);
+                        if exact then
+                            same := equal(asSpan(&failure), expected);
+                        end if;
+                        if not same then
+                            printLn(asSpan(&failure));
+                        end if;
+                        destroyString(failure);
+                        assertTrue(same, message);
+                    when Right(right as done: Unit) do
+                        assertTrue(false, message);
+                end case;
+        end case;
+        destroyViewEngine(engine);
+        return nil;
+    end;
+
+    function test002UnknownName(): Unit is
+        assertTrue(written("002-unknown-name", "page.jinja", @bytes("templates/view/refused/002-unknown-name/page.jinja")), "the file page.jinja of 002-unknown-name is written");
+        refused("002-unknown-name", "page.jinja", "page.jinja:2: V1001: ", false, "002-unknown-name is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test003Unprintable(): Unit is
+        assertTrue(written("003-unprintable", "page.jinja", @bytes("templates/view/refused/003-unprintable/page.jinja")), "the file page.jinja of 003-unprintable is written");
+        refused("003-unprintable", "page.jinja", "page.jinja:1: V1003: ", false, "003-unprintable is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test004OptionNotAsked(): Unit is
+        assertTrue(written("004-option-not-asked", "page.jinja", @bytes("templates/view/refused/004-option-not-asked/page.jinja")), "the file page.jinja of 004-option-not-asked is written");
+        refused("004-option-not-asked", "page.jinja", "page.jinja:1: V1004: ", false, "004-option-not-asked is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test005IsDefined(): Unit is
+        assertTrue(written("005-is-defined", "page.jinja", @bytes("templates/view/refused/005-is-defined/page.jinja")), "the file page.jinja of 005-is-defined is written");
+        refused("005-is-defined", "page.jinja", "page.jinja:1: H7082: `is defined' cannot be asked: the template is compiled against one data type, so every name is known when the programme is compiled, and a name that does not exist is a compile error already", true, "005-is-defined is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test006Script(): Unit is
+        assertTrue(written("006-script", "page.jinja", @bytes("templates/view/refused/006-script/page.jinja")), "the file page.jinja of 006-script is written");
+        refused("006-script", "page.jinja", "page.jinja:1: H7067: a value cannot stand in a <script> element, in a template literal: there is no escaping that makes that safe", true, "006-script is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test007EventAttribute(): Unit is
+        assertTrue(written("007-event-attribute", "page.jinja", @bytes("templates/view/refused/007-event-attribute/page.jinja")), "the file page.jinja of 007-event-attribute is written");
+        refused("007-event-attribute", "page.jinja", "page.jinja:1: H7067: a value cannot stand in the JavaScript of the attribute onclick, in a comment: there is no escaping that makes that safe", true, "007-event-attribute is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test008UnquotedAttribute(): Unit is
+        assertTrue(written("008-unquoted-attribute", "page.jinja", @bytes("templates/view/refused/008-unquoted-attribute/page.jinja")), "the file page.jinja of 008-unquoted-attribute is written");
+        refused("008-unquoted-attribute", "page.jinja", "page.jinja:1: H7067: a value cannot stand in the unquoted value of the attribute class (quote the value): there is no escaping that makes that safe", true, "008-unquoted-attribute is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test009BranchesDiffer(): Unit is
+        assertTrue(written("009-branches-differ", "page.jinja", @bytes("templates/view/refused/009-branches-differ/page.jinja")), "the file page.jinja of 009-branches-differ is written");
+        refused("009-branches-differ", "page.jinja", "page.jinja:1: H7095: the branches of this {% if %} end in different places in the HTML: the value of the attribute class and a tag name", true, "009-branches-differ is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test010ParentPath(): Unit is
+        refused("010-parent-path", "../page.jinja", "H7003: \"../page.jinja\": the path leaves", false, "010-parent-path is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test012AutoescapeOff(): Unit is
+        assertTrue(written("012-autoescape-off", "page.jinja", @bytes("templates/view/refused/012-autoescape-off/page.jinja")), "the file page.jinja of 012-autoescape-off is written");
+        refused("012-autoescape-off", "page.jinja", "page.jinja:1: H7033: {% autoescape %} is refused: escaping cannot be switched off for a stretch of template -- write |safe on the one value that is meant to go out unescaped, where a grep finds it", true, "012-autoescape-off is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test013TagName(): Unit is
+        assertTrue(written("013-tag-name", "page.jinja", @bytes("templates/view/refused/013-tag-name/page.jinja")), "the file page.jinja of 013-tag-name is written");
+        refused("013-tag-name", "page.jinja", "page.jinja:1: H7067: a value cannot stand in right after <, where a tag name goes: there is no escaping that makes that safe", true, "013-tag-name is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test014UnknownFilter(): Unit is
+        assertTrue(written("014-unknown-filter", "page.jinja", @bytes("templates/view/refused/014-unknown-filter/page.jinja")), "the file page.jinja of 014-unknown-filter is written");
+        refused("014-unknown-filter", "page.jinja", "page.jinja:1: H7076: the filter |reverse is not supported", true, "014-unknown-filter is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test016Operator(): Unit is
+        assertTrue(written("016-operator", "page.jinja", @bytes("templates/view/refused/016-operator/page.jinja")), "the file page.jinja of 016-operator is written");
+        refused("016-operator", "page.jinja", "page.jinja:1: H7016: the operator / divides into a fraction, and @template has no fractions; // divides into a whole number", true, "016-operator is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test017TwoNames(): Unit is
+        assertTrue(written("017-two-names", "page.jinja", @bytes("templates/view/refused/017-two-names/page.jinja")), "the file page.jinja of 017-two-names is written");
+        refused("017-two-names", "page.jinja", "page.jinja:1: H7086: only a name compared with a literal, or with a computed number, is supported", true, "017-two-names is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test021BlockNobodyDefined(): Unit is
+        assertTrue(written("021-block-nobody-defined", "base.jinja", @bytes("templates/view/refused/021-block-nobody-defined/base.jinja")), "the file base.jinja of 021-block-nobody-defined is written");
+        assertTrue(written("021-block-nobody-defined", "page.jinja", @bytes("templates/view/refused/021-block-nobody-defined/page.jinja")), "the file page.jinja of 021-block-nobody-defined is written");
+        refused("021-block-nobody-defined", "page.jinja", "page.jinja:1: H7066: the block nowhere is defined here, and no template this one extends has a block of that name; Jinja2 drops it without a word, and here it is refused", true, "021-block-nobody-defined is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test022SuperWithoutParent(): Unit is
+        assertTrue(written("022-super-without-parent", "page.jinja", @bytes("templates/view/refused/022-super-without-parent/page.jinja")), "the file page.jinja of 022-super-without-parent is written");
+        refused("022-super-without-parent", "page.jinja", "page.jinja:1: H7063: super() in a block that no template above this one has", true, "022-super-without-parent is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test023IncludeItself(): Unit is
+        assertTrue(written("023-include-itself", "page.jinja", @bytes("templates/view/refused/023-include-itself/page.jinja")), "the file page.jinja of 023-include-itself is written");
+        refused("023-include-itself", "page.jinja", "page.jinja:1: H7057: \"page.jinja\" includes or extends itself: page.jinja -> page.jinja", true, "023-include-itself is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test024TextAfterExtends(): Unit is
+        assertTrue(written("024-text-after-extends", "base.jinja", @bytes("templates/view/refused/024-text-after-extends/base.jinja")), "the file base.jinja of 024-text-after-extends is written");
+        assertTrue(written("024-text-after-extends", "page.jinja", @bytes("templates/view/refused/024-text-after-extends/page.jinja")), "the file page.jinja of 024-text-after-extends is written");
+        refused("024-text-after-extends", "page.jinja", "page.jinja:1: H7059: text after {% extends %} and outside a block is dropped by Jinja2; here it is refused", true, "024-text-after-extends is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test025BlockInForUnscoped(): Unit is
+        assertTrue(written("025-block-in-for-unscoped", "page.jinja", @bytes("templates/view/refused/025-block-in-for-unscoped/page.jinja")), "the file page.jinja of 025-block-in-for-unscoped is written");
+        refused("025-block-in-for-unscoped", "page.jinja", "page.jinja:1: V1001: ", false, "025-block-in-for-unscoped is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test026MacroRecursion(): Unit is
+        assertTrue(written("026-macro-recursion", "page.jinja", @bytes("templates/view/refused/026-macro-recursion/page.jinja")), "the file page.jinja of 026-macro-recursion is written");
+        refused("026-macro-recursion", "page.jinja", "page.jinja:1: H7090: the macro m calls itself: m -> m; a template is expanded when the programme is compiled, and a recursion would not end", true, "026-macro-recursion is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test027UnknownMacro(): Unit is
+        assertTrue(written("027-unknown-macro", "page.jinja", @bytes("templates/view/refused/027-unknown-macro/page.jinja")), "the file page.jinja of 027-unknown-macro is written");
+        refused("027-unknown-macro", "page.jinja", "page.jinja:1: H7089: there is no macro nope", true, "027-unknown-macro is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test028LoopInInclude(): Unit is
+        assertTrue(written("028-loop-in-include", "inc.jinja", @bytes("templates/view/refused/028-loop-in-include/inc.jinja")), "the file inc.jinja of 028-loop-in-include is written");
+        assertTrue(written("028-loop-in-include", "page.jinja", @bytes("templates/view/refused/028-loop-in-include/page.jinja")), "the file page.jinja of 028-loop-in-include is written");
+        refused("028-loop-in-include", "page.jinja", "inc.jinja:1: H7071: `loop' only exists inside a {% for %}", true, "028-loop-in-include is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test029ImportedMacroNoData(): Unit is
+        assertTrue(written("029-imported-macro-no-data", "m.jinja", @bytes("templates/view/refused/029-imported-macro-no-data/m.jinja")), "the file m.jinja of 029-imported-macro-no-data is written");
+        assertTrue(written("029-imported-macro-no-data", "page.jinja", @bytes("templates/view/refused/029-imported-macro-no-data/page.jinja")), "the file page.jinja of 029-imported-macro-no-data is written");
+        refused("029-imported-macro-no-data", "page.jinja", "m.jinja:1: H7070: title: a macro brought in with {% from ... import %} or {% import %} does not see the template's data, as in Jinja2 -- pass it as an argument", true, "029-imported-macro-no-data is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test034CssUrl(): Unit is
+        assertTrue(written("034-css-url", "page.jinja", @bytes("templates/view/refused/034-css-url/page.jinja")), "the file page.jinja of 034-css-url is written");
+        refused("034-css-url", "page.jinja", "page.jinja:1: H7067: a value cannot stand in a <style> element, in url( ): there is no escaping that makes that safe", true, "034-css-url is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test035JsAfterName(): Unit is
+        assertTrue(written("035-js-after-name", "page.jinja", @bytes("templates/view/refused/035-js-after-name/page.jinja")), "the file page.jinja of 035-js-after-name is written");
+        refused("035-js-after-name", "page.jinja", "page.jinja:1: H7067: a value cannot stand in a <script> element, right after a name or a number: there is no escaping that makes that safe", true, "035-js-after-name is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test036JsRegex(): Unit is
+        assertTrue(written("036-js-regex", "page.jinja", @bytes("templates/view/refused/036-js-regex/page.jinja")), "the file page.jinja of 036-js-regex is written");
+        refused("036-js-regex", "page.jinja", "page.jinja:1: H7067: a value cannot stand in a <script> element, at the start of a regular expression: there is no escaping that makes that safe", true, "036-js-regex is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test042SetInIf(): Unit is
+        assertTrue(written("042-set-in-if", "page.jinja", @bytes("templates/view/refused/042-set-in-if/page.jinja")), "the file page.jinja of 042-set-in-if is written");
+        refused("042-set-in-if", "page.jinja", "page.jinja:1: H7110: {% set label %} inside an {% if %} is refused: in Jinja2 the name is still there after the {% endif %} when the branch ran, and missing when it did not, which a compiled template cannot follow; set it before the {% if %}, or use {% with %}", true, "042-set-in-if is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test043DivideByData(): Unit is
+        assertTrue(written("043-divide-by-data", "page.jinja", @bytes("templates/view/refused/043-divide-by-data/page.jinja")), "the file page.jinja of 043-divide-by-data is written");
+        refused("043-divide-by-data", "page.jinja", "page.jinja:1: H7105: // divides by a number written in the template only: a divisor from the data could be zero, and a division by zero stops the programme", true, "043-divide-by-data is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test044IndexSubscript(): Unit is
+        assertTrue(written("044-index-subscript", "page.jinja", @bytes("templates/view/refused/044-index-subscript/page.jinja")), "the file page.jinja of 044-index-subscript is written");
+        refused("044-index-subscript", "page.jinja", "page.jinja:1: H7023: [ ] takes a name in quotes, as in a[\"b\"]: an index into a list fails when the page is rendered if the list is shorter, which a compiled template cannot allow", true, "044-index-subscript is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test045SetBlockInAttribute(): Unit is
+        assertTrue(written("045-set-block-in-attribute", "page.jinja", @bytes("templates/view/refused/045-set-block-in-attribute/page.jinja")), "the file page.jinja of 045-set-block-in-attribute is written");
+        refused("045-set-block-in-attribute", "page.jinja", "page.jinja:1: H7113: the text of a {% set %} block is HTML, escaped already, and is printed in HTML text only, not in the value of the attribute title", true, "045-set-block-in-attribute is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test046ConcatSafe(): Unit is
+        assertTrue(written("046-concat-safe", "page.jinja", @bytes("templates/view/refused/046-concat-safe/page.jinja")), "the file page.jinja of 046-concat-safe is written");
+        refused("046-concat-safe", "page.jinja", "page.jinja:1: H7107: ~ joins texts that are escaped when printed; a |safe value or a {% set %} block's text cannot be joined to them -- print it on its own", true, "046-concat-safe is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test047SetAfterExtends(): Unit is
+        assertTrue(written("047-set-after-extends", "base.jinja", @bytes("templates/view/refused/047-set-after-extends/base.jinja")), "the file base.jinja of 047-set-after-extends is written");
+        assertTrue(written("047-set-after-extends", "page.jinja", @bytes("templates/view/refused/047-set-after-extends/page.jinja")), "the file page.jinja of 047-set-after-extends is written");
+        refused("047-set-after-extends", "page.jinja", "page.jinja:1: H7103: a {% set %} after {% extends %} and outside a block is refused: whether a block sees it depends on the order in which Jinja2 runs the two templates", true, "047-set-after-extends is refused as @template refuses it");
+        return nil;
+    end;
+
+    function test048CallerWithoutCall(): Unit is
+        assertTrue(written("048-caller-without-call", "page.jinja", @bytes("templates/view/refused/048-caller-without-call/page.jinja")), "the file page.jinja of 048-caller-without-call is written");
+        refused("048-caller-without-call", "page.jinja", "page.jinja:1: H7112: caller() stands in a macro that a {% call %} block calls", true, "048-caller-without-call is refused as @template refuses it");
+        return nil;
+    end;
+end module body.

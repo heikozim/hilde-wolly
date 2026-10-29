@@ -1,0 +1,1992 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    makeEmpty,
+    fromLiteral,
+    fromSpan,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length,
+    nth,
+    insertBack,
+    insertFront,
+    removeLast
+);
+import Standard.Text (
+    equal,
+    startsWith
+);
+import Standard.Html (
+    Policy,
+    makePolicy
+);
+import Standard.Unicode (
+    toUpper,
+    toLower
+);
+import Standard.FileHelpers (
+    formatSize as fileSize
+);
+import Standard.I18n (
+    Catalog,
+    Arguments,
+    makeArguments,
+    addText as addArgumentText,
+    destroyArguments,
+    translate,
+    noCount
+);
+import Standard.Template (
+    Render,
+    display
+);
+import Wolly.ViewData (
+    ViewData,
+    ViewKind,
+    ViewText,
+    ViewInteger,
+    ViewBool,
+    ViewList,
+    ViewMap,
+    ViewMissing,
+    ViewHtml,
+    makeMapData,
+    makeListData,
+    makeTextData,
+    makeIntegerData,
+    makeBoolData,
+    makeMissingData,
+    makeSanitizedHtmlData,
+    destroyViewData,
+    readViewJson,
+    rootNode,
+    kindOf,
+    isTextual,
+    isInteger,
+    isList,
+    isMap,
+    isMissing,
+    textOf,
+    integerOf,
+    boolOf,
+    childCount,
+    firstChild,
+    nextSibling,
+    memberNamed,
+    elementAt,
+    addText,
+    addCopy,
+    copyData
+);
+import Wolly.View (
+    ViewEngine,
+    addFunction
+);
+import Wolly.Asset (
+    assetVersion
+);
+
+module body Wolly.ViewFunctions is
+    -- The options selectOptions reads at most.
+    constant mostOptions: Index := 1000;
+
+    ---
+    --- Whole numbers of any size: limbs of 32 bits, the lowest first, each
+    --- in a Nat64, no zero limb at the top; zero has none.
+    ---
+
+    constant limbBase: Nat64 := 4294967296;
+
+    function trimmed(limbs: Buffer[Nat64]): Buffer[Nat64] is
+        var b: Buffer[Nat64] := limbs;
+        var going: Bool := length(&b) > 0;
+        while going do
+            let top: Nat64 := nth(&b, length(&b) - 1);
+            if top = 0 then
+                let dropped: Nat64 := removeLast(&!b);
+                going := length(&b) > 0;
+            else
+                going := false;
+            end if;
+        end while;
+        return b;
+    end;
+
+    function bigOf(value: Nat64): Buffer[Nat64] is
+        var limbs: Buffer[Nat64] := allocateEmpty();
+        var rest: Nat64 := value;
+        while rest > 0 do
+            insertBack(&!limbs, rem(rest, limbBase));
+            rest := rest / limbBase;
+        end while;
+        return limbs;
+    end;
+
+    generic [A: Region, B: Region]
+    function compared(a: &[Buffer[Nat64], A], b: &[Buffer[Nat64], B]): Int32 is
+        let n: Index := length(a);
+        let m: Index := length(b);
+        if n /= m then
+            if n < m then
+                return -1;
+            end if;
+            return 1;
+        end if;
+        var i: Index := n;
+        while i > 0 do
+            i := i - 1;
+            let x: Nat64 := nth(a, i);
+            let y: Nat64 := nth(b, i);
+            if x < y then
+                return -1;
+            end if;
+            if x > y then
+                return 1;
+            end if;
+        end while;
+        return 0;
+    end;
+
+    generic [A: Region, B: Region]
+    function summed(a: &[Buffer[Nat64], A], b: &[Buffer[Nat64], B]): Buffer[Nat64] is
+        var out: Buffer[Nat64] := allocateEmpty();
+        var carry: Nat64 := 0;
+        var i: Index := 0;
+        var n: Index := length(a);
+        if length(b) > n then
+            n := length(b);
+        end if;
+        while i < n do
+            var x: Nat64 := 0;
+            if i < length(a) then
+                x := nth(a, i);
+            end if;
+            var y: Nat64 := 0;
+            if i < length(b) then
+                y := nth(b, i);
+            end if;
+            let total: Nat64 := (x + y) + carry;
+            insertBack(&!out, rem(total, limbBase));
+            carry := total / limbBase;
+            i := i + 1;
+        end while;
+        if carry > 0 then
+            insertBack(&!out, carry);
+        end if;
+        return out;
+    end;
+
+    -- a - b, with a not below b.
+    generic [A: Region, B: Region]
+    function difference(a: &[Buffer[Nat64], A], b: &[Buffer[Nat64], B]): Buffer[Nat64] is
+        var out: Buffer[Nat64] := allocateEmpty();
+        var owed: Nat64 := 0;
+        var i: Index := 0;
+        while i < length(a) do
+            let x: Nat64 := nth(a, i);
+            var y: Nat64 := owed;
+            if i < length(b) then
+                y := y + nth(b, i);
+            end if;
+            if x >= y then
+                insertBack(&!out, x - y);
+                owed := 0;
+            else
+                insertBack(&!out, (x + limbBase) - y);
+                owed := 1;
+            end if;
+            i := i + 1;
+        end while;
+        return trimmed(out);
+    end;
+
+    -- a times m, m below 2 to the 32.
+    function times(a: Buffer[Nat64], m: Nat64): Buffer[Nat64] is
+        var out: Buffer[Nat64] := allocateEmpty();
+        var carry: Nat64 := 0;
+        var i: Index := 0;
+        while i < length(&a) do
+            let product: Nat64 := (nth(&a, i) * m) + carry;
+            insertBack(&!out, rem(product, limbBase));
+            carry := product / limbBase;
+            i := i + 1;
+        end while;
+        if carry > 0 then
+            insertBack(&!out, carry);
+        end if;
+        destroyFree(a);
+        return trimmed(out);
+    end;
+
+    -- a times 2 to the bits.
+    function shiftedLeft(a: Buffer[Nat64], bits: Index): Buffer[Nat64] is
+        var out: Buffer[Nat64] := a;
+        var whole: Index := bits / 32;
+        while whole > 0 do
+            insertFront(&!out, 0);
+            whole := whole - 1;
+        end while;
+        var single: Index := rem(bits, 32);
+        while single > 0 do
+            out := times(out, 2);
+            single := single - 1;
+        end while;
+        return trimmed(out);
+    end;
+
+    function powerOfTwo(bits: Index): Buffer[Nat64] is
+        return shiftedLeft(bigOf(1), bits);
+    end;
+
+    -- The quotient and the remainder of a division by a number below 2 to
+    -- the 32.
+    record Division: Linear is
+        quotient: Buffer[Nat64];
+        remainder: Nat64;
+    end;
+
+    generic [A: Region]
+    function divided(a: &[Buffer[Nat64], A], d: Nat64): Division is
+        var digits: Buffer[Nat64] := allocateEmpty();
+        var rest: Nat64 := 0;
+        var i: Index := length(a);
+        while i > 0 do
+            i := i - 1;
+            let current: Nat64 := (rest * limbBase) + nth(a, i);
+            insertFront(&!digits, current / d);
+            rest := rem(current, d);
+        end while;
+        return Division(quotient => trimmed(digits), remainder => rest);
+    end;
+
+    -- The decimal digits of a, 0 for zero.
+    function decimalOf(a: Buffer[Nat64]): String is
+        if length(&a) = 0 then
+            destroyFree(a);
+            return fromLiteral("0");
+        end if;
+        var groups: Buffer[Nat64] := allocateEmpty();
+        var rest: Buffer[Nat64] := a;
+        while length(&rest) > 0 do
+            let division: Division := divided(&rest, 1000000000);
+            let { quotient: Buffer[Nat64], remainder: Nat64 } := division;
+            destroyFree(rest);
+            rest := quotient;
+            insertBack(&!groups, remainder);
+        end while;
+        destroyFree(rest);
+        var out: StringBuilder := makeStringBuilder();
+        var k: Index := length(&groups);
+        var first: Bool := true;
+        while k > 0 do
+            k := k - 1;
+            let group: Nat64 := nth(&groups, k);
+            if first then
+                writeNat(&!out, group, 1);
+            else
+                writeNat(&!out, group, 9);
+            end if;
+            first := false;
+        end while;
+        destroyFree(groups);
+        return finalize(out);
+    end;
+
+    -- value in decimal, at least width digits with zeros in front.
+    generic [B: Region]
+    function writeNat(out: &![StringBuilder, B], value: Nat64, width: Index): Unit is
+        var digits: Buffer[Nat64] := allocateEmpty();
+        var rest: Nat64 := value;
+        while (rest > 0) or (length(&digits) < width) do
+            insertBack(&!digits, rem(rest, 10));
+            rest := rest / 10;
+        end while;
+        var k: Index := length(&digits);
+        while k > 0 do
+            k := k - 1;
+            writeByte(&~out, digitByte(nth(&digits, k)));
+        end while;
+        destroyFree(digits);
+        return nil;
+    end;
+
+    function digitByte(digit: Nat64): Nat8 is
+        case toNat8(digit) of
+            when Some(value as d: Nat8) do
+                return d + '0';
+            when None do
+                return '?';
+        end case;
+    end;
+
+    generic [A: Region]
+    function bitAt(a: &[Buffer[Nat64], A], bit: Index): Bool is
+        let limb: Index := bit / 32;
+        if limb >= length(a) then
+            return false;
+        end if;
+        var value: Nat64 := nth(a, limb);
+        var k: Index := rem(bit, 32);
+        while k > 0 do
+            value := value / 2;
+            k := k - 1;
+        end while;
+        return rem(value, 2) = 1;
+    end;
+
+    -- Whether a bit below bits is set.
+    generic [A: Region]
+    function lowBitsSet(a: &[Buffer[Nat64], A], bits: Index): Bool is
+        var i: Index := 0;
+        while i < bits do
+            if bitAt(a, i) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- a divided by 2 to the bits, rounded down.
+    function shiftedRight(a: Buffer[Nat64], bits: Index): Buffer[Nat64] is
+        var out: Buffer[Nat64] := a;
+        var k: Index := bits;
+        while k > 0 do
+            var step: Nat64 := 2;
+            var taken: Index := 1;
+            if k >= 31 then
+                step := 2147483648;
+                taken := 31;
+            end if;
+            let division: Division := divided(&out, step);
+            let { quotient: Buffer[Nat64], remainder: Nat64 } := division;
+            destroyFree(out);
+            out := quotient;
+            k := k - taken;
+        end while;
+        return out;
+    end;
+
+    ---
+    --- Floats: a positive finite value as mantissa times 2 to the exponent,
+    --- the mantissa of 53 bits for a normal value, as IEEE 754 stores it.
+    ---
+
+    record Parts: Free is
+        mantissa: Nat64;
+        exponent: Int64;
+    end;
+
+    constant twoTo52: Float64 := 4503599627370496.0;
+    constant twoTo53: Float64 := 9007199254740992.0;
+    constant mantissaLow: Nat64 := 4503599627370496;
+    constant leastExponent: Int64 := -1074;
+
+    -- The parts of value, positive and finite.  Halving and doubling are
+    -- exact, so the mantissa is the value's.
+    function partsOf(value: Float64): Parts is
+        var x: Float64 := value;
+        var e: Int64 := 0;
+        while x >= twoTo53 do
+            x := x / 2.0;
+            e := e + 1;
+        end while;
+        while x < twoTo52 do
+            x := x * 2.0;
+            e := e - 1;
+        end while;
+        var f: Nat64 := 0;
+        case toNat64(x) of
+            when Some(value as n: Nat64) do
+                f := n;
+            when None do
+                skip;
+        end case;
+        -- A value below the normal ones has fewer bits than it seemed.
+        while e < leastExponent do
+            f := f / 2;
+            e := e + 1;
+        end while;
+        return Parts(mantissa => f, exponent => e);
+    end;
+
+    function indexOfInt(value: Int64): Index is
+        case toIndex(value) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The shortest digits that read back as the value, and where the point
+    -- stands: the value is 0.digits times 10 to the point.  The algorithm
+    -- of Burger and Dybvig, with the ends of the interval included when
+    -- the mantissa is even, as IEEE's rounding to even reads them.
+    record Shortest: Linear is
+        digits: String;
+        point: Int64;
+    end;
+
+    function shortestOf(parts: Parts): Shortest is
+        let f: Nat64 := parts.mantissa;
+        let e: Int64 := parts.exponent;
+        let even: Bool := rem(f, 2) = 0;
+        var r: Buffer[Nat64] := allocateEmpty();
+        var s: Buffer[Nat64] := allocateEmpty();
+        var plus: Buffer[Nat64] := allocateEmpty();
+        var minus: Buffer[Nat64] := allocateEmpty();
+        destroyFree(r);
+        destroyFree(s);
+        destroyFree(plus);
+        destroyFree(minus);
+        if e >= 0 then
+            let bits: Index := indexOfInt(e);
+            if f /= mantissaLow then
+                r := shiftedLeft(bigOf(f), bits + 1);
+                s := bigOf(2);
+                plus := powerOfTwo(bits);
+                minus := powerOfTwo(bits);
+            else
+                r := shiftedLeft(bigOf(f), bits + 2);
+                s := bigOf(4);
+                plus := powerOfTwo(bits + 1);
+                minus := powerOfTwo(bits);
+            end if;
+        else
+            let bits: Index := indexOfInt(0 - e);
+            if (e = leastExponent) or (f /= mantissaLow) then
+                r := shiftedLeft(bigOf(f), 1);
+                s := powerOfTwo(bits + 1);
+                plus := bigOf(1);
+                minus := bigOf(1);
+            else
+                r := shiftedLeft(bigOf(f), 2);
+                s := powerOfTwo(bits + 2);
+                plus := bigOf(2);
+                minus := bigOf(1);
+            end if;
+        end if;
+        var k: Int64 := 0;
+        var scaling: Bool := true;
+        while scaling do
+            let high: Buffer[Nat64] := summed(&r, &plus);
+            let c: Int32 := compared(&high, &s);
+            destroyFree(high);
+            if (even and (c >= 0)) or ((not even) and (c > 0)) then
+                s := times(s, 10);
+                k := k + 1;
+            else
+                scaling := false;
+            end if;
+        end while;
+        scaling := true;
+        while scaling do
+            let high: Buffer[Nat64] := times(summed(&r, &plus), 10);
+            let c: Int32 := compared(&high, &s);
+            destroyFree(high);
+            if (even and (c < 0)) or ((not even) and (c <= 0)) then
+                r := times(r, 10);
+                plus := times(plus, 10);
+                minus := times(minus, 10);
+                k := k - 1;
+            else
+                scaling := false;
+            end if;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        var going: Bool := true;
+        while going do
+            r := times(r, 10);
+            plus := times(plus, 10);
+            minus := times(minus, 10);
+            var digit: Nat64 := 0;
+            while compared(&r, &s) >= 0 do
+                let less: Buffer[Nat64] := difference(&r, &s);
+                destroyFree(r);
+                r := less;
+                digit := digit + 1;
+            end while;
+            let low: Int32 := compared(&r, &minus);
+            let high: Buffer[Nat64] := summed(&r, &plus);
+            let top: Int32 := compared(&high, &s);
+            destroyFree(high);
+            let lowDone: Bool := (even and (low <= 0)) or ((not even) and (low < 0));
+            let highDone: Bool := (even and (top >= 0)) or ((not even) and (top > 0));
+            if (not lowDone) and (not highDone) then
+                writeByte(&!out, digitByte(digit));
+            else
+                going := false;
+                if lowDone and (not highDone) then
+                    writeByte(&!out, digitByte(digit));
+                else if highDone and (not lowDone) then
+                    writeByte(&!out, digitByte(digit + 1));
+                else
+                    let twice: Buffer[Nat64] := shiftedLeft(trimmed(r), 1);
+                    let half: Int32 := compared(&twice, &s);
+                    destroyFree(twice);
+                    r := allocateEmpty();
+                    if (half < 0) or ((half = 0) and (rem(digit, 2) = 0)) then
+                        writeByte(&!out, digitByte(digit));
+                    else
+                        writeByte(&!out, digitByte(digit + 1));
+                    end if;
+                end if;
+            end if;
+        end while;
+        destroyFree(r);
+        destroyFree(s);
+        destroyFree(plus);
+        destroyFree(minus);
+        return Shortest(digits => finalize(out), point => k);
+    end;
+
+    function isFinite(value: Float64): Bool is
+        return (value = value) and (value <= 1.7976931348623157e308) and (value >= -1.7976931348623157e308);
+    end;
+
+    -- The exponent as Go writes it after e: a sign and at least two
+    -- digits.
+    generic [B: Region]
+    function writeExponent(out: &![StringBuilder, B], exponent: Int64): Unit is
+        var e: Int64 := exponent;
+        if e < 0 then
+            writeByte(&~out, '-');
+            e := 0 - e;
+        else
+            writeByte(&~out, '+');
+        end if;
+        case toNat64(e) of
+            when Some(value as n: Nat64) do
+                writeNat(&~out, n, 2);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function formatShortest(value: Float64): String is
+        if value /= value then
+            return fromLiteral("NaN");
+        end if;
+        if value > 1.7976931348623157e308 then
+            return fromLiteral("+Inf");
+        end if;
+        if value < -1.7976931348623157e308 then
+            return fromLiteral("-Inf");
+        end if;
+        if value = 0.0 then
+            return fromLiteral("0");
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        var positive: Float64 := value;
+        if value < 0.0 then
+            writeByte(&!out, '-');
+            positive := 0.0 - value;
+        end if;
+        let { digits: String, point: Int64 } := shortestOf(partsOf(positive));
+        let count: Index := spanLength(asSpan(&digits));
+        let exponent: Int64 := point - 1;
+        if (exponent < -4) or (exponent >= 6) then
+            writeByte(&!out, byteOf(&digits, 0));
+            if count > 1 then
+                writeByte(&!out, '.');
+                writeString(&!out, spanPart(asSpan(&digits), 1, count - 1));
+            end if;
+            writeByte(&!out, 'e');
+            writeExponent(&!out, exponent);
+        else if point <= 0 then
+            writeString(&!out, "0.");
+            var zeros: Int64 := 0 - point;
+            while zeros > 0 do
+                writeByte(&!out, '0');
+                zeros := zeros - 1;
+            end while;
+            writeString(&!out, asSpan(&digits));
+        else
+            let whole: Index := indexOfInt(point);
+            if whole >= count then
+                writeString(&!out, asSpan(&digits));
+                var zeros: Index := whole - count;
+                while zeros > 0 do
+                    writeByte(&!out, '0');
+                    zeros := zeros - 1;
+                end while;
+            else
+                writeString(&!out, spanPart(asSpan(&digits), 0, whole));
+                writeByte(&!out, '.');
+                writeString(&!out, spanPart(asSpan(&digits), whole, count - whole));
+            end if;
+        end if;
+        destroyString(digits);
+        return finalize(out);
+    end;
+
+    generic [Q: Region]
+    function byteOf(text: &[String, Q], at: Index): Nat8 is
+        let bytes: Span[Nat8, Q] := asSpan(text);
+        return bytes[at];
+    end;
+
+    function formatFixed(value: Float64, decimals: Index): String is
+        if not isFinite(value) then
+            return formatShortest(value);
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        var positive: Float64 := value;
+        if value < 0.0 then
+            writeByte(&!out, '-');
+            positive := 0.0 - value;
+        end if;
+        -- The value times 10 to the decimals, rounded to a whole number,
+        -- a tie to the even one.
+        var scaled: Buffer[Nat64] := allocateEmpty();
+        if positive > 0.0 then
+            let parts: Parts := partsOf(positive);
+            destroyFree(scaled);
+            scaled := bigOf(parts.mantissa);
+            var d: Index := 0;
+            while d < decimals do
+                scaled := times(scaled, 10);
+                d := d + 1;
+            end while;
+            if parts.exponent >= 0 then
+                scaled := shiftedLeft(scaled, indexOfInt(parts.exponent));
+            else
+                let bits: Index := indexOfInt(0 - parts.exponent);
+                let half: Bool := bitAt(&scaled, bits - 1);
+                let below: Bool := lowBitsSet(&scaled, bits - 1);
+                scaled := shiftedRight(scaled, bits);
+                let odd: Bool := bitAt(&scaled, 0);
+                if half and (below or odd) then
+                    let one: Buffer[Nat64] := bigOf(1);
+                    let more: Buffer[Nat64] := summed(&scaled, &one);
+                    destroyFree(one);
+                    destroyFree(scaled);
+                    scaled := more;
+                end if;
+            end if;
+        end if;
+        let digits: String := decimalOf(scaled);
+        let count: Index := spanLength(asSpan(&digits));
+        if count <= decimals then
+            writeByte(&!out, '0');
+            if decimals > 0 then
+                writeByte(&!out, '.');
+                var zeros: Index := decimals - count;
+                while zeros > 0 do
+                    writeByte(&!out, '0');
+                    zeros := zeros - 1;
+                end while;
+                writeString(&!out, asSpan(&digits));
+            end if;
+        else
+            writeString(&!out, spanPart(asSpan(&digits), 0, count - decimals));
+            if decimals > 0 then
+                writeByte(&!out, '.');
+                writeString(&!out, spanPart(asSpan(&digits), count - decimals, decimals));
+            end if;
+        end if;
+        destroyString(digits);
+        return finalize(out);
+    end;
+
+    ---
+    --- Arguments and results
+    ---
+
+    generic [C: Region]
+    function callArity(call: &[ViewData, C]): Index is
+        if not isList(call, rootNode()) then
+            return 0;
+        end if;
+        return childCount(call, rootNode());
+    end;
+
+    -- The node of the argument at, 0 when there is none: 0 is the root,
+    -- never an argument.
+    generic [C: Region]
+    function argumentAt(call: &[ViewData, C], at: Index): Index is
+        case elementAt(call, rootNode(), at) of
+            when Some(value as node: Index) do
+                return node;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The node after node in its list or map, 0 when there is none: a walk
+    -- from one to the next, where elementAt would count from the first.
+    generic [C: Region]
+    function nodeAfter(call: &[ViewData, C], node: Index): Index is
+        case nextSibling(call, node) of
+            when Some(value as next: Index) do
+                return next;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function refusal(name: Span[Nat8, Static], message: Span[Nat8, Static]): Either[String, ViewData] is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, name);
+        writeString(&!out, ": ");
+        writeString(&!out, message);
+        return Left(left => finalize(out));
+    end;
+
+    function refused(call: ViewData, name: Span[Nat8, Static], message: Span[Nat8, Static]): Either[String, ViewData] is
+        destroyViewData(call);
+        return refusal(name, message);
+    end;
+
+    function textResult(call: ViewData, text: String): Either[String, ViewData] is
+        destroyViewData(call);
+        let made: ViewData := makeTextData(asSpan(&text));
+        destroyString(text);
+        return Right(right => made);
+    end;
+
+    function integerResult(call: ViewData, value: Int64): Either[String, ViewData] is
+        destroyViewData(call);
+        return Right(right => makeIntegerData(value));
+    end;
+
+    function boolResult(call: ViewData, value: Bool): Either[String, ViewData] is
+        destroyViewData(call);
+        return Right(right => makeBoolData(value));
+    end;
+
+    -- Whether the call has count arguments, each a text or HTML.
+    generic [C: Region]
+    function textsGiven(call: &[ViewData, C], count: Index): Bool is
+        if callArity(call) /= count then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < count do
+            if not isTextual(call, argumentAt(call, i)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [C: Region]
+    function integersGiven(call: &[ViewData, C], count: Index): Bool is
+        if callArity(call) /= count then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < count do
+            if not isInteger(call, argumentAt(call, i)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [C: Region]
+    function textArgument(call: &[ViewData, C], at: Index): Span[Nat8, C] is
+        return textOf(call, argumentAt(call, at));
+    end;
+
+    generic [C: Region]
+    function integerArgument(call: &[ViewData, C], at: Index): Int64 is
+        return integerOf(call, argumentAt(call, at));
+    end;
+
+    function floatOf(value: Int64): Float64 is
+        case toFloat64(value) of
+            when Some(value as f: Float64) do
+                return f;
+            when None do
+                return 0.0;
+        end case;
+    end;
+
+    constant largestInt: Int64 := 9223372036854775807;
+    constant smallestInt: Int64 := -9223372036854775807;
+
+    function absolute(value: Int64): Int64 is
+        if value < 0 then
+            return 0 - value;
+        end if;
+        return value;
+    end;
+
+    -- a op b (0 add, 1 subtract, 2 multiply), None outside Int64.
+    function checked(a: Int64, b: Int64, op: Index): Option[Int64] is
+        if (a < smallestInt) or (b < smallestInt) then
+            return None();
+        end if;
+        if op = 0 then
+            if ((b > 0) and (a > (largestInt - b))) or ((b < 0) and (a < (smallestInt - b))) then
+                return None();
+            end if;
+            return Some(value => a + b);
+        else if op = 1 then
+            if ((b < 0) and (a > (largestInt + b))) or ((b > 0) and (a < (smallestInt + b))) then
+                return None();
+            end if;
+            return Some(value => a - b);
+        end if;
+        if (a = 0) or (b = 0) then
+            return Some(value => 0);
+        end if;
+        if absolute(a) > (largestInt / absolute(b)) then
+            return None();
+        end if;
+        return Some(value => a * b);
+    end;
+
+    function arithmetic(call: ViewData, name: Span[Nat8, Static], op: Index): Either[String, ViewData] is
+        if not integersGiven(&call, 2) then
+            return refused(call, name, "takes two whole numbers");
+        end if;
+        let a: Int64 := integerArgument(&call, 0);
+        let b: Int64 := integerArgument(&call, 1);
+        case checked(a, b, op) of
+            when Some(value as result: Int64) do
+                return integerResult(call, result);
+            when None do
+                return refused(call, name, "the result leaves the whole numbers of Int64");
+        end case;
+    end;
+
+    ---
+    --- The general helper functions
+    ---
+
+    function hasPrefix(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 2) then
+            return refused(call, "hasPrefix", "takes two texts");
+        end if;
+        let found: Bool := startsWith(textArgument(&call, 0), textArgument(&call, 1));
+        return boolResult(call, found);
+    end;
+
+    function upper(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "upper", "takes one text");
+        end if;
+        case toUpper(textArgument(&call, 0)) of
+            when Some(value as text: String) do
+                return textResult(call, text);
+            when None do
+                return refused(call, "upper", "the text is not UTF-8");
+        end case;
+    end;
+
+    function lower(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "lower", "takes one text");
+        end if;
+        case toLower(textArgument(&call, 0)) of
+            when Some(value as text: String) do
+                return textResult(call, text);
+            when None do
+                return refused(call, "lower", "the text is not UTF-8");
+        end case;
+    end;
+
+    function joinStrings(call: ViewData): Either[String, ViewData] is
+        let elements: Index := argumentAt(&call, 0);
+        let two: Bool := callArity(&call) = 2;
+        let listed: Bool := isList(&call, elements);
+        let separator: Index := argumentAt(&call, 1);
+        let textual: Bool := isTextual(&call, separator);
+        if (not two) or (not listed) or (not textual) then
+            return refused(call, "joinStrings", "takes a list of texts and a text");
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        var element: Option[Index] := firstChild(&call, elements);
+        var first: Bool := true;
+        var going: Bool := true;
+        while going do
+            case element of
+                when Some(value as at: Index) do
+                    if not isTextual(&call, at) then
+                        destroyString(finalize(out));
+                        return refused(call, "joinStrings", "takes a list of texts and a text");
+                    end if;
+                    if not first then
+                        writeString(&!out, textArgument(&call, 1));
+                    end if;
+                    first := false;
+                    writeString(&!out, textOf(&call, at));
+                    element := nextSibling(&call, at);
+                when None do
+                    going := false;
+            end case;
+        end while;
+        return textResult(call, finalize(out));
+    end;
+
+    function add(call: ViewData): Either[String, ViewData] is
+        return arithmetic(call, "add", 0);
+    end;
+
+    function subtract(call: ViewData): Either[String, ViewData] is
+        return arithmetic(call, "subtract", 1);
+    end;
+
+    function multiply(call: ViewData): Either[String, ViewData] is
+        return arithmetic(call, "multiply", 2);
+    end;
+
+    -- The text under key in the settings, the empty text when there is
+    -- none or no settings at all, as a nil map gives in Go.
+    function setting(call: ViewData): Either[String, ViewData] is
+        let settings: Index := argumentAt(&call, 0);
+        if (callArity(&call) /= 2) or (not isTextual(&call, argumentAt(&call, 1))) then
+            return refused(call, "setting", "takes the settings and a key");
+        end if;
+        if isMissing(&call, settings) then
+            return textResult(call, makeEmpty());
+        end if;
+        if not isMap(&call, settings) then
+            return refused(call, "setting", "takes the settings, a map, and a key");
+        end if;
+        case memberNamed(&call, settings, textArgument(&call, 1)) of
+            when Some(value as at: Index) do
+                if isTextual(&call, at) then
+                    let text: String := fromSpan(textOf(&call, at));
+                    return textResult(call, text);
+                end if;
+                return refused(call, "setting", "a setting is a text");
+            when None do
+                return textResult(call, makeEmpty());
+        end case;
+    end;
+
+    function lucyPolicy(): Policy is
+        case makePolicy("a,abbr,b,blockquote,br,caption,code,col,colgroup,dd,div,dl,dt,em,figcaption,figure,h1,h2,h3,h4,h5,h6,hr,i,img,li,mark,ol,p,pre,q,s,small,span,strong,sub,sup,table,tbody,td,tfoot,th,thead,time,tr,u,ul,wbr",
+            "title,class,lang,dir,href,src,alt,width,height,colspan,rowspan,start,datetime", false) of
+            when Some(value as policy: Policy) do
+                return policy;
+            when None do
+                abort("Wolly.ViewFunctions: the sanitize policy is refused by Standard.Html");
+        end case;
+    end;
+
+    function safeHTML(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "safeHTML", "takes one text");
+        end if;
+        let made: ViewData := makeSanitizedHtmlData(textArgument(&call, 0), lucyPolicy());
+        destroyViewData(call);
+        return Right(right => made);
+    end;
+
+    function formatSize(call: ViewData): Either[String, ViewData] is
+        if not integersGiven(&call, 1) then
+            return refused(call, "formatSize", "takes one whole number");
+        end if;
+        let size: Int64 := integerArgument(&call, 0);
+        if size < 0 then
+            return textResult(call, display(&size));
+        end if;
+        case toNat64(size) of
+            when Some(value as n: Nat64) do
+                return textResult(call, fileSize(n));
+            when None do
+                return refused(call, "formatSize", "takes one whole number");
+        end case;
+    end;
+
+    function mulPrice(call: ViewData): Either[String, ViewData] is
+        return arithmetic(call, "mulPrice", 2);
+    end;
+
+    function centToEur(call: ViewData): Either[String, ViewData] is
+        if not integersGiven(&call, 1) then
+            return refused(call, "centToEur", "takes one whole number");
+        end if;
+        let cents: Int64 := integerArgument(&call, 0);
+        return textResult(call, formatFixed(floatOf(cents) / 100.0, 2));
+    end;
+
+    function formatPrice(call: ViewData): Either[String, ViewData] is
+        if not integersGiven(&call, 1) then
+            return refused(call, "formatPrice", "takes one whole number");
+        end if;
+        let cents: Int64 := integerArgument(&call, 0);
+        let euros: Int64 := cents / 100;
+        var cent: Int64 := cents - (euros * 100);
+        if cent < 0 then
+            cent := 0 - cent;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        let whole: String := display(&euros);
+        writeString(&!out, asSpan(&whole));
+        destroyString(whole);
+        writeByte(&!out, ',');
+        case toNat64(cent) of
+            when Some(value as n: Nat64) do
+                writeNat(&!out, n, 2);
+            when None do
+                skip;
+        end case;
+        writeString(&!out, " EUR");
+        return textResult(call, finalize(out));
+    end;
+
+    -- The commas of text: one fewer than the elements of an array, or more.
+    generic [T: Region]
+    function commasIn(text: Span[Nat8, T]): Index is
+        var count: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] = ',' then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    -- The options of a select field: a JSON array of texts; anything else,
+    -- the empty text included, gives no options, as json.Unmarshal's
+    -- failure gives nil in Go.
+    -- More than mostOptions commas are an error: Wolly.ViewData.readViewJson
+    -- takes time with the square of a list's length.
+    function selectOptions(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "selectOptions", "takes one text");
+        end if;
+        if commasIn(textArgument(&call, 0)) >= mostOptions then
+            return refused(call, "selectOptions", "takes at most 1000 options");
+        end if;
+        case readViewJson(textArgument(&call, 0)) of
+            when Left(left as message: String) do
+                destroyString(message);
+                destroyViewData(call);
+                return Right(right => makeListData());
+            when Right(right as options: ViewData) do
+                destroyViewData(call);
+                var good: Bool := isList(&options, rootNode());
+                if good then
+                    var element: Option[Index] := firstChild(&options, rootNode());
+                    var going: Bool := true;
+                    while going do
+                        case element of
+                            when Some(value as at: Index) do
+                                if not isTextual(&options, at) then
+                                    good := false;
+                                end if;
+                                element := nextSibling(&options, at);
+                            when None do
+                                going := false;
+                        end case;
+                    end while;
+                end if;
+                if good then
+                    return Right(right => options);
+                end if;
+                destroyViewData(options);
+                return Right(right => makeListData());
+        end case;
+    end;
+
+    ---
+    --- Dates, after Howard Hinnant's algorithms for the days of the
+    --- proleptic Gregorian calendar, as Go's time package counts them.
+    ---
+
+    record Date: Free is
+        year: Int64;
+        month: Int64;
+        day: Int64;
+        good: Bool;
+    end;
+
+    function leapYear(year: Int64): Bool is
+        return ((rem(year, 4) = 0) and (rem(year, 100) /= 0)) or (rem(year, 400) = 0);
+    end;
+
+    function daysInMonth(year: Int64, month: Int64): Int64 is
+        if month = 2 then
+            if leapYear(year) then
+                return 29;
+            end if;
+            return 28;
+        end if;
+        if (month = 4) or (month = 6) or (month = 9) or (month = 11) then
+            return 30;
+        end if;
+        return 31;
+    end;
+
+    -- The number of digits from at, count of them, all decimal digits; -1
+    -- when one is not.
+    generic [T: Region]
+    function digitsAt(text: Span[Nat8, T], at: Index, count: Index): Int64 is
+        if (at + count) > spanLength(text) then
+            return -1;
+        end if;
+        var value: Int64 := 0;
+        var i: Index := 0;
+        while i < count do
+            let b: Nat8 := text[at + i];
+            if (b < '0') or (b > '9') then
+                return -1;
+            end if;
+            value := (value * 10) + digitValue(b);
+            i := i + 1;
+        end while;
+        return value;
+    end;
+
+    -- Whether the bytes from at, count of them, are all decimal digits.
+    generic [T: Region]
+    function allDigits(text: Span[Nat8, T], at: Index, count: Index): Bool is
+        var i: Index := 0;
+        while i < count do
+            let b: Nat8 := text[at + i];
+            if (b < '0') or (b > '9') then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function digitValue(b: Nat8): Int64 is
+        case toInt64(b - '0') of
+            when Some(value as n: Int64) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- YYYY-MM-DD at the start of text, as Go's time.Parse reads the layout
+    -- 2006-01-02, the day checked against its month.
+    generic [T: Region]
+    function dateAt(text: Span[Nat8, T]): Date is
+        let bad: Date := Date(year => 0, month => 0, day => 0, good => false);
+        if spanLength(text) < 10 then
+            return bad;
+        end if;
+        if (text[4] /= '-') or (text[7] /= '-') then
+            return bad;
+        end if;
+        let year: Int64 := digitsAt(text, 0, 4);
+        let month: Int64 := digitsAt(text, 5, 2);
+        let day: Int64 := digitsAt(text, 8, 2);
+        if (year < 0) or (month < 1) or (month > 12) or (day < 1) then
+            return bad;
+        end if;
+        if day > daysInMonth(year, month) then
+            return bad;
+        end if;
+        return Date(year => year, month => month, day => day, good => true);
+    end;
+
+    function floorDiv(a: Int64, b: Int64): Int64 is
+        let q: Int64 := a / b;
+        if (rem(a, b) /= 0) and ((a < 0) /= (b < 0)) then
+            return q - 1;
+        end if;
+        return q;
+    end;
+
+    function daysFromCivil(date: Date): Int64 is
+        var y: Int64 := date.year;
+        if date.month <= 2 then
+            y := y - 1;
+        end if;
+        let era: Int64 := floorDiv(y, 400);
+        let yoe: Int64 := y - (era * 400);
+        var shifted: Int64 := date.month + 9;
+        if date.month > 2 then
+            shifted := date.month - 3;
+        end if;
+        let doy: Int64 := (((153 * shifted) + 2) / 5) + (date.day - 1);
+        let doe: Int64 := (((yoe * 365) + (yoe / 4)) - (yoe / 100)) + doy;
+        return ((era * 146097) + doe) - 719468;
+    end;
+
+    function civilFromDays(days: Int64): Date is
+        let z: Int64 := days + 719468;
+        let era: Int64 := floorDiv(z, 146097);
+        let doe: Int64 := z - (era * 146097);
+        let yoe: Int64 := (((doe - (doe / 1460)) + (doe / 36524)) - (doe / 146096)) / 365;
+        var y: Int64 := yoe + (era * 400);
+        let doy: Int64 := doe - (((365 * yoe) + (yoe / 4)) - (yoe / 100));
+        let mp: Int64 := ((5 * doy) + 2) / 153;
+        let d: Int64 := (doy - (((153 * mp) + 2) / 5)) + 1;
+        var m: Int64 := mp + 3;
+        if mp >= 10 then
+            m := mp - 9;
+        end if;
+        if m <= 2 then
+            y := y + 1;
+        end if;
+        return Date(year => y, month => m, day => d, good => true);
+    end;
+
+    -- Sunday 0 to Saturday 6; the first of January 1970 was a Thursday.
+    function weekdayOf(date: Date): Int64 is
+        let days: Int64 := daysFromCivil(date);
+        return rem(rem(days + 4, 7) + 7, 7);
+    end;
+
+    function weekdayName(day: Int64): Span[Nat8, Static] is
+        if day = 0 then
+            return "Sunday";
+        else if day = 1 then
+            return "Monday";
+        else if day = 2 then
+            return "Tuesday";
+        else if day = 3 then
+            return "Wednesday";
+        else if day = 4 then
+            return "Thursday";
+        else if day = 5 then
+            return "Friday";
+        end if;
+        return "Saturday";
+    end;
+
+    function monthName(month: Int64): Span[Nat8, Static] is
+        if month = 1 then
+            return "January";
+        else if month = 2 then
+            return "February";
+        else if month = 3 then
+            return "March";
+        else if month = 4 then
+            return "April";
+        else if month = 5 then
+            return "May";
+        else if month = 6 then
+            return "June";
+        else if month = 7 then
+            return "July";
+        else if month = 8 then
+            return "August";
+        else if month = 9 then
+            return "September";
+        else if month = 10 then
+            return "October";
+        else if month = 11 then
+            return "November";
+        end if;
+        return "December";
+    end;
+
+    generic [B: Region]
+    function writeInt(out: &![StringBuilder, B], value: Int64, width: Index): Unit is
+        var v: Int64 := value;
+        if v < 0 then
+            writeByte(&~out, '-');
+            v := 0 - v;
+        end if;
+        case toNat64(v) of
+            when Some(value as n: Nat64) do
+                writeNat(&~out, n, width);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The date as Go's time formats 2006-01-02.
+    function dateText(date: Date): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeInt(&!out, date.year, 4);
+        writeByte(&!out, '-');
+        writeInt(&!out, date.month, 2);
+        writeByte(&!out, '-');
+        writeInt(&!out, date.day, 2);
+        return finalize(out);
+    end;
+
+    -- A date argument of the whole text, or a date that is not good.
+    generic [C: Region]
+    function dateArgument(call: &[ViewData, C]): Date is
+        let text: Span[Nat8, C] := textArgument(call, 0);
+        let date: Date := dateAt(text);
+        if spanLength(text) /= 10 then
+            return Date(year => 0, month => 0, day => 0, good => false);
+        end if;
+        return date;
+    end;
+
+    -- The text of the argument as it is, which Go gives back when it
+    -- cannot read the date.
+    function unchanged(call: ViewData): Either[String, ViewData] is
+        let text: String := fromSpan(textArgument(&call, 0));
+        return textResult(call, text);
+    end;
+
+    -- 2006-01-02 15:04:05 as 02.01.2006 15:04; the seconds may have a
+    -- fraction after a point or a comma, as Go's time.Parse allows.
+    function formatDate(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "formatDate", "takes one text");
+        end if;
+        let date: Date := dateAt(textArgument(&call, 0));
+        let clock: Int64 := clockAt(textArgument(&call, 0));
+        if (not date.good) or (clock < 0) then
+            return unchanged(call);
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeInt(&!out, date.day, 2);
+        writeByte(&!out, '.');
+        writeInt(&!out, date.month, 2);
+        writeByte(&!out, '.');
+        writeInt(&!out, date.year, 4);
+        writeByte(&!out, ' ');
+        writeInt(&!out, clock / 60, 2);
+        writeByte(&!out, ':');
+        writeInt(&!out, rem(clock, 60), 2);
+        return textResult(call, finalize(out));
+    end;
+
+    -- The hour and minute of " HH:MM:SS" after the date, as minutes, -1
+    -- when the rest of the text is not that, with a fraction of a second
+    -- allowed.
+    generic [T: Region]
+    function clockAt(text: Span[Nat8, T]): Int64 is
+        let n: Index := spanLength(text);
+        if n < 19 then
+            return -1;
+        end if;
+        if (text[10] /= ' ') or (text[13] /= ':') or (text[16] /= ':') then
+            return -1;
+        end if;
+        let hour: Int64 := digitsAt(text, 11, 2);
+        let minute: Int64 := digitsAt(text, 14, 2);
+        let second: Int64 := digitsAt(text, 17, 2);
+        if (hour < 0) or (hour > 23) or (minute < 0) or (minute > 59) or (second < 0) or (second > 59) then
+            return -1;
+        end if;
+        if n > 19 then
+            if ((text[19] /= '.') and (text[19] /= ',')) or (n = 20) then
+                return -1;
+            end if;
+            if not allDigits(text, 20, n - 20) then
+                return -1;
+            end if;
+        end if;
+        return (hour * 60) + minute;
+    end;
+
+    ---
+    --- The Go chart functions
+    ---
+
+    function readableNumber(call: ViewData): Either[String, ViewData] is
+        if not integersGiven(&call, 1) then
+            return refused(call, "readableNumber", "takes one whole number");
+        end if;
+        let n: Int64 := integerArgument(&call, 0);
+        var out: StringBuilder := makeStringBuilder();
+        if n >= 1000000000 then
+            let text: String := formatFixed(floatOf(n) / 1000000000.0, 1);
+            writeString(&!out, asSpan(&text));
+            destroyString(text);
+            writeString(&!out, " G");
+        else if n >= 1000000 then
+            let text: String := formatFixed(floatOf(n) / 1000000.0, 1);
+            writeString(&!out, asSpan(&text));
+            destroyString(text);
+            writeString(&!out, " M");
+        else if n >= 1000 then
+            let text: String := formatFixed(floatOf(n) / 1000.0, 1);
+            writeString(&!out, asSpan(&text));
+            destroyString(text);
+            writeString(&!out, " k");
+        else
+            let text: String := display(&n);
+            writeString(&!out, asSpan(&text));
+            destroyString(text);
+        end if;
+        return textResult(call, finalize(out));
+    end;
+
+    -- The text Go prints for value / maxValue * 100, a float64; 0 for a
+    -- maximum of 0.
+    function barHeight(call: ViewData): Either[String, ViewData] is
+        if not integersGiven(&call, 2) then
+            return refused(call, "barHeight", "takes two whole numbers");
+        end if;
+        let value: Int64 := integerArgument(&call, 0);
+        let most: Int64 := integerArgument(&call, 1);
+        if most = 0 then
+            return textResult(call, formatShortest(0.0));
+        end if;
+        let ratio: Float64 := floatOf(value) / floatOf(most);
+        return textResult(call, formatShortest(ratio * 100.0));
+    end;
+
+    function formatDay(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "formatDay", "takes one text");
+        end if;
+        let date: Date := dateArgument(&call);
+        if not date.good then
+            return unchanged(call);
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, weekdayName(weekdayOf(date)));
+        writeByte(&!out, ' ');
+        writeInt(&!out, date.day, 1);
+        writeByte(&!out, ' ');
+        writeString(&!out, monthName(date.month));
+        return textResult(call, finalize(out));
+    end;
+
+    function formatFullDate(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "formatFullDate", "takes one text");
+        end if;
+        let date: Date := dateArgument(&call);
+        if not date.good then
+            return unchanged(call);
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, weekdayName(weekdayOf(date)));
+        writeByte(&!out, ' ');
+        writeInt(&!out, date.day, 1);
+        writeByte(&!out, ' ');
+        writeString(&!out, monthName(date.month));
+        writeByte(&!out, ' ');
+        writeInt(&!out, date.year, 1);
+        return textResult(call, finalize(out));
+    end;
+
+    function isWeekend(call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "isWeekend", "takes one text");
+        end if;
+        let date: Date := dateArgument(&call);
+        if not date.good then
+            return boolResult(call, false);
+        end if;
+        let day: Int64 := weekdayOf(date);
+        return boolResult(call, (day = 0) or (day = 6));
+    end;
+
+    function shiftedDate(call: ViewData, name: Span[Nat8, Static], step: Int64): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, name, "takes one text");
+        end if;
+        let date: Date := dateArgument(&call);
+        if not date.good then
+            return unchanged(call);
+        end if;
+        return textResult(call, dateText(civilFromDays(daysFromCivil(date) + step)));
+    end;
+
+    function prevDate(call: ViewData): Either[String, ViewData] is
+        return shiftedDate(call, "prevDate", -1);
+    end;
+
+    function nextDate(call: ViewData): Either[String, ViewData] is
+        return shiftedDate(call, "nextDate", 1);
+    end;
+
+    function formatHour(call: ViewData): Either[String, ViewData] is
+        if not integersGiven(&call, 1) then
+            return refused(call, "formatHour", "takes one whole number");
+        end if;
+        let hour: Int64 := integerArgument(&call, 0);
+        var out: StringBuilder := makeStringBuilder();
+        if hour < 0 then
+            writeInt(&!out, hour, 1);
+        else
+            writeInt(&!out, hour, 2);
+        end if;
+        writeString(&!out, ":00");
+        return textResult(call, finalize(out));
+    end;
+
+    ---
+    --- The builtins of Go's templates
+    ---
+
+    -- The kind of a node as a small code: 1 a text (or HTML), 2 a whole
+    -- number, 3 a truth value, 4 a list, 5 a map, 6 a missing value.
+    generic [C: Region]
+    function kindCode(call: &[ViewData, C], node: Index): Nat8 is
+        case kindOf(call, node) of
+            when ViewText do
+                return 1;
+            when ViewHtml do
+                return 1;
+            when ViewInteger do
+                return 2;
+            when ViewBool do
+                return 3;
+            when ViewList do
+                return 4;
+            when ViewMap do
+                return 5;
+            when ViewMissing do
+                return 6;
+        end case;
+    end;
+
+    -- Whether two arguments are equal: 1 equal, 0 not, -1 when they are
+    -- not of one comparable kind.
+    generic [C: Region]
+    function equality(call: &[ViewData, C], a: Index, b: Index): Int32 is
+        let ka: Nat8 := kindCode(call, a);
+        let kb: Nat8 := kindCode(call, b);
+        if (ka /= kb) or (ka = 4) or (ka = 5) then
+            return -1;
+        end if;
+        var same: Bool := true;
+        if ka = 1 then
+            same := equal(textOf(call, a), textOf(call, b));
+        else if ka = 2 then
+            same := integerOf(call, a) = integerOf(call, b);
+        else if ka = 3 then
+            same := boolOf(call, a) = boolOf(call, b);
+        end if;
+        if same then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- The order of two arguments: -1, 0 or 1, and 2 when they are not two
+    -- whole numbers or two texts.
+    generic [C: Region]
+    function ordering(call: &[ViewData, C], a: Index, b: Index): Int32 is
+        let ka: Nat8 := kindCode(call, a);
+        let kb: Nat8 := kindCode(call, b);
+        if ka /= kb then
+            return 2;
+        end if;
+        if ka = 2 then
+            let x: Int64 := integerOf(call, a);
+            let y: Int64 := integerOf(call, b);
+            if x < y then
+                return -1;
+            end if;
+            if x > y then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        if ka = 1 then
+            let x: Span[Nat8, C] := textOf(call, a);
+            let y: Span[Nat8, C] := textOf(call, b);
+            var i: Index := 0;
+            while (i < spanLength(x)) and (i < spanLength(y)) do
+                if x[i] < y[i] then
+                    return -1;
+                end if;
+                if x[i] > y[i] then
+                    return 1;
+                end if;
+                i := i + 1;
+            end while;
+            if spanLength(x) < spanLength(y) then
+                return -1;
+            end if;
+            if spanLength(x) > spanLength(y) then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        return 2;
+    end;
+
+    -- eq a b c: whether a equals one of the others, as Go's eq.
+    function eq(call: ViewData): Either[String, ViewData] is
+        let n: Index := callArity(&call);
+        if n < 2 then
+            return refused(call, "eq", "takes at least two values");
+        end if;
+        let first: Index := argumentAt(&call, 0);
+        var found: Bool := false;
+        var other: Index := first;
+        var i: Index := 1;
+        while i < n do
+            other := nodeAfter(&call, other);
+            let same: Int32 := equality(&call, first, other);
+            if same < 0 then
+                return refused(call, "eq", "incompatible types for comparison");
+            end if;
+            if same = 1 then
+                found := true;
+            end if;
+            i := i + 1;
+        end while;
+        return boolResult(call, found);
+    end;
+
+    function ne(call: ViewData): Either[String, ViewData] is
+        if callArity(&call) /= 2 then
+            return refused(call, "ne", "takes two values");
+        end if;
+        let same: Int32 := equality(&call, argumentAt(&call, 0), argumentAt(&call, 1));
+        if same < 0 then
+            return refused(call, "ne", "incompatible types for comparison");
+        end if;
+        return boolResult(call, same = 0);
+    end;
+
+    -- lt, le, gt and ge: which orders count as true.
+    function orderedBy(call: ViewData, name: Span[Nat8, Static], less: Bool, same: Bool, more: Bool): Either[String, ViewData] is
+        if callArity(&call) /= 2 then
+            return refused(call, name, "takes two values");
+        end if;
+        let order: Int32 := ordering(&call, argumentAt(&call, 0), argumentAt(&call, 1));
+        if order = 2 then
+            return refused(call, name, "takes two whole numbers or two texts");
+        end if;
+        return boolResult(call, ((order < 0) and less) or ((order = 0) and same) or ((order > 0) and more));
+    end;
+
+    function lt(call: ViewData): Either[String, ViewData] is
+        return orderedBy(call, "lt", true, false, false);
+    end;
+
+    function le(call: ViewData): Either[String, ViewData] is
+        return orderedBy(call, "le", true, true, false);
+    end;
+
+    function gt(call: ViewData): Either[String, ViewData] is
+        return orderedBy(call, "gt", false, false, true);
+    end;
+
+    function ge(call: ViewData): Either[String, ViewData] is
+        return orderedBy(call, "ge", false, true, true);
+    end;
+
+    -- The zero value of the kind of the first value of a map, as Go's index
+    -- gives it for a key a typed map does not hold; missing for an empty
+    -- map.
+    generic [C: Region]
+    function zeroOf(call: &[ViewData, C], map: Index): ViewData is
+        case firstChild(call, map) of
+            when Some(value as first: Index) do
+                let kind: Nat8 := kindCode(call, first);
+                if kind = 1 then
+                    return makeTextData("");
+                else if kind = 2 then
+                    return makeIntegerData(0);
+                else if kind = 3 then
+                    return makeBoolData(false);
+                else if kind = 4 then
+                    return makeListData();
+                else if kind = 5 then
+                    return makeMapData();
+                end if;
+                return makeMissingData();
+            when None do
+                return makeMissingData();
+        end case;
+    end;
+
+    -- index x k1 k2 ...: each key a text for a map (a whole number is its
+    -- decimal text) or a whole number for a list.
+    function index(call: ViewData): Either[String, ViewData] is
+        let n: Index := callArity(&call);
+        if n < 1 then
+            return refused(call, "index", "takes a value and keys");
+        end if;
+        var at: Index := argumentAt(&call, 0);
+        var key: Index := at;
+        var k: Index := 1;
+        while k < n do
+            key := nodeAfter(&call, key);
+            let kind: Nat8 := kindCode(&call, at);
+            if kind = 5 then
+                var found: Option[Index] := None();
+                if isTextual(&call, key) then
+                    found := memberNamed(&call, at, textOf(&call, key));
+                else if isInteger(&call, key) then
+                    let number: Int64 := integerOf(&call, key);
+                    let digits: String := display(&number);
+                    found := memberNamed(&call, at, asSpan(&digits));
+                    destroyString(digits);
+                else
+                    return refused(call, "index", "a key of a map is a text or a whole number");
+                end if;
+                case found of
+                    when Some(value as member: Index) do
+                        at := member;
+                    when None do
+                        if (k + 1) < n then
+                            return refused(call, "index", "the map has no such key, so nothing follows it");
+                        end if;
+                        let zero: ViewData := zeroOf(&call, at);
+                        destroyViewData(call);
+                        return Right(right => zero);
+                end case;
+            else if kind = 4 then
+                if not isInteger(&call, key) then
+                    return refused(call, "index", "an index of a list is a whole number");
+                end if;
+                let position: Int64 := integerOf(&call, key);
+                if position < 0 then
+                    return refused(call, "index", "index out of range");
+                end if;
+                case elementAt(&call, at, intToIndex(position)) of
+                    when Some(value as element: Index) do
+                        at := element;
+                    when None do
+                        return refused(call, "index", "index out of range");
+                end case;
+            else
+                return refused(call, "index", "can index a map or a list only");
+            end if;
+            k := k + 1;
+        end while;
+        let result: ViewData := copyData(&call, at);
+        destroyViewData(call);
+        return Right(right => result);
+    end;
+
+    function intToIndex(value: Int64): Index is
+        case toIndex(value) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function indexToInt(value: Index): Int64 is
+        case toInt64(value) of
+            when Some(value as n: Int64) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- slice x i j: the bytes of a text from i to j, or the elements of a
+    -- list; j is the end when it is not given.
+    function slice(call: ViewData): Either[String, ViewData] is
+        let n: Index := callArity(&call);
+        if (n < 2) or (n > 3) then
+            return refused(call, "slice", "takes a value and one or two indexes");
+        end if;
+        let x: Index := argumentAt(&call, 0);
+        let kind: Nat8 := kindCode(&call, x);
+        var size: Index := 0;
+        if kind = 1 then
+            size := spanLength(textOf(&call, x));
+        else if kind = 4 then
+            size := childCount(&call, x);
+        else
+            return refused(call, "slice", "can slice a text or a list only");
+        end if;
+        if not isInteger(&call, argumentAt(&call, 1)) then
+            return refused(call, "slice", "an index is a whole number");
+        end if;
+        let begin: Int64 := integerOf(&call, argumentAt(&call, 1));
+        var upto: Int64 := indexToInt(size);
+        if n = 3 then
+            if not isInteger(&call, argumentAt(&call, 2)) then
+                return refused(call, "slice", "an index is a whole number");
+            end if;
+            upto := integerOf(&call, argumentAt(&call, 2));
+        end if;
+        if (begin < 0) or (upto < begin) or (upto > indexToInt(size)) then
+            return refused(call, "slice", "index out of range");
+        end if;
+        let start: Index := intToIndex(begin);
+        let finish: Index := intToIndex(upto);
+        if kind = 1 then
+            let part: String := fromSpan(spanPart(textOf(&call, x), start, finish - start));
+            return textResult(call, part);
+        end if;
+        var list: ViewData := makeListData();
+        var element: Index := 0;
+        case elementAt(&call, x, start) of
+            when Some(value as found: Index) do
+                element := found;
+            when None do
+                skip;
+        end case;
+        var i: Index := start;
+        while (i < finish) and (element /= 0) do
+            let copied: Index := addCopy(&!list, rootNode(), &call, element);
+            element := nodeAfter(&call, element);
+            i := i + 1;
+        end while;
+        destroyViewData(call);
+        return Right(right => list);
+    end;
+
+    -- len x: the bytes of a text, the elements of a list or a map, as Go's
+    -- len.
+    function len(call: ViewData): Either[String, ViewData] is
+        if callArity(&call) /= 1 then
+            return refused(call, "len", "takes one value");
+        end if;
+        let x: Index := argumentAt(&call, 0);
+        let kind: Nat8 := kindCode(&call, x);
+        if kind = 1 then
+            let measured: Int64 := indexToInt(spanLength(textOf(&call, x)));
+            return integerResult(call, measured);
+        end if;
+        if (kind = 4) or (kind = 5) then
+            let measured: Int64 := indexToInt(childCount(&call, x));
+            return integerResult(call, measured);
+        end if;
+        return refused(call, "len", "takes a text, a list or a map");
+    end;
+
+    ---
+    --- t and asset
+    ---
+
+    -- The name of the argument at: 1 to 9.
+    function argumentName(at: Index): Span[Nat8, Static] is
+        if at = 0 then
+            return "1";
+        else if at = 1 then
+            return "2";
+        else if at = 2 then
+            return "3";
+        else if at = 3 then
+            return "4";
+        else if at = 4 then
+            return "5";
+        else if at = 5 then
+            return "6";
+        else if at = 6 then
+            return "7";
+        else if at = 7 then
+            return "8";
+        end if;
+        return "9";
+    end;
+
+    -- An argument as Go prints it with %v: a text as it is, a whole number
+    -- in decimal, a truth value true or false.  None for any other kind.
+    generic [C: Region]
+    function printed(call: &[ViewData, C], node: Index): Option[String] is
+        let kind: Nat8 := kindCode(call, node);
+        if kind = 1 then
+            return Some(value => fromSpan(textOf(call, node)));
+        else if kind = 2 then
+            let number: Int64 := integerOf(call, node);
+            return Some(value => display(&number));
+        else if kind = 3 then
+            if boolOf(call, node) then
+                return Some(value => fromLiteral("true"));
+            end if;
+            return Some(value => fromLiteral("false"));
+        end if;
+        return None();
+    end;
+
+    generic [K: Free]
+    function translateWith(catalog: Catalog[K], keyOf: Fn[String, Option[K]], call: ViewData): Either[String, ViewData] is
+        let n: Index := callArity(&call);
+        if (n < 2) or (n > 11) or (not isTextual(&call, argumentAt(&call, 0)))
+            or (not isTextual(&call, argumentAt(&call, 1))) then
+            return refused(call, "t", "takes a language, a key and at most nine arguments");
+        end if;
+        let key: String := fromSpan(textArgument(&call, 1));
+        let lookup: Fn[String, Option[K]] := keyOf;
+        let found: Option[K] := lookup(fromSpan(asSpan(&key)));
+        case found of
+            when None do
+                return textResult(call, key);
+            when Some(value as known: K) do
+                destroyString(key);
+                var arguments: Arguments := makeArguments();
+                var i: Index := 2;
+                while i < n do
+                    case printed(&call, argumentAt(&call, i)) of
+                        when Some(value as text: String) do
+                            addArgumentText(&!arguments, argumentName(i - 2), asSpan(&text));
+                            destroyString(text);
+                        when None do
+                            destroyArguments(arguments);
+                            return refused(call, "t", "an argument is a text, a whole number or a truth value");
+                    end case;
+                    i := i + 1;
+                end while;
+                let text: String := translate(catalog, textArgument(&call, 0), known, noCount(), &arguments);
+                destroyArguments(arguments);
+                return textResult(call, text);
+        end case;
+    end;
+
+    generic [T: Region]
+    function assetWith(root: Span[Nat8, T], call: ViewData): Either[String, ViewData] is
+        if not textsGiven(&call, 1) then
+            return refused(call, "asset", "takes one path");
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, textArgument(&call, 0));
+        case assetVersion(root, textArgument(&call, 0)) of
+            when Some(value as version: String) do
+                writeString(&!out, asSpan(&version));
+                destroyString(version);
+            when None do
+                skip;
+        end case;
+        return textResult(call, finalize(out));
+    end;
+
+    generic [R: Region]
+    function addStandardFunctions(engine: &![ViewEngine, R]): Unit is
+        addFunction(&~engine, "hasPrefix", hasPrefix);
+        addFunction(&~engine, "upper", upper);
+        addFunction(&~engine, "lower", lower);
+        addFunction(&~engine, "joinStrings", joinStrings);
+        addFunction(&~engine, "add", add);
+        addFunction(&~engine, "subtract", subtract);
+        addFunction(&~engine, "multiply", multiply);
+        addFunction(&~engine, "setting", setting);
+        addFunction(&~engine, "safeHTML", safeHTML);
+        addFunction(&~engine, "formatSize", formatSize);
+        addFunction(&~engine, "mulPrice", mulPrice);
+        addFunction(&~engine, "centToEur", centToEur);
+        addFunction(&~engine, "formatDate", formatDate);
+        addFunction(&~engine, "formatPrice", formatPrice);
+        addFunction(&~engine, "selectOptions", selectOptions);
+        addFunction(&~engine, "readableNumber", readableNumber);
+        addFunction(&~engine, "barHeight", barHeight);
+        addFunction(&~engine, "formatDay", formatDay);
+        addFunction(&~engine, "formatFullDate", formatFullDate);
+        addFunction(&~engine, "isWeekend", isWeekend);
+        addFunction(&~engine, "prevDate", prevDate);
+        addFunction(&~engine, "nextDate", nextDate);
+        addFunction(&~engine, "formatHour", formatHour);
+        addFunction(&~engine, "eq", eq);
+        addFunction(&~engine, "ne", ne);
+        addFunction(&~engine, "lt", lt);
+        addFunction(&~engine, "le", le);
+        addFunction(&~engine, "gt", gt);
+        addFunction(&~engine, "ge", ge);
+        addFunction(&~engine, "index", index);
+        addFunction(&~engine, "slice", slice);
+        addFunction(&~engine, "len", len);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,64 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Short values sealed in the token form of version 0xCC that Go
+implementations of Fernet write, so that Wolly reads and writes what they keep: a key of
+48 bytes, written as URL Base64 with padding, is a signing key of 16 bytes
+and an encryption key of 32.
+
+A token is 0xCC, the time in seconds as 8 bytes big endian, a nonce of 24
+random bytes, the XChaCha20-Poly1305 ciphertext of the value with the
+first 9 bytes as associated data, and the HMAC-SHA3-512 of all that under
+the signing key.  open checks the HMAC first, in constant time, then the
+ciphertext; a token of another version is refused.  The time is written
+but never checked: a sealed value has no age limit.
+"""
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.Fernet is
+    """
+    The bytes a token adds to its value: 1 + 8 + 24 + 16 + 64.
+    """
+    function overheadBytes(): Index
+        ensures result = 113;
+
+    """
+    The two keys of keyText, the URL Base64 of 48 bytes.  None for text of
+    another form.
+    No contract: an Option read from text.
+    """
+    generic [K: Region]
+    function readFernetKey(keyText: Span[Nat8, K]): Option[String];
+
+    """
+    A new key: 48 random bytes in URL Base64 with padding.  None when the
+    random source fails.
+    No contract: an Option over the random source.
+    """
+    function newFernetKey(): Option[String];
+
+    """
+    The token of value under the key keyText at the time now.  None when
+    keyText is no key, the random source or libcrypto fails.  No ensures:
+    an Option over the random source.
+    """
+    generic [K: Region, V: Region]
+    function sealFernet(keyText: Span[Nat8, K], value: Span[Nat8, V], now: Int64): Option[String]
+        requires now >= 0;
+
+    """
+    The value of token under the key keyText.  None when keyText is no key,
+    token is not of version 0xCC or too short, its HMAC or its ciphertext
+    does not hold.
+    No contract: an Option read from a token.
+    """
+    generic [K: Region, T: Region]
+    function openFernet(keyText: Span[Nat8, K], token: Span[Nat8, T]): Option[String];
+end module.

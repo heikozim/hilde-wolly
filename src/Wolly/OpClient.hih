@@ -1,0 +1,346 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The fixed list of clients of an OpenID provider, kept in the table
+op_clients: who may sign in, where the browser goes back to, how a client
+proves itself, and what it may ask for.
+
+A web client is a server with a secret; a native client is an app on a
+device, public, with a code challenge only and a refresh token of its own per device;
+a service client is a machine with a secret that uses Client Credentials
+only.  A secret is shown once and kept as the hex of its SHA-256.  A
+redirect URI is matched exactly, except that a native client's loopback
+URI registered without a port takes any port (RFC 8252, section 7.3).
+
+A client may have shorter limits than the provider (seconds, 0 for the
+provider's), a page where a person starts it (initiate_login_uri) and a
+picture for that tile as a data URI, and, a web client only, leave the
+code challenge and the nonce out of its sign-in request (laxAuth).  A
+client's tokens are signed with the algorithm of its column sign_alg,
+ML-DSA-44 or ML-DSA-44-Ed25519, or with the provider's when it is empty;
+the column id_token_alg is read and kept as an older provider wrote it, and
+RS256 there is a mark without effect.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.OpClient is
+    """
+    How a client authenticates and what it may ask for.
+    """
+    union ClientKind: Free is
+        case WebClient;
+        case NativeClient;
+        case ServiceClient;
+    end;
+
+    """
+    Limits of a sign-in in seconds: idle without activity, max since the
+    last full authentication, refresh the life of one refresh token.  For a
+    client 0 means the provider's value.
+    """
+    record Limits: Free is
+        idle: Int64;
+        max: Int64;
+        refresh: Int64;
+    end;
+
+    """
+    A client of the list.  The URIs and the audience are lists, kept in the
+    table one a line; idTokenAlg is empty, or RS256 as an older provider
+    marked a client, which changes nothing here.  signAlg is the algorithm
+    of the client's tokens, empty for the provider's.
+    """
+    record OpClient: Linear is
+        id: String;
+        name: String;
+        kind: ClientKind;
+        secretHash: String;
+        redirectUris: Buffer[String];
+        logoutUris: Buffer[String];
+        audience: Buffer[String];
+        limits: Limits;
+        disabled: Bool;
+        initiateLoginUri: String;
+        logo: String;
+        idTokenAlg: String;
+        signAlg: String;
+        laxAuth: Bool;
+        created: Int64;
+        updated: Int64;
+    end;
+
+    """
+    Frees client.
+    No contract: it only frees.
+    """
+    function destroyClient(client: OpClient): Unit;
+
+    """
+    Frees clients.
+    No contract: it only frees.
+    """
+    function destroyClients(clients: Buffer[OpClient]): Unit;
+
+    """
+    Why a client definition or a change was refused.
+    """
+    union ClientProblem: Linear is
+        case ClientRefused is
+            reason: String;
+        case LimitTooLong is
+            reason: String;
+        case ClientExists;
+        case NoClient;
+    end;
+
+    """
+    The text of problem, as the command line prints it.
+    """
+    generic [P: Region]
+    function describeProblem(problem: &[ClientProblem, P]): String
+        ensures length(&result) > 0;
+
+    """
+    Frees problem.
+    No contract: it only frees.
+    """
+    function destroyProblem(problem: ClientProblem): Unit;
+
+    """
+    The name of kind: web, native or service.
+    """
+    function kindName(kind: ClientKind): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The kind named text, None for another name.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function kindOf(text: Span[Nat8, T]): Option[ClientKind];
+
+    """
+    Whether text is a client ID: a lowercase letter, then 1 to 39 lowercase
+    letters, digits and dashes.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Region]
+    function isClientId(text: Span[Nat8, T]): Bool;
+
+    """
+    The most bytes of a logo: 48 KiB.
+    """
+    function mostLogoBytes(): Index
+        ensures result = 49152;
+
+    """
+    The data URI of the picture bytes: data:, its type, ;base64, and the
+    bytes in standard Base64.  Right Left when bytes is empty, larger than
+    mostLogoBytes or no picture of the types png, jpeg, gif or webp.
+    No contract: an Either read from the bytes.
+    """
+    generic [B: Region]
+    function logoDataUri(bytes: Span[Nat8, B]): Either[ClientProblem, String];
+
+    """
+    The limits of client that hold: the shorter of each and the provider's
+    limits session, 0 counting as the provider's.
+    """
+    function effectiveLimits(client: Limits, session: Limits): Limits
+        requires (session.idle > 0) and (session.max > 0) and (session.refresh > 0)
+        ensures (result.idle <= session.idle) and (result.max <= session.max) and (result.refresh <= session.refresh);
+
+    """
+    Why the definition client would be refused, or None: its ID, a name of 1
+    to 100 bytes, redirect URIs for a web or native client and none for a
+    service client, every URI allowed for its kind (https, http only when
+    allowHttp, for a native client a loopback http URI or a private-use
+    scheme), a start page only for a web or native client, a logo of the
+    form logoDataUri writes, idTokenAlg empty or the mark RS256, laxAuth only for a
+    web client, audiences of the form of an ID, limits not negative and not
+    longer than session.
+    No contract: an Option read from text.
+    """
+    generic [C: Region]
+    function clientProblem(client: &[OpClient, C], session: Limits, allowHttp: Bool): Option[ClientProblem];
+
+    """
+    Makes the table op_clients, when it is not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareClients(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Adds client at now after clientProblem: its name trimmed, a new secret
+    for a web or service client.  Right Right holds the secret to show
+    once, empty for a native client; Right Left why it was refused.
+    """
+    generic [R: Region, C: Region]
+    function addClient(db: &![Database[Writing], R], client: &[OpClient, C], session: Limits, allowHttp: Bool,
+        now: Int64): Either[DbError, Either[ClientProblem, String]]
+        requires now > 0;
+
+    """
+    The client id, Right None when there is none or id is no ID.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, I: Region]
+    function getClient(db: &![Database[M], R], id: Span[Nat8, I]): Either[DbError, Option[OpClient]];
+
+    """
+    Every client, ordered by ID.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region]
+    function listClients(db: &![Database[M], R]): Either[DbError, Buffer[OpClient]];
+
+    """
+    The client id when it may use the token endpoint: it is there and not
+    disabled; a native client gave no secret (secretGiven false), a web or
+    service client gave its secret.  Right None otherwise.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, I: Region, S: Region]
+    function authenticateClient(db: &![Database[Writing], R], id: Span[Nat8, I], secret: Span[Nat8, S],
+        secretGiven: Bool): Either[DbError, Option[OpClient]];
+
+    """
+    Gives the web or service client id a new secret at now and gives it, to
+    show once.
+    """
+    generic [R: Region, I: Region]
+    function rotateSecret(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Either[DbError, Either[ClientProblem, String]]
+        requires now > 0;
+
+    """
+    Sets the limits of the client id.  Right None when done.
+    """
+    generic [R: Region, I: Region]
+    function setLimits(db: &![Database[Writing], R], id: Span[Nat8, I], limits: Limits, session: Limits,
+        now: Int64): Either[DbError, Option[ClientProblem]]
+        requires now > 0;
+
+    """
+    Sets the start page of the client id, empty to remove its tile.
+    """
+    generic [R: Region, I: Region, U: Region]
+    function setStartUrl(db: &![Database[Writing], R], id: Span[Nat8, I], uri: Span[Nat8, U], session: Limits,
+        allowHttp: Bool, now: Int64): Either[DbError, Option[ClientProblem]]
+        requires now > 0;
+
+    """
+    Sets the logo of the client id, a data URI or empty.
+    """
+    generic [R: Region, I: Region, L: Region]
+    function setLogo(db: &![Database[Writing], R], id: Span[Nat8, I], logo: Span[Nat8, L], session: Limits,
+        allowHttp: Bool, now: Int64): Either[DbError, Option[ClientProblem]]
+        requires now > 0;
+
+    """
+    Clears the mark of the algorithm of the client id: alg must be empty,
+    the default ML-DSA-44; anything else is refused.
+    """
+    generic [R: Region, I: Region, A: Region]
+    function setIdTokenAlg(db: &![Database[Writing], R], id: Span[Nat8, I], alg: Span[Nat8, A], session: Limits,
+        allowHttp: Bool, now: Int64): Either[DbError, Option[ClientProblem]]
+        requires now > 0;
+
+    """
+    Sets the algorithm the tokens of the client id are signed with:
+    ML-DSA-44, ML-DSA-44-Ed25519, or empty for the provider's.  Any other
+    name is refused.
+    """
+    generic [R: Region, I: Region, A: Region]
+    function setSignAlg(db: &![Database[Writing], R], id: Span[Nat8, I], alg: Span[Nat8, A], session: Limits,
+        allowHttp: Bool, now: Int64): Either[DbError, Option[ClientProblem]]
+        requires now > 0;
+
+    """
+    Lets the web client id leave the code challenge and the nonce out, or takes it back.
+    """
+    generic [R: Region, I: Region]
+    function setLaxAuth(db: &![Database[Writing], R], id: Span[Nat8, I], lax: Bool, session: Limits, allowHttp: Bool,
+        now: Int64): Either[DbError, Option[ClientProblem]]
+        requires now > 0;
+
+    """
+    Blocks or unblocks the client id.
+    """
+    generic [R: Region, I: Region]
+    function setDisabled(db: &![Database[Writing], R], id: Span[Nat8, I], disabled: Bool,
+        now: Int64): Either[DbError, Option[ClientProblem]]
+        requires now > 0;
+
+    """
+    Gives the client id the name name, trimmed: 1 to 100 bytes without a
+    control byte.
+    """
+    generic [R: Region, I: Region, N: Region]
+    function setClientName(db: &![Database[Writing], R], id: Span[Nat8, I], name: Span[Nat8, N],
+        now: Int64): Either[DbError, Option[ClientProblem]]
+        requires now > 0;
+
+    """
+    The number of enabled clients an older provider marked RS256; their
+    tokens are ML-DSA-44 here as every other client's.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region]
+    function rsaClients(db: &![Database[M], R]): Either[DbError, Int64];
+
+    """
+    Whether uri may be the redirect of client: one of its redirect URIs, or
+    for a native client a loopback URI registered without a port with the
+    same host, path and query.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [C: Region, U: Region]
+    function redirectAllowed(client: &[OpClient, C], uri: Span[Nat8, U]): Bool;
+
+    """
+    Whether client is one of its logout URIs.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [C: Region, U: Region]
+    function logoutAllowed(client: &[OpClient, C], uri: Span[Nat8, U]): Bool;
+
+    """
+    Whether client has a tile on the portal: enabled, no service client,
+    with a start page.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [C: Region]
+    function isListed(client: &[OpClient, C]): Bool;
+
+    """
+    The start page of client with the parameter iss set to issuer, the
+    query then sorted, as initiate_login_uri asks; empty when it has none.
+    No contract: its length follows the input.
+    """
+    generic [C: Region, I: Region]
+    function startUrl(client: &[OpClient, C], issuer: Span[Nat8, I]): String;
+
+    """
+    The audience of the access tokens of client: its audience list, or its
+    ID when the list is empty.
+    No contract: its length follows the input.
+    """
+    generic [C: Region]
+    function audienceOf(client: &[OpClient, C]): Buffer[String];
+end module.

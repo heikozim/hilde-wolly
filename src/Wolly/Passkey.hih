@@ -1,0 +1,283 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Passkeys (WebAuthn Level 3), the part of the server: a challenge, the
+check of a registration, and the check of a login, with the keys kept in
+SQLite.  The browser's half, navigator.credentials, is the page's.
+
+A challenge is 32 random bytes in base64url, for one name and one purpose,
+valid newChallenge's 300 seconds and once: the check takes it out of the
+table in the same statement that reads it, so that a second use finds
+nothing, whatever the first one came to.  A new challenge takes the place
+of the one before for the same name and purpose, so that the table holds
+one for each at most.
+
+A registration passes when the client data is of type webauthn.create
+with the challenge and the origin given and not cross-origin, the
+attestation is of the format none, and its authenticator data has the
+hash of the relying party's id, the user present and verified, and a
+credential with a key of ES256 (P-256) or EdDSA (Ed25519) in COSE.  The
+key is kept as a DER SubjectPublicKeyInfo, the credential id in base64url.
+
+A login passes when the client data is of type webauthn.get with a
+challenge of the user of the credential, the authenticator data has the
+hash of the id, the user present and verified, and a counter above the
+one kept (or both 0: a passkey that does not count), and the signature is
+one of the authenticator data and the SHA-256 of the client data under
+the key kept (Standard.X509.verifyMessage).
+
+No attestation is checked beyond none: who made the authenticator is not
+asked.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Passkey is
+    """
+    What a challenge is for.
+    """
+    union Purpose: Free is
+        case Create;
+        case Get;
+    end;
+
+    """
+    Why a registration or a login was refused.
+    """
+    union Refusal: Free is
+        """
+        The name is no name of Wolly.Role.isName.
+        """
+        case BadName;
+        """
+        A part is no JSON, no CBOR, too long, or not where it must be.
+        """
+        case PasskeyMalformed;
+        """
+        The client data is of the other type, or cross-origin.
+        """
+        case PasskeyWrongType;
+        """
+        No challenge of this purpose and name, or one that ran out.
+        """
+        case WrongChallenge;
+        """
+        The client data names another origin.
+        """
+        case WrongOrigin;
+        """
+        The authenticator data is for another relying party.
+        """
+        case WrongParty;
+        """
+        The user was not present, or not verified.
+        """
+        case NotVerified;
+        """
+        An attestation of another format than none.
+        """
+        case Attested;
+        """
+        A key of another kind than ES256 or EdDSA.
+        """
+        case BadKey;
+        """
+        The credential is registered already.
+        """
+        case Known;
+        """
+        No credential of this id.
+        """
+        case Unknown;
+        """
+        The signature does not fit.
+        """
+        case BadSignature;
+        """
+        The counter did not go up: perhaps a copy of the authenticator.
+        """
+        case PasskeyReplayed;
+        """
+        The name has mostPasskeys passkeys already.
+        """
+        case PasskeyTooMany;
+    end;
+
+    """
+    A passkey of a name: its credential id in base64url and when it was
+    registered, in seconds since 1970.
+    """
+    record PasskeyEntry: Linear is
+        credential: String;
+        createdAt: Int64;
+    end;
+
+    """
+    Frees a list of listPasskeys.
+    No contract: it only frees.
+    """
+    function destroyPasskeyEntries(entries: Buffer[PasskeyEntry]): Unit;
+
+    """
+    The most passkeys a name may have: 20.
+    """
+    function mostPasskeys(): Int64
+        ensures result = 20;
+
+    """
+    The seconds a challenge is valid: 300.
+    """
+    function challengeSeconds(): Int64
+        ensures result = 300;
+
+    """
+    Makes the tables of challenges and of keys, if they are not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function preparePasskeys(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    A new challenge for name and purpose, in base64url; Right None when name
+    is no name or the random source failed.
+    """
+    generic [R: Region, N: Region]
+    function newChallenge(db: &![Database[Writing], R], name: Span[Nat8, N], purpose: Purpose,
+        now: Int64): Either[DbError, Option[String]]
+        requires now > 0;
+
+    """
+    Checks a registration of name: the client data JSON and the attestation
+    object, both as the browser sent them, decoded from base64url.  Right
+    None when the key is kept.
+    """
+    generic [R: Region, N: Region, C: Region, A: Region, I: Region, O: Region]
+    function register(db: &![Database[Writing], R], name: Span[Nat8, N], clientData: Span[Nat8, C],
+        attestation: Span[Nat8, A], rpId: Span[Nat8, I], origin: Span[Nat8, O],
+        now: Int64): Either[DbError, Option[Refusal]]
+        requires now > 0;
+
+    """
+    Checks a registration as register does, and gives the credential id
+    in base64url when the key is kept: Right Right with it, Right Left
+    with the refusal.
+    """
+    generic [R: Region, N: Region, C: Region, A: Region, I: Region, O: Region]
+    function registerCredential(db: &![Database[Writing], R], name: Span[Nat8, N], clientData: Span[Nat8, C],
+        attestation: Span[Nat8, A], rpId: Span[Nat8, I], origin: Span[Nat8, O],
+        now: Int64): Either[DbError, Either[Refusal, String]]
+        requires now > 0;
+
+    """
+    Checks a login with the credential id in base64url, the client data
+    JSON, the authenticator data and the signature, decoded from base64url.
+    Right Right with the name of the user when it passes.
+    """
+    generic [R: Region, D: Region, C: Region, U: Region, S: Region, I: Region, O: Region]
+    function authenticate(db: &![Database[Writing], R], credential: Span[Nat8, D], clientData: Span[Nat8, C],
+        authenticatorData: Span[Nat8, U], signature: Span[Nat8, S], rpId: Span[Nat8, I],
+        origin: Span[Nat8, O], now: Int64): Either[DbError, Either[Refusal, String]]
+        requires now > 0;
+
+    """
+    A challenge for a login whose user is not known yet, bound to bound,
+    a name of Wolly.Role.isName the application chooses for one login
+    attempt; the passkey names its user.  Right None when bound is no
+    name or the random source failed.  A new one takes the place of the
+    one before for the same bound.
+    """
+    generic [R: Region, B: Region]
+    function newDiscoverableChallenge(db: &![Database[Writing], R], bound: Span[Nat8, B],
+        now: Int64): Either[DbError, Option[String]]
+        requires now > 0;
+
+    """
+    Checks a login as authenticate does, with a challenge of
+    newDiscoverableChallenge for bound; the user is the one whose
+    credential it is.  Right Right with that name when it passes.
+    """
+    generic [R: Region, B: Region, D: Region, C: Region, U: Region, S: Region, I: Region, O: Region]
+    function authenticateDiscoverable(db: &![Database[Writing], R], bound: Span[Nat8, B], credential: Span[Nat8, D],
+        clientData: Span[Nat8, C], authenticatorData: Span[Nat8, U],
+        signature: Span[Nat8, S], rpId: Span[Nat8, I], origin: Span[Nat8, O],
+        now: Int64): Either[DbError, Either[Refusal, String]]
+        requires now > 0;
+
+    """
+    The passkeys of name, the oldest first.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function listPasskeys(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[DbError, Buffer[PasskeyEntry]];
+
+    """
+    The name whose passkey credential is, in base64url as listPasskeys
+    gives it; Right None for an unknown credential.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, D: Region]
+    function passkeyOwner(db: &![Database[Writing], R], credential: Span[Nat8, D]): Either[DbError, Option[String]];
+
+    """
+    Removes the one passkey credential of name.  Right true when name had
+    it; a credential of another name is left alone.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region, D: Region]
+    function removePasskey(db: &![Database[Writing], R], name: Span[Nat8, N],
+        credential: Span[Nat8, D]): Either[DbError, Bool];
+
+    """
+    Removes every passkey of name, and its challenges.  Right true when it
+    had one.  For a passkey that is lost or was registered by someone who
+    had the session for a moment.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function removePasskeys(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[DbError, Bool];
+
+    """
+    The number of passkeys of name.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, N: Region]
+    function passkeyCount(db: &![Database[M], R], name: Span[Nat8, N]): Either[DbError, Int64];
+
+    """
+    bytes in base64url without padding (RFC 4648, section 5).
+    """
+    generic [B: Region]
+    function toBase64Url(bytes: Span[Nat8, B]): String
+        ensures length(&result) = (((spanLength(bytes) * 4) + 2) / 3);
+
+    """
+    The bytes of a base64url text without padding; None for anything else.
+    No contract: an Option read from foreign text.
+    """
+    generic [T: Region]
+    function fromBase64Url(text: Span[Nat8, T]): Option[String];
+
+    """
+    The host of an origin as the relying party id: what follows the last
+    "://" up to a ":" of the port, or, for an IPv6 address in brackets,
+    the address between them ("https://[::1]:8443" gives "::1").  An
+    origin without "://" is taken whole as the host.
+    """
+    generic [O: Region]
+    function relyingPartyId(origin: Span[Nat8, O]): String
+        ensures length(&result) <= spanLength(origin);
+end module.

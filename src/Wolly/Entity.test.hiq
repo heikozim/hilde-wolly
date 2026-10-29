@@ -1,0 +1,503 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database in memory.  An article has a title (text of
+-- at most 12 bytes, required, unique), a summary (text of at most 40
+-- bytes) and stars (an integer, unique).
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Entity (
+    ValueType,
+    TextValue,
+    IntegerValue,
+    Change,
+    Stored,
+    NoEntity,
+    UnknownField,
+    WrongType,
+    EntityTooLong,
+    NotUtf8,
+    Taken,
+    Required,
+    BadActor,
+    mostFields,
+    mostLength,
+    mostFound,
+    isFieldName,
+    prepareEntities,
+    defineField,
+    dropField,
+    createEntity,
+    setText,
+    setInteger,
+    clearValue,
+    deleteEntity,
+    textOf,
+    integerField,
+    kindOf,
+    missingField,
+    findText,
+    findInteger,
+    auditCount
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Entity.Test is
+    -- The number of each case of Change, 0 for Stored, -1 for an error.
+    function caseOf(result: Either[DbError, Change]): Int64 is
+        case result of
+            when Left(left as error: DbError) do
+                return -1;
+            when Right(right as change: Change) do
+                case change of
+                    when Stored do
+                        return 0;
+                    when NoEntity do
+                        return 1;
+                    when UnknownField do
+                        return 2;
+                    when WrongType do
+                        return 3;
+                    when EntityTooLong do
+                        return 4;
+                    when NotUtf8 do
+                        return 5;
+                    when Taken do
+                        return 6;
+                    when Required do
+                        return 7;
+                    when BadActor do
+                        return 8;
+                end case;
+        end case;
+    end;
+
+    function yes(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertTrue(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function no(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertFalse(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- The number of the new entity, 0 when there is none.
+    function made(result: Either[DbError, Option[Int64]]): Int64 is
+        case result of
+            when Right(right as found: Option[Int64]) do
+                case found of
+                    when Some(value as id: Int64) do
+                        return id;
+                    when None do
+                        return 0;
+                end case;
+            when Left(left as error: DbError) do
+                return -1;
+        end case;
+    end;
+
+    -- Whether result is the text wanted.
+    function textIs(result: Either[DbError, Option[String]], wanted: Span[Nat8, Static]): Bool is
+        case result of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as text: String) do
+                        let same: Bool := equal(asSpan(&text), wanted);
+                        destroyString(text);
+                        return same;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function textNone(result: Either[DbError, Option[String]]): Bool is
+        case result of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                        return false;
+                    when None do
+                        return true;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function integerIs(result: Either[DbError, Option[Int64]], wanted: Int64): Bool is
+        case result of
+            when Right(right as found: Option[Int64]) do
+                case found of
+                    when Some(value as number: Int64) do
+                        return number = wanted;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function integerNone(result: Either[DbError, Option[Int64]]): Bool is
+        case result of
+            when Right(right as found: Option[Int64]) do
+                case found of
+                    when Some(value as number: Int64) do
+                        return false;
+                    when None do
+                        return true;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    -- Whether result holds exactly first and then second, or only first
+    -- when second is 0, or nothing when first is 0.
+    function foundAre(result: Either[DbError, Buffer[Int64]], first: Int64, second: Int64): Bool is
+        case result of
+            when Right(right as found: Buffer[Int64]) do
+                let one: Index := 1;
+                let two: Index := 2;
+                var wanted: Index := 0;
+                if first /= 0 then
+                    wanted := one;
+                end if;
+                if second /= 0 then
+                    wanted := two;
+                end if;
+                var fits: Bool := length(&found) = wanted;
+                if fits and (wanted >= 1) then
+                    fits := nth(&found, 0) = first;
+                end if;
+                if fits and (wanted = 2) then
+                    fits := nth(&found, 1) = second;
+                end if;
+                destroyFree(found);
+                return fits;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function audits(result: Either[DbError, Int64]): Int64 is
+        case result of
+            when Right(right as total: Int64) do
+                return total;
+            when Left(left as error: DbError) do
+                return -1;
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R]): Unit is
+        case prepareEntities(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the tables could not be made");
+            when None do
+                skip;
+        end case;
+        case prepareEntities(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a second prepareEntities fails");
+            when None do
+                skip;
+        end case;
+        yes(defineField(&~db, "article", "title", TextValue(), true, true, 12, "admin", 100), "title is defined");
+        yes(defineField(&~db, "article", "summary", TextValue(), false, false, 40, "admin", 100), "summary is defined");
+        yes(defineField(&~db, "article", "stars", IntegerValue(), false, true, 1, "admin", 100), "stars is defined");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runDefine(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        assertTrue(audits(auditCount(&~db)) = 3, "three definitions, three lines of audit");
+        yes(defineField(&~db, "article", "title", TextValue(), true, true, 12, "admin", 101), "the same field again is no error");
+        assertTrue(audits(auditCount(&~db)) = 3, "and writes no line");
+        no(defineField(&~db, "article", "title", TextValue(), true, true, 13, "admin", 101), "another length is another shape");
+        no(defineField(&~db, "article", "title", TextValue(), false, true, 12, "admin", 101), "so is required");
+        no(defineField(&~db, "article", "title", TextValue(), true, false, 12, "admin", 101), "and unique");
+        no(defineField(&~db, "article", "title", IntegerValue(), true, true, 1, "admin", 101), "and the type");
+        no(defineField(&~db, "article", "Title", TextValue(), false, false, 10, "admin", 101), "a field that is no name");
+        no(defineField(&~db, "Article", "body", TextValue(), false, false, 10, "admin", 101), "a kind that is no name");
+        no(defineField(&~db, "article", "body", TextValue(), false, false, 10, "Admin", 101), "an actor that is no name");
+        no(defineField(&~db, "article", "body", TextValue(), false, false, 0, "admin", 101), "a length of 0");
+        yes(defineField(&~db, "article", "body", TextValue(), false, false, mostLength(), "admin", 101), "a length of mostLength");
+        no(defineField(&~db, "article", "lead", TextValue(), false, false, mostLength() + 1, "admin", 101), "one more");
+        no(defineField(&~db, "article", "count", IntegerValue(), false, false, 2, "admin", 101), "an integer field of length 2");
+        assertTrue(audits(auditCount(&~db)) = 4, "only body was written down");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runQuota(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        -- 61 more fields make 64: faa to fhe.
+        var defined: Int64 := 3;
+        var first: Nat8 := 'a';
+        while first <= 'h' do
+            var second: Nat8 := 'a';
+            while second <= 'h' do
+                if defined < mostFields() then
+                    var out: StringBuilder := makeStringBuilder();
+                    writeByte(&!out, 'f');
+                    writeByte(&!out, first);
+                    writeByte(&!out, second);
+                    let name: String := finalize(out);
+                    yes(defineField(&~db, "article", asSpan(&name), IntegerValue(), false, false, 1, "admin", 102), "a field up to mostFields");
+                    destroyString(name);
+                    defined := defined + 1;
+                end if;
+                second := second + 1;
+            end while;
+            first := first + 1;
+        end while;
+        assertTrue(defined = mostFields(), "64 fields");
+        no(defineField(&~db, "article", "extra", IntegerValue(), false, false, 1, "admin", 102), "a 65th field is refused");
+        yes(defineField(&~db, "note", "extra", IntegerValue(), false, false, 1, "admin", 102), "another kind counts of its own");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runValues(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        assertTrue(made(createEntity(&~db, "note", "admin", 200)) = 0, "a kind without fields has no entities");
+        assertTrue(made(createEntity(&~db, "article", "Admin", 200)) = 0, "nor an actor that is no name");
+        let first: Int64 := made(createEntity(&~db, "article", "admin", 200));
+        let second: Int64 := made(createEntity(&~db, "article", "editor", 201));
+        assertTrue((first > 0) and (second > first), "two articles");
+        assertTrue(textIs(kindOf(&~db, first), "article"), "the kind of the first");
+        assertTrue(textNone(kindOf(&~db, 999)), "no kind of no entity");
+        assertTrue(textIs(missingField(&~db, first), "title"), "a new article lacks its title");
+        assertTrue(caseOf(setText(&~db, first, "title", "Hello", "editor", 202)) = 0, "a title is stored");
+        assertTrue(textIs(textOf(&~db, first, "title"), "Hello"), "and read back");
+        assertTrue(textNone(missingField(&~db, first)), "so the first is complete");
+        assertTrue(caseOf(setText(&~db, first, "title", "Hello again", "editor", 203)) = 0, "a title is changed");
+        assertTrue(textIs(textOf(&~db, first, "title"), "Hello again"), "to the new text");
+        assertTrue(caseOf(setText(&~db, first, "title", "123456789012", "editor", 204)) = 0, "12 bytes fit");
+        assertTrue(caseOf(setText(&~db, first, "title", "1234567890123", "editor", 204)) = 4, "13 bytes do not");
+        assertTrue(textIs(textOf(&~db, first, "title"), "123456789012"), "and the title is the one before");
+        var bad: StringBuilder := makeStringBuilder();
+        writeByte(&!bad, 'o');
+        writeByte(&!bad, 255);
+        let broken: String := finalize(bad);
+        assertTrue(caseOf(setText(&~db, first, "title", asSpan(&broken), "editor", 204)) = 5, "bytes that are no UTF-8");
+        destroyString(broken);
+        assertTrue(caseOf(setText(&~db, first, "title", "ok", "Editor", 204)) = 8, "an actor that is no name");
+        assertTrue(caseOf(setText(&~db, 999, "title", "ok", "editor", 204)) = 1, "no such entity");
+        assertTrue(caseOf(setText(&~db, first, "colour", "red", "editor", 204)) = 2, "no such field");
+        assertTrue(caseOf(setText(&~db, first, "stars", "five", "editor", 204)) = 3, "a text into an integer field");
+        assertTrue(caseOf(setInteger(&~db, first, "summary", 5, "editor", 204)) = 3, "an integer into a text field");
+        assertTrue(caseOf(setInteger(&~db, first, "stars", 5, "editor", 205)) = 0, "stars are stored");
+        assertTrue(integerIs(integerField(&~db, first, "stars"), 5), "and read back");
+        assertTrue(integerNone(integerField(&~db, first, "title")), "a text field has no integer");
+        assertTrue(textNone(textOf(&~db, first, "stars")), "an integer field has no text");
+        assertTrue(caseOf(setInteger(&~db, 999, "stars", 5, "editor", 205)) = 1, "no such entity for an integer");
+        assertTrue(caseOf(setInteger(&~db, first, "colour", 5, "editor", 205)) = 2, "no such field for an integer");
+        assertTrue(caseOf(setInteger(&~db, first, "stars", 5, "Editor", 205)) = 8, "nor an actor that is no name");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runUnique(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        let first: Int64 := made(createEntity(&~db, "article", "admin", 300));
+        let second: Int64 := made(createEntity(&~db, "article", "admin", 300));
+        assertTrue(caseOf(setText(&~db, first, "title", "Same", "admin", 301)) = 0, "the first takes a title");
+        assertTrue(caseOf(setText(&~db, second, "title", "Same", "admin", 302)) = 6, "the second cannot take it");
+        assertTrue(textNone(textOf(&~db, second, "title")), "and has none");
+        assertTrue(caseOf(setText(&~db, first, "title", "Same", "admin", 303)) = 0, "the first may set its own title again");
+        assertTrue(caseOf(setText(&~db, first, "title", "Other", "admin", 304)) = 0, "the first changes its title");
+        assertTrue(caseOf(setText(&~db, second, "title", "Same", "admin", 305)) = 0, "which frees the old one");
+        assertTrue(caseOf(setText(&~db, first, "summary", "Same", "admin", 306)) = 0, "a field that is not unique");
+        assertTrue(caseOf(setText(&~db, second, "summary", "Same", "admin", 307)) = 0, "takes the same text twice");
+        assertTrue(caseOf(setInteger(&~db, first, "stars", 3, "admin", 308)) = 0, "the first takes 3 stars");
+        assertTrue(caseOf(setInteger(&~db, second, "stars", 3, "admin", 309)) = 6, "a unique integer is taken too");
+        assertTrue(caseOf(clearValue(&~db, first, "stars", "admin", 310)) = 0, "the first clears its stars");
+        assertTrue(caseOf(setInteger(&~db, second, "stars", 3, "admin", 311)) = 0, "which frees them");
+        assertTrue(foundAre(findText(&~db, "article", "summary", "Same"), first, second), "both by their summary");
+        assertTrue(foundAre(findText(&~db, "article", "title", "Same"), second, 0), "one by its title");
+        assertTrue(foundAre(findText(&~db, "article", "title", "None"), 0, 0), "none by a title nobody has");
+        assertTrue(foundAre(findText(&~db, "note", "title", "Same"), 0, 0), "nor in another kind");
+        assertTrue(foundAre(findInteger(&~db, "article", "stars", 3), second, 0), "one by its stars");
+        assertTrue(foundAre(findInteger(&~db, "article", "stars", 4), 0, 0), "none by other stars");
+        assertTrue(mostFound() = 1000, "a search gives at most 1000");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runClearDelete(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        let first: Int64 := made(createEntity(&~db, "article", "admin", 400));
+        let second: Int64 := made(createEntity(&~db, "article", "admin", 400));
+        assertTrue(caseOf(setText(&~db, first, "title", "Kept", "admin", 401)) = 0, "a title");
+        assertTrue(caseOf(setText(&~db, first, "summary", "Short", "admin", 401)) = 0, "a summary");
+        assertTrue(caseOf(clearValue(&~db, first, "title", "admin", 402)) = 7, "a required field is not cleared");
+        assertTrue(textIs(textOf(&~db, first, "title"), "Kept"), "the title is still there");
+        assertTrue(caseOf(clearValue(&~db, first, "summary", "admin", 402)) = 0, "the summary is cleared");
+        assertTrue(textNone(textOf(&~db, first, "summary")), "and gone");
+        assertTrue(caseOf(clearValue(&~db, first, "summary", "admin", 402)) = 0, "clearing it again is stored");
+        assertTrue(caseOf(clearValue(&~db, 999, "summary", "admin", 402)) = 1, "no such entity to clear");
+        assertTrue(caseOf(clearValue(&~db, first, "colour", "admin", 402)) = 2, "no such field to clear");
+        assertTrue(caseOf(clearValue(&~db, first, "summary", "Admin", 402)) = 8, "nor by an actor that is no name");
+        let before: Int64 := audits(auditCount(&~db));
+        no(deleteEntity(&~db, first, "Admin", 403), "an actor that is no name deletes nothing");
+        yes(deleteEntity(&~db, first, "admin", 403), "the first is deleted");
+        assertTrue(audits(auditCount(&~db)) = (before + 1), "with a line of audit");
+        no(deleteEntity(&~db, first, "admin", 404), "a second delete finds nothing");
+        assertTrue(textNone(kindOf(&~db, first)), "the first is gone");
+        assertTrue(textNone(textOf(&~db, first, "title")), "and its values with it");
+        assertTrue(caseOf(setText(&~db, second, "title", "Kept", "admin", 405)) = 0, "its unique title is free again");
+        assertTrue(caseOf(setText(&~db, second, "summary", "Long enough", "admin", 406)) = 0, "the second has a summary");
+        no(dropField(&~db, "article", "summary", "Admin", 407), "an actor that is no name drops nothing");
+        yes(dropField(&~db, "article", "summary", "admin", 407), "summary is dropped");
+        no(dropField(&~db, "article", "summary", "admin", 408), "a second drop finds nothing");
+        assertTrue(textNone(textOf(&~db, second, "summary")), "with its values");
+        assertTrue(caseOf(setText(&~db, second, "summary", "x", "admin", 409)) = 2, "and the field is unknown");
+        yes(dropField(&~db, "article", "title", "admin", 410), "title is dropped");
+        yes(defineField(&~db, "article", "title", TextValue(), true, true, 12, "admin", 411), "and defined again");
+        let third: Int64 := made(createEntity(&~db, "article", "admin", 412));
+        assertTrue(caseOf(setText(&~db, third, "title", "Kept", "admin", 413)) = 0, "a dropped unique value is free");
+        return nil;
+    end;
+
+    function withDatabase(run: Int64): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                if run = 0 then
+                    runDefine(&!db);
+                end if;
+                if run = 1 then
+                    runQuota(&!db);
+                end if;
+                if run = 2 then
+                    runValues(&!db);
+                end if;
+                if run = 3 then
+                    runUnique(&!db);
+                end if;
+                if run = 4 then
+                    runClearDelete(&!db);
+                end if;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testDefine(): Unit is
+        withDatabase(0);
+        return nil;
+    end;
+
+    function testQuota(): Unit is
+        withDatabase(1);
+        return nil;
+    end;
+
+    function testValues(): Unit is
+        withDatabase(2);
+        return nil;
+    end;
+
+    function testUnique(): Unit is
+        withDatabase(3);
+        return nil;
+    end;
+
+    function testClearDelete(): Unit is
+        withDatabase(4);
+        return nil;
+    end;
+
+    function testUnprepared(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                assertTrue(caseOf(setText(&!db, 1, "title", "x", "admin", 1)) = -1, "without the tables a set fails");
+                assertTrue(audits(auditCount(&!db)) = -1, "and so does the audit");
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testIsFieldName(): Unit is
+        assertTrue(isFieldName("a"), "one letter");
+        assertTrue(isFieldName("title_2"), "letters, digits and underscore");
+        assertTrue(isFieldName("abcdefghijklmnopqrstuvwxyzabcde"), "31 bytes");
+        assertFalse(isFieldName("abcdefghijklmnopqrstuvwxyzabcdef"), "32 bytes");
+        assertFalse(isFieldName(""), "empty");
+        assertFalse(isFieldName("2title"), "a digit first");
+        assertFalse(isFieldName("_title"), "an underscore first");
+        assertFalse(isFieldName("Title"), "a capital");
+        assertFalse(isFieldName("ti-tle"), "a hyphen");
+        assertFalse(isFieldName("ti tle"), "a space");
+        assertFalse(isFieldName("`"), "the byte before a");
+        assertFalse(isFieldName("a{"), "the byte after z");
+        assertFalse(isFieldName("a/"), "the byte before 0");
+        assertFalse(isFieldName("a:"), "the byte after 9");
+        assertFalse(isFieldName("id"), "id is a column");
+        assertFalse(isFieldName("kind"), "kind is a column");
+        assertFalse(isFieldName("version"), "version is a column");
+        assertFalse(isFieldName("created_at"), "created_at is a column");
+        assertFalse(isFieldName("created_by"), "created_by is a column");
+        assertFalse(isFieldName("updated_at"), "updated_at is a column");
+        assertFalse(isFieldName("updated_by"), "updated_by is a column");
+        assertTrue(isFieldName("ids"), "the control: a name that begins with a column is a name");
+        return nil;
+    end;
+end module body.

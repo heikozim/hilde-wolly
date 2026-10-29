@@ -1,0 +1,1032 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The layout, the header, the blocks and the drawing of docs/bunti-format.md.
+-- The cells are a buffer of size * size values, row by row.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    length,
+    nth,
+    storeNth,
+    destroyFree
+);
+import Standard.Gzip (
+    crc32
+);
+import Wolly.BuntiRs (
+    RsCoder,
+    makeRsCoder,
+    destroyRsCoder,
+    rsParityWith,
+    rsCorrectWith,
+    rsParity,
+    rsCorrect
+);
+import Wolly.BuntiDna (
+    dnaBaseCount,
+    dnaEncode,
+    dnaDecode
+);
+import Wolly.Image (
+    pngOfRgb
+);
+
+module body Wolly.Bunti is
+    constant versionMost: Index := 60;
+    constant quietCells: Index := 4;
+    constant headerBytes: Index := 8;
+    constant headerParity: Index := 8;
+    constant headerCells: Index := 64;
+    constant lengthMost: Index := 65535;
+    constant formatVersion: Index := 1;
+    constant black: Nat8 := 4;
+    constant white: Nat8 := 5;
+
+    record BuntiCode: Linear is
+        size: Index;
+        cells: Buffer[Nat8];
+    end;
+
+    -- What the header says.
+    record Header: Free is
+        mode: Index;
+        level: Index;
+        count: Index;
+        crc: Nat32;
+    end;
+
+    function blackCell(): Nat8 is
+        return black;
+    end;
+
+    function whiteCell(): Nat8 is
+        return white;
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as number: Index) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function natOf(number: Index): Nat32 is
+        case toNat32(number) of
+            when Some(value as n: Nat32) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function indexOf(number: Nat32): Index is
+        case toIndex(number) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Layout
+    ---
+
+    function isBuntiSize(size: Index): Bool is
+        if (size < 21) or (size > 257) then
+            return false;
+        end if;
+        let rest: Index := size - 17;
+        return (rest - ((rest / 4) * 4)) = 0;
+    end;
+
+    function versionOf(size: Index): Index is
+        return (size - 17) / 4;
+    end;
+
+    function sizeOf(version: Index): Index is
+        return (version * 4) + 17;
+    end;
+
+    function isReference(size: Index, x: Index, y: Index): Bool is
+        if (y = 8) and ((x < 4) or (x >= (size - 4))) then
+            return true;
+        end if;
+        return (y = (size - 9)) and (x < 4);
+    end;
+
+    function isDataCell(size: Index, x: Index, y: Index): Bool is
+        if (x >= size) or (y >= size) then
+            return false;
+        end if;
+        if ((x < 8) and (y < 8)) or (((x + 8) >= size) and (y < 8)) then
+            return false;
+        end if;
+        if (x < 8) and ((y + 8) >= size) then
+            return false;
+        end if;
+        if ((x + 6) >= size) and ((y + 6) >= size) then
+            return false;
+        end if;
+        return not isReference(size, x, y);
+    end;
+
+    function dataCells(size: Index): Index is
+        return (size * size) - 240;
+    end;
+
+    function payloadCells(size: Index): Index is
+        return dataCells(size) - (headerCells * 2);
+    end;
+
+    function referenceX(size: Index, k: Index): Index is
+        let base: Index := k - ((k / 4) * 4);
+        if (k / 4) = 1 then
+            return (size - 4) + base;
+        end if;
+        return base;
+    end;
+
+    function referenceY(size: Index, k: Index): Index is
+        if (k / 4) = 2 then
+            return size - 9;
+        end if;
+        return 8;
+    end;
+
+    -- The cell of a finder pattern at i, j of its 7 by 7: black on its
+    -- edge and in its 3 by 3 middle.
+    function finderCell(i: Index, j: Index): Nat8 is
+        if ((i = 0) or (i = 6)) or ((j = 0) or (j = 6)) then
+            return black;
+        end if;
+        if ((i >= 2) and (i <= 4)) and ((j >= 2) and (j <= 4)) then
+            return black;
+        end if;
+        return white;
+    end;
+
+    -- The cell of the corner pattern at i, j of its 5 by 5: black on its
+    -- edge and in its middle.
+    function cornerCell(i: Index, j: Index): Nat8 is
+        if ((i = 0) or (i = 4)) or ((j = 0) or (j = 4)) then
+            return black;
+        end if;
+        if (i = 2) and (j = 2) then
+            return black;
+        end if;
+        return white;
+    end;
+
+    -- Cells of size, white, with the finder, corner and reference cells.
+    function frameOf(size: Index): Buffer[Nat8] is
+        var cells: Buffer[Nat8] := initialize(size * size, white);
+        var j: Index := 0;
+        while j < 7 do
+            var i: Index := 0;
+            while i < 7 do
+                let f: Nat8 := finderCell(i, j);
+                storeNth(&!cells, (j * size) + i, f);
+                storeNth(&!cells, (j * size) + ((size - 7) + i), f);
+                storeNth(&!cells, (((size - 7) + j) * size) + i, f);
+                i := i + 1;
+            end while;
+            j := j + 1;
+        end while;
+        var cj: Index := 0;
+        while cj < 5 do
+            var ci: Index := 0;
+            while ci < 5 do
+                storeNth(&!cells, (((size - 5) + cj) * size) + ((size - 5) + ci), cornerCell(ci, cj));
+                ci := ci + 1;
+            end while;
+            cj := cj + 1;
+        end while;
+        var k: Index := 0;
+        while k < 12 do
+            storeNth(&!cells, (referenceY(size, k) * size) + referenceX(size, k), narrow(k - ((k / 4) * 4)));
+            k := k + 1;
+        end while;
+        return cells;
+    end;
+
+    function blankBunti(size: Index): Option[BuntiCode] is
+        if not isBuntiSize(size) then
+            return None();
+        end if;
+        let code: BuntiCode := BuntiCode(size => size, cells => frameOf(size));
+        return Some(value => code);
+    end;
+
+    ---
+    --- Bases
+    ---
+
+    function letterOf(base: Nat8): Nat8 is
+        if base = 0 then
+            return 'A';
+        end if;
+        if base = 1 then
+            return 'C';
+        end if;
+        if base = 2 then
+            return 'G';
+        end if;
+        return 'T';
+    end;
+
+    generic [O: Region]
+    function putBases(out: &![Buffer[Nat8], O], byte: Index): Unit is
+        insertBack(&~out, narrow(byte / 64));
+        insertBack(&~out, narrow((byte / 16) - ((byte / 64) * 4)));
+        insertBack(&~out, narrow((byte / 4) - ((byte / 16) * 4)));
+        insertBack(&~out, narrow(byte - ((byte / 4) * 4)));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function basesOfBytes(bytes: Span[Nat8, R]): String is
+        var bases: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < spanLength(bytes) do
+            putBases(&!bases, wide(bytes[i]));
+            i := i + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        var j: Index := 0;
+        while j < length(&bases) do
+            writeByte(&!out, letterOf(nth(&bases, j)));
+            j := j + 1;
+        end while;
+        destroyFree(bases);
+        return finalize(out);
+    end;
+
+    -- The byte of the four bases from at on; a value above 3 counts as A.
+    generic [B: Region]
+    function byteAt(bases: &[Buffer[Nat8], B], at: Index): Index is
+        var byte: Index := 0;
+        var k: Index := 0;
+        while k < 4 do
+            var base: Index := wide(nth(bases, at + k));
+            if base > 3 then
+                base := (0 : Index);
+            end if;
+            byte := (byte * 4) + base;
+            k := k + 1;
+        end while;
+        return byte;
+    end;
+
+    ---
+    --- Levels and blocks
+    ---
+
+    function levelCode(level: BuntiLevel): Index is
+        case level of
+            when LevelL do
+                return 0;
+            when LevelM do
+                return 1;
+            when LevelQ do
+                return 2;
+            when LevelH do
+                return 3;
+        end case;
+    end;
+
+    -- The parity bytes of a full block of 255 at a level code.
+    function fullParity(level: Index): Index is
+        if level = 0 then
+            return 36;
+        end if;
+        if level = 1 then
+            return 76;
+        end if;
+        if level = 2 then
+            return 128;
+        end if;
+        return 154;
+    end;
+
+    function modeCode(mode: BuntiMode): Index is
+        case mode of
+            when Plain do
+                return 1;
+            when Dna do
+                return 2;
+        end case;
+    end;
+
+    function blockCount(count: Index, level: Index): Index is
+        let most: Index := (255 : Index) - fullParity(level);
+        return (count + (most - 1)) / most;
+    end;
+
+    -- The parity bytes of each block for count bytes at level: in
+    -- proportion to the longest block, even, at least 2.
+    function parityOf(count: Index, level: Index): Index is
+        if count = 0 then
+            return 0;
+        end if;
+        let blocks: Index := blockCount(count, level);
+        let longest: Index := (count + (blocks - 1)) / blocks;
+        let full: Index := fullParity(level);
+        let most: Index := (255 : Index) - full;
+        var parity: Index := ((longest * full) + (most - 1)) / most;
+        if (parity - ((parity / 2) * 2)) = 1 then
+            parity := parity + 1;
+        end if;
+        if parity < 2 then
+            parity := (2 : Index);
+        end if;
+        return parity;
+    end;
+
+    function codewordCount(count: Index, level: Index): Index is
+        return count + (blockCount(count, level) * parityOf(count, level));
+    end;
+
+    function basesNeeded(count: Index, mode: Index, level: Index): Index is
+        let codewords: Index := codewordCount(count, level);
+        if mode = 2 then
+            return dnaBaseCount(codewords);
+        end if;
+        return codewords * 4;
+    end;
+
+    function buntiCapacity(version: Index, mode: BuntiMode, level: BuntiLevel): Index is
+        let cells: Index := payloadCells(sizeOf(version));
+        let m: Index := modeCode(mode);
+        let l: Index := levelCode(level);
+        var count: Index := cells / 4;
+        if count > lengthMost then
+            count := lengthMost;
+        end if;
+        while (count > 0) and (basesNeeded(count, m, l) > cells) do
+            count := count - 1;
+        end while;
+        return count;
+    end;
+
+    ---
+    --- Encoding
+    ---
+
+    -- The codewords of payload at level: the data bytes of the blocks
+    -- column by column, then their parity column by column.
+    generic [R: Region]
+    function codewordsOf(payload: Span[Nat8, R], level: Index): Buffer[Nat8] is
+        let count: Index := spanLength(payload);
+        var data: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < count do
+            insertBack(&!data, payload[i]);
+            i := i + 1;
+        end while;
+        if count = 0 then
+            destroyFree(data);
+            let none: Buffer[Nat8] := allocateEmpty();
+            return none;
+        else
+            let made: Buffer[Nat8] := interleaved(&data, count, level);
+            destroyFree(data);
+            return made;
+        end if;
+    end;
+
+    generic [D: Region]
+    function interleaved(data: &[Buffer[Nat8], D], count: Index, level: Index): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        let blocks: Index := blockCount(count, level);
+        let parity: Index := parityOf(count, level);
+        let short: Index := count / blocks;
+        let longer: Index := count - (short * blocks);
+        -- The parity of every block, block after block.
+        var parities: Buffer[Nat8] := allocateEmpty();
+        let coder: RsCoder := makeRsCoder(parity);
+        var b: Index := 0;
+        var first: Index := 0;
+        while b < blocks do
+            var size: Index := short;
+            if b < longer then
+                size := size + 1;
+            end if;
+            let p: Buffer[Nat8] := rsParityWith(&coder, data, first, size);
+            var k: Index := 0;
+            while k < parity do
+                insertBack(&!parities, nth(&p, k));
+                k := k + 1;
+            end while;
+            destroyFree(p);
+            first := first + size;
+            b := b + 1;
+        end while;
+        destroyRsCoder(coder);
+        var column: Index := 0;
+        while column <= short do
+            var block: Index := 0;
+            var start: Index := 0;
+            while block < blocks do
+                var size: Index := short;
+                if block < longer then
+                    size := size + 1;
+                end if;
+                if column < size then
+                    insertBack(&!out, nth(data, start + column));
+                end if;
+                start := start + size;
+                block := block + 1;
+            end while;
+            column := column + 1;
+        end while;
+        var pc: Index := 0;
+        while pc < parity do
+            var block: Index := 0;
+            while block < blocks do
+                insertBack(&!out, nth(&parities, (block * parity) + pc));
+                block := block + 1;
+            end while;
+            pc := pc + 1;
+        end while;
+        destroyFree(parities);
+        return out;
+    end;
+
+    -- The 64 bases of the header.
+    function headerBases(version: Index, mode: Index, level: Index, count: Index, crc: Nat32): Buffer[Nat8] is
+        var header: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!header, narrow(((formatVersion * 16) + (mode * 4)) + level));
+        insertBack(&!header, narrow(version));
+        insertBack(&!header, narrow(count / 256));
+        insertBack(&!header, narrow(count - ((count / 256) * 256)));
+        let c: Index := indexOf(crc);
+        insertBack(&!header, narrow(c / 16777216));
+        insertBack(&!header, narrow((c / 65536) - ((c / 16777216) * 256)));
+        insertBack(&!header, narrow((c / 256) - ((c / 65536) * 256)));
+        insertBack(&!header, narrow(c - ((c / 256) * 256)));
+        let p: Buffer[Nat8] := rsParity(&header, 0, headerBytes, headerParity);
+        var k: Index := 0;
+        while k < headerParity do
+            insertBack(&!header, nth(&p, k));
+            k := k + 1;
+        end while;
+        destroyFree(p);
+        var bases: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < length(&header) do
+            putBases(&!bases, wide(nth(&header, i)));
+            i := i + 1;
+        end while;
+        destroyFree(header);
+        return bases;
+    end;
+
+    -- The cells of a code of size with the data sequence: the header, the
+    -- payload, the filling, the header again.
+    generic [H: Region, P: Region]
+    function cellsOf(size: Index, header: &[Buffer[Nat8], H], payload: &[Buffer[Nat8], P]): Buffer[Nat8] is
+        var cells: Buffer[Nat8] := frameOf(size);
+        let total: Index := dataCells(size);
+        let tail: Index := total - headerCells;
+        var n: Index := 0;
+        var y: Index := 0;
+        while y < size do
+            var x: Index := 0;
+            while x < size do
+                if isDataCell(size, x, y) then
+                    var value: Nat8 := 0;
+                    if n < headerCells then
+                        value := nth(header, n);
+                    else
+                        if n >= tail then
+                            value := nth(header, n - tail);
+                        else
+                            let at: Index := n - headerCells;
+                            if at < length(payload) then
+                                value := nth(payload, at);
+                            else
+                                value := narrow(at - ((at / 4) * 4));
+                            end if;
+                        end if;
+                    end if;
+                    storeNth(&!cells, (y * size) + x, value);
+                    n := n + 1;
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return cells;
+    end;
+
+    function codeOf(size: Index, cells: Buffer[Nat8]): Either[BuntiError, BuntiCode] is
+        let code: BuntiCode := BuntiCode(size => size, cells => cells);
+        return Right(right => code);
+    end;
+
+    function failed(error: BuntiError): Either[BuntiError, BuntiCode] is
+        let result: Either[BuntiError, BuntiCode] := Left(left => error);
+        return result;
+    end;
+
+    generic [R: Region]
+    function encodeBunti(payload: Span[Nat8, R], mode: BuntiMode, level: BuntiLevel): Either[BuntiError, BuntiCode] is
+        let count: Index := spanLength(payload);
+        let m: Index := modeCode(mode);
+        let l: Index := levelCode(level);
+        if count > lengthMost then
+            return failed(TooLong());
+        end if;
+        let needed: Index := basesNeeded(count, m, l);
+        var version: Index := 1;
+        while (version <= versionMost) and (payloadCells(sizeOf(version)) < needed) do
+            version := version + 1;
+        end while;
+        if version > versionMost then
+            return failed(TooLong());
+        end if;
+        let size: Index := sizeOf(version);
+        let codewords: Buffer[Nat8] := codewordsOf(payload, l);
+        var bases: Buffer[Nat8] := allocateEmpty();
+        var placed: Bool := true;
+        if m = 2 then
+            case dnaEncode(&codewords) of
+                when Some(value as made: Buffer[Nat8]) do
+                    destroyFree(bases);
+                    bases := made;
+                when None do
+                    placed := false;
+            end case;
+        else
+            var i: Index := 0;
+            while i < length(&codewords) do
+                putBases(&!bases, wide(nth(&codewords, i)));
+                i := i + 1;
+            end while;
+        end if;
+        destroyFree(codewords);
+        if not placed then
+            destroyFree(bases);
+            return failed(NoSeed());
+        else
+            let header: Buffer[Nat8] := headerBases(version, m, l, count, crc32(payload));
+            let cells: Buffer[Nat8] := cellsOf(size, &header, &bases);
+            destroyFree(header);
+            destroyFree(bases);
+            return codeOf(size, cells);
+        end if;
+    end;
+
+    ---
+    --- Decoding
+    ---
+
+    -- The values of the data cells, in order.
+    generic [C: Region]
+    function sequenceOf(code: &[BuntiCode, C]): Buffer[Nat8] is
+        let size: Index := code->size;
+        let cells: &[Buffer[Nat8], C] := &(code->cells);
+        var out: Buffer[Nat8] := allocateEmpty();
+        var y: Index := 0;
+        while y < size do
+            var x: Index := 0;
+            while x < size do
+                if isDataCell(size, x, y) then
+                    insertBack(&!out, nth(cells, (y * size) + x));
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return out;
+    end;
+
+    -- The header of the copy from first on, when it reads and fits size.
+    generic [S: Region]
+    function headerAt(sequence: &[Buffer[Nat8], S], first: Index, size: Index): Option[Header] is
+        var bytes: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < (headerBytes + headerParity) do
+            insertBack(&!bytes, narrow(byteAt(sequence, first + (i * 4))));
+            i := i + 1;
+        end while;
+        var result: Option[Header] := None();
+        case rsCorrect(&!bytes, headerParity) of
+            when Some(value as fixed: Index) do
+                let b0: Index := wide(nth(&bytes, 0));
+                let version: Index := b0 / 16;
+                let mode: Index := (b0 / 4) - ((b0 / 16) * 4);
+                let level: Index := b0 - ((b0 / 4) * 4);
+                let count: Index := (wide(nth(&bytes, 2)) * 256) + wide(nth(&bytes, 3));
+                let c: Index := (((wide(nth(&bytes, 4)) * 16777216) + (wide(nth(&bytes, 5)) * 65536)) + (wide(nth(&bytes, 6)) * 256)) + wide(nth(&bytes, 7));
+                let fits: Bool := ((version = formatVersion) and ((mode = 1) or (mode = 2))) and (wide(nth(&bytes, 1)) = versionOf(size));
+                if fits and (basesNeeded(count, mode, level) <= payloadCells(size)) then
+                    result := Some(value => Header(mode => mode, level => level, count => count, crc => natOf(c)));
+                end if;
+            when None do
+                skip;
+        end case;
+        destroyFree(bytes);
+        return result;
+    end;
+
+    generic [S: Region]
+    function headerOf(sequence: &[Buffer[Nat8], S], size: Index): Option[Header] is
+        case headerAt(sequence, 0, size) of
+            when Some(value as header: Header) do
+                return Some(value => header);
+            when None do
+                return headerAt(sequence, length(sequence) - headerCells, size);
+        end case;
+    end;
+
+    -- The payload of the codewords, block by block corrected; None when a
+    -- block has too many wrong bytes.
+    generic [W: Region]
+    function payloadOf(codewords: &[Buffer[Nat8], W], count: Index, level: Index): Option[String] is
+        if count = 0 then
+            let nothing: StringBuilder := makeStringBuilder();
+            let empty: String := finalize(nothing);
+            return Some(value => empty);
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        let blocks: Index := blockCount(count, level);
+        let parity: Index := parityOf(count, level);
+        let short: Index := count / blocks;
+        let longer: Index := count - (short * blocks);
+        var whole: Bool := true;
+        let coder: RsCoder := makeRsCoder(parity);
+        var b: Index := 0;
+        while whole and (b < blocks) do
+            var size: Index := short;
+            if b < longer then
+                size := size + 1;
+            end if;
+            var block: Buffer[Nat8] := allocateEmpty();
+            var column: Index := 0;
+            while column < size do
+                -- Column short holds a byte of the longer blocks only, which
+                -- come first: the same place.
+                insertBack(&!block, nth(codewords, (column * blocks) + b));
+                column := column + 1;
+            end while;
+            var p: Index := 0;
+            while p < parity do
+                insertBack(&!block, nth(codewords, (count + (p * blocks)) + b));
+                p := p + 1;
+            end while;
+            case rsCorrectWith(&coder, &!block) of
+                when Some(value as fixed: Index) do
+                    var k: Index := 0;
+                    while k < size do
+                        writeByte(&!out, nth(&block, k));
+                        k := k + 1;
+                    end while;
+                when None do
+                    whole := false;
+            end case;
+            destroyFree(block);
+            b := b + 1;
+        end while;
+        destroyRsCoder(coder);
+        let made: String := finalize(out);
+        if whole then
+            return Some(value => made);
+        else
+            destroyString(made);
+            return None();
+        end if;
+    end;
+
+    function payloadFailed(error: BuntiError): Either[BuntiError, String] is
+        let result: Either[BuntiError, String] := Left(left => error);
+        return result;
+    end;
+
+    -- The codewords of the payload bases of sequence.
+    generic [S: Region]
+    function codewordsFrom(sequence: &[Buffer[Nat8], S], header: Header): Buffer[Nat8] is
+        let total: Index := codewordCount(header.count, header.level);
+        if header.mode = 2 then
+            return dnaDecode(sequence, headerCells, total);
+        end if;
+        var out: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < total do
+            insertBack(&!out, narrow(byteAt(sequence, headerCells + (i * 4))));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [C: Region]
+    function decodeBunti(code: &[BuntiCode, C]): Either[BuntiError, String] is
+        let size: Index := code->size;
+        let sequence: Buffer[Nat8] := sequenceOf(code);
+        case headerOf(&sequence, size) of
+            when None do
+                destroyFree(sequence);
+                return payloadFailed(BadHeader());
+            when Some(value as header: Header) do
+                let codewords: Buffer[Nat8] := codewordsFrom(&sequence, header);
+                destroyFree(sequence);
+                let payload: Option[String] := payloadOf(&codewords, header.count, header.level);
+                destroyFree(codewords);
+                case payload of
+                    when None do
+                        return payloadFailed(Damaged());
+                    when Some(value as text: String) do
+                        if crc32(asSpan(&text)) = header.crc then
+                            return Right(right => text);
+                        else
+                            destroyString(text);
+                            return payloadFailed(BadChecksum());
+                        end if;
+                end case;
+        end case;
+    end;
+
+    generic [C: Region]
+    function buntiHeaderReads(code: &[BuntiCode, C]): Bool is
+        let size: Index := code->size;
+        let sequence: Buffer[Nat8] := sequenceOf(code);
+        var reads: Bool := false;
+        case headerOf(&sequence, size) of
+            when Some(value as header: Header) do
+                reads := true;
+            when None do
+                skip;
+        end case;
+        destroyFree(sequence);
+        return reads;
+    end;
+
+    generic [C: Region]
+    function buntiSequence(code: &[BuntiCode, C]): String is
+        let size: Index := code->size;
+        let sequence: Buffer[Nat8] := sequenceOf(code);
+        var out: StringBuilder := makeStringBuilder();
+        case headerOf(&sequence, size) of
+            when Some(value as header: Header) do
+                let count: Index := basesNeeded(header.count, header.mode, header.level);
+                var i: Index := 0;
+                while i < count do
+                    writeByte(&!out, letterOf(nth(&sequence, headerCells + i)));
+                    i := i + 1;
+                end while;
+            when None do
+                skip;
+        end case;
+        destroyFree(sequence);
+        return finalize(out);
+    end;
+
+    ---
+    --- Cells
+    ---
+
+    generic [C: Region]
+    function buntiSize(code: &[BuntiCode, C]): Index is
+        return code->size;
+    end;
+
+    generic [C: Region]
+    function buntiCell(code: &[BuntiCode, C], x: Index, y: Index): Nat8 is
+        let size: Index := code->size;
+        if (x >= size) or (y >= size) then
+            return white;
+        end if;
+        return nth(&(code->cells), (y * size) + x);
+    end;
+
+    generic [C: Region]
+    function setBuntiCell(code: &![BuntiCode, C], x: Index, y: Index, value: Nat8): Unit is
+        let size: Index := code->size;
+        setIn(&!(code->cells), size, x, y, value);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function setIn(cells: &![Buffer[Nat8], B], size: Index, x: Index, y: Index, value: Nat8): Unit is
+        if (x < size) and (y < size) then
+            storeNth(&~cells, (y * size) + x, value);
+        end if;
+        return nil;
+    end;
+
+    function destroyBunti(code: BuntiCode): Unit is
+        let { size as s: Index, cells as c: Buffer[Nat8] } := code;
+        destroyFree(c);
+        return nil;
+    end;
+
+    ---
+    --- Drawing
+    ---
+
+    function cellRed(value: Nat8): Nat8 is
+        if value = 0 then
+            return 0;
+        end if;
+        if value = 1 then
+            return 0;
+        end if;
+        if value = 2 then
+            return 250;
+        end if;
+        if value = 3 then
+            return 220;
+        end if;
+        if value = 4 then
+            return 0;
+        end if;
+        return 255;
+    end;
+
+    function cellGreen(value: Nat8): Nat8 is
+        if value = 0 then
+            return 170;
+        end if;
+        if value = 1 then
+            return 90;
+        end if;
+        if value = 2 then
+            return 205;
+        end if;
+        if value = 3 then
+            return 30;
+        end if;
+        if value = 4 then
+            return 0;
+        end if;
+        return 255;
+    end;
+
+    function cellBlue(value: Nat8): Nat8 is
+        if value = 0 then
+            return 70;
+        end if;
+        if value = 1 then
+            return 220;
+        end if;
+        if value = 2 then
+            return 0;
+        end if;
+        if value = 3 then
+            return 30;
+        end if;
+        if value = 4 then
+            return 0;
+        end if;
+        return 255;
+    end;
+
+    generic [C: Region]
+    function pixelSide(code: &[BuntiCode, C], scale: Index): Index is
+        return ((code->size) + (quietCells * 2)) * scale;
+    end;
+
+    -- The value of the cell under the pixel cell column cx, row cy of the
+    -- drawing, the quiet zone white.
+    generic [C: Region]
+    function drawnCell(code: &[BuntiCode, C], cx: Index, cy: Index): Nat8 is
+        if (cx < quietCells) or (cy < quietCells) then
+            return white;
+        end if;
+        return buntiCell(code, cx - quietCells, cy - quietCells);
+    end;
+
+    generic [C: Region]
+    function buntiPixels(code: &[BuntiCode, C], scale: Index): String is
+        let side: Index := pixelSide(code, scale);
+        var out: StringBuilder := makeStringBuilder();
+        var py: Index := 0;
+        while py < side do
+            var px: Index := 0;
+            while px < side do
+                let value: Nat8 := drawnCell(code, px / scale, py / scale);
+                writeByte(&!out, cellRed(value));
+                writeByte(&!out, cellGreen(value));
+                writeByte(&!out, cellBlue(value));
+                px := px + 1;
+            end while;
+            py := py + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [O: Region]
+    function writeNumber(out: &![StringBuilder, O], number: Index): Unit is
+        if number >= 10 then
+            writeNumber(&~out, number / 10);
+        end if;
+        writeByte(&~out, narrow(number - ((number / 10) * 10)) + '0');
+        return nil;
+    end;
+
+    function hexDigit(n: Nat8): Nat8 is
+        if n < 10 then
+            return n + '0';
+        end if;
+        return (n - 10) + 'a';
+    end;
+
+    generic [O: Region]
+    function writeColour(out: &![StringBuilder, O], value: Nat8): Unit is
+        writeByte(&~out, '#');
+        let r: Nat8 := cellRed(value);
+        let g: Nat8 := cellGreen(value);
+        let b: Nat8 := cellBlue(value);
+        writeByte(&~out, hexDigit(r / 16));
+        writeByte(&~out, hexDigit(r - ((r / 16) * 16)));
+        writeByte(&~out, hexDigit(g / 16));
+        writeByte(&~out, hexDigit(g - ((g / 16) * 16)));
+        writeByte(&~out, hexDigit(b / 16));
+        writeByte(&~out, hexDigit(b - ((b / 16) * 16)));
+        return nil;
+    end;
+
+    generic [C: Region]
+    function buntiSvg(code: &[BuntiCode, C], scale: Index): String is
+        let size: Index := code->size;
+        let side: Index := pixelSide(code, scale);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"");
+        writeNumber(&!out, side);
+        writeString(&!out, "\" height=\"");
+        writeNumber(&!out, side);
+        writeString(&!out, "\" viewBox=\"0 0 ");
+        writeNumber(&!out, side);
+        writeString(&!out, " ");
+        writeNumber(&!out, side);
+        writeString(&!out, "\" shape-rendering=\"crispEdges\"><rect width=\"");
+        writeNumber(&!out, side);
+        writeString(&!out, "\" height=\"");
+        writeNumber(&!out, side);
+        writeString(&!out, "\" fill=\"#ffffff\"/>");
+        var y: Index := 0;
+        while y < size do
+            var x: Index := 0;
+            while x < size do
+                let value: Nat8 := buntiCell(code, x, y);
+                var run: Index := 1;
+                while ((x + run) < size) and (buntiCell(code, x + run, y) = value) do
+                    run := run + 1;
+                end while;
+                if value /= white then
+                    writeString(&!out, "<rect x=\"");
+                    writeNumber(&!out, (x + quietCells) * scale);
+                    writeString(&!out, "\" y=\"");
+                    writeNumber(&!out, (y + quietCells) * scale);
+                    writeString(&!out, "\" width=\"");
+                    writeNumber(&!out, run * scale);
+                    writeString(&!out, "\" height=\"");
+                    writeNumber(&!out, scale);
+                    writeString(&!out, "\" fill=\"");
+                    writeColour(&!out, value);
+                    writeString(&!out, "\"/>");
+                end if;
+                x := x + run;
+            end while;
+            y := y + 1;
+        end while;
+        writeString(&!out, "</svg>\n");
+        return finalize(out);
+    end;
+
+    generic [C: Region]
+    function buntiPng(code: &[BuntiCode, C], scale: Index): Option[String] is
+        let side: Index := pixelSide(code, scale);
+        return pngOfRgb(side, side, buntiPixels(code, scale));
+    end;
+end module body.

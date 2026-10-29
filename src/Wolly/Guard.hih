@@ -1,0 +1,64 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Protection of a request that changes something against cross-site request
+forgery, in two lines, after Standard.Csrf.
+
+A form carries formToken of the session in a field named by
+csrfFieldName.  changeAllowed takes a request whose method changes
+something, POST for one, only when the browser's headers say it came
+from the server's own origin (Sec-Fetch-Site, else Origin) and the field
+holds the token of the session the request came with.  A request whose
+method changes nothing is always allowed: a GET must not change anything,
+which is the handler's duty.
+
+The server's own origin is the scheme the web server reports (HTTPS) and
+the Host the request names.  A browser sends the Host of the page it
+asks, so a page of another site cannot make it name this one and an
+Origin of its own.
+"""
+import Standard.String (
+    String
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Guard is
+    """
+    The name of the form field that carries the token: csrf.
+    """
+    function csrfFieldName(): Span[Nat8, Static]
+        ensures spanLength(result) = 4;
+
+    """
+    The token for the forms of the session of sessionToken, under key.
+    None when key is shorter than Standard.Csrf.csrfKeyBytes or libcrypto
+    fails.
+    No contract: an Option from a computation that can fail.
+    """
+    generic [K: Region, T: Region]
+    function formToken(key: Span[Nat8, K], sessionToken: Span[Nat8, T]): Option[String];
+
+    """
+    The origin of the server as the request names it: https:// when the
+    web server says HTTPS is on, else http://, and the Host header.  None
+    when there is no Host, or it holds a byte that no host and port have.
+    No contract: an Option read from the request.
+    """
+    generic [R: Region]
+    function expectedOrigin(request: &[Request, R]): Option[String];
+
+    """
+    Whether the request may change something: always for a method that
+    changes nothing, else only from the server's own origin and with the
+    token of the session of sessionToken in the form field.
+    No contract: the answer reads the request.
+    """
+    generic [R: Region, K: Region, T: Region]
+    function changeAllowed(request: &[Request, R], key: Span[Nat8, K], sessionToken: Span[Nat8, T]): Bool;
+end module.

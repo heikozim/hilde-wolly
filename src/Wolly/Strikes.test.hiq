@@ -1,0 +1,80 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Strikes (
+    prepareStrikes,
+    strike,
+    clearStrikes,
+    pruneStrikes
+);
+
+module body Wolly.Strikes.Test is
+    constant now: Int64 := 1800000000;
+    constant window: Int64 := 900;
+
+    function isTrue(result: Either[DbError, Bool]): Bool is
+        case result of
+            when Right(right as b: Bool) do
+                return b;
+            when Left(left as error: DbError) do
+                abort("the database failed");
+        end case;
+    end;
+
+    function holds(result: Option[DbError]): Bool is
+        case result of
+            when None do
+                return true;
+            when Some(value as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function testSeries(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                assertTrue(holds(prepareStrikes(&!db)), "the table is made");
+                assertFalse(isTrue(strike(&!db, "10.0.0.1", 3, window, now)), "the first");
+                assertFalse(isTrue(strike(&!db, "10.0.0.1", 3, window, now + 10)), "the second");
+                assertTrue(isTrue(strike(&!db, "10.0.0.1", 3, window, now + 20)), "the third earns it");
+                assertFalse(isTrue(strike(&!db, "10.0.0.1", 3, window, now + 30)), "the fourth does not again");
+                assertFalse(isTrue(strike(&!db, "10.0.0.2", 3, window, now)), "another key counts alone");
+                assertTrue(holds(clearStrikes(&!db, "10.0.0.1")), "cleared");
+                assertFalse(isTrue(strike(&!db, "10.0.0.1", 3, window, now + 40)), "a new series");
+                assertFalse(isTrue(strike(&!db, "10.0.0.1", 3, window, now + 50)), "its second");
+                assertFalse(isTrue(strike(&!db, "10.0.0.1", 3, window, now + 941)), "out of the window: a new series");
+                assertFalse(isTrue(strike(&!db, "10.0.0.1", 3, window, now + 942)), "its second");
+                assertTrue(isTrue(strike(&!db, "10.0.0.1", 3, window, now + 943)), "its third");
+                assertTrue(isTrue(strike(&!db, "10.0.0.3", 1, window, now)), "a limit of one at once");
+                assertFalse(isTrue(strike(&!db, "10.0.0.4", 0, window, now)), "a limit of nothing");
+                assertFalse(isTrue(strike(&!db, "", 1, window, now)), "no key");
+                case pruneStrikes(&!db, window, now + 1000) of
+                    when Right(right as n: Int64) do
+                        assertTrue(n = 2, "the series that began at now go");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "pruned");
+                end case;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database");
+        end case;
+        return nil;
+    end;
+end module body.

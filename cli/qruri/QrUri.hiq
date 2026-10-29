@@ -1,0 +1,60 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Wolly.Qr (
+    qrDataUri
+);
+
+import Wolly.Version (
+    answerAboutBare
+);
+import Wolly.Confine (
+    sandboxAsked,
+    toolPolicy,
+    confineTool,
+    printToolSandbox
+);
+
+module body Wolly.Example.QrUri is
+    function command(): ExitCode is
+        if answerAboutBare("qruri") then
+            return ExitSuccess();
+        end if;
+        if sandboxAsked() then
+            printToolSandbox("qruri", "stdio", toolPolicy("stdio"));
+            return ExitSuccess();
+        end if;
+        if argumentCount() /= 2 then
+            printLn("usage: qruri TEXT");
+            return ExitFailure();
+        end if;
+        if not confineTool(toolPolicy("stdio")) then
+            printLn("qruri: the sandbox was refused");
+            return ExitFailure();
+        end if;
+        case qrDataUri(nthArgument(1)) of
+            when Some(value as uri: String) do
+                printLn(asSpan(&uri));
+                destroyString(uri);
+                return ExitSuccess();
+            when None do
+                printLn("qruri: the text does not fit a code");
+                return ExitFailure();
+        end case;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        let code: ExitCode := command();
+        surrenderRoot(power);
+        return code;
+    end;
+end module body.

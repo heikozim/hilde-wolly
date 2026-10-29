@@ -1,0 +1,491 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeFirst,
+    nthRef,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    toLower,
+    trim,
+    indexOfByte,
+    substring
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam,
+    requestBody
+);
+import Standard.Log (
+    Log,
+    Entry,
+    Info,
+    makeEntry,
+    addText,
+    writeEntry
+);
+import Wolly.Request (
+    cookie
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish,
+    decimalText
+);
+import Wolly.OpClient (
+    Limits
+);
+import Wolly.OpUrl (
+    UrlParts,
+    QueryPair,
+    destroyUrlParts,
+    parseUrl,
+    parseQuery,
+    destroyPairs
+);
+import Wolly.OpKey (
+    KeyFamily,
+    MlDsa
+);
+import Wolly.OpStore (
+    OpSession,
+    destroySession,
+    isAlive,
+    sessionByToken
+);
+import Wolly.Account (
+    Account,
+    destroyAccount,
+    accountById
+);
+
+module body Wolly.OpBase is
+    constant formBytes: Index := 16384;
+
+    generic [I: Region, N: Region, C: Region]
+    function makeSettings(issuer: Span[Nat8, I], name: Span[Nat8, N], cookieName: Span[Nat8, C], allowHttp: Bool,
+        idle: Int64, max: Int64): Option[OpSettings] is
+        if (idle <= 0) or (max <= 0) or (idle > max) then
+            let none: Option[OpSettings] := None();
+            return none;
+        end if;
+        if not issuerHolds(issuer, allowHttp) then
+            let none: Option[OpSettings] := None();
+            return none;
+        end if;
+        return Some(value => OpSettings(issuer => fromSpan(issuer), name => fromSpan(name), cookieName => fromSpan(cookieName),
+            allowHttp => allowHttp, session => Limits(idle => idle, max => max, refresh => idle), accessTtl => 600,
+            idTokenTtl => 600, codeTtl => 60, requestTtl => 600, keyRotation => 7776000, leeway => 120,
+            loginPath => fromSpan("/login"), logoutPath => fromSpan("/login/logout"), defaultFamily => MlDsa()));
+    end;
+
+    function withDefaultFamily(settings: OpSettings, family: KeyFamily): OpSettings is
+        let { issuer: String, name: String, cookieName: String, allowHttp: Bool, session: Limits, accessTtl: Int64,
+            idTokenTtl: Int64, codeTtl: Int64, requestTtl: Int64, keyRotation: Int64, leeway: Int64, loginPath: String,
+            logoutPath: String, defaultFamily: KeyFamily } := settings;
+        return OpSettings(issuer => issuer, name => name, cookieName => cookieName, allowHttp => allowHttp,
+            session => session, accessTtl => accessTtl, idTokenTtl => idTokenTtl, codeTtl => codeTtl,
+            requestTtl => requestTtl, keyRotation => keyRotation, leeway => leeway, loginPath => loginPath,
+            logoutPath => logoutPath, defaultFamily => family);
+    end;
+
+    -- Whether issuer is scheme://host with nothing after it, https unless
+    -- allowHttp.
+    generic [I: Region]
+    function issuerHolds(issuer: Span[Nat8, I], allowHttp: Bool): Bool is
+        case parseUrl(issuer) of
+            when Some(value as parts: UrlParts) do
+                let holds: Bool := partsHold(&parts, allowHttp);
+                destroyUrlParts(parts);
+                return holds;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [P: Region]
+    function partsHold(parts: &[UrlParts, P], allowHttp: Bool): Bool is
+        let scheme: Span[Nat8, P] := asSpan(&(parts->scheme));
+        let schemeFits: Bool := equal(scheme, "https") or (allowHttp and equal(scheme, "http"));
+        return schemeFits and parts->hasAuthority and (length(&(parts->host)) > 0) and (not parts->hasUser) and
+            (length(&(parts->path)) = 0) and (not parts->hasQuery) and (not parts->hasFragment);
+    end;
+
+    function destroySettings(settings: OpSettings): Unit is
+        let { issuer: String, name: String, cookieName: String, allowHttp: Bool, session: Limits, accessTtl: Int64,
+            idTokenTtl: Int64, codeTtl: Int64, requestTtl: Int64, keyRotation: Int64, leeway: Int64, loginPath: String,
+            logoutPath: String, defaultFamily: KeyFamily } := settings;
+        destroyString(issuer);
+        destroyString(name);
+        destroyString(cookieName);
+        destroyString(loginPath);
+        destroyString(logoutPath);
+        return nil;
+    end;
+
+    generic [S: Region]
+    function keyKeep(settings: &[OpSettings, S]): Int64 is
+        let longest: Int64 := if settings->accessTtl > settings->idTokenTtl then settings->accessTtl else settings->idTokenTtl;
+        let keep: Int64 := longest + settings->leeway;
+        if keep <= 0 then
+            return 1;
+        end if;
+        return keep;
+    end;
+
+    function mostFormBytes(): Index is
+        return formBytes;
+    end;
+
+    generic [R: Region]
+    function isPost(request: &[Request, R]): Bool is
+        case requestParam(request, "REQUEST_METHOD") of
+            when Some(value as verb: String) do
+                let post: Bool := equal(asSpan(&verb), "POST");
+                destroyString(verb);
+                return post;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the content type of request is a form.
+    generic [R: Region]
+    function isForm(request: &[Request, R]): Bool is
+        case requestParam(request, "CONTENT_TYPE") of
+            when Some(value as contentType: String) do
+                let lower: String := toLower(asSpan(&contentType));
+                destroyString(contentType);
+                let main: Span[Nat8, Static] := "application/x-www-form-urlencoded";
+                var fits: Bool := false;
+                borrow l: &[String, L] := &lower do
+                    let text: Span[Nat8, L] := asSpan(l);
+                    case indexOfByte(text, ';') of
+                        when Some(value as semicolon: Index) do
+                            fits := equal(trim(substring(text, 0, semicolon)), main);
+                        when None do
+                            fits := equal(trim(text), main);
+                    end case;
+                end borrow;
+                destroyString(lower);
+                return fits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function bodyOf(request: &[Request, R]): Option[Buffer[QueryPair]] is
+        let raw: Span[Nat8, R] := requestBody(request);
+        if spanLength(raw) > formBytes then
+            let none: Option[Buffer[QueryPair]] := None();
+            return none;
+        end if;
+        if isPost(request) and isForm(request) then
+            return parseQuery(raw);
+        end if;
+        let empty: Buffer[QueryPair] := allocateEmpty();
+        return Some(value => empty);
+    end;
+
+    generic [R: Region]
+    function formOf(request: &[Request, R]): Option[Buffer[QueryPair]] is
+        case bodyOf(request) of
+            when Some(value as fromBody: Buffer[QueryPair]) do
+                var pairs: Buffer[QueryPair] := fromBody;
+                case requestParam(request, "QUERY_STRING") of
+                    when Some(value as query: String) do
+                        let parsed: Option[Buffer[QueryPair]] := parseQuery(asSpan(&query));
+                        destroyString(query);
+                        case parsed of
+                            when Some(value as found: Buffer[QueryPair]) do
+                                var rest: Buffer[QueryPair] := found;
+                                while bufferLength(&rest) > 0 do
+                                    insertBack(&!pairs, removeFirst(&!rest));
+                                end while;
+                                destroyEmpty(rest);
+                            when None do
+                                destroyPairs(pairs);
+                                let none: Option[Buffer[QueryPair]] := None();
+                                return none;
+                        end case;
+                    when None do
+                        skip;
+                end case;
+                return Some(value => pairs);
+            when None do
+                let none: Option[Buffer[QueryPair]] := None();
+                return none;
+        end case;
+    end;
+
+    generic [P: Region, N: Region]
+    function valueOf(pairs: &[Buffer[QueryPair], P], name: Span[Nat8, N]): String is
+        var i: Index := 0;
+        while i < bufferLength(pairs) do
+            let pair: &[QueryPair, P] := nthRef(pairs, i);
+            if equal(asSpan(&(pair->name)), name) then
+                return fromSpan(asSpan(&(pair->value)));
+            end if;
+            i := i + 1;
+        end while;
+        return fromSpan("");
+    end;
+
+    generic [P: Region, N: Region]
+    function hasValue(pairs: &[Buffer[QueryPair], P], name: Span[Nat8, N]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(pairs) do
+            let pair: &[QueryPair, P] := nthRef(pairs, i);
+            if equal(asSpan(&(pair->name)), name) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region, N: Region]
+    function cookieOf(request: &[Request, R], name: Span[Nat8, N]): String is
+        case cookie(request, name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [S: Region]
+    function flowCookieName(settings: &[OpSettings, S]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&(settings->cookieName)));
+        writeString(&!out, "-flow");
+        return finalize(out);
+    end;
+
+    generic [N: Region, V: Region]
+    function cookieHeader(name: Span[Nat8, N], value: Span[Nat8, V], maxAge: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, name);
+        writeByte(&!out, '=');
+        if maxAge >= 0 then
+            writeString(&!out, value);
+        end if;
+        writeString(&!out, "; Path=/");
+        if maxAge > 0 then
+            writeString(&!out, "; Max-Age=");
+            let digits: String := decimalText(maxAge);
+            writeString(&!out, asSpan(&digits));
+            destroyString(digits);
+        else if maxAge < 0 then
+            writeString(&!out, "; Max-Age=0");
+        end if;
+        writeString(&!out, "; HttpOnly; Secure; SameSite=Strict");
+        return finalize(out);
+    end;
+
+    generic [S: Region]
+    function errorPage(settings: &[OpSettings, S], message: Span[Nat8, Static]): String is
+        var page: StringBuilder := makeStringBuilder();
+        writeString(&!page, asSpan(&(settings->name)));
+        writeString(&!page, ": ");
+        writeString(&!page, message);
+        writeByte(&!page, 10);
+        let text: String := finalize(page);
+        let response: Response := addHeader(makeResponse(400, "text/plain; charset=utf-8"), "Cache-Control", "no-store");
+        let output: String := finish(response, asSpan(&text));
+        destroyString(text);
+        return output;
+    end;
+
+    generic [L: Region, C: Region]
+    function redirectTo(status: Nat16, location: Span[Nat8, L], cookies: &[Buffer[String], C]): String is
+        var response: Response := addHeader(makeResponse(status, "text/html; charset=utf-8"), "Location", location);
+        response := addHeader(response, "Cache-Control", "no-store");
+        var i: Index := 0;
+        while i < bufferLength(cookies) do
+            response := addHeader(response, "Set-Cookie", asSpan(nthRef(cookies, i)));
+            i := i + 1;
+        end while;
+        let escaped: String := htmlEscape(location);
+        var page: StringBuilder := makeStringBuilder();
+        writeString(&!page, "<a href=\"");
+        writeString(&!page, asSpan(&escaped));
+        writeString(&!page, "\">Found</a>.\n");
+        destroyString(escaped);
+        let text: String := finalize(page);
+        let output: String := finish(response, asSpan(&text));
+        destroyString(text);
+        return output;
+    end;
+
+    generic [B: Region, C: Region]
+    function jsonOutput(status: Nat16, contentType: Span[Nat8, Static], content: Span[Nat8, B],
+        cacheControl: Span[Nat8, C]): String is
+        var response: Response := makeResponse(status, contentType);
+        if spanLength(cacheControl) > 0 then
+            response := addHeader(response, "Cache-Control", cacheControl);
+        end if;
+        return finish(response, content);
+    end;
+
+    function destroySubject(subject: Subject): Unit is
+        let { email: String, name: String } := subject;
+        destroyString(email);
+        destroyString(name);
+        return nil;
+    end;
+
+    generic [R: Region, I: Region]
+    function activeSubject(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Option[Subject]] is
+        case accountById(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[Account]) do
+                case found of
+                    when Some(value as account: Account) do
+                        let { id as accountId: String, email: String, name: String, locked: Bool, lockedAt: Int64,
+                            mustChangePassword: Bool, hasPassword: Bool, hasTotp: Bool, createdAt: Int64,
+                            updatedAt: Int64 } := account;
+                        destroyString(accountId);
+                        if locked then
+                            destroyString(email);
+                            destroyString(name);
+                            let none: Option[Subject] := None();
+                            return Right(right => none);
+                        end if;
+                        return Right(right => Some(value => Subject(email => email, name => name)));
+                    when None do
+                        let none: Option[Subject] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region]
+    function cookieSession(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        now: Int64): Either[DbError, Option[OpSession]] is
+        let token: String := cookieOf(request, asSpan(&(settings->cookieName)));
+        let found: Either[DbError, Option[OpSession]] := sessionByToken(&~db, asSpan(&token));
+        destroyString(token);
+        case found of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as maybe: Option[OpSession]) do
+                case maybe of
+                    when Some(value as session: OpSession) do
+                        let limits: Limits := settings->session;
+                        if not isAlive(&session, now, limits.idle, limits.max) then
+                            destroySession(session);
+                            let none: Option[OpSession] := None();
+                            return Right(right => none);
+                        end if;
+                        let subject: String := subjectCopy(&session);
+                        let active: Either[DbError, Option[Subject]] := activeSubject(&~db, asSpan(&subject));
+                        destroyString(subject);
+                        case active of
+                            when Left(left as error: DbError) do
+                                destroySession(session);
+                                return Left(left => error);
+                            when Right(right as who: Option[Subject]) do
+                                case who of
+                                    when Some(value as s: Subject) do
+                                        destroySubject(s);
+                                        return Right(right => Some(value => session));
+                                    when None do
+                                        destroySession(session);
+                                        let none: Option[OpSession] := None();
+                                        return Right(right => none);
+                                end case;
+                        end case;
+                    when None do
+                        let none: Option[OpSession] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    generic [S: Region]
+    function subjectCopy(session: &[OpSession, S]): String is
+        return fromSpan(asSpan(&(session->subject)));
+    end;
+
+    generic [L: Region, C: Region, U: Region, I: Region, E: Region, A: Region]
+    function audit(log: &![Log, L], event: Span[Nat8, Static], client: Span[Nat8, C], subject: Span[Nat8, U],
+        sid: Span[Nat8, I], reason: Span[Nat8, E], result: Span[Nat8, Static], addr: Span[Nat8, A]): Unit is
+        var entry: Entry := addText(makeEntry(Info(), "audit"), "event", event);
+        if spanLength(client) > 0 then
+            entry := addText(entry, "client", client);
+        end if;
+        if spanLength(subject) > 0 then
+            entry := addText(entry, "subject", subject);
+        end if;
+        if spanLength(sid) > 0 then
+            entry := addText(entry, "sid", sid);
+        end if;
+        if spanLength(reason) > 0 then
+            entry := addText(entry, "reason", reason);
+        end if;
+        entry := addText(entry, "result", result);
+        if spanLength(addr) > 0 then
+            entry := addText(entry, "addr", addr);
+        end if;
+        let written: Bool := writeEntry(&~log, entry);
+        return nil;
+    end;
+
+    generic [T: Region]
+    function htmlEscape(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            if c = '&' then
+                writeString(&!out, "&amp;");
+            else if c = '<' then
+                writeString(&!out, "&lt;");
+            else if c = '>' then
+                writeString(&!out, "&gt;");
+            else if c = '"' then
+                writeString(&!out, "&#34;");
+            else if c = '\'' then
+                writeString(&!out, "&#39;");
+            else
+                writeByte(&!out, c);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+end module body.

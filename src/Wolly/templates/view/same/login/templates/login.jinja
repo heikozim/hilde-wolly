@@ -1,0 +1,23 @@
+{#
+Part of Wolly, a web framework in Hilde.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The login form.  name is what the visitor typed and comes back as it was
+sent: the compiler escapes it for the text and for the attribute it lands
+in.  The hidden field is the one Wolly.Guard reads, csrf.
+-#}
+{% extends "templates/view/same/login/templates/base.jinja" %}
+{% block title %}Login{% endblock %}
+{% block content %}
+{%- if message %}
+<p class="message">{{ message }}{% if name %}: {{ name }}{% endif %}</p>
+{%- endif %}
+<form method="post" action="/login">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input name="name" value="{{ name }}" autocomplete="username">
+<input type="password" name="password" autocomplete="current-password">
+<button>Log in</button>
+</form>
+{% endblock %}

@@ -1,0 +1,39 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Pseudonyms of personal data, a client address for one, for what is kept
+and logged: the HMAC-SHA256 of the value under a key of the
+server, in hex.  The same value gives the same pseudonym as long as the
+key stays, so a pseudonym can be counted and compared, and without the key
+it cannot be turned back.
+
+There is no pseudonym without a key: a plain SHA-256 of an IPv4 address
+is turned back by trying all 2^32 of them.  The key is a machine key of
+at least 32 bytes (Wolly.Secret); the HMAC is taken under the HMAC of the
+purpose under it, so the key of the pseudonyms is not the key of anything
+else even when one file serves two purposes.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Pseudonym is
+    """
+    The hex digits of a pseudonym: 64.
+    """
+    function pseudonymDigits(): Index
+        ensures result = 64;
+
+    """
+    The pseudonym of value under key.  None when key is shorter than 32
+    bytes or libcrypto fails.
+    No contract: a short key is answered with None, not refused, and the
+    digest is the work of libcrypto.
+    """
+    generic [K: Region, V: Region]
+    function pseudonym(key: Span[Nat8, K], value: Span[Nat8, V]): Option[String];
+end module.

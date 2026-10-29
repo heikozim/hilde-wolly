@@ -1,0 +1,78 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A limit on how often one key may do one thing: at most limit times within
+window seconds, counted in SQLite, so that it holds across the requests and
+the processes of an application.  The key is what is limited, a client
+address for one; the scope names the thing, so that two limits on one key
+do not share a count.
+
+A request over the limit is not counted, so a client that keeps asking
+waits for its old requests to leave the window and not for its refusals.
+Each call removes the counts of its scope that have left the window, so the
+table holds at most limit rows per key and scope.  Counting and adding are
+one transaction: two requests at once cannot both take the last place.
+
+Web servers limit floods of one connection and the connections of a client
+(Hiawatha's BanOnFlooding and ConnectionsPerIP); this is the limit across
+connections for what costs, a form or a search.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Limit is
+    """
+    The verdict on one call of hit.
+    """
+    union Verdict: Free is
+        """
+        Within the limit; the call is counted.
+        """
+        case Allowed;
+        """
+        Over the limit; the call is not counted.  retryAfter is the number
+        of seconds until the oldest counted call leaves the window, at
+        least 1, for a Retry-After header.
+        """
+        case Limited is
+            retryAfter: Int64;
+    end;
+
+    """
+    Makes the table of counted calls and its index, if they are not there.
+    None when both exist afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareLimits(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Counts one call of key in scope at the time now, in seconds, unless
+    key has made limit calls in scope within the window seconds before
+    now; then the verdict is Limited and nothing is counted.  Fails with
+    the error of SQLite, and then nothing is counted either.
+    """
+    generic [R: Region, S: Region, K: Region]
+    function hit(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K], now: Int64,
+                 limit: Int64, window: Int64): Either[DbError, Verdict]
+        requires now >= 0
+        requires limit > 0
+        requires window > 0;
+
+    """
+    The answer to a limited call: 429 with a Retry-After of retryAfter
+    seconds and a short text, as the CGI output.
+    """
+    function tooManyRequests(retryAfter: Int64): String
+        requires retryAfter > 0;
+end module.

@@ -1,0 +1,69 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Reads a Bunti code (Wolly.Bunti) out of a picture, as a camera gives it:
+red, green and blue bytes of each pixel, row by row (docs/bunti-format.md).
+
+A pixel is dark when the highest of its three values lies below the
+threshold Otsu's method finds for them: black is dark, and the four colours
+of the bases are not, each having one value near the top.  The finder
+patterns are found by the runs dark, light, dark, light, dark of the widths
+1 : 1 : 3 : 1 : 1 along the rows, checked down the column of their middle;
+the corner pattern by 1 : 1 : 1 : 1 : 1.  The finder whose two others stand
+at a right angle to it is the top left, the turn from it to the two
+others tells top right from bottom left, so a code is read in any of its
+four turns.  Their distance in cells gives the size, tried with its
+neighbours; the three finders and the corner pattern give a perspective
+transformation, and every cell is sampled in its middle and given the base
+whose reference cell is nearest in colour.  The header must read and
+name the size, Reed-Solomon and the CRC-32 must agree: a picture gives
+its payload or an error, never other bytes.
+
+Nothing here reads a file, the network or the clock.
+
+    case decodeBuntiPixels(width, height, asSpan(&frame)) of
+        when Right(right as payload: String) do ...
+        when Left(left as error: BuntiError) do ...  -- NotFound, Damaged
+    end case;
+"""
+import Standard.String (
+    String
+);
+import Wolly.Bunti (
+    BuntiError,
+    BuntiCode
+);
+
+module Wolly.BuntiScan is
+    """
+    The cells of the code in width by height pixels of red, green and blue,
+    row by row; Left NotFound when there is none, or pixels is not width
+    * height * 3 bytes.  The header of the code is read already.
+    No contract: it reads pixels as a parser reads text, and any width,
+    height and length of pixels is answered, an impossible one with Left
+    NotFound, never with a trap.
+    """
+    generic [R: Region]
+    function readBuntiPixels(width: Index, height: Index, pixels: Span[Nat8, R]): Either[BuntiError, BuntiCode];
+
+    """
+    The payload of the code in the pixels: readBuntiPixels, then
+    Wolly.Bunti.decodeBunti.
+    No contract: as readBuntiPixels, any width, height and length of
+    pixels is answered with an Either, never with a trap.
+    """
+    generic [R: Region]
+    function decodeBuntiPixels(width: Index, height: Index, pixels: Span[Nat8, R]): Either[BuntiError, String];
+
+    """
+    The payload of the code in the PNG in data, read through Wolly.Image
+    with at most maxPixels pixels.
+    """
+    generic [R: Region]
+    function decodeBuntiPng(data: Span[Nat8, R], maxPixels: Index): Either[BuntiError, String]
+        requires maxPixels > 0;
+end module.

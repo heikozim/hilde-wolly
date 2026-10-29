@@ -1,0 +1,57 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Checks of form fields by allowlist: what a value may hold, not what it
+must not.  Each check is a walk over the bytes and says yes or no; what
+to answer is the handler's.
+
+The rules of a password are not here but in Wolly.Passphrase, which has
+no rules of character classes (NIST SP 800-63B-4).
+"""
+module Wolly.Field is
+    """
+    The ASCII letters, a to z and A to Z.
+    """
+    function letters(): Span[Nat8, Static]
+        ensures spanLength(result) = 52;
+
+    """
+    The decimal digits.
+    """
+    function digits(): Span[Nat8, Static]
+        ensures spanLength(result) = 10;
+
+    """
+    Whether every byte of value is one of allowed, and value has at most
+    most bytes.  The empty value is allowed.
+    No contract: a walk over value; any value may be asked.
+    """
+    generic [V: Region, A: Region]
+    function onlyFrom(value: Span[Nat8, V], allowed: Span[Nat8, A], most: Index): Bool;
+
+    """
+    Whether value is an e-mail address of the plain kind: a local part of
+    letters, digits and . _ % + -, not starting or ending with a dot and
+    without two dots in a row; an @; a domain of labels of letters, digits
+    and hyphens, a label neither starting nor ending with a hyphen, at
+    most 63 bytes each, the last of two or more letters; at most 254 bytes
+    in all.  Quoted local parts and addresses of IP literals are refused.
+    No contract: a walk over value; false is the answer for a bad one.
+    """
+    generic [V: Region]
+    function isEmail(value: Span[Nat8, V]): Bool;
+
+    """
+    Whether value is a date as YYYY-MM-DD, the form an input of type date
+    sends: four digits of a year from 0001, two of a month, two of a day
+    that the month of that year has, leap years of the Gregorian calendar
+    included.
+    No contract: a walk over value; false is the answer for a bad one.
+    """
+    generic [V: Region]
+    function isDate(value: Span[Nat8, V]): Bool;
+end module.

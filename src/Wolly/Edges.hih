@@ -1,0 +1,145 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Relations between things of an application as edges in SQLite: from a
+node to a node, of a kind, with a weight.  No graph database: a table, the
+recursive queries of SQL for what SQL does well, and Standard.Graph for
+what it does not.
+
+Reachability and the nodes above one (a hierarchy read upwards) are one
+WITH RECURSIVE query each.  Its UNION keeps every node once, so a cycle
+in the edges ends the recursion instead of running it forever, and a
+query stops after mostNodes nodes in any case.
+
+The lightest route (Dijkstra), the route of fewest edges and a cycle load
+the edges of one kind into a Standard.Graph and ask it.  A node is named
+by a text of 1 to 128 bytes of letters, digits, dot, colon, hyphen and
+underscore, so that a route can be given as the names one a line.
+
+The edges live beside the rest of the data; nothing here asks whether a
+node exists elsewhere.  Built on Standard.Database; its statements are
+written for SQLite.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Edges is
+    """
+    A route between two nodes, or none.
+    """
+    union EdgeRoute: Linear is
+        """
+        No route leads there, or a node is unknown.
+        """
+        case NoRoute;
+        """
+        weight is the sum of the weights of its edges, or their number for
+        the route of fewest edges; nodes are their names one a line, the
+        first and the last included.
+        """
+        case Found is
+            weight: Nat64;
+            nodes: String;
+    end;
+
+    """
+    The most nodes a query of reachability gives: 10000.
+    """
+    function mostNodes(): Int64
+        ensures result = 10000;
+
+    """
+    Whether name may name a node: 1 to 128 bytes of a to z, A to Z, 0 to
+    9, dot, colon, hyphen and underscore.
+    No contract: a walk over name; false is the answer for a bad one.
+    """
+    generic [N: Region]
+    function isNodeName(name: Span[Nat8, N]): Bool;
+
+    """
+    Makes the table of edges and its index, if they are not there.  None
+    when both exist afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareEdges(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    The edge from source to target of kind with weight; an edge of the
+    same three there before takes the new weight.  Right false when a name
+    is no node name, and then nothing is stored.
+    """
+    generic [R: Region, S: Region, T: Region, K: Region]
+    function addEdge(db: &![Database[Writing], R], source: Span[Nat8, S], target: Span[Nat8, T], kind: Span[Nat8, K],
+                     weight: Int64): Either[DbError, Bool]
+        requires weight >= 0;
+
+    """
+    Removes the edge from source to target of kind.  Right true when there
+    was one.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, S: Region, T: Region, K: Region]
+    function removeEdge(db: &![Database[Writing], R], source: Span[Nat8, S], target: Span[Nat8, T],
+                        kind: Span[Nat8, K]): Either[DbError, Bool];
+
+    """
+    The nodes reachable from origin along edges of kind, origin itself only
+    when a cycle leads back to it, sorted, one a line, at most mostNodes.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, S: Region, K: Region]
+    function reachable(db: &![Database[M], R], origin: Span[Nat8, S], kind: Span[Nat8, K]): Either[DbError, String];
+
+    """
+    The nodes from which node is reachable along edges of kind: in a
+    hierarchy whose edges point from a parent to a child, the parents of
+    node and theirs.  Sorted, one a line, at most mostNodes.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, N: Region, K: Region]
+    function ancestors(db: &![Database[M], R], node: Span[Nat8, N], kind: Span[Nat8, K]): Either[DbError, String];
+
+    """
+    The lightest route from origin to goal along edges of kind, after the
+    sum of their weights (Dijkstra, Standard.Graph.lightestPath).
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, S: Region, G: Region, K: Region]
+    function lightestRoute(db: &![Database[M], R], kind: Span[Nat8, K], origin: Span[Nat8, S],
+                           goal: Span[Nat8, G]): Either[DbError, EdgeRoute];
+
+    """
+    The route of fewest edges from origin to goal along edges of kind
+    (breadth first, Standard.Graph.shortestPath); its weight is their
+    number.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, S: Region, G: Region, K: Region]
+    function fewestEdges(db: &![Database[M], R], kind: Span[Nat8, K], origin: Span[Nat8, S],
+                         goal: Span[Nat8, G]): Either[DbError, EdgeRoute];
+
+    """
+    A cycle among the edges of kind, as the names of its nodes one a line,
+    the first again at the end; None when there is none.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, K: Region]
+    function findCycleOf(db: &![Database[M], R], kind: Span[Nat8, K]): Either[DbError, Option[String]];
+
+    """
+    Gives back what a route holds.
+    No contract: it only gives the value back.
+    """
+    function destroyRoute(route: EdgeRoute): Unit;
+end module.

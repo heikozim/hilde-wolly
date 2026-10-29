@@ -1,0 +1,150 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    bytesToHex
+);
+import Standard.X509 (
+    PrivateKey,
+    Certificate,
+    EcP256,
+    generateKey,
+    privateKeyToPem,
+    privateKeyFromPem,
+    destroyPrivateKey,
+    certificateFromPem,
+    certificateToPem,
+    fingerprintSha256,
+    destroyCertificate,
+    selfSigned,
+    issue,
+    verifyChain
+);
+
+module body Wolly.Pki is
+    constant authorityMaxDays: Nat32 := 3650;
+    constant machineMaxDays: Nat32 := 825;
+
+    function authorityDays(): Nat32 is
+        return authorityMaxDays;
+    end;
+
+    function machineDays(): Nat32 is
+        return machineMaxDays;
+    end;
+
+    function newKey(): Option[String] is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                let pem: Option[String] := privateKeyToPem(&key);
+                destroyPrivateKey(key);
+                return pem;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [K: Region, C: Region]
+    function authorityCertificate(keyPem: Span[Nat8, K], commonName: Span[Nat8, C], days: Nat32): Option[String] is
+        if days > authorityMaxDays then
+            return None();
+        end if;
+        case privateKeyFromPem(keyPem) of
+            when Some(value as key: PrivateKey) do
+                case selfSigned(&key, commonName, "", days, true) of
+                    when Some(value as cert: Certificate) do
+                        let pem: Option[String] := certificateToPem(&cert);
+                        destroyCertificate(cert);
+                        destroyPrivateKey(key);
+                        return pem;
+                    when None do
+                        destroyPrivateKey(key);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [A: Region, K: Region, M: Region, C: Region, N: Region]
+    function issueUnder(ca: &[Certificate, A], caKey: &[PrivateKey, K], machineKey: &[PrivateKey, M],
+                        commonName: Span[Nat8, C], names: Span[Nat8, N], days: Nat32): Option[String] is
+        case issue(ca, caKey, machineKey, commonName, names, days, false) of
+            when Some(value as cert: Certificate) do
+                let pem: Option[String] := certificateToPem(&cert);
+                destroyCertificate(cert);
+                return pem;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [A: Region, K: Region, M: Region, C: Region, N: Region]
+    function issueMachine(caPem: Span[Nat8, A], caKeyPem: Span[Nat8, K], machineKeyPem: Span[Nat8, M],
+                          commonName: Span[Nat8, C], names: Span[Nat8, N], days: Nat32): Option[String] is
+        if days > machineMaxDays then
+            return None();
+        end if;
+        case certificateFromPem(caPem) of
+            when Some(value as ca: Certificate) do
+                case privateKeyFromPem(caKeyPem) of
+                    when Some(value as caKey: PrivateKey) do
+                        case privateKeyFromPem(machineKeyPem) of
+                            when Some(value as machineKey: PrivateKey) do
+                                let pem: Option[String] := issueUnder(&ca, &caKey, &machineKey, commonName, names, days);
+                                destroyPrivateKey(machineKey);
+                                destroyPrivateKey(caKey);
+                                destroyCertificate(ca);
+                                return pem;
+                            when None do
+                                destroyPrivateKey(caKey);
+                                destroyCertificate(ca);
+                                return None();
+                        end case;
+                    when None do
+                        destroyCertificate(ca);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [C: Region, A: Region, H: Region]
+    function verifies(certPem: Span[Nat8, C], caPem: Span[Nat8, A], host: Span[Nat8, H], at: Int64): Bool is
+        case verifyChain(certPem, caPem, host, at) of
+            when Some(value as why: String) do
+                destroyString(why);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [C: Region]
+    function fingerprint(certPem: Span[Nat8, C]): Option[String] is
+        case certificateFromPem(certPem) of
+            when Some(value as cert: Certificate) do
+                let print: Option[String] := fingerprintSha256(&cert);
+                destroyCertificate(cert);
+                case print of
+                    when Some(value as raw: String) do
+                        let hex: String := bytesToHex(asSpan(&raw));
+                        destroyString(raw);
+                        return Some(value => hex);
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+end module body.

@@ -1,0 +1,185 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    startsWith,
+    substring,
+    parseInt,
+    bytesToHex,
+    equal
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.Log (
+    Log,
+    Entry,
+    Info,
+    makeEntry,
+    addText,
+    addInteger,
+    writeEntry
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam,
+    destroyRequest
+);
+import Wolly.Request (
+    requestMethod,
+    requestPath
+);
+import Wolly.Response (
+    makeResponse,
+    addHeader,
+    finish,
+    withHeader
+);
+import Wolly.Router (
+    Route,
+    dispatch
+);
+
+module body Wolly.Middleware is
+    constant allowed: Span[Nat8, Static] := "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
+    constant requestIdBytes: Index := 16;
+
+    -- The steps before from position at on.
+    generic [B: Region]
+    function runBefores(request: Request, befores: &[Buffer[Fn[Request, Step]], B], at: Index): Step is
+        if at >= length(befores) then
+            return Next(request => request);
+        else
+            let step: Fn[Request, Step] := nth(befores, at);
+            case step(request) of
+                when Next(request as passed: Request) do
+                    return runBefores(passed, befores, at + 1);
+                when Answer(output: String) do
+                    return Answer(output => output);
+            end case;
+        end if;
+    end;
+
+    -- The steps after from position at on.
+    generic [A: Region]
+    function runAfters(output: String, afters: &[Buffer[Fn[String, String]], A], at: Index): String is
+        if at >= length(afters) then
+            return output;
+        else
+            let step: Fn[String, String] := nth(afters, at);
+            return runAfters(step(output), afters, at + 1);
+        end if;
+    end;
+
+    generic [R: Region, B: Region, A: Region]
+    function dispatchWith(request: Request, routes: &[Buffer[Route], R], befores: &[Buffer[Fn[Request, Step]], B],
+                          afters: &[Buffer[Fn[String, String]], A]): String is
+        case runBefores(request, befores, 0) of
+            when Next(request as passed: Request) do
+                return runAfters(dispatch(passed, routes), afters, 0);
+            when Answer(output: String) do
+                return runAfters(output, afters, 0);
+        end case;
+    end;
+
+    -- A part of the request for the log, "-" when it has none.
+    function orDash(part: Option[String]): String is
+        case part of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("-");
+        end case;
+    end;
+
+    -- A new id for one request: 16 random bytes as 32 hex digits, "-" when
+    -- the system gives no random bytes.
+    function newRequestId(): String is
+        case randomBytes(requestIdBytes) of
+            when Some(value as raw: String) do
+                let id: String := bytesToHex(asSpan(&raw));
+                destroyString(raw);
+                return id;
+            when None do
+                return fromSpan("-");
+        end case;
+    end;
+
+    -- The status an answer begins with, 0 when it begins with none.
+    generic [O: Region]
+    function statusOf(output: Span[Nat8, O]): Int64 is
+        if startsWith(output, "Status: ") and (spanLength(output) >= 11) then
+            case parseInt(substring(output, 8, 11)) of
+                when Some(value as status: Int64) do
+                    return status;
+                when None do
+                    return 0;
+            end case;
+        else
+            return 0;
+        end if;
+    end;
+
+    generic [R: Region, B: Region, A: Region, L: Region]
+    function dispatchLogged(request: Request, routes: &[Buffer[Route], R], befores: &[Buffer[Fn[Request, Step]], B],
+                            afters: &[Buffer[Fn[String, String]], A], log: &![Log, L]): String is
+        let verb: String := orDash(requestMethod(&request));
+        let path: String := orDash(requestPath(&request));
+        let client: String := orDash(requestParam(&request, "REMOTE_ADDR"));
+        let id: String := newRequestId();
+        let output: String := withHeader(dispatchWith(request, routes, befores, afters), "X-Request-Id", asSpan(&id));
+        let named: Entry := addText(addText(addText(makeEntry(Info(), "request"), "method", asSpan(&verb)), "path", asSpan(&path)), "client", asSpan(&client));
+        let counted: Entry := addInteger(named, "status", statusOf(asSpan(&output)));
+        let written: Bool := writeEntry(log, addText(counted, "request_id", asSpan(&id)));
+        destroyString(verb);
+        destroyString(path);
+        destroyString(client);
+        destroyString(id);
+        return output;
+    end;
+
+    generic [V: Region]
+    function isKnown(verb: Span[Nat8, V]): Bool is
+        let reading: Bool := (equal(verb, "GET") or equal(verb, "HEAD")) or equal(verb, "OPTIONS");
+        let writing: Bool := ((equal(verb, "POST") or equal(verb, "PUT")) or equal(verb, "PATCH")) or equal(verb, "DELETE");
+        return reading or writing;
+    end;
+
+    function knownMethods(request: Request): Step is
+        case requestMethod(&request) of
+            when Some(value as verb: String) do
+                let known: Bool := isKnown(asSpan(&verb));
+                destroyString(verb);
+                if known then
+                    return Next(request => request);
+                else
+                    destroyRequest(request);
+                    let refusal: String := finish(addHeader(makeResponse(405, "text/plain; charset=utf-8"), "Allow", allowed), "method not allowed\n");
+                    return Answer(output => refusal);
+                end if;
+            when None do
+                destroyRequest(request);
+                return Answer(output => finish(makeResponse(400, "text/plain; charset=utf-8"), "bad request\n"));
+        end case;
+    end;
+
+    function securityHeaders(output: String): String is
+        let sniffed: String := withHeader(output, "X-Content-Type-Options", "nosniff");
+        let framed: String := withHeader(sniffed, "X-Frame-Options", "DENY");
+        return withHeader(framed, "Referrer-Policy", "same-origin");
+    end;
+end module body.

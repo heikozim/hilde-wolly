@@ -1,0 +1,745 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The language: what it refuses and where, injections among them, what it
+-- takes, and what it finds among five lines in a database in memory.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Values,
+    noValues,
+    start,
+    advance,
+    columnInt64,
+    columnText,
+    withText,
+    withInt64,
+    finish,
+    closeDatabase,
+    Transaction,
+    begin,
+    rollback
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.File (
+    removeFileIfThere
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Search (
+    SearchError,
+    indexDocument
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Dialect (
+    onPostgres
+);
+import Wolly.LogStore (
+    prepareLogStore,
+    keepLine
+);
+import Wolly.Response (
+    decimalText
+);
+import Wolly.Query (
+    QueryProblem,
+    QueryTooLong,
+    NoQuery,
+    TooDeep,
+    TooManyTerms,
+    UnexpectedByte,
+    UnclosedQuote,
+    UnclosedParenthesis,
+    ExpectedTerm,
+    ExpectedOperator,
+    UnquotedWord,
+    UnknownQueryField,
+    BadValue,
+    BadTime,
+    BadRange,
+    TooManyWords,
+    TooManyTexts,
+    QueryError,
+    QueryFailure,
+    QueryRefused,
+    TooManyLines,
+    QueryStorage,
+    QueryResult,
+    mostQueryBytes,
+    mostQueryDepth,
+    mostQueryNodes,
+    mostQueryTexts,
+    windowStart,
+    checkQuery,
+    findByQuery,
+    destroyResult,
+    hostTermSql,
+    textTermSql
+);
+
+import Standard.Text (
+    equal,
+    contains
+);
+
+module body Wolly.Query.Test is
+    constant now: Int64 := 5000;
+
+    function nameOf(problem: QueryProblem): Span[Nat8, Static] is
+        case problem of
+            when QueryTooLong do
+                return "QueryTooLong";
+            when NoQuery do
+                return "NoQuery";
+            when TooDeep do
+                return "TooDeep";
+            when TooManyTerms do
+                return "TooManyTerms";
+            when UnexpectedByte do
+                return "UnexpectedByte";
+            when UnclosedQuote do
+                return "UnclosedQuote";
+            when UnclosedParenthesis do
+                return "UnclosedParenthesis";
+            when ExpectedTerm do
+                return "ExpectedTerm";
+            when ExpectedOperator do
+                return "ExpectedOperator";
+            when UnquotedWord do
+                return "UnquotedWord";
+            when UnknownQueryField do
+                return "UnknownQueryField";
+            when BadValue do
+                return "BadValue";
+            when BadTime do
+                return "BadTime";
+            when BadRange do
+                return "BadRange";
+            when TooManyWords do
+                return "TooManyWords";
+            when TooManyTexts do
+                return "TooManyTexts";
+        end case;
+    end;
+
+    -- The query is refused with problem at position.
+    generic [Q: Region]
+    function refusedAt(query: Span[Nat8, Q], position: Index, problem: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case checkQuery(query, now) of
+            when Some(value as error: QueryError) do
+                let fit: Bool := (error.position = position) and equal(nameOf(error.problem), problem);
+                if not fit then
+                    printLn(nameOf(error.problem));
+                    let at: String := decimalText(wideOf(error.position));
+                    printLn(asSpan(&at));
+                    destroyString(at);
+                end if;
+                assertTrue(fit, message);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [Q: Region]
+    function taken(query: Span[Nat8, Q], message: Span[Nat8, Static]): Unit is
+        case checkQuery(query, now) of
+            when Some(value as error: QueryError) do
+                printLn(nameOf(error.problem));
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function wideOf(i: Index): Int64 is
+        case toInt64(i) of
+            when Some(value as number: Int64) do
+                return number;
+            when None do
+                return 0 - 1;
+        end case;
+    end;
+
+    -- count copies of part, then tail.
+    function repeated(part: Span[Nat8, Static], count: Index, tail: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeString(&!out, part);
+            i := i + 1;
+        end while;
+        writeString(&!out, tail);
+        return finalize(out);
+    end;
+
+    -- A word of count letters in quotes.
+    function quoted(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, '"');
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!out, 'a');
+            i := i + 1;
+        end while;
+        writeByte(&!out, '"');
+        return finalize(out);
+    end;
+
+    -- count parentheses around host:a.
+    function nested(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!out, '(');
+            i := i + 1;
+        end while;
+        writeString(&!out, "host:a");
+        i := (0 : Index);
+        while i < count do
+            writeByte(&!out, ')');
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function testRules(): Unit is
+        assertTrue(mostQueryBytes() = 1024, "1024 bytes a query");
+        assertTrue(mostQueryDepth() = 16, "16 levels");
+        assertTrue(mostQueryNodes() = 64, "64 nodes");
+        assertTrue(mostQueryTexts() = 8, "8 texts");
+        assertTrue(windowStart(100, 30) = 70, "a window inside the time");
+        assertTrue(windowStart(10, 30) = 0, "a window before 1970 starts at 0");
+        assertTrue(windowStart(30, 30) = 0, "a window of the whole time");
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        refusedAt("", 0, "NoQuery", "empty");
+        refusedAt("  \t ", 0, "NoQuery", "spaces");
+        refusedAt("host:dbnode and", 15, "ExpectedTerm", "and at the end");
+        refusedAt("host:dbnode level:error", 12, "ExpectedOperator", "two terms without and");
+        refusedAt("and host:a", 0, "ExpectedTerm", "and first");
+        refusedAt("host:a or not", 13, "ExpectedTerm", "not at the end");
+        refusedAt("host:a)", 6, "ExpectedOperator", "a parenthesis never opened");
+        refusedAt("(host:dbnode", 0, "UnclosedParenthesis", "a parenthesis never closed");
+        refusedAt("(host:a level:info)", 8, "ExpectedOperator", "two terms in parentheses");
+        refusedAt("\"mariadb", 0, "UnclosedQuote", "a quote never closed");
+        refusedAt("mariadb", 0, "UnquotedWord", "a word without quotes");
+        refusedAt("bogus:x", 0, "UnknownQueryField", "an unknown field");
+        refusedAt("level:ERROR", 6, "BadValue", "a level in capitals");
+        refusedAt("level:err*", 6, "BadValue", "no prefix of a level");
+        refusedAt("source:*", 7, "BadValue", "an empty prefix");
+        refusedAt("host:\"web1 example\"", 5, "BadValue", "no host name, at the quote");
+        refusedAt("host:-web", 5, "BadValue", "a label begins with a hyphen");
+        refusedAt("time:", 5, "BadValue", "a field without a value");
+        refusedAt("time:last 24x", 10, "BadTime", "an unknown unit");
+        refusedAt("time:last 0h", 10, "BadTime", "a window of nothing");
+        refusedAt("time:last h", 10, "BadTime", "a unit without an amount");
+        refusedAt("time:2026-02-30", 5, "BadTime", "the 30th of February");
+        refusedAt("time:2100-02-29", 5, "BadTime", "2100 is no leap year");
+        refusedAt("time:1969-12-31", 5, "BadTime", "before 1970");
+        refusedAt("time:\"2026-10-15T24:00:00Z\"", 5, "BadTime", "hour 24");
+        refusedAt("time:[2026-10-15 .. 2026-10-14]", 5, "BadRange", "a range backwards");
+        refusedAt("id:[5 .. x]", 9, "BadValue", "an id that is no number");
+        refusedAt("id:[5 3]", 6, "BadValue", "a range without dots");
+        refusedAt("id:[3 .. 5", 10, "BadValue", "a range not closed");
+        refusedAt("\"...\"", 0, "BadValue", "text without a word");
+        refusedAt("\"a b c d e f g h i j k l m n o p q\"", 33, "TooManyWords", "17 words");
+        let longWord: String := quoted(65);
+        refusedAt(asSpan(&longWord), 1, "TooManyWords", "a word of 65 bytes");
+        destroyString(longWord);
+        refusedAt("time:last 1000000h", 10, "BadTime", "an amount of seven digits");
+        refusedAt("id:1234567890123456789", 3, "BadValue", "an id of 19 digits");
+        refusedAt("time:1234567890123", 5, "BadTime", "seconds of 13 digits");
+        refusedAt("host:a*b", 5, "BadValue", "a star inside a host");
+        refusedAt("time:[2026-10-14 .. x]", 20, "BadTime", "the end of a range no time");
+        let nine: String := repeated("\"a\" or ", 8, "\"a\"");
+        refusedAt(asSpan(&nine), 56, "TooManyTexts", "nine texts");
+        destroyString(nine);
+        refusedAt("host:a' OR '1'='1", 6, "UnexpectedByte", "a quote of SQL");
+        refusedAt("host:dbnode; DROP TABLE wolly_log_lines", 11, "UnexpectedByte", "a second statement");
+        refusedAt("level:error -- and", 12, "ExpectedOperator", "a comment of SQL is a word without a field");
+        refusedAt("host:a = 1", 7, "UnexpectedByte", "an equals sign");
+        refusedAt("host:a or \\", 10, "UnexpectedByte", "a backslash");
+        let escape: String := repeated("host:a", 1, "\t\n");
+        refusedAt(asSpan(&escape), 7, "UnexpectedByte", "a line end");
+        destroyString(escape);
+        var withEscape: StringBuilder := makeStringBuilder();
+        writeString(&!withEscape, "\"red");
+        writeByte(&!withEscape, 27);
+        writeString(&!withEscape, "[31m\"");
+        let colour: String := finalize(withEscape);
+        refusedAt(asSpan(&colour), 4, "UnexpectedByte", "a terminal escape in quotes");
+        destroyString(colour);
+        let long: String := repeated(" ", 1014, "level:error");
+        refusedAt(asSpan(&long), 1024, "QueryTooLong", "1024 bytes and more");
+        destroyString(long);
+        let deep: String := nested(17);
+        refusedAt(asSpan(&deep), 17, "TooDeep", "17 parentheses");
+        destroyString(deep);
+        let nots: String := repeated("not ", 17, "host:a");
+        refusedAt(asSpan(&nots), 68, "TooDeep", "17 times not");
+        destroyString(nots);
+        let many: String := repeated("host:a or ", 32, "host:a");
+        refusedAt(asSpan(&many), 317, "TooManyTerms", "33 terms, 65 nodes");
+        destroyString(many);
+        return nil;
+    end;
+
+    function testTaken(): Unit is
+        taken("host:dbnode and level:error and time:last 24h and \"mariadb\"", "the example");
+        taken("HOST:web1.example.org AND NOT (level:info OR level:warn)", "capitals and parentheses");
+        taken("source:/var/log/* and id:[1 .. 3]", "a prefix and a range");
+        taken("time:[\"2026-10-15T08:00:00Z\" .. \"2026-10-15T09:00:00\"]", "a range of moments");
+        taken("time:[1000..2000] or id:7", "a range without spaces");
+        taken("time:2026-10-15 and source:\"/var/log/a b.log\"", "a day, a source in quotes");
+        taken("time:last 3w or time:last 59s or time:last 2d or time:last 15m", "every unit");
+        taken("\"Grüße aus Köln\"", "words in UTF-8");
+        let eight: String := repeated("\"a\" or ", 7, "\"a\"");
+        taken(asSpan(&eight), "eight texts");
+        destroyString(eight);
+        let deep: String := nested(16);
+        taken(asSpan(&deep), "16 parentheses");
+        destroyString(deep);
+        let nots: String := repeated("not ", 16, "host:a");
+        taken(asSpan(&nots), "16 times not");
+        destroyString(nots);
+        let many: String := repeated("host:a or ", 31, "host:a");
+        taken(asSpan(&many), "32 terms, 63 nodes");
+        destroyString(many);
+        let full: String := repeated(" ", 1013, "level:error");
+        taken(asSpan(&full), "1024 bytes");
+        destroyString(full);
+        return nil;
+    end;
+
+    generic [R: Region, H: Region, S: Region, L: Region, T: Region]
+    function keep(db: &![Database[Writing], R], host: Span[Nat8, H], source: Span[Nat8, S], at: Int64,
+                  level: Span[Nat8, L], line: Span[Nat8, T]): Unit is
+        case keepLine(&~db, host, source, at, level, line) of
+            when Right(right as kept: Option[Int64]) do
+                case kept of
+                    when Some(value as id: Int64) do
+                        assertTrue(true, "a line kept");
+                    when None do
+                        assertTrue(false, "a line kept");
+                end case;
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "a line kept");
+        end case;
+        return nil;
+    end;
+
+    -- The numbers found, joined by commas.
+    generic [K: Region]
+    function joined(keys: &[Buffer[Int64], K]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < length(keys) do
+            if i > 0 then
+                writeByte(&!out, ',');
+            end if;
+            let number: String := decimalText(nth(keys, i));
+            writeString(&!out, asSpan(&number));
+            destroyString(number);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The query finds total lines, keys of them on the page asked.
+    generic [R: Region]
+    function foundPage(db: &![Database[Writing], R], query: Span[Nat8, Static], mostLines: Int64, limit: Int64, offset: Int64,
+                       total: Int64, keys: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case findByQuery(&~db, query, now, mostLines, limit, offset) of
+            when Right(right as result: QueryResult) do
+                let { total as all: Int64, keys as lines: Buffer[Int64] } := result;
+                let shown: String := joined(&lines);
+                let fit: Bool := (all = total) and equal(asSpan(&shown), keys);
+                if not fit then
+                    printLn(asSpan(&shown));
+                end if;
+                assertTrue(fit, message);
+                destroyString(shown);
+                destroyFree(lines);
+            when Left(left as failure: QueryFailure) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function found(db: &![Database[Writing], R], query: Span[Nat8, Static], total: Int64, keys: Span[Nat8, Static],
+                   message: Span[Nat8, Static]): Unit is
+        foundPage(&~db, query, 1000, 100, 0, total, keys, message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function failsWith(db: &![Database[Writing], R], query: Span[Nat8, Static], mostLines: Int64, wanted: Span[Nat8, Static],
+                       message: Span[Nat8, Static]): Unit is
+        case findByQuery(&~db, query, now, mostLines, 100, 0) of
+            when Right(right as result: QueryResult) do
+                destroyResult(result);
+                assertTrue(false, message);
+            when Left(left as failure: QueryFailure) do
+                case failure of
+                    when QueryRefused(reason as error: QueryError) do
+                        assertTrue(equal(nameOf(error.problem), wanted), message);
+                    when TooManyLines do
+                        assertTrue(equal("TooManyLines", wanted), message);
+                    when QueryStorage(error as error: DbError) do
+                        assertTrue(false, message);
+                end case;
+        end case;
+        return nil;
+    end;
+
+    -- The lines in the table, read past the query module.
+    generic [R: Region]
+    function lineCount(db: &![Database[Writing], R]): Int64 is
+        var cursor: Cursor := start(&~db, "SELECT count(*) FROM wolly_log_lines", noValues());
+        var count: Int64 := 0 - 1;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return 0 - 1;
+            when None do
+                return count;
+        end case;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                assertTrue(true, "the tables");
+        end case;
+        keep(&~db, "web1.example.org", "/var/log/app.log", 1000, "error", "Database connection to mariadb failed");
+        keep(&~db, "web1.example.org", "/var/log/app.log", 2000, "info", "User Schmidt logged in");
+        keep(&~db, "dbnode", "/var/log/db.log", 3000, "error", "mariadb: table full");
+        keep(&~db, "dbnode", "/var/log/db.log", 4000, "warn", "mariadb slow query");
+        keep(&~db, "web2.example.org", "/srv/x.log", 5000, "error", "disk almost full");
+        -- Standard.Search's table is shared on SQLite: a document of another part under the key of line 2 must not
+        -- count as line 2.  On PostgreSQL the words are the table's own, so there is no other document to put.
+        if not onPostgres(&db) then
+            case indexDocument(&~db, "2", "another application", "mariadb in a document of its own") of
+                when Left(left as failure: SearchError) do
+                    assertTrue(false, "a document of another part under the key of line 2");
+                when Right(right as done: Unit) do
+                    assertTrue(true, "a document of another part under the key of line 2");
+            end case;
+        end if;
+        found(&~db, "host:dbnode and level:error and time:last 24h and \"mariadb\"", 1, "3", "the example");
+        -- A word in a window of few lines (textPlan on SQLite): the hits of lines 1 and 4 lie outside it.
+        found(&~db, "\"mariadb\" and time:[2500 .. 3500]", 1, "3", "a word in a narrow window keeps only its lines");
+        found(&~db, "\"mariadb\" and time:[3000 .. 4000]", 2, "4,3", "a window from one hit to the next keeps both");
+        found(&~db, "\"mariadb\" and time:[6000 .. 7000]", 0, "", "a window of no line keeps nothing");
+        -- An equal term under and filters the set of the other side: on either side, a host in
+        -- capitals, a source, a level, beside an or.
+        found(&~db, "\"mariadb\" and host:DBNODE", 2, "4,3", "a host after a word filters the word");
+        found(&~db, "host:dbnode and \"mariadb\"", 2, "4,3", "a host before a word filters the word");
+        found(&~db, "level:error and source:/var/log/app.log", 1, "1", "a source filters a level");
+        found(&~db, "(level:error or level:warn) and host:dbnode", 2, "4,3", "a host filters an or");
+        found(&~db, "host:web1.example.org and level:info", 1, "2", "a level filters a host");
+        found(&~db, "host:nowhere and \"mariadb\"", 0, "", "a host of no line keeps nothing");
+        found(&~db, "level:error", 3, "5,3,1", "a level, newest first");
+        found(&~db, "\"mariadb\"", 3, "4,3,1", "a word");
+        found(&~db, "\"MariaDB\"", 3, "4,3,1", "a word in another case");
+        found(&~db, "host:DBNODE", 2, "4,3", "a host in capitals");
+        found(&~db, "host:DbN*", 2, "4,3", "a prefix of a host in capitals");
+        found(&~db, "not time:[4000 .. 5000]", 3, "3,2,1", "a time under not narrows nothing");
+        found(&~db, "not level:error", 2, "4,2", "not");
+        found(&~db, "host:web1.example.org or host:dbnode", 4, "4,3,2,1", "or");
+        found(&~db, "host:\"dbnode\"", 2, "4,3", "a value in quotes");
+        found(&~db, "host:web* and not level:info", 2, "5,1", "a prefix of a host");
+        found(&~db, "host:dbnode* or host:web2*", 3, "5,4,3", "a whole host as a prefix");
+        found(&~db, "source:/var/log/* and id:[2 .. 3]", 2, "3,2", "a prefix of a source and a range of ids");
+        found(&~db, "id:4", 1, "4", "one id");
+        found(&~db, "time:[2000 .. 3000]", 2, "3,2", "both ends of a range");
+        found(&~db, "time:last 17m", 2, "5,4", "a window: from 3980");
+        found(&~db, "time:last 1000s", 2, "5,4", "a window that starts at a line");
+        found(&~db, "time:1970-01-01", 5, "5,4,3,2,1", "a day is the whole day");
+        found(&~db, "time:[1970-01-01 .. 1970-01-01] and level:warn", 1, "4", "a day as both ends");
+        found(&~db, "(\"mariadb\" or \"disk\") and not host:dbnode", 2, "5,1", "parentheses");
+        found(&~db, "not (\"mariadb\" or \"disk\")", 1, "2", "not before parentheses");
+        found(&~db, "level:info or level:warn and host:dbnode", 2, "4,2", "and binds before or");
+        found(&~db, "not not level:info", 1, "2", "not twice");
+        found(&~db, "\"connection to mariadb\"", 1, "1", "a phrase");
+        found(&~db, "\"mariadb connection\"", 0, "", "a phrase in another order");
+        found(&~db, "\"dbnode\"", 0, "", "text in quotes is the line, not the host");
+        found(&~db, "\"error\"", 0, "", "nor the level");
+        found(&~db, "level:error and not level:error", 0, "", "nothing");
+        found(&~db, "time:[4500 .. 9999] and (level:error or id:1)", 1, "5", "a window and a term outside it");
+        found(&~db, "time:[4000 .. 5000] or id:1", 3, "5,4,1", "a time under or narrows nothing");
+        foundPage(&~db, "level:error", 1000, 1, 1, 3, "3", "the second page of one");
+        foundPage(&~db, "level:error", 1000, 2, 2, 3, "1", "the last page");
+        foundPage(&~db, "time:[4000 .. 5000] and level:error", 2, 100, 0, 1, "5", "two lines in the window, two allowed");
+        failsWith(&~db, "level:error", 4, "TooManyLines", "five lines in the window, four allowed");
+        failsWith(&~db, "time:[2000 .. 5000] or level:error", 4, "TooManyLines", "a time under or is no window: 5 lines, not 4");
+        failsWith(&~db, "level:ERROR", 1000, "BadValue", "a refused query runs nothing");
+        found(&~db, "source:\"/x'; DROP TABLE wolly_log_lines; --\"", 0, "", "SQL in a value is a value");
+        found(&~db, "host:dbnode and source:\"/var/log/db.log' OR '1'='1\"", 0, "", "nor does it open the condition");
+        found(&~db, "\"NEAR(mariadb disk) OR *\"", 0, "", "FTS5 syntax in quotes is words");
+        found(&~db, "\"mariadb OR disk\"", 0, "", "OR in quotes is a word");
+        found(&~db, "\"body:disk\"", 0, "", "a column of FTS5 in quotes is a word");
+        found(&~db, "\"title:dbnode\"", 0, "", "nor the other column");
+        found(&~db, "\"disk*\"", 1, "5", "a star in quotes is no prefix");
+        assertTrue(lineCount(&~db) = 5, "every line is still there");
+        found(&~db, "level:error", 3, "5,3,1", "and the sets of the queries before are gone");
+        return nil;
+    end;
+
+    -- Lines at the seconds around days, the values from date -u: a time in
+    -- a query is the second it names.
+    generic [R: Region]
+    function exerciseTimes(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                assertTrue(true, "the tables");
+        end case;
+        keep(&~db, "a", "/l", 1792022399, "info", "the last second of 2026-10-14");
+        keep(&~db, "a", "/l", 1792022400, "info", "the first second of 2026-10-15");
+        keep(&~db, "a", "/l", 1792108799, "info", "the last second of 2026-10-15");
+        keep(&~db, "a", "/l", 1792108800, "info", "the first second of 2026-10-16");
+        keep(&~db, "a", "/l", 951825600, "info", "noon of a leap day");
+        keep(&~db, "a", "/l", 253402300799, "info", "the last second of 9999");
+        keep(&~db, "a", "/l", 0, "info", "the epoch");
+        keep(&~db, "Web.Example.ORG", "/l", 1000000000, "info", "a host kept in capitals");
+        found(&~db, "host:web.example.org", 1, "8", "a host kept in capitals, asked in small letters");
+        found(&~db, "host:WEB.e*", 1, "8", "and as a prefix");
+        found(&~db, "time:2026-10-15", 2, "3,2", "a day from its first to its last second");
+        found(&~db, "time:\"2026-10-15T00:00:00Z\"", 1, "2", "a moment");
+        found(&~db, "time:\"2026-10-15T23:59:59\"", 1, "3", "a moment without Z");
+        found(&~db, "time:[2026-10-14 .. 2026-10-15]", 3, "3,2,1", "two days");
+        found(&~db, "time:\"2000-02-29T12:00:00Z\"", 1, "5", "a leap day");
+        found(&~db, "time:[2000-02-29 .. 2000-02-29]", 1, "5", "a leap day as a range");
+        found(&~db, "time:\"9999-12-31T23:59:59Z\"", 1, "6", "the last second");
+        found(&~db, "time:1970-01-01", 1, "7", "the epoch");
+        found(&~db, "time:[1792022400 .. 1792108799]", 2, "3,2", "the same day in seconds");
+        return nil;
+    end;
+
+    function testTimes(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseTimes(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testFind(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+    -- A store in a file of the working directory, for two connections; removed before and after.
+    constant besidePath: Span[Nat8, Static] := "query-beside-writer.db";
+
+    function removeBesideStore(): Unit is
+        let a: Bool := removeFileIfThere(besidePath);
+        let b: Bool := removeFileIfThere("query-beside-writer.db-wal");
+        let c: Bool := removeFileIfThere("query-beside-writer.db-shm");
+        let d: Bool := removeFileIfThere("query-beside-writer.db-journal");
+        return nil;
+    end;
+
+    -- While the second connection holds the write lock of the store, a search on the first runs
+    -- at once and finds its lines (with BEGIN IMMEDIATE it waited 5 s and failed).
+    generic [A: Region, B: Region]
+    function searchBesideWriter(first: &![Database[Writing], A], second: &![Database[Writing], B]): Unit is
+        case prepareLogStore(&~first) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables of the file");
+            when Right(right as done: Unit) do
+                assertTrue(true, "the tables of the file");
+        end case;
+        keep(&~first, "web1", "/l", 1000, "error", "one");
+        keep(&~first, "web1", "/l", 2000, "info", "two");
+        case begin(&~second) of
+            when Left(left as error: DbError) do
+                assertTrue(false, "the second connection begins to write");
+            when Right(right as held: Transaction) do
+                let before: Nat64 := wallNanos();
+                foundPage(&~first, "host:web1", 1000, 100, 0, 2, "2,1", "a search beside a writer finds its lines");
+                assertTrue((wallNanos() - before) < (2000000000 : Nat64), "and does not wait for the writer");
+                rollback(&~second, held);
+        end case;
+        -- The search left no lock: the second keeps a line at once, and the next search sees it.
+        let written: Nat64 := wallNanos();
+        keep(&~second, "web1", "/l", 3000, "info", "three");
+        assertTrue((wallNanos() - written) < (2000000000 : Nat64), "a writer after a search does not wait");
+        foundPage(&~first, "host:web1", 1000, 100, 0, 3, "3,2,1", "the next search sees the line of the writer");
+        return nil;
+    end;
+
+    function testSearchBesideWriter(): Unit is
+        removeBesideStore();
+        case openSqlite(besidePath) of
+            when Right(right as one: Database[Writing]) do
+                var first: Database[Writing] := one;
+                case openSqlite(besidePath) of
+                    when Right(right as two: Database[Writing]) do
+                        var second: Database[Writing] := two;
+                        searchBesideWriter(&!first, &!second);
+                        closeDatabase(second);
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "a second connection to the file");
+                end case;
+                closeDatabase(first);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a store in a file");
+        end case;
+        removeBesideStore();
+        return nil;
+    end;
+    -- The plan of the term host: the index on lower(host) and at, no scan of the lines of the
+    -- window (without it a search of a host and a word spent 1.3 s of 1.7 s in the scan).
+    generic [R: Region]
+    function exerciseHostPlan(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        -- A search first: it makes the temporary table of the sets on this connection, into which
+        -- the statement inserts.
+        found(&~db, "host:dbnode", 0, "", "a search of an empty store finds nothing");
+        var rows: Int64 := 0;
+        var indexed: Bool := false;
+        var scanned: Bool := false;
+        var cursor: Cursor := start(&~db, hostTermSql(), withText(withInt64(withInt64(withInt64(noValues(), 0), 0), 9999), "dbnode"));
+        while advance(&!cursor) do
+            rows := rows + 1;
+            if contains(columnText(&cursor, 3), "INDEX wolly_log_lines_host") then
+                indexed := true;
+            end if;
+            if contains(columnText(&cursor, 3), "SCAN wolly_log_lines") then
+                scanned := true;
+            end if;
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the plan is read");
+            when None do
+                skip;
+        end case;
+        assertTrue(rows > 0, "the plan has a row");
+        assertTrue(indexed, "host: searches the index on lower(host) and at");
+        assertFalse(scanned, "host: scans no table of lines");
+        return nil;
+    end;
+
+    function testHostPlan(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseHostPlan(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    -- The plan of a word in a window of few lines: FTS5 takes both bounds of the rowid (its
+    -- index string ends in "><"), each bound from the index on at (without it a search
+    -- of a word in the last hour read all 96 150 hits of a store, cold over 10 s).
+    generic [R: Region]
+    function exerciseTextPlan(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        found(&~db, "\"mariadb\"", 0, "", "a search of an empty store finds nothing");
+        var rows: Int64 := 0;
+        var bounded: Bool := false;
+        var windowed: Bool := false;
+        let values: Values := withInt64(withInt64(withInt64(withInt64(withInt64(withInt64(withText(withInt64(noValues(), 0), "body : \"mariadb\""), 0), 9999), 0), 9999), 0), 9999);
+        var cursor: Cursor := start(&~db, textTermSql(), values);
+        while advance(&!cursor) do
+            rows := rows + 1;
+            if contains(columnText(&cursor, 3), "hilde_search VIRTUAL TABLE INDEX") and contains(columnText(&cursor, 3), "><") then
+                bounded := true;
+            end if;
+            if contains(columnText(&cursor, 3), "INDEX wolly_log_lines_at") then
+                windowed := true;
+            end if;
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the plan is read");
+            when None do
+                skip;
+        end case;
+        assertTrue(rows > 0, "the plan has a row");
+        assertTrue(bounded, "a word in a narrow window reads the hits between two rowids");
+        assertTrue(windowed, "the bounds come from the index on at");
+        return nil;
+    end;
+
+    function testTextPlan(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseTextPlan(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,321 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Checks: View ViewCompile ViewContext
+--
+-- The limits of a load Wolly.View holds a tenant's template to beyond those
+-- of ViewGuard.test.hiq, each asked at the value it allows and one past it:
+-- names bound at one place, files that are no regular file or have a
+-- second hard link, attribute
+-- names, text expanded, chains of operators.  A file that changes between
+-- its look and its open (V0004) cannot be made to happen in a test: the
+-- window is a few system calls.  The limits of a render are in
+-- ViewBudgets.test.hiq.  The templates are written below view-limits-root
+-- in the working directory of the test.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    Listener,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory,
+    linkFile,
+    removeFile,
+    removeFileIfThere,
+    listenUnix,
+    closeListener
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData,
+    makeMapData,
+    rootNode,
+    putList,
+    putText,
+    addInteger
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    renderView,
+    mostMadeBytes
+);
+import Standard.Template (
+    displayIndex
+);
+import Wolly.ViewFunctions (
+    addStandardFunctions
+);
+
+module body Wolly.ViewLimits.Test is
+    constant root: Span[Nat8, Static] := "view-limits-root";
+
+    function prepared(): Bool is
+        let made: Bool := createDirectory(root);
+        return true;
+    end;
+
+    generic [N: Region]
+    function pathOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, root);
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [N: Region, T: Region]
+    function written(name: Span[Nat8, N], text: Span[Nat8, T]): Bool is
+        let path: String := pathOf(name);
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                destroyString(path);
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                destroyString(path);
+                return false;
+        end case;
+    end;
+
+    generic [T: Region]
+    function repeated(text: Span[Nat8, T], count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeString(&!out, text);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The template name rendered with data by an engine of the directory
+    -- and the functions of Wolly.ViewFunctions: Right with the length of
+    -- the output, Left with the error.
+    generic [N: Region]
+    function outcome(name: Span[Nat8, N], data: ViewData): Either[String, Index] is
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, root);
+        addStandardFunctions(&!engine);
+        var out: StringBuilder := makeStringBuilder();
+        let result: Either[String, Unit] := renderView(&!engine, name, &data, &!out);
+        destroyViewData(data);
+        destroyViewEngine(engine);
+        let text: String := finalize(out);
+        let length: Index := spanLength(asSpan(&text));
+        destroyString(text);
+        case result of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as done: Unit) do
+                return Right(right => length);
+        end case;
+    end;
+
+    -- {"x": "v"}.
+    function small(): ViewData is
+        case readViewJson("{\"x\": \"v\"}") of
+            when Right(right as data: ViewData) do
+                return data;
+            when Left(left as message: String) do
+                destroyString(message);
+                return makeMapData();
+        end case;
+    end;
+
+    generic [N: Region]
+    function rendersLength(name: Span[Nat8, N], data: ViewData, expected: Index, message: Span[Nat8, Static]): Unit is
+        case outcome(name, data) of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, message);
+            when Right(right as length: Index) do
+                if length /= expected then
+                    print("length ");
+                    printLn(length);
+                end if;
+                assertTrue(length = expected, message);
+        end case;
+        return nil;
+    end;
+
+    generic [N: Region]
+    function refuses(name: Span[Nat8, N], data: ViewData, code: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case outcome(name, data) of
+            when Left(left as failure: String) do
+                let found: Bool := contains(asSpan(&failure), code);
+                if not found then
+                    printLn(asSpan(&failure));
+                end if;
+                destroyString(failure);
+                assertTrue(found, message);
+            when Right(right as length: Index) do
+                printLn("rendered where an error was asked for");
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- {% set v1 = x %} to {% set vcount = x %}, then {{ x }}.
+    function sets(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 1;
+        while i <= count do
+            writeString(&!out, "{% set v");
+            let number: String := displayIndex(i);
+            writeString(&!out, asSpan(&number));
+            destroyString(number);
+            writeString(&!out, " = x %}");
+            i := i + 1;
+        end while;
+        writeString(&!out, "{{ x }}");
+        return finalize(out);
+    end;
+
+    function testBindings(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        let most: String := sets(256);
+        assertTrue(written("most.jinja", asSpan(&most)), "256 names are written");
+        destroyString(most);
+        let more: String := sets(257);
+        assertTrue(written("more.jinja", asSpan(&more)), "257 names are written");
+        destroyString(more);
+        rendersLength("most.jinja", small(), 1, "256 names bound at one place are read");
+        refuses("more.jinja", small(), "V0011", "257 names bound at one place are refused");
+        return nil;
+    end;
+
+    function testNoRegularFile(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        let made: Bool := createDirectory("view-limits-root/folder.jinja");
+        refuses("folder.jinja", small(), "V0012", "a directory is no template");
+        case listenUnix("view-limits-root/socket.jinja", 384) of
+            when Some(value as listener: Listener) do
+                refuses("socket.jinja", small(), "V0012", "a socket is no template, nor is a fifo");
+                let closed: Bool := closeListener(listener);
+            when None do
+                assertTrue(false, "the socket is made");
+        end case;
+        return nil;
+    end;
+
+    -- A template with a second hard link is refused under both names, since
+    -- the other name could write it; with the link removed it is read.
+    function testHardLink(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        let gone: Bool := removeFileIfThere("view-limits-root/linked-b.jinja");
+        assertTrue(written("linked.jinja", "{{ x }}"), "the template is written");
+        rendersLength("linked.jinja", small(), 1, "the control: a template of one name is read");
+        assertTrue(linkFile("view-limits-root/linked.jinja", "view-limits-root/linked-b.jinja"), "the hard link is made");
+        refuses("linked.jinja", small(), "V0004", "a template of two names is refused");
+        refuses("linked-b.jinja", small(), "V0004", "and so is its second name");
+        assertTrue(removeFile("view-limits-root/linked-b.jinja"), "the hard link is removed");
+        rendersLength("linked.jinja", small(), 1, "with one name again it is read");
+        return nil;
+    end;
+
+    -- <a NAME="{{ x }}">y</a> with a name of count bytes.
+    function attribute(count: Index): String is
+        let name: String := repeated("a", count);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<a ");
+        writeString(&!out, asSpan(&name));
+        writeString(&!out, "=\"{{ x }}\">y</a>");
+        destroyString(name);
+        return finalize(out);
+    end;
+
+    function testAttributeName(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        let most: String := attribute(63);
+        assertTrue(written("most.jinja", asSpan(&most)), "a name of 63 bytes is written");
+        destroyString(most);
+        let more: String := attribute(64);
+        assertTrue(written("more.jinja", asSpan(&more)), "a name of 64 bytes is written");
+        destroyString(more);
+        rendersLength("most.jinja", small(), 76, "a value in an attribute of 63 bytes is written");
+        refuses("more.jinja", small(), "H7067", "a value in an attribute of 64 bytes is refused");
+        return nil;
+    end;
+
+    -- A macro of 65536 bytes of text called count times: count * 65536
+    -- bytes of text expanded.
+    function expanded(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{% macro m() %}");
+        let content: String := repeated("x", 65536);
+        writeString(&!out, asSpan(&content));
+        destroyString(content);
+        writeString(&!out, "{% endmacro %}");
+        let calls: String := repeated("{{ m() }}", count);
+        writeString(&!out, asSpan(&calls));
+        destroyString(calls);
+        return finalize(out);
+    end;
+
+    function testTextExpanded(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        let most: String := expanded(256);
+        assertTrue(written("most.jinja", asSpan(&most)), "256 calls are written");
+        destroyString(most);
+        let more: String := expanded(257);
+        assertTrue(written("more.jinja", asSpan(&more)), "257 calls are written");
+        destroyString(more);
+        rendersLength("most.jinja", small(), 16777216, "16 MiB of text expanded are read");
+        refuses("more.jinja", small(), "V0013", "16 MiB and 64 KiB of text expanded are refused");
+        return nil;
+    end;
+
+    -- {{ x ~ x ... }} with count operators: the tags, the expression and
+    -- each operator nest one deeper, count + 2 in all.
+    function chain(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{{ x");
+        let rest: String := repeated(" ~ x", count);
+        writeString(&!out, asSpan(&rest));
+        destroyString(rest);
+        writeString(&!out, " }}");
+        return finalize(out);
+    end;
+
+    function testChain(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        let most: String := chain(62);
+        assertTrue(written("most.jinja", asSpan(&most)), "62 operators are written");
+        destroyString(most);
+        let more: String := chain(63);
+        assertTrue(written("more.jinja", asSpan(&more)), "63 operators are written");
+        destroyString(more);
+        rendersLength("most.jinja", small(), 63, "a chain 64 deep is read");
+        refuses("more.jinja", small(), "V0001", "a chain 65 deep is refused");
+        return nil;
+    end;
+end module body.

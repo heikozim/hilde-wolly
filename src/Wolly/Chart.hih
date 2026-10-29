@@ -1,0 +1,61 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The arithmetic of a bar chart, no drawing: a number as people read it,
+the median of a row of counts, the height of a bar and how far a count
+lies from the median.  All in integers, so that the same counts give the
+same chart on every machine; a tenth is the finest step.
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Wolly.Chart is
+    """
+    value as people read it: the digits below 1000, else one decimal and
+    k, M or G, rounded half up at the tenth: 1234 is 1.2 k, 1500000 is
+    1.5 M, 2000000000 is 2.0 G.
+    """
+    function readableNumber(value: Int64): String
+        requires value >= 0;
+
+    """
+    The median of values: the middle one of the sorted values, or the
+    mean of the two in the middle, rounded down; 0 for none.  values
+    itself stays as it is.
+    No contract: it lies between the least and the largest value, which
+    costs more than O(1) to state.
+    """
+    generic [R: Region]
+    function median(values: &[Buffer[Int64], R]): Int64;
+
+    """
+    The height of the bar of value in percent of most, rounded down, at
+    most 100; 0 when most is not above 0.
+    """
+    function barHeight(value: Int64, most: Int64): Int64
+        ensures (result >= 0) and (result <= 100);
+
+    """
+    The largest today and middle changeTenths takes: 10^15, so that ten
+    times their difference and half of middle added to it fit an Int64.
+    """
+    function mostChangeValue(): Int64
+        ensures result = 1000000000000000;
+
+    """
+    How far today lies from middle, the median of the days before, in
+    tenths of middle, rounded half away from zero: 5 for half again as
+    much, -5 for half of it.  For a middle of 0, ten times today.
+    """
+    function changeTenths(today: Int64, middle: Int64): Int64
+        requires (today >= 0) and (middle >= 0)
+        requires (today <= mostChangeValue()) and (middle <= mostChangeValue());
+end module.

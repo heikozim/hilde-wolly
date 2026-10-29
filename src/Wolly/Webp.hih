@@ -1,0 +1,95 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+WebP read in Hilde alone: lossless pictures (VP8L, RFC 9649) and lossy
+ones (VP8 key frames through Wolly.Vp8) with their alpha (ALPH), in a
+plain file or in the extended one (VP8X) when it holds no animation.  The
+pixels come as red, green and blue, row by row from the top, three bytes a
+pixel, and the alpha apart, one byte a pixel, 255 where there is none.
+
+The four transforms (predictor, colour, subtract green, colour indexing
+with pixels bundled), the colour cache, backward references with their
+distance codes, and prefix codes per group of an entropy image are read;
+the alpha of a lossy picture raw or as such a stream, its filter undone.
+Animations answer Unsupported.
+
+Nothing of the file is trusted: every chunk length is checked against what
+is left, the size against maxPixels and 16000 a side before anything is
+allocated, the prefix codes of all groups against a budget of four entries
+a pixel, a code not complete or a reference before the first pixel answers
+Broken.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Webp is
+    """
+    Why a WebP was not read.
+    """
+    union WebpError: Free is
+        """
+        The bytes do not begin with RIFF....WEBP.
+        """
+        case NotWebp;
+        """
+        Wider or higher than 16000, more than maxPixels pixels, or prefix
+        codes beyond the budget.
+        """
+        case WebpTooLarge;
+        """
+        An animation, or a VP8 frame that is no key frame or not shown.
+        """
+        case WebpUnsupported;
+        """
+        The file ends early, a length does not fit, or the bits are not
+        what the codes say.
+        """
+        case WebpBroken;
+    end;
+
+    """
+    A picture read: its width, its height, its pixels and their alpha.
+    """
+    type WebpPicture: Linear;
+
+    """
+    The picture of the WebP in data, with at most maxPixels pixels.  An
+    Either read from bytes, so no ensures.
+    """
+    generic [D: Region]
+    function readWebp(data: Span[Nat8, D], maxPixels: Index): Either[WebpError, WebpPicture]
+        requires maxPixels > 0;
+
+    generic [P: Region]
+    function webpWidth(picture: &[WebpPicture, P]): Index
+        ensures (result >= 1) and (result <= 16000);
+
+    generic [P: Region]
+    function webpHeight(picture: &[WebpPicture, P]): Index
+        ensures (result >= 1) and (result <= 16000);
+
+    """
+    The pixels: red, green and blue, width times height times 3 bytes.
+    """
+    generic [P: Region]
+    function webpPixels(picture: &[WebpPicture, P]): Span[Nat8, P]
+        ensures spanLength(result) = ((webpWidth(picture) * webpHeight(picture)) * 3);
+
+    """
+    The alpha of each pixel, width times height bytes, 255 for opaque.
+    """
+    generic [P: Region]
+    function webpAlpha(picture: &[WebpPicture, P]): Span[Nat8, P]
+        ensures spanLength(result) = (webpWidth(picture) * webpHeight(picture));
+
+    """
+    Gives the picture and its pixels back.
+    No contract: it only gives the value back.
+    """
+    function destroyWebp(picture: WebpPicture): Unit;
+end module.

@@ -1,0 +1,41 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The database of a test: SQLite in memory, or the PostgreSQL of the test server when
+the environment says so, so that one test file runs on both backends.
+
+- WOLLY_DB unset or "sqlite": an SQLite database in memory.
+- WOLLY_DB "postgres": a connection to the server named by HILDE_PG_HOST, HILDE_PG_PORT,
+  HILDE_PG_DATABASE, HILDE_PG_USER, HILDE_PG_PASSWORD and HILDE_PG_CA (scripts/db/server.sh
+  makes the server and prints them), over TLS with the password, and the schema public of
+  the database dropped and made again, so that no test sees the tables of another.
+- A variable that is missing on a run with postgres stops the test: it never falls back to
+  SQLite, since that would count a run on PostgreSQL that did not happen.
+- A database that does not keep its text as UTF8 stops the test as well: the server is
+  started with LC_ALL=C.UTF-8, since initdb in the C locale makes SQL_ASCII.
+
+    case openTestDatabase() of
+        when Right(right as opened: Database[Writing]) do
+            ...
+            closeDatabase(opened);
+        when Left(left as error: DbError) do
+            ...
+    end case;
+"""
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.TestDb is
+    """
+    The database of a test, as the environment says.
+    No contract: the outcome is the result of I/O.
+    """
+    function openTestDatabase(): Either[DbError, Database[Writing]];
+end module.

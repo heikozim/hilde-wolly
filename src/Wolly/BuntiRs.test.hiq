@@ -1,0 +1,312 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The field against the known powers, the parity of the HELLO WORLD
+-- example of ISO/IEC 18004 (version 1-M, 16 data and 10 parity bytes),
+-- and blocks of every parity Wolly.Bunti uses damaged at random: up to
+-- parity / 2 wrong bytes corrected exactly, one more refused and the block
+-- left as it was.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    storeNth,
+    destroyFree
+);
+import Wolly.BuntiRs (
+    mostBlockBytes,
+    gfMultiply,
+    rsParity,
+    rsCorrect
+);
+
+module body Wolly.BuntiRs.Test is
+    -- A linear congruential generator of Numerical Recipes, mod 2^32.
+    function next(state: Nat32): Nat32 is
+        return modularAdd(modularMultiply(state, (1664525 : Nat32)), (1013904223 : Nat32));
+    end;
+
+    function below(state: Nat32, bound: Index): Index is
+        case toIndex(state / 65536) of
+            when Some(value as high: Index) do
+                return high - ((high / bound) * bound);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function byteOf(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function testField(): Unit is
+        assertTrue(mostBlockBytes() = 255, "255 bytes a block");
+        assertTrue(gfMultiply(2, 128) = 29, "2^8 is 0x1D for 0x11D");
+        assertTrue(gfMultiply(3, 7) = 9, "3 times 7 without carry");
+        assertTrue(gfMultiply(0, 200) = 0, "0 times");
+        assertTrue(gfMultiply(1, 200) = 200, "1 times");
+        var x: Index := 1;
+        var i: Index := 0;
+        var cycle: Index := 0;
+        while i < 255 do
+            x := gfMultiply(x, 2);
+            if x = 1 then
+                cycle := cycle + 1;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue((x = 1) and (cycle = 1), "2 has order 255: it is primitive");
+        return nil;
+    end;
+
+    function testIsoVector(): Unit is
+        var block: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!block, byteOf(32));
+        insertBack(&!block, byteOf(91));
+        insertBack(&!block, byteOf(11));
+        insertBack(&!block, byteOf(120));
+        insertBack(&!block, byteOf(209));
+        insertBack(&!block, byteOf(114));
+        insertBack(&!block, byteOf(220));
+        insertBack(&!block, byteOf(77));
+        insertBack(&!block, byteOf(67));
+        insertBack(&!block, byteOf(64));
+        insertBack(&!block, byteOf(236));
+        insertBack(&!block, byteOf(17));
+        insertBack(&!block, byteOf(236));
+        insertBack(&!block, byteOf(17));
+        insertBack(&!block, byteOf(236));
+        insertBack(&!block, byteOf(17));
+        var wanted: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!wanted, byteOf(196));
+        insertBack(&!wanted, byteOf(35));
+        insertBack(&!wanted, byteOf(39));
+        insertBack(&!wanted, byteOf(119));
+        insertBack(&!wanted, byteOf(235));
+        insertBack(&!wanted, byteOf(215));
+        insertBack(&!wanted, byteOf(231));
+        insertBack(&!wanted, byteOf(226));
+        insertBack(&!wanted, byteOf(93));
+        insertBack(&!wanted, byteOf(23));
+        let parity: Buffer[Nat8] := rsParity(&block, 0, 16, 10);
+        var same: Bool := length(&parity) = 10;
+        var j: Index := 0;
+        while same and (j < 10) do
+            same := nth(&parity, j) = nth(&wanted, j);
+            j := j + 1;
+        end while;
+        assertTrue(same, "the parity of the HELLO WORLD example");
+        destroyFree(parity);
+        destroyFree(wanted);
+        destroyFree(block);
+        return nil;
+    end;
+
+    -- A block of count random bytes and parity parity bytes.
+    function blockOf(seed: Nat32, count: Index, parity: Index): Buffer[Nat8] is
+        var state: Nat32 := seed;
+        var block: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < count do
+            state := next(state);
+            insertBack(&!block, byteOf(below(state, 256)));
+            i := i + 1;
+        end while;
+        if parity > 0 then
+            let p: Buffer[Nat8] := rsParity(&block, 0, count, parity);
+            var k: Index := 0;
+            while k < parity do
+                insertBack(&!block, nth(&p, k));
+                k := k + 1;
+            end while;
+            destroyFree(p);
+        end if;
+        return block;
+    end;
+
+    generic [A: Region, B: Region]
+    function sameBlock(a: &[Buffer[Nat8], A], b: &[Buffer[Nat8], B]): Bool is
+        if length(a) /= length(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(a) do
+            if nth(a, i) /= nth(b, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- errors wrong bytes at distinct places of block, each changed to
+    -- another value; the generator state after.
+    generic [B: Region]
+    function damage(block: &![Buffer[Nat8], B], seed: Nat32, errors: Index): Nat32 is
+        var state: Nat32 := seed;
+        let n: Index := lengthMut(&~block);
+        var hit: Buffer[Bool] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            insertBack(&!hit, false);
+            i := i + 1;
+        end while;
+        var done: Index := 0;
+        while done < errors do
+            state := next(state);
+            let at: Index := below(state, n);
+            if not nth(&hit, at) then
+                storeNth(&!hit, at, true);
+                state := next(state);
+                let flip: Index := (1 : Index) + below(state, 255);
+                case toIndex(nthMut(&~block, at)) of
+                    when Some(value as old: Index) do
+                        storeNth(&~block, at, byteOf(bitwiseXor(old, flip)));
+                    when None do
+                        skip;
+                end case;
+                done := done + 1;
+            end if;
+        end while;
+        destroyFree(hit);
+        return state;
+    end;
+
+    -- For each parity: rounds blocks of random length with up to parity / 2
+    -- errors corrected to the very block, one more refused.
+    function exerciseParity(parity: Index, rounds: Index): Unit is
+        var state: Nat32 := 12345;
+        var exact: Index := 0;
+        var refused: Index := 0;
+        var miscorrected: Index := 0;
+        var untouched: Index := 0;
+        var r: Index := 0;
+        while r < rounds do
+            state := next(state);
+            let count: Index := (1 : Index) + below(state, (255 : Index) - parity);
+            state := next(state);
+            let original: Buffer[Nat8] := blockOf(state, count, parity);
+            state := next(state);
+            let errors: Index := below(state, (parity / 2) + 1);
+            var damaged: Buffer[Nat8] := copyOf(&original);
+            state := damage(&!damaged, state, errors);
+            case rsCorrect(&!damaged, parity) of
+                when Some(value as fixed: Index) do
+                    if (fixed = errors) and sameBlock(&damaged, &original) then
+                        exact := exact + 1;
+                    end if;
+                when None do
+                    skip;
+            end case;
+            var over: Buffer[Nat8] := copyOf(&original);
+            state := damage(&!over, state, (parity / 2) + 1);
+            let before: Buffer[Nat8] := copyOf(&over);
+            case rsCorrect(&!over, parity) of
+                when Some(value as fixed: Index) do
+                    if sameBlock(&over, &original) then
+                        skip;
+                    else
+                        miscorrected := miscorrected + 1;
+                    end if;
+                when None do
+                    refused := refused + 1;
+                    if sameBlock(&over, &before) then
+                        untouched := untouched + 1;
+                    end if;
+            end case;
+            destroyFree(before);
+            destroyFree(over);
+            destroyFree(damaged);
+            destroyFree(original);
+            r := r + 1;
+        end while;
+        assertTrue(exact = rounds, "every block within the capacity corrected exactly");
+        assertTrue((refused + miscorrected) = rounds, "no block beyond the capacity made the block it was");
+        assertTrue(untouched = refused, "a refused block is left as it was");
+        print("parity ");
+        print(parity);
+        print(": beyond the capacity refused ");
+        print(refused);
+        print(", made another block ");
+        printLn(miscorrected);
+        -- With two parity bytes a block one error beyond is mostly taken for
+        -- another (radius 1 covers n * 255 of 65536 words); Wolly.Bunti's
+        -- CRC-32 refuses it then.  From 10 on RS itself refuses.
+        if parity >= 10 then
+            assertTrue((refused * 100) >= (rounds * 99), "at least 99 of 100 blocks beyond the capacity refused");
+        else
+            -- Measured with this generator: the same blocks every run.
+            assertTrue((refused = 140) and (miscorrected = 160), "parity 2: 140 refused, 160 taken for another block");
+        end if;
+        return nil;
+    end;
+
+    generic [A: Region]
+    function copyOf(a: &[Buffer[Nat8], A]): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < length(a) do
+            insertBack(&!out, nth(a, i));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    function testCorrect(): Unit is
+        exerciseParity(2, 300);
+        exerciseParity(10, 200);
+        exerciseParity(36, 60);
+        exerciseParity(76, 30);
+        exerciseParity(128, 20);
+        exerciseParity(154, 20);
+        return nil;
+    end;
+
+    function testEdges(): Unit is
+        var whole: Buffer[Nat8] := blockOf(7, 20, 8);
+        case rsCorrect(&!whole, 8) of
+            when Some(value as fixed: Index) do
+                assertTrue(fixed = 0, "a whole block: nothing changed");
+            when None do
+                assertTrue(false, "a whole block: nothing changed");
+        end case;
+        destroyFree(whole);
+        var short: Buffer[Nat8] := blockOf(7, 0, 0);
+        insertBack(&!short, (1 : Nat8));
+        insertBack(&!short, (2 : Nat8));
+        case rsCorrect(&!short, 4) of
+            when Some(value as fixed: Index) do
+                assertTrue(false, "a block not longer than its parity is refused");
+            when None do
+                assertTrue(true, "a block not longer than its parity is refused");
+        end case;
+        destroyFree(short);
+        var longest: Buffer[Nat8] := blockOf(9, 101, 154);
+        assertTrue(length(&longest) = 255, "a block of 255 bytes");
+        let next0: Nat32 := damage(&!longest, 3, 77);
+        case rsCorrect(&!longest, 154) of
+            when Some(value as fixed: Index) do
+                assertTrue(fixed = 77, "77 errors of 255 bytes corrected");
+            when None do
+                assertTrue(false, "77 errors of 255 bytes corrected");
+        end case;
+        destroyFree(longest);
+        return nil;
+    end;
+end module body.

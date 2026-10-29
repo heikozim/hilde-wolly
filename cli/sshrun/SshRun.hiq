@@ -1,0 +1,139 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    asSpan
+);
+import Standard.Text (
+    parseNat
+);
+import Standard.File (
+    Command
+);
+import Standard.Ssh (
+    SshError,
+    CommandResult,
+    sshCommand,
+    addRemoteWord,
+    runCommand,
+    destroyResult
+);
+
+import Wolly.Version (
+    answerAboutBare
+);
+
+module body Wolly.Example.SshRun is
+    constant usage: Span[Nat8, Static] := "usage: sshrun HOST PORT USER MILLIS MOST WORD...";
+
+    -- A number of the arguments as an Index; None when it is none.
+    function indexArgument(n: Index): Option[Index] is
+        case parseNat(nthArgument(n)) of
+            when Some(value as number: Nat64) do
+                return toIndex(number);
+            when None do
+                return None();
+        end case;
+    end;
+
+    function millisArgument(n: Index): Option[Nat32] is
+        case parseNat(nthArgument(n)) of
+            when Some(value as number: Nat64) do
+                return toNat32(number);
+            when None do
+                return None();
+        end case;
+    end;
+
+    function errorName(error: SshError): Span[Nat8, Static] is
+        case error of
+            when BadTarget do
+                return "BadTarget";
+            when NotStarted do
+                return "NotStarted";
+            when CommandTimedOut do
+                return "CommandTimedOut";
+            when OutputTooLarge do
+                return "OutputTooLarge";
+            when PipeFailed do
+                return "PipeFailed";
+        end case;
+    end;
+
+    generic [R: Region]
+    function show(result: &[CommandResult, R]): Unit is
+        print("code=");
+        printLn(result->code);
+        printLn("output:");
+        print(asSpan(&(result->output)));
+        printLn("errors:");
+        print(asSpan(&(result->errors)));
+        return nil;
+    end;
+
+    function run(port: Index, millis: Nat32, most: Index): ExitCode is
+        case sshCommand("/usr/bin/ssh", nthArgument(1), nthArgument(3), port, 5) of
+            when Left(left as error: SshError) do
+                print("error=");
+                printLn(errorName(error));
+                return ExitFailure();
+            when Right(right as built: Command) do
+                var remote: Command := built;
+                var i: Index := 6;
+                while i < argumentCount() do
+                    remote := addRemoteWord(remote, nthArgument(i));
+                    i := i + 1;
+                end while;
+                case runCommand(remote, millis, most) of
+                    when Left(left as error: SshError) do
+                        print("error=");
+                        printLn(errorName(error));
+                        return ExitFailure();
+                    when Right(right as result: CommandResult) do
+                        show(&result);
+                        destroyResult(result);
+                        return ExitSuccess();
+                end case;
+        end case;
+    end;
+
+    function command(): ExitCode is
+        if answerAboutBare("sshrun") then
+            return ExitSuccess();
+        end if;
+        if argumentCount() < 7 then
+            printLn(usage);
+            return ExitFailure();
+        end if;
+        case indexArgument(2) of
+            when None do
+                printLn(usage);
+                return ExitFailure();
+            when Some(value as port: Index) do
+                case millisArgument(4) of
+                    when None do
+                        printLn(usage);
+                        return ExitFailure();
+                    when Some(value as millis: Nat32) do
+                        case indexArgument(5) of
+                            when None do
+                                printLn(usage);
+                                return ExitFailure();
+                            when Some(value as most: Index) do
+                                return run(port, millis, most);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        let code: ExitCode := command();
+        surrenderRoot(power);
+        return code;
+    end;
+end module body.

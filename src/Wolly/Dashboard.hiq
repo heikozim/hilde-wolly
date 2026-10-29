@@ -1,0 +1,508 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Template (
+    Render
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    civilAt,
+    formatRfc3339
+);
+import Standard.Database (
+    Database,
+    DbError
+);
+import Wolly.Metrics (
+    Fold,
+    isMetricName,
+    series,
+    latestMetric
+);
+import Wolly.Svg (
+    lineChart,
+    barChart,
+    tile,
+    tileWithChange
+);
+import Wolly.Chart (
+    mostChangeValue
+);
+import Wolly.SoundSearch (
+    destroyKeys
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Dashboard is
+    constant panelsMost: Index := 32;
+    constant nameMost: Index := 32;
+    constant titleMost: Index := 200;
+    constant stepLeast: Int64 := 60;
+    constant stepMost: Int64 := 31622400;
+    constant bucketsLeast: Index := 2;
+    constant bucketsMost: Index := 1000;
+    constant dayLength: Int64 := 86400;
+    constant livePathMost: Index := 128;
+    constant everyLeast: Int64 := 5;
+    constant everyMost: Int64 := 3600;
+    constant sheet: Span[Nat8, Static] := ":root{color-scheme:light dark}body.wolly-dashboard{margin:0;padding:1rem;font-family:system-ui,sans-serif;background:Canvas;color:CanvasText}.wolly-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 1rem}.wolly-head h1{font-size:1.4rem;margin:0}.wolly-head p{margin:0;opacity:.7}.wolly-panels{display:grid;grid-template-columns:repeat(auto-fill,minmax(18rem,1fr));gap:1rem;margin-top:1rem}.wolly-panel{border:1px solid color-mix(in srgb,CanvasText 20%,transparent);border-radius:.5rem;padding:.75rem;min-width:0}.wolly-panel h2{font-size:1rem;margin:0 0 .5rem}.wolly-panel svg{width:100%;height:auto;display:block}.wolly-note{opacity:.7;margin:0}.wolly-up{color:#1a7f37}.wolly-down{color:#cf222e}@media (prefers-color-scheme:dark){.wolly-up{color:#3fb950}.wolly-down{color:#f85149}}";
+
+    -- What dashboard-panel.jinja shows.
+    record PanelView: Linear is
+        name: String;
+        title: String;
+        kind: String;
+        figure: String;
+        url: String;
+        every: Int64;
+    end;
+
+    -- What dashboard-page.jinja shows.
+    record PageView: Linear is
+        title: String;
+        style: String;
+        top: String;
+        refresh: Int64;
+        script: String;
+        quiet: Int64;
+        generated: String;
+        panels: Buffer[String];
+    end;
+
+    function mostPanels(): Index is
+        return panelsMost;
+    end;
+
+    generic [N: Region]
+    function isPanelName(name: Span[Nat8, N]): Bool is
+        let size: Index := spanLength(name);
+        if (size = 0) or (size > nameMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := name[i];
+            let fit: Bool := ((byte >= 'a') and (byte <= 'z')) or (((byte >= '0') and (byte <= '9')) or (byte = '-'));
+            if not fit then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [P: Region]
+    function isLivePath(path: Span[Nat8, P]): Bool is
+        let size: Index := spanLength(path);
+        if (size < 2) or (size > livePathMost) then
+            return false;
+        end if;
+        if path[0] /= '/' then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < size do
+            let byte: Nat8 := path[i];
+            let letter: Bool := ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+            let mark: Bool := ((byte = '-') or (byte = '_')) or ((byte = '.') or (byte = '/'));
+            if not ((letter or ((byte >= '0') and (byte <= '9'))) or mark) then
+                return false;
+            end if;
+            if ((byte = '.') or (byte = '/')) and (path[i - 1] = byte) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function isLive(live: Live): Bool is
+        if not (isLivePath(live.base) and isLivePath(live.script)) then
+            return false;
+        end if;
+        if live.base[spanLength(live.base) - 1] /= '/' then
+            return false;
+        end if;
+        if live.script[spanLength(live.script) - 1] = '/' then
+            return false;
+        end if;
+        return (live.every >= everyLeast) and (live.every <= everyMost);
+    end;
+
+    -- A title: 1 to titleMost bytes, none a control byte.
+    generic [T: Region]
+    function isTitle(title: Span[Nat8, T]): Bool is
+        let size: Index := spanLength(title);
+        if (size = 0) or (size > titleMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if (title[i] < 32) or (title[i] = 127) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function isPanel(panel: Panel): Bool is
+        if not (isPanelName(panel.name) and isTitle(panel.title)) then
+            return false;
+        end if;
+        if not isMetricName(panel.metric) then
+            return false;
+        end if;
+        if (panel.step < stepLeast) or (panel.step > stepMost) then
+            return false;
+        end if;
+        return (panel.buckets >= bucketsLeast) and (panel.buckets <= bucketsMost);
+    end;
+
+    function firstBucket(now: Int64, step: Int64, buckets: Int64): Int64 is
+        let slots: Int64 := (now / step) + 1;
+        if buckets >= slots then
+            return 0;
+        end if;
+        return (slots - buckets) * step;
+    end;
+
+    generic [P: Region]
+    function validPanels(panels: &[Buffer[Panel], P]): Bool is
+        let count: Index := length(panels);
+        if count > panelsMost then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < count do
+            let panel: Panel := nth(panels, i);
+            if not isPanel(panel) then
+                return false;
+            end if;
+            var k: Index := 0;
+            while k < i do
+                let other: Panel := nth(panels, k);
+                if equal(other.name, panel.name) then
+                    return false;
+                end if;
+                k := k + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [P: Region, N: Region]
+    function findPanel(panels: &[Buffer[Panel], P], name: Span[Nat8, N]): Option[Panel] is
+        if not isPanelName(name) then
+            return None();
+        end if;
+        var i: Index := 0;
+        while i < length(panels) do
+            let panel: Panel := nth(panels, i);
+            if equal(panel.name, name) then
+                return Some(value => panel);
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    function wide(i: Index): Int64 is
+        case toInt64(i) of
+            when Some(value as number: Int64) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function kindName(kind: PanelKind): Span[Nat8, Static] is
+        case kind of
+            when TilePanel do
+                return "tile";
+            when ChangePanel do
+                return "change";
+            when LinePanel do
+                return "line";
+            when BarPanel do
+                return "bars";
+        end case;
+    end;
+
+    generic [R: Region]
+    function twoDigits(out: &![StringBuilder, R], value: Nat8): Unit is
+        writeByte(&~out, (value / 10) + 48);
+        writeByte(&~out, (value - ((value / 10) * 10)) + 48);
+        return nil;
+    end;
+
+    -- One label a line for each bucket from first: HH:MM of its start in
+    -- UTC for buckets shorter than a day, MM-DD else.
+    function labelsOf(first: Int64, step: Int64, buckets: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        var at: Int64 := first;
+        while i < buckets do
+            if i > 0 then
+                writeByte(&!out, 10);
+            end if;
+            case civilAt(Instant(seconds => at, nanos => 0), 0) of
+                when Some(value as civil: Civil) do
+                    if step < dayLength then
+                        twoDigits(&!out, civil.hour);
+                        writeByte(&!out, ':');
+                        twoDigits(&!out, civil.minute);
+                    else
+                        twoDigits(&!out, civil.month);
+                        writeByte(&!out, '-');
+                        twoDigits(&!out, civil.day);
+                    end if;
+                when None do
+                    skip;
+            end case;
+            at := at + step;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The tile of a change: the last of two buckets against the one before.
+    generic [B: Region]
+    function changeTile(values: &[Buffer[Int64], B], title: Span[Nat8, Static]): String is
+        if length(values) /= 2 then
+            return fromSpan("");
+        end if;
+        let before: Int64 := nth(values, 0);
+        let last: Int64 := nth(values, 1);
+        if (before < 0) or (last < 0) or (before > mostChangeValue()) or (last > mostChangeValue()) then
+            return fromSpan("");
+        end if;
+        return tileWithChange(title, last, before);
+    end;
+
+    -- The chart of panel, empty for a tile without a sample.
+    generic [Q: Free, R: Region]
+    function figureOf(db: &![Database[Q], R], panel: Panel, now: Int64): Either[DbError, String] is
+        case panel.kind of
+            when TilePanel do
+                case latestMetric(&~db, panel.metric) of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as latest: Option[Int64]) do
+                        case latest of
+                            when Some(value as sample: Int64) do
+                                if sample < 0 then
+                                    return Right(right => fromSpan(""));
+                                end if;
+                                return Right(right => tile(panel.title, sample));
+                            when None do
+                                return Right(right => fromSpan(""));
+                        end case;
+                end case;
+            when ChangePanel do
+                let pair: Index := 2;
+                case series(&~db, panel.metric, firstBucket(now, panel.step, wide(pair)), panel.step, pair, panel.fold) of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as values: Buffer[Int64]) do
+                        let text: String := changeTile(&values, panel.title);
+                        destroyFree(values);
+                        return Right(right => text);
+                end case;
+            when LinePanel do
+                case series(&~db, panel.metric, firstBucket(now, panel.step, wide(panel.buckets)), panel.step, panel.buckets, panel.fold) of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as values: Buffer[Int64]) do
+                        let text: String := lineChart(&values, panel.title);
+                        destroyFree(values);
+                        return Right(right => text);
+                end case;
+            when BarPanel do
+                let first: Int64 := firstBucket(now, panel.step, wide(panel.buckets));
+                case series(&~db, panel.metric, first, panel.step, panel.buckets, panel.fold) of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as values: Buffer[Int64]) do
+                        let labels: String := labelsOf(first, panel.step, panel.buckets);
+                        let text: String := barChart(&values, asSpan(&labels), panel.title);
+                        destroyString(labels);
+                        destroyFree(values);
+                        return Right(right => text);
+                end case;
+        end case;
+    end;
+
+    generic [V: Region]
+    function renderPanel(view: &[PanelView, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/dashboard-panel.jinja", view, out);
+        return finalize(out);
+    end;
+
+    generic [Q: Free, R: Region]
+    function panelFragment(db: &![Database[Q], R], panel: Panel, now: Int64): Either[DbError, String] is
+        return fragmentWith(&~db, panel, now, fromSpan(""), 0);
+    end;
+
+    generic [Q: Free, R: Region]
+    function livePanelFragment(db: &![Database[Q], R], panel: Panel, now: Int64, live: Live): Either[DbError, String] is
+        var url: StringBuilder := makeStringBuilder();
+        writeString(&!url, live.base);
+        writeString(&!url, panel.name);
+        return fragmentWith(&~db, panel, now, finalize(url), live.every);
+    end;
+
+    -- The fragment of panel; with a url it asks for url again every every
+    -- seconds, with the empty url it does not.
+    generic [Q: Free, R: Region]
+    function fragmentWith(db: &![Database[Q], R], panel: Panel, now: Int64, url: String, every: Int64): Either[DbError, String] is
+        case figureOf(&~db, panel, now) of
+            when Left(left as error: DbError) do
+                destroyString(url);
+                return Left(left => error);
+            when Right(right as figure: String) do
+                let view: PanelView := PanelView(name => fromSpan(panel.name), title => fromSpan(panel.title),
+                                                 kind => fromSpan(kindName(panel.kind)), figure => figure, url => url,
+                                                 every => every);
+                let text: String := renderPanel(&view);
+                let { name as n: String, title as t: String, kind as k: String, figure as f: String, url as u: String,
+                      every as e: Int64 } := view;
+                destroyString(n);
+                destroyString(t);
+                destroyString(k);
+                destroyString(f);
+                destroyString(u);
+                return Right(right => text);
+        end case;
+    end;
+
+    generic [V: Region]
+    function renderPage(view: &[PageView, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/dashboard-page.jinja", view, out);
+        return finalize(out);
+    end;
+
+    -- now as RFC 3339 in UTC, or empty.
+    function timeText(now: Int64): String is
+        case formatRfc3339(Instant(seconds => now, nanos => 0), 0) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [Q: Free, R: Region, P: Region, T: Region, S: Region, H: Region]
+    function dashboardPage(db: &![Database[Q], R], panels: &[Buffer[Panel], P], title: Span[Nat8, T],
+                           style: Span[Nat8, S], top: Span[Nat8, H], now: Int64, refresh: Int64): Either[DashboardFailure, String] is
+        let none: Live := Live(base => "", script => "", every => 0);
+        return pageWith(&~db, panels, title, style, top, now, refresh, false, none);
+    end;
+
+    generic [Q: Free, R: Region, P: Region, T: Region, S: Region, H: Region]
+    function liveDashboardPage(db: &![Database[Q], R], panels: &[Buffer[Panel], P], title: Span[Nat8, T],
+                               style: Span[Nat8, S], top: Span[Nat8, H], now: Int64, live: Live): Either[DashboardFailure, String] is
+        return pageWith(&~db, panels, title, style, top, now, 0, true, live);
+    end;
+
+    -- The page; live tells whether the panels ask for themselves again
+    -- through htmx after the paths and seconds of how.
+    generic [Q: Free, R: Region, P: Region, T: Region, S: Region, H: Region]
+    function pageWith(db: &![Database[Q], R], panels: &[Buffer[Panel], P], title: Span[Nat8, T], style: Span[Nat8, S],
+                      top: Span[Nat8, H], now: Int64, refresh: Int64, live: Bool, how: Live): Either[DashboardFailure, String] is
+        if not validPanels(panels) then
+            return Left(left => UnfitPanels());
+        end if;
+        var fragments: Buffer[String] := allocateEmpty();
+        var problem: Option[DbError] := None();
+        var going: Bool := true;
+        var i: Index := 0;
+        while going and (i < length(panels)) do
+            case fragmentOf(&~db, nth(panels, i), now, live, how) of
+                when Left(left as error: DbError) do
+                    problem := Some(value => error);
+                    going := false;
+                when Right(right as fragment: String) do
+                    insertBack(&!fragments, fragment);
+            end case;
+            i := i + 1;
+        end while;
+        case problem of
+            when Some(value as error: DbError) do
+                destroyKeys(fragments);
+                return Left(left => DashboardStorage(error => error));
+            when None do
+                let script: String := scriptOf(live, how);
+                var quiet: Int64 := 0;
+                if live then
+                    quiet := how.every;
+                end if;
+                let view: PageView := PageView(title => fromSpan(title), style => fromSpan(style), top => fromSpan(top),
+                                               refresh => refresh, script => script, quiet => quiet,
+                                               generated => timeText(now), panels => fragments);
+                let text: String := renderPage(&view);
+                let { title as t: String, style as s: String, top as h: String, refresh as r: Int64, script as c: String,
+                      quiet as q: Int64, generated as g: String, panels as p: Buffer[String] } := view;
+                destroyString(t);
+                destroyString(s);
+                destroyString(h);
+                destroyString(c);
+                destroyString(g);
+                destroyKeys(p);
+                return Right(right => text);
+        end case;
+    end;
+
+    -- The path of the script of how when live, else empty.
+    function scriptOf(live: Bool, how: Live): String is
+        if live then
+            return fromSpan(how.script);
+        end if;
+        return fromSpan("");
+    end;
+
+    -- The fragment of panel: livePanelFragment after how when live, else
+    -- panelFragment; how is only read when live.
+    generic [Q: Free, R: Region]
+    function fragmentOf(db: &![Database[Q], R], panel: Panel, now: Int64, live: Bool, how: Live): Either[DbError, String] is
+        if live then
+            return livePanelFragment(&~db, panel, now, how);
+        end if;
+        return panelFragment(&~db, panel, now);
+    end;
+
+    function dashboardStyle(): Span[Nat8, Static] is
+        return sheet;
+    end;
+end module body.

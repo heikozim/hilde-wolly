@@ -1,0 +1,60 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    startsWith,
+    contains
+);
+import Wolly.Response (
+    makeResponse,
+    finish
+);
+import Wolly.Ban (
+    longestBanSeconds,
+    withBan
+);
+
+module body Wolly.Ban.Test is
+    function banned(seconds: Int64): String is
+        return finish(withBan(makeResponse(303, "text/plain; charset=utf-8"), seconds), "sent\n");
+    end;
+
+    function testBan(): Unit is
+        let one: String := banned(1);
+        assertTrue(contains(asSpan(&one), "\r\nX-Hiawatha-Ban: 1\r\n"), "one second");
+        assertTrue(startsWith(asSpan(&one), "Status: 303 "), "the status stays");
+        assertTrue(contains(asSpan(&one), "\r\n\r\nsent\n"), "and so does the body");
+        destroyString(one);
+        let hour: String := banned(3600);
+        assertTrue(contains(asSpan(&hour), "\r\nX-Hiawatha-Ban: 3600\r\n"), "an hour, with a zero inside");
+        destroyString(hour);
+        return nil;
+    end;
+
+    function testLongest(): Unit is
+        assertTrue(longestBanSeconds() = 86400, "a day is the longest");
+        let day: String := banned(86400);
+        assertTrue(contains(asSpan(&day), "\r\nX-Hiawatha-Ban: 86400\r\n"), "a day stays a day");
+        destroyString(day);
+        let more: String := banned(86401);
+        assertTrue(contains(asSpan(&more), "\r\nX-Hiawatha-Ban: 86400\r\n"), "a second more is cut to a day");
+        assertFalse(contains(asSpan(&more), "86401"), "and the asked seconds are nowhere");
+        destroyString(more);
+        let most: String := banned(9223372036854775807);
+        assertTrue(contains(asSpan(&most), "\r\nX-Hiawatha-Ban: 86400\r\n"), "the largest Int64 is cut to a day");
+        destroyString(most);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,100 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Backoff (
+    BackoffRule,
+    defaultRule,
+    delayAfter,
+    prepareBackoff,
+    backoffWait,
+    backoffFail,
+    backoffFailures,
+    backoffReset,
+    pruneBackoff
+);
+
+module body Wolly.Backoff.Test is
+    constant now: Int64 := 1800000000;
+
+    function testDelays(): Unit is
+        let rule: BackoffRule := defaultRule();
+        assertTrue(delayAfter(rule, 0) = 0, "nothing at first");
+        assertTrue(delayAfter(rule, 2) = 0, "two are free");
+        assertTrue(delayAfter(rule, 3) = 1, "the base at the third");
+        assertTrue(delayAfter(rule, 4) = 2, "doubled");
+        assertTrue(delayAfter(rule, 12) = 512, "nine doublings");
+        assertTrue(delayAfter(rule, 13) = 900, "capped");
+        assertTrue(delayAfter(rule, 1000) = 900, "still capped");
+        let odd: BackoffRule := BackoffRule(free => 0, base => 1, max => 3, forget => 60);
+        assertTrue(delayAfter(odd, 1) = 2, "an odd cap, below it");
+        assertTrue(delayAfter(odd, 2) = 3, "an odd cap, reached");
+        return nil;
+    end;
+
+    function waitOf(result: Either[DbError, Int64]): Int64 is
+        case result of
+            when Right(right as n: Int64) do
+                return n;
+            when Left(left as error: DbError) do
+                abort("the database failed");
+        end case;
+    end;
+
+    function holds(result: Option[DbError]): Bool is
+        case result of
+            when None do
+                return true;
+            when Some(value as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function testCounting(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let rule: BackoffRule := defaultRule();
+                assertTrue(holds(prepareBackoff(&!db)), "the table is made");
+                assertTrue(waitOf(backoffWait(&!db, "a", rule, now)) = 0, "an unknown key waits not");
+                assertTrue(holds(backoffFail(&!db, "a", rule, now)), "one failure");
+                assertTrue(holds(backoffFail(&!db, "a", rule, now)), "two failures");
+                assertTrue(waitOf(backoffWait(&!db, "a", rule, now)) = 0, "two are free");
+                assertTrue(holds(backoffFail(&!db, "a", rule, now)), "three failures");
+                assertTrue(waitOf(backoffWait(&!db, "a", rule, now)) = 1, "a second after the third");
+                assertTrue(holds(backoffFail(&!db, "a", rule, now + 1)), "four failures");
+                assertTrue(waitOf(backoffWait(&!db, "a", rule, now + 1)) = 2, "two seconds after the fourth");
+                assertTrue(waitOf(backoffWait(&!db, "a", rule, now + 3)) = 0, "the wait is over");
+                assertTrue(waitOf(backoffFailures(&!db, "a", rule, now + 3)) = 4, "four on record");
+                assertTrue(waitOf(backoffFailures(&!db, "b", rule, now)) = 0, "another key has none");
+                assertTrue(waitOf(backoffFailures(&!db, "a", rule, now + 86402)) = 0, "forgotten after a day");
+                assertTrue(holds(backoffFail(&!db, "a", rule, now + 86402)), "a failure after a day");
+                assertTrue(waitOf(backoffFailures(&!db, "a", rule, now + 86402)) = 1, "starts again from one");
+                assertTrue(holds(backoffReset(&!db, "a")), "reset");
+                assertTrue(waitOf(backoffFailures(&!db, "a", rule, now + 86402)) = 0, "nothing after a reset");
+                assertTrue(holds(backoffFail(&!db, "c", rule, now)), "an old failure");
+                assertTrue(holds(backoffFail(&!db, "d", rule, now + 86400)), "a young failure");
+                assertTrue(waitOf(pruneBackoff(&!db, rule, now + 86401)) = 1, "the old key goes");
+                assertTrue(waitOf(backoffFailures(&!db, "d", rule, now + 86401)) = 1, "the young key stays");
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database");
+        end case;
+        return nil;
+    end;
+end module body.

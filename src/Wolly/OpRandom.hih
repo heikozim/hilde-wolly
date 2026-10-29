@@ -1,0 +1,51 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The random values of an OpenID provider and how they are kept.
+
+A secret (a session cookie, a code, a refresh token, a client secret) is
+two base32 texts of 128 random bits each, 52 uppercase letters and digits;
+an ID that is shown (a session, a device, a request) is one such text in
+lowercase.  A secret is stored only as the lowercase hex of its SHA-256: a
+copy of the database opens nothing.
+"""
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.OpRandom is
+    """
+    A new secret of 256 random bits, 52 characters.  None when the random
+    source fails.
+    No contract: an Option over the random source.
+    """
+    function randomToken(): Option[String];
+
+    """
+    A new ID of 128 random bits, 26 lowercase characters.  None when the
+    random source fails.
+    No contract: an Option over the random source.
+    """
+    function randomId(): Option[String];
+
+    """
+    The lowercase hex of the SHA-256 of token, 64 characters; empty when
+    libcrypto fails, which no stored hash equals.
+    """
+    generic [T: Region]
+    function tokenHash(token: Span[Nat8, T]): String
+        ensures (length(&result) = 64) or (length(&result) = 0);
+
+    """
+    Whether the SHA-256 of token is the stored hash, compared in constant
+    time.  False for an empty token.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Region, H: Region]
+    function tokenMatches(token: Span[Nat8, T], hash: Span[Nat8, H]): Bool;
+end module.

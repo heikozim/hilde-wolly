@@ -1,0 +1,38 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Hello, World behind Hiawatha: a FastCGI responder on the socket hello.sock
+in the working directory, until SIGTERM or SIGINT, with a few routes and a
+cookie.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Example.Hello is
+    """
+    The answer to every request, chosen by its route: GET / greets the
+    world, GET /hello/:name the name, GET /visits counts the visits in a
+    cookie, GET /files/* shows the rest of the path, GET /numbers?page=n
+    lists a page of the numbers 1 to 45; anything else gets
+    404 or 405.
+    """
+    function handle(request: Request): String
+        ensures length(&result) > 0;
+
+    """
+    Serves handle on hello.sock until SIGTERM or SIGINT.  Success when a
+    signal ended it, failure when the socket or the server could not be
+    set up.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(): ExitCode;
+end module.

@@ -1,0 +1,286 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+
+module body Wolly.Phonetic is
+    -- The base letter of the Latin-1 letter at offset + 192 (U+00C0),
+    -- 0 for one that has none (Æ, Ð, ×, Þ, æ, ð, ÷, þ).
+    function latinBase(offset: Nat8): Nat8 is
+        -- Upper and lower case of Latin-1 lie 32 apart, but ß and ÷ sit
+        -- where no capital has a lower case.
+        if offset = 31 then
+            return 's';
+        end if;
+        var low: Nat8 := offset;
+        if offset >= 32 then
+            low := offset - 32;
+        end if;
+        if low <= 5 then
+            return 'a';
+        end if;
+        if low = 7 then
+            return 'c';
+        end if;
+        if (low >= 8) and (low <= 11) then
+            return 'e';
+        end if;
+        if (low >= 12) and (low <= 15) then
+            return 'i';
+        end if;
+        if low = 17 then
+            return 'n';
+        end if;
+        if ((low >= 18) and (low <= 22)) or (low = 24) then
+            return 'o';
+        end if;
+        if (low >= 25) and (low <= 28) then
+            return 'u';
+        end if;
+        if (low = 29) or (offset = 63) then
+            return 'y';
+        end if;
+        return 0;
+    end;
+
+    generic [W: Region]
+    function lettersOf(word: Span[Nat8, W]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(word);
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := word[i];
+            if (byte >= 'a') and (byte <= 'z') then
+                writeByte(&!out, byte);
+            end if;
+            if (byte >= 'A') and (byte <= 'Z') then
+                writeByte(&!out, byte + 32);
+            end if;
+            -- C3 80 to C3 BF: U+00C0 to U+00FF.
+            if ((byte = 195) and ((i + 1) < size)) and ((word[i + 1] >= 128) and (word[i + 1] <= 191)) then
+                let base: Nat8 := latinBase(word[i + 1] - 128);
+                if base /= 0 then
+                    writeByte(&!out, base);
+                end if;
+                i := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [S: Region]
+    function isIn(byte: Nat8, set: Span[Nat8, S]): Bool is
+        var i: Index := 0;
+        while i < spanLength(set) do
+            if set[i] = byte then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Writes the code of the letter at at, none for h, 48 for an x not after
+    -- c, k or q.
+    generic [L: Region, B: Region]
+    function writeCode(letters: Span[Nat8, L], at: Index, out: &![StringBuilder, B]): Unit is
+        let byte: Nat8 := letters[at];
+        var before: Nat8 := 0;
+        if at > 0 then
+            before := letters[at - 1];
+        end if;
+        var after: Nat8 := 0;
+        if (at + 1) < spanLength(letters) then
+            after := letters[at + 1];
+        end if;
+        if isIn(byte, "aeijouy") then
+            writeByte(&~out, '0');
+        end if;
+        if byte = 'b' then
+            writeByte(&~out, '1');
+        end if;
+        if byte = 'p' then
+            if after = 'h' then
+                writeByte(&~out, '3');
+            else
+                writeByte(&~out, '1');
+            end if;
+        end if;
+        if (byte = 'd') or (byte = 't') then
+            if isIn(after, "csz") then
+                writeByte(&~out, '8');
+            else
+                writeByte(&~out, '2');
+            end if;
+        end if;
+        if isIn(byte, "fvw") then
+            writeByte(&~out, '3');
+        end if;
+        if isIn(byte, "gkq") then
+            writeByte(&~out, '4');
+        end if;
+        if byte = 'x' then
+            if not isIn(before, "ckq") then
+                writeByte(&~out, '4');
+            end if;
+            writeByte(&~out, '8');
+        end if;
+        if byte = 'l' then
+            writeByte(&~out, '5');
+        end if;
+        if (byte = 'm') or (byte = 'n') then
+            writeByte(&~out, '6');
+        end if;
+        if byte = 'r' then
+            writeByte(&~out, '7');
+        end if;
+        if (byte = 's') or (byte = 'z') then
+            writeByte(&~out, '8');
+        end if;
+        if byte = 'c' then
+            writeByte(&~out, codeOfC(at = 0, before, after));
+        end if;
+        return nil;
+    end;
+
+    -- c: at the start 4 before a h k l o q r u x, else 8; later 8 after s
+    -- or z, else 4 before a h k o q u x, else 8.
+    function codeOfC(first: Bool, before: Nat8, after: Nat8): Nat8 is
+        if first then
+            if isIn(after, "ahkloqrux") then
+                return '4';
+            end if;
+            return '8';
+        end if;
+        if (before = 's') or (before = 'z') then
+            return '8';
+        end if;
+        if isIn(after, "ahkoqux") then
+            return '4';
+        end if;
+        return '8';
+    end;
+
+    generic [W: Region]
+    function cologne(word: Span[Nat8, W]): String is
+        let letters: String := lettersOf(word);
+        var raw: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(asSpan(&letters)) do
+            writeCode(asSpan(&letters), i, &!raw);
+            i := i + 1;
+        end while;
+        destroyString(letters);
+        let digits: String := finalize(raw);
+        let code: String := collapsed(asSpan(&digits));
+        destroyString(digits);
+        return code;
+    end;
+
+    -- The digits without a digit repeated in a row, and without a 0 that
+    -- does not lead.
+    generic [D: Region]
+    function collapsed(digits: Span[Nat8, D]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var previous: Nat8 := 0;
+        var i: Index := 0;
+        while i < spanLength(digits) do
+            let digit: Nat8 := digits[i];
+            if (i = 0) or (digit /= previous) then
+                if (digit /= '0') or (i = 0) then
+                    writeByte(&!out, digit);
+                end if;
+            end if;
+            previous := digit;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The Soundex digit of a letter, 0 for a e i o u y h w.
+    function soundexDigit(byte: Nat8): Nat8 is
+        if isIn(byte, "bfpv") then
+            return '1';
+        end if;
+        if isIn(byte, "cgjkqsxz") then
+            return '2';
+        end if;
+        if (byte = 'd') or (byte = 't') then
+            return '3';
+        end if;
+        if byte = 'l' then
+            return '4';
+        end if;
+        if (byte = 'm') or (byte = 'n') then
+            return '5';
+        end if;
+        if byte = 'r' then
+            return '6';
+        end if;
+        return 0;
+    end;
+
+    generic [W: Region]
+    function soundex(word: Span[Nat8, W]): String is
+        let letters: String := lettersOf(word);
+        let code: String := soundexOf(asSpan(&letters));
+        destroyString(letters);
+        return code;
+    end;
+
+    generic [L: Region]
+    function soundexOf(letters: Span[Nat8, L]): String is
+        var out: StringBuilder := makeStringBuilder();
+        if spanLength(letters) = 0 then
+            return finalize(out);
+        else
+            return soundexWrite(letters, out);
+        end if;
+    end;
+
+    generic [L: Region]
+    function soundexWrite(letters: Span[Nat8, L], start: StringBuilder): String is
+        var out: StringBuilder := start;
+        writeByte(&!out, letters[0] - 32);
+        var written: Index := 1;
+        var last: Nat8 := soundexDigit(letters[0]);
+        var i: Index := 1;
+        while (i < spanLength(letters)) and (written < 4) do
+            let byte: Nat8 := letters[i];
+            let digit: Nat8 := soundexDigit(byte);
+            if digit = 0 then
+                -- A vowel or y parts two letters of one code; h and w do
+                -- not.
+                if (byte /= 'h') and (byte /= 'w') then
+                    last := (0 : Nat8);
+                end if;
+            else
+                if digit /= last then
+                    writeByte(&!out, digit);
+                    written := written + 1;
+                end if;
+                last := digit;
+            end if;
+            i := i + 1;
+        end while;
+        while written < 4 do
+            writeByte(&!out, '0');
+            written := written + 1;
+        end while;
+        return finalize(out);
+    end;
+end module body.

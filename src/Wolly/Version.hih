@@ -1,0 +1,107 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The release of Wolly and what its programmes say about themselves.
+
+- release is the number of the first line of CHANGELOG; scripts/check-version.pl holds the two the same.
+- version, -V or --version as the one argument: the version line.
+- The same word and --full: the full text of Standard.About, a line library for each C library the
+  programme names, before the copyright.
+- info as the one argument: the info text of Standard.About.
+- answerAbout prints whichever was asked and says whether one was; the programme then exits 0.
+
+    var libraries: Buffer[String] := allocateEmpty();
+    insertBack(&!libraries, library("libcrypto", cryptoVersion()));
+    let answered: Bool := answerAbout("hello", &libraries);
+    destroyLibraries(libraries);
+    if answered then
+        return ExitSuccess();
+    end if;
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Wolly.Version is
+    """
+    The release, three numbers with a dot between them.
+    """
+    function release(): Span[Nat8, Static]
+        ensures spanLength(result) >= 5;
+
+    """
+    The holder of the copyright on the version line.
+    """
+    function notice(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The long name of the acronym, the head of the info text.
+    """
+    function longName(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    Whether the one argument of the process is version, -V or --version.
+    No contract: the answer is read from the arguments of the process.
+    """
+    function versionAsked(): Bool;
+
+    """
+    Whether the two arguments of the process are version, -V or --version
+    and then --full.
+    No contract: the answer is read from the arguments of the process.
+    """
+    function fullVersionAsked(): Bool;
+
+    """
+    Whether the one argument of the process is info.
+    No contract: the answer is read from the arguments of the process.
+    """
+    function infoAsked(): Bool;
+
+    """
+    Prints the version line: the name of the programme, a space, the release,
+    a comma, a space and the copyright with notice.
+    """
+    generic [P: Region]
+    function printVersion(program: Span[Nat8, P]): Unit
+        requires spanLength(program) > 0;
+
+    """
+    A line library of the full version: name, a space and version, the
+    version as the library gives it.
+    """
+    generic [V: Region]
+    function library(name: Span[Nat8, Static], version: Span[Nat8, V]): String
+        requires spanLength(name) > 0
+        ensures length(&result) > spanLength(name);
+
+    """
+    Gives the strings of libraries back.
+    No contract: it only consumes.
+    """
+    function destroyLibraries(libraries: Buffer[String]): Unit;
+
+    """
+    Prints the version line, the full version with libraries or the info
+    text, whichever the arguments ask for, and says whether one was asked.
+    No contract: the answer is read from the arguments of the process.
+    """
+    generic [R: Region]
+    function answerAbout(program: Span[Nat8, Static], libraries: &[Buffer[String], R]): Bool;
+
+    """
+    answerAbout for a programme that links no C library of its own.
+    No contract: the answer is read from the arguments of the process.
+    """
+    function answerAboutBare(program: Span[Nat8, Static]): Bool;
+end module.

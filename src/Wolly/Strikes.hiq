@@ -1,0 +1,124 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Wolly.Limit.  A strike is an
+-- upsert and a read of the count in one transaction, so two failures at
+-- once get two numbers and only one of them is the limit.
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withInt64,
+    withText,
+    begin,
+    commit,
+    rollback,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    finish
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.Strikes is
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_strikes (key TEXT PRIMARY KEY, strikes INTEGER NOT NULL, started INTEGER NOT NULL) STRICT";
+    constant makeTablePg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_strikes (key TEXT PRIMARY KEY, strikes BIGINT NOT NULL, started BIGINT NOT NULL)";
+    constant addStrike: Span[Nat8, Static] := "INSERT INTO wolly_strikes (key, strikes, started) VALUES (?, 1, ?) ON CONFLICT (key) DO UPDATE SET strikes = CASE WHEN ? - wolly_strikes.started > ? THEN 1 ELSE wolly_strikes.strikes + 1 END, started = CASE WHEN ? - wolly_strikes.started > ? THEN ? ELSE wolly_strikes.started END";
+    constant readCount: Span[Nat8, Static] := "SELECT strikes FROM wolly_strikes WHERE key = ?";
+    constant dropKey: Span[Nat8, Static] := "DELETE FROM wolly_strikes WHERE key = ?";
+    constant dropOld: Span[Nat8, Static] := "DELETE FROM wolly_strikes WHERE started < ?";
+
+    generic [R: Region]
+    function prepareStrikes(db: &![Database[Writing], R]): Option[DbError] is
+        let table: Span[Nat8, Static] := pick(&db, makeTable, makeTablePg);
+        case execute(&~db, table, noValues()) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    -- The work of strike inside its transaction: the count after this
+    -- failure.
+    generic [R: Region, K: Region]
+    function counted(db: &![Database[Writing], R], key: Span[Nat8, K], window: Int64, now: Int64): Either[DbError, Int64] is
+        case execute(&~db, addStrike, withInt64(withInt64(withInt64(withInt64(withInt64(withInt64(withText(noValues(), key),
+            now), now), window), now), window), now)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as changed: Nat64) do
+                skip;
+        end case;
+        var cursor: Cursor := start(&~db, readCount, withText(noValues(), key));
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => count);
+        end case;
+    end;
+
+    generic [R: Region, K: Region]
+    function strike(db: &![Database[Writing], R], key: Span[Nat8, K], limit: Int64, window: Int64,
+        now: Int64): Either[DbError, Bool] is
+        if (limit < 1) or (spanLength(key) = 0) then
+            return Right(right => false);
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as open: Transaction) do
+                case counted(&~db, key, window, now) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, open);
+                        return Left(left => error);
+                    when Right(right as count: Int64) do
+                        case commit(&~db, open) of
+                            when Left(left as error: DbError) do
+                                return Left(left => error);
+                            when Right(right as done: Unit) do
+                                return Right(right => count = limit);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, K: Region]
+    function clearStrikes(db: &![Database[Writing], R], key: Span[Nat8, K]): Option[DbError] is
+        case execute(&~db, dropKey, withText(noValues(), key)) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    generic [R: Region]
+    function pruneStrikes(db: &![Database[Writing], R], window: Int64, now: Int64): Either[DbError, Int64] is
+        case execute(&~db, dropOld, withInt64(noValues(), now - window)) of
+            when Right(right as changed: Nat64) do
+                case toInt64(changed) of
+                    when Some(value as n: Int64) do
+                        return Right(right => n);
+                    when None do
+                        return Right(right => (0 : Int64));
+                end case;
+            when Left(left as error: DbError) do
+                return Left(left => error);
+        end case;
+    end;
+end module body.

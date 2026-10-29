@@ -1,0 +1,182 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    storeNth,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Values,
+    Cursor,
+    noValues,
+    withText,
+    withInt64,
+    execute,
+    start,
+    advance,
+    columnInt64,
+    finish
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.Metrics is
+    constant bucketsMost: Index := 1000;
+    constant nameMost: Index := 64;
+    -- A bucket is at most a year (366 days), so that start + step * 1000
+    -- stays far inside an Int64.
+    constant stepMost: Int64 := 31622400;
+    constant zero: Int64 := 0;
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_metrics (name TEXT NOT NULL, at INTEGER NOT NULL CHECK (at >= 0), value INTEGER NOT NULL CHECK (value >= 0)) STRICT";
+    constant makeIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_metrics_name_at ON wolly_metrics (name, at)";
+    constant makeTablePg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_metrics (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, at BIGINT NOT NULL CHECK (at >= 0), value BIGINT NOT NULL CHECK (value >= 0))";
+    constant putSample: Span[Nat8, Static] := "INSERT INTO wolly_metrics (name, at, value) VALUES (?, ?, ?)";
+    constant totals: Span[Nat8, Static] := "SELECT (at - ?) / ?, SUM(value) FROM wolly_metrics WHERE name = ? AND at >= ? AND at < ? GROUP BY 1 ORDER BY 1";
+    constant totalsPg: Span[Nat8, Static] := "SELECT (at - ?) / ?, CAST(SUM(value) AS BIGINT) FROM wolly_metrics WHERE name = ? AND at >= ? AND at < ? GROUP BY 1 ORDER BY 1";
+    constant highests: Span[Nat8, Static] := "SELECT (at - ?) / ?, MAX(value) FROM wolly_metrics WHERE name = ? AND at >= ? AND at < ? GROUP BY 1 ORDER BY 1";
+    constant latest: Span[Nat8, Static] := "SELECT value FROM wolly_metrics WHERE name = ? ORDER BY at DESC, rowid DESC LIMIT 1";
+    constant latestPg: Span[Nat8, Static] := "SELECT value FROM wolly_metrics WHERE name = ? ORDER BY at DESC, id DESC LIMIT 1";
+    constant prune: Span[Nat8, Static] := "DELETE FROM wolly_metrics WHERE at < ?";
+
+    function mostBuckets(): Index is
+        return bucketsMost;
+    end;
+
+    generic [N: Region]
+    function isMetricName(name: Span[Nat8, N]): Bool is
+        let size: Index := spanLength(name);
+        if (size = 0) or (size > nameMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := name[i];
+            let lower: Bool := (byte >= 97) and (byte <= 122);
+            let digit: Bool := (byte >= 48) and (byte <= 57);
+            let mark: Bool := ((byte = 46) or (byte = 45)) or (byte = 95);
+            if not ((lower or digit) or mark) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function prepareMetrics(db: &![Database[Writing], R]): Option[DbError] is
+        let makeTableSql: Span[Nat8, Static] := pick(&db, makeTable, makeTablePg);
+        case execute(&~db, makeTableSql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                case execute(&~db, makeIndex, noValues()) of
+                    when Left(left as failure: DbError) do
+                        return Some(value => failure);
+                    when Right(right as indexed: Nat64) do
+                        return None();
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, N: Region]
+    function recordMetric(db: &![Database[Writing], R], name: Span[Nat8, N], at: Int64, value: Int64): Either[DbError, Bool] is
+        if ((not isMetricName(name)) or (value < 0)) or (at < 0) then
+            return Right(right => false);
+        end if;
+        case execute(&~db, putSample, withInt64(withInt64(withText(noValues(), name), at), value)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as kept: Nat64) do
+                return Right(right => true);
+        end case;
+    end;
+
+    function emptySeries(): Either[DbError, Buffer[Int64]] is
+        let none: Buffer[Int64] := allocateEmpty();
+        let result: Either[DbError, Buffer[Int64]] := Right(right => none);
+        return result;
+    end;
+
+    generic [Q: Free, R: Region, N: Region]
+    function series(db: &![Database[Q], R], name: Span[Nat8, N], since: Int64, step: Int64, buckets: Index,
+                    fold: Fold): Either[DbError, Buffer[Int64]] is
+        if ((not isMetricName(name)) or ((step < 1) or (step > stepMost))) or ((since < 0) or (buckets = 0)) then
+            return emptySeries();
+        end if;
+        var count: Index := buckets;
+        if count > bucketsMost then
+            count := bucketsMost;
+        end if;
+        var span: Int64 := 0;
+        var k: Index := 0;
+        while k < count do
+            span := span + step;
+            k := k + 1;
+        end while;
+        var sql: Span[Nat8, Static] := pick(&db, totals, totalsPg);
+        case fold of
+            when Total do
+                sql := pick(&db, totals, totalsPg);
+            when Highest do
+                sql := highests;
+        end case;
+        let values: Values := withInt64(withInt64(withText(withInt64(withInt64(noValues(), since), step), name), since), since + span);
+        var buffer: Buffer[Int64] := initialize(count, zero);
+        var cursor: Cursor := start(&~db, sql, values);
+        while advance(&!cursor) do
+            let bucket: Int64 := columnInt64(&cursor, 0);
+            case toIndex(bucket) of
+                when Some(value as position: Index) do
+                    -- The query takes no sample at or after the end, so
+                    -- position is below count; storeNth aborts if not.
+                    storeNth(&!buffer, position, columnInt64(&cursor, 1));
+                when None do
+                    skip;
+            end case;
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyFree(buffer);
+                return Left(left => error);
+            when None do
+                return Right(right => buffer);
+        end case;
+    end;
+
+    generic [Q: Free, R: Region, N: Region]
+    function latestMetric(db: &![Database[Q], R], name: Span[Nat8, N]): Either[DbError, Option[Int64]] is
+        let latestSql: Span[Nat8, Static] := pick(&db, latest, latestPg);
+        var cursor: Cursor := start(&~db, latestSql, withText(noValues(), name));
+        var found: Bool := false;
+        var latestValue: Int64 := 0;
+        if advance(&!cursor) then
+            found := true;
+            latestValue := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                if found then
+                    let some: Option[Int64] := Some(value => latestValue);
+                    return Right(right => some);
+                end if;
+                return Right(right => None());
+        end case;
+    end;
+
+    generic [R: Region]
+    function pruneMetrics(db: &![Database[Writing], R], before: Int64): Either[DbError, Nat64] is
+        return execute(&~db, prune, withInt64(noValues(), before));
+    end;
+end module body.

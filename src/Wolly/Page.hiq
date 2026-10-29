@@ -1,0 +1,115 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Text (
+    parseNat
+);
+
+module body Wolly.Page is
+    constant one: Nat64 := 1;
+
+    record Page: Free is
+        current: Nat64;
+        size: Nat64;
+        total: Nat64;
+        pages: Nat64;
+        invariant (size >= 1) and (size <= 1000);
+        invariant (current >= 1) and (current <= pages);
+    end;
+
+    function defaultSize(): Nat64 is
+        return 20;
+    end;
+
+    function largestSize(): Nat64 is
+        return 1000;
+    end;
+
+    function makePage(requested: Nat64, total: Nat64, size: Nat64): Page is
+        var each: Nat64 := size;
+        if each = 0 then
+            each := defaultSize();
+        end if;
+        if each > largestSize() then
+            each := largestSize();
+        end if;
+        -- Rounded up without total + each - 1, which could pass the
+        -- largest Nat64.
+        var pages: Nat64 := total / each;
+        if (pages * each) < total then
+            pages := pages + one;
+        end if;
+        if pages = 0 then
+            pages := one;
+        end if;
+        var current: Nat64 := requested;
+        if current < 1 then
+            current := one;
+        end if;
+        if current > pages then
+            current := pages;
+        end if;
+        return Page(current => current, size => each, total => total, pages => pages);
+    end;
+
+    generic [R: Region]
+    function pageFrom(text: Span[Nat8, R]): Nat64 is
+        case parseNat(text) of
+            when Some(value as number: Nat64) do
+                if number = 0 then
+                    return 1;
+                else
+                    return number;
+                end if;
+            when None do
+                return 1;
+        end case;
+    end;
+
+    function pageNumber(page: Page): Nat64 is
+        return page.current;
+    end;
+
+    function pageSize(page: Page): Nat64 is
+        return page.size;
+    end;
+
+    function itemCount(page: Page): Nat64 is
+        return page.total;
+    end;
+
+    function pageCount(page: Page): Nat64 is
+        return page.pages;
+    end;
+
+    function offset(page: Page): Nat64 is
+        return (page.current - 1) * page.size;
+    end;
+
+    function hasPrevious(page: Page): Bool is
+        return page.current > 1;
+    end;
+
+    function hasNext(page: Page): Bool is
+        return page.current < page.pages;
+    end;
+
+    function previousPage(page: Page): Nat64 is
+        if page.current > 1 then
+            return page.current - 1;
+        else
+            return page.current;
+        end if;
+    end;
+
+    function nextPage(page: Page): Nat64 is
+        if page.current < page.pages then
+            return page.current + 1;
+        else
+            return page.current;
+        end if;
+    end;
+end module body.

@@ -1,0 +1,951 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Coordinates in the picture are Float64 pixels; the middle of the cell
+-- at column u and row v of a code is the point (u + 0.5, v + 0.5) of the
+-- grid, which the transformation takes into the picture.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    storeNth,
+    destroyFree
+);
+import Wolly.Bunti (
+    BuntiError,
+    NotFound,
+    BuntiCode,
+    blankBunti,
+    isDataCell,
+    referenceX,
+    referenceY,
+    setBuntiCell,
+    buntiHeaderReads,
+    decodeBunti,
+    destroyBunti
+);
+import Wolly.Image (
+    RgbImage,
+    ImageError,
+    rgbOfPng
+);
+
+module body Wolly.BuntiScan is
+    -- A finder or corner pattern found: its middle, the pixels of one of
+    -- its cells, and how many scans found it.
+    record Candidate: Free is
+        x: Float64;
+        y: Float64;
+        side: Float64;
+        count: Index;
+        corner: Bool;
+    end;
+
+    -- A point of the picture.
+    record Point: Free is
+        x: Float64;
+        y: Float64;
+    end;
+
+    -- x = (a u + b v + c) / (g u + h v + 1), y = (d u + e v + f) / (g u + h v + 1).
+    record Transform: Free is
+        a: Float64;
+        b: Float64;
+        c: Float64;
+        d: Float64;
+        e: Float64;
+        f: Float64;
+        g: Float64;
+        h: Float64;
+    end;
+
+    -- The colour sampled at a point, and whether the point lay in the picture.
+    record Colour: Free is
+        red: Index;
+        green: Index;
+        blue: Index;
+        inside: Bool;
+    end;
+
+    -- The three finders of a code: top left, top right, bottom left.
+    record Finders: Free is
+        topLeft: Candidate;
+        topRight: Candidate;
+        bottomLeft: Candidate;
+        found: Bool;
+    end;
+
+    ---
+    --- Numbers
+    ---
+
+    function fl(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as f: Float64) do
+                return f;
+            when None do
+                return 0.0;
+        end case;
+    end;
+
+    -- The whole part of f, 0 below 0.
+    function whole(f: Float64): Index is
+        if f < 0.0 then
+            return 0;
+        end if;
+        case toInt64(f) of
+            when Some(value as n: Int64) do
+                case toIndex(n) of
+                    when Some(value as i: Index) do
+                        return i;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function absolute(f: Float64): Float64 is
+        if f < 0.0 then
+            return 0.0 - f;
+        end if;
+        return f;
+    end;
+
+    function squareRoot(f: Float64): Float64 is
+        if f <= 0.0 then
+            return 0.0;
+        end if;
+        var x: Float64 := f;
+        if x < 1.0 then
+            x := 1.0;
+        end if;
+        var i: Index := 0;
+        while i < 40 do
+            x := (x + (f / x)) / 2.0;
+            i := i + 1;
+        end while;
+        return x;
+    end;
+
+    function distance(a: Point, b: Point): Float64 is
+        let dx: Float64 := a.x - b.x;
+        let dy: Float64 := a.y - b.y;
+        return squareRoot((dx * dx) + (dy * dy));
+    end;
+
+    function pointOf(c: Candidate): Point is
+        return Point(x => c.x, y => c.y);
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as number: Index) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Dark pixels
+    ---
+
+    -- The highest of red, green and blue of the pixel at (x, y).
+    generic [R: Region]
+    function topAt(pixels: Span[Nat8, R], width: Index, x: Index, y: Index): Index is
+        let at: Index := ((y * width) + x) * 3;
+        var top: Nat8 := pixels[at];
+        if pixels[at + 1] > top then
+            top := pixels[at + 1];
+        end if;
+        if pixels[at + 2] > top then
+            top := pixels[at + 2];
+        end if;
+        return wide(top);
+    end;
+
+    -- The threshold of Otsu's method over the highest value of each pixel,
+    -- taken from every other pixel of every other row: a pixel at or below
+    -- it is dark.
+    generic [R: Region]
+    function threshold(pixels: Span[Nat8, R], width: Index, height: Index): Index is
+        var histogram: Buffer[Index] := initialize(256, (0 : Index));
+        var count: Index := 0;
+        var y: Index := 0;
+        while y < height do
+            var x: Index := 0;
+            while x < width do
+                let v: Index := topAt(pixels, width, x, y);
+                let before: Index := nth(&histogram, v);
+                storeNth(&!histogram, v, before + 1);
+                count := count + 1;
+                x := x + 2;
+            end while;
+            y := y + 2;
+        end while;
+        var sum: Float64 := 0.0;
+        var t: Index := 0;
+        while t < 256 do
+            sum := sum + (fl(t) * fl(nth(&histogram, t)));
+            t := t + 1;
+        end while;
+        let total: Float64 := fl(count);
+        var weightBack: Float64 := 0.0;
+        var sumBack: Float64 := 0.0;
+        var best: Float64 := 0.0;
+        var chosen: Index := 127;
+        var k: Index := 0;
+        while k < 256 do
+            let here: Float64 := fl(nth(&histogram, k));
+            weightBack := weightBack + here;
+            sumBack := sumBack + (fl(k) * here);
+            let weightFore: Float64 := total - weightBack;
+            if (weightBack > 0.0) and (weightFore > 0.0) then
+                let meanBack: Float64 := sumBack / weightBack;
+                let meanFore: Float64 := (sum - sumBack) / weightFore;
+                let gap: Float64 := meanBack - meanFore;
+                let between: Float64 := (weightBack * weightFore) * (gap * gap);
+                if between > best then
+                    best := between;
+                    chosen := k;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        destroyFree(histogram);
+        return chosen;
+    end;
+
+    ---
+    --- Patterns
+    ---
+
+    -- Whether five runs are 1 : 1 : 3 : 1 : 1 (a finder) or, with corner,
+    -- 1 : 1 : 1 : 1 : 1; each within half a cell.
+    function patternFits(r0: Index, r1: Index, r2: Index, r3: Index, r4: Index, corner: Bool): Bool is
+        let total: Index := (((r0 + r1) + r2) + r3) + r4;
+        var cells: Float64 := 7.0;
+        var middle: Float64 := 3.0;
+        if corner then
+            cells := 5.0;
+            middle := 1.0;
+        end if;
+        if fl(total) < cells then
+            return false;
+        end if;
+        let cell: Float64 := fl(total) / cells;
+        let slack: Float64 := cell / 2.0;
+        if (absolute(fl(r0) - cell) >= slack) or (absolute(fl(r1) - cell) >= slack) then
+            return false;
+        end if;
+        if (absolute(fl(r3) - cell) >= slack) or (absolute(fl(r4) - cell) >= slack) then
+            return false;
+        end if;
+        return absolute(fl(r2) - (cell * middle)) < (slack * middle);
+    end;
+
+    generic [R: Region]
+    function isDark(pixels: Span[Nat8, R], width: Index, darkMost: Index, x: Index, y: Index): Bool is
+        return topAt(pixels, width, x, y) <= darkMost;
+    end;
+
+    -- The runs through (x, y) along a column, or along a row with across;
+    -- Some the middle of the pattern along that line and its length, when
+    -- the five runs fit.
+    generic [R: Region]
+    function crossCheck(pixels: Span[Nat8, R], width: Index, height: Index, darkMost: Index, x: Index, y: Index,
+                        across: Bool, corner: Bool): Option[Point] is
+        var limit: Index := height;
+        var at: Index := y;
+        if across then
+            limit := width;
+            at := x;
+        end if;
+        var counts: Buffer[Index] := initialize(5, (0 : Index));
+        -- up or left from the middle
+        var i: Index := at;
+        var phase: Index := 2;
+        var going: Bool := true;
+        while going do
+            var px: Index := x;
+            var py: Index := i;
+            if across then
+                px := i;
+                py := y;
+            end if;
+            let wanted: Bool := (phase = 2) or (phase = 0);
+            if isDark(pixels, width, darkMost, px, py) = wanted then
+                let before: Index := nth(&counts, phase);
+                storeNth(&!counts, phase, before + 1);
+                if i = 0 then
+                    going := false;
+                else
+                    i := i - 1;
+                end if;
+            else
+                if phase = 0 then
+                    going := false;
+                else
+                    phase := phase - 1;
+                end if;
+            end if;
+        end while;
+        -- down or right from the middle
+        var j: Index := at + 1;
+        var phase2: Index := 2;
+        var going2: Bool := j < limit;
+        while going2 do
+            var px: Index := x;
+            var py: Index := j;
+            if across then
+                px := j;
+                py := y;
+            end if;
+            let wanted: Bool := (phase2 = 2) or (phase2 = 4);
+            if isDark(pixels, width, darkMost, px, py) = wanted then
+                let before: Index := nth(&counts, phase2);
+                storeNth(&!counts, phase2, before + 1);
+                j := j + 1;
+                if j >= limit then
+                    going2 := false;
+                end if;
+            else
+                if phase2 = 4 then
+                    going2 := false;
+                else
+                    phase2 := phase2 + 1;
+                end if;
+            end if;
+        end while;
+        let r0: Index := nth(&counts, 0);
+        let r1: Index := nth(&counts, 1);
+        let r2: Index := nth(&counts, 2);
+        let r3: Index := nth(&counts, 3);
+        let r4: Index := nth(&counts, 4);
+        destroyFree(counts);
+        if not patternFits(r0, r1, r2, r3, r4, corner) then
+            return None();
+        end if;
+        -- The middle: the end of the middle run less half of it.
+        let middleEnd: Index := (j - r4) - r3;
+        let centre: Float64 := fl(middleEnd) - (fl(r2) / 2.0);
+        let total: Index := (((r0 + r1) + r2) + r3) + r4;
+        return Some(value => Point(x => centre, y => fl(total)));
+    end;
+
+    -- Adds the pattern at (x, y) of cell side to the candidates, or counts
+    -- it to one found there before.
+    generic [C: Region]
+    function addCandidate(candidates: &![Buffer[Candidate], C], x: Float64, y: Float64, side: Float64, corner: Bool): Unit is
+        var i: Index := 0;
+        var merged: Bool := false;
+        while (i < lengthMut(&~candidates)) and (not merged) do
+            let c: Candidate := nthMut(&~candidates, i);
+            let near: Bool := (absolute(c.x - x) < (c.side * 3.0)) and (absolute(c.y - y) < (c.side * 3.0));
+            let like: Bool := (side < (c.side * 1.6)) and (c.side < (side * 1.6));
+            if ((c.corner = corner) and near) and like then
+                let n: Float64 := fl(c.count);
+                let m: Float64 := n + 1.0;
+                storeNth(&~candidates, i, Candidate(x => ((c.x * n) + x) / m, y => ((c.y * n) + y) / m, side => ((c.side * n) + side) / m,
+                                                    count => c.count + 1, corner => corner));
+                merged := true;
+            end if;
+            i := i + 1;
+        end while;
+        if not merged then
+            insertBack(&~candidates, Candidate(x => x, y => y, side => side, count => 1, corner => corner));
+        end if;
+        return nil;
+    end;
+
+    -- The candidates of finder and corner patterns, along every third row:
+    -- the middle band of a finder is 3 cells high, 6 pixels at the smallest
+    -- cell that reads (2 pixels), so a third row crosses it at least once.
+    generic [R: Region]
+    function candidatesOf(pixels: Span[Nat8, R], width: Index, height: Index, darkMost: Index): Buffer[Candidate] is
+        var candidates: Buffer[Candidate] := allocateEmpty();
+        var y: Index := 0;
+        while y < height do
+            var starts: Buffer[Index] := allocateEmpty();
+            var runs: Buffer[Index] := allocateEmpty();
+            var colours: Buffer[Bool] := allocateEmpty();
+            var x: Index := 0;
+            while x < width do
+                let d: Bool := isDark(pixels, width, darkMost, x, y);
+                let n: Index := length(&runs);
+                if (n > 0) and (nth(&colours, n - 1) = d) then
+                    let before: Index := nth(&runs, n - 1);
+                    storeNth(&!runs, n - 1, before + 1);
+                else
+                    insertBack(&!starts, x);
+                    insertBack(&!runs, (1 : Index));
+                    insertBack(&!colours, d);
+                end if;
+                x := x + 1;
+            end while;
+            var k: Index := 0;
+            while (k + 4) < length(&runs) do
+                if nth(&colours, k) then
+                    let r0: Index := nth(&runs, k);
+                    let r1: Index := nth(&runs, k + 1);
+                    let r2: Index := nth(&runs, k + 2);
+                    let r3: Index := nth(&runs, k + 3);
+                    let r4: Index := nth(&runs, k + 4);
+                    var kind: Index := 0;
+                    while kind < 2 do
+                        let corner: Bool := kind = 1;
+                        if patternFits(r0, r1, r2, r3, r4, corner) then
+                            let cx: Index := nth(&starts, k + 2) + (r2 / 2);
+                            case crossCheck(pixels, width, height, darkMost, cx, y, false, corner) of
+                                when Some(value as down: Point) do
+                                    let cy: Index := whole(down.x);
+                                    case crossCheck(pixels, width, height, darkMost, cx, cy, true, corner) of
+                                        when Some(value as along: Point) do
+                                            var cells: Float64 := 7.0;
+                                            if corner then
+                                                cells := 5.0;
+                                            end if;
+                                            let side: Float64 := (along.y + down.y) / (cells * 2.0);
+                                            let ratio: Float64 := along.y / down.y;
+                                            if (ratio > 0.6) and (ratio < 1.67) then
+                                                addCandidate(&!candidates, along.x + 0.5, down.x + 0.5, side, corner);
+                                            end if;
+                                        when None do
+                                            skip;
+                                    end case;
+                                when None do
+                                    skip;
+                            end case;
+                        end if;
+                        kind := kind + 1;
+                    end while;
+                end if;
+                k := k + 1;
+            end while;
+            destroyFree(starts);
+            destroyFree(runs);
+            destroyFree(colours);
+            y := y + 3;
+        end while;
+        return candidates;
+    end;
+
+    ---
+    --- The three finders
+    ---
+
+    function noFinders(c: Candidate): Finders is
+        return Finders(topLeft => c, topRight => c, bottomLeft => c, found => false);
+    end;
+
+    -- The three finders of a, b, c in their places, with how far they are
+    -- from a square corner (lower is better); found false when they are
+    -- not a corner at all.
+    function placed(a: Candidate, b: Candidate, c: Candidate): Finders is
+        let ab: Float64 := distance(pointOf(a), pointOf(b));
+        let ac: Float64 := distance(pointOf(a), pointOf(c));
+        let bc: Float64 := distance(pointOf(b), pointOf(c));
+        -- The top left is the one opposite the longest side.
+        var corner: Candidate := a;
+        var one: Candidate := b;
+        var two: Candidate := c;
+        if (ac > ab) and (ac > bc) then
+            corner := b;
+            one := a;
+            two := c;
+        end if;
+        if (ab > ac) and (ab > bc) then
+            corner := c;
+            one := a;
+            two := b;
+        end if;
+        let ux: Float64 := one.x - corner.x;
+        let uy: Float64 := one.y - corner.y;
+        let vx: Float64 := two.x - corner.x;
+        let vy: Float64 := two.y - corner.y;
+        let lu: Float64 := squareRoot((ux * ux) + (uy * uy));
+        let lv: Float64 := squareRoot((vx * vx) + (vy * vy));
+        if (lu <= 0.0) or (lv <= 0.0) then
+            return noFinders(a);
+        end if;
+        let cosine: Float64 := ((ux * vx) + (uy * vy)) / (lu * lv);
+        let ratio: Float64 := lu / lv;
+        let side: Float64 := ((corner.side + one.side) + two.side) / 3.0;
+        let square: Bool := ((absolute(cosine) < 0.3) and (ratio > 0.7)) and (ratio < 1.43);
+        if (not square) or ((lu < (side * 10.0)) or (lv < (side * 10.0))) then
+            return noFinders(a);
+        end if;
+        -- On a picture whose y runs down, the top right lies clockwise of
+        -- the bottom left as seen from the top left.
+        let turn: Float64 := (ux * vy) - (uy * vx);
+        if turn > 0.0 then
+            return Finders(topLeft => corner, topRight => one, bottomLeft => two, found => true);
+        end if;
+        return Finders(topLeft => corner, topRight => two, bottomLeft => one, found => true);
+    end;
+
+    function squareness(f: Finders): Float64 is
+        let ux: Float64 := f.topRight.x - f.topLeft.x;
+        let uy: Float64 := f.topRight.y - f.topLeft.y;
+        let vx: Float64 := f.bottomLeft.x - f.topLeft.x;
+        let vy: Float64 := f.bottomLeft.y - f.topLeft.y;
+        let lu: Float64 := squareRoot((ux * ux) + (uy * uy));
+        let lv: Float64 := squareRoot((vx * vx) + (vy * vy));
+        let cosine: Float64 := ((ux * vx) + (uy * vy)) / (lu * lv);
+        return absolute(cosine) + absolute(1.0 - (lu / lv));
+    end;
+
+    -- The best three finder candidates, of those found most often.
+    generic [C: Region]
+    function findersOf(candidates: &[Buffer[Candidate], C]): Finders is
+        var best: Finders := noFinders(Candidate(x => 0.0, y => 0.0, side => 1.0, count => 0, corner => false));
+        var bestScore: Float64 := 1000.0;
+        let n: Index := length(candidates);
+        var i: Index := 0;
+        while i < n do
+            let a: Candidate := nth(candidates, i);
+            var j: Index := i + 1;
+            while (not a.corner) and (j < n) do
+                let b: Candidate := nth(candidates, j);
+                var k: Index := j + 1;
+                while (not b.corner) and (k < n) do
+                    let c: Candidate := nth(candidates, k);
+                    if not c.corner then
+                        let f: Finders := placed(a, b, c);
+                        if f.found then
+                            -- Patterns found by few scans weigh less.
+                            let seen: Index := (a.count + b.count) + c.count;
+                            let score: Float64 := squareness(f) + (3.0 / fl(seen));
+                            if score < bestScore then
+                                bestScore := score;
+                                best := f;
+                            end if;
+                        end if;
+                    end if;
+                    k := k + 1;
+                end while;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return best;
+    end;
+
+    ---
+    --- The transformation
+    ---
+
+    function project(t: Transform, u: Float64, v: Float64): Point is
+        let w: Float64 := ((t.g * u) + (t.h * v)) + 1.0;
+        return Point(x => (((t.a * u) + (t.b * v)) + t.c) / w, y => (((t.d * u) + (t.e * v)) + t.f) / w);
+    end;
+
+    -- The affine transformation that takes the grid points of the three
+    -- finders to their middles in the picture.
+    function affineOf(f: Finders, size: Index): Transform is
+        let span: Float64 := fl(size) - 7.0;
+        let ax: Float64 := (f.topRight.x - f.topLeft.x) / span;
+        let ay: Float64 := (f.topRight.y - f.topLeft.y) / span;
+        let bx: Float64 := (f.bottomLeft.x - f.topLeft.x) / span;
+        let by: Float64 := (f.bottomLeft.y - f.topLeft.y) / span;
+        return Transform(a => ax, b => bx, c => f.topLeft.x - (3.5 * (ax + bx)), d => ay, e => by, f => f.topLeft.y - (3.5 * (ay + by)),
+                         g => 0.0, h => 0.0);
+    end;
+
+    -- Row r of the system of eight equations, its right side at 8.
+    generic [M: Region]
+    function putRow(m: &![Buffer[Float64], M], r: Index, values: Buffer[Float64]): Unit is
+        var k: Index := 0;
+        while k < 9 do
+            storeNth(&~m, (r * 9) + k, nth(&values, k));
+            k := k + 1;
+        end while;
+        destroyFree(values);
+        return nil;
+    end;
+
+    function rowOf(u: Float64, v: Float64, p: Float64, forX: Bool): Buffer[Float64] is
+        var row: Buffer[Float64] := allocateEmpty();
+        if forX then
+            insertBack(&!row, u);
+            insertBack(&!row, v);
+            insertBack(&!row, 1.0);
+            insertBack(&!row, 0.0);
+            insertBack(&!row, 0.0);
+            insertBack(&!row, 0.0);
+        else
+            insertBack(&!row, 0.0);
+            insertBack(&!row, 0.0);
+            insertBack(&!row, 0.0);
+            insertBack(&!row, u);
+            insertBack(&!row, v);
+            insertBack(&!row, 1.0);
+        end if;
+        insertBack(&!row, 0.0 - (u * p));
+        insertBack(&!row, 0.0 - (v * p));
+        insertBack(&!row, p);
+        return row;
+    end;
+
+    -- The perspective transformation of four grid points to four points of
+    -- the picture, by Gaussian elimination; None when they lie on a line.
+    function perspectiveOf(us: Buffer[Float64], vs: Buffer[Float64], ps: Buffer[Point]): Option[Transform] is
+        var m: Buffer[Float64] := initialize(72, 0.0);
+        var q: Index := 0;
+        while q < 4 do
+            let p: Point := nth(&ps, q);
+            putRow(&!m, q * 2, rowOf(nth(&us, q), nth(&vs, q), p.x, true));
+            putRow(&!m, (q * 2) + 1, rowOf(nth(&us, q), nth(&vs, q), p.y, false));
+            q := q + 1;
+        end while;
+        destroyFree(us);
+        destroyFree(vs);
+        destroyFree(ps);
+        var singular: Bool := false;
+        var col: Index := 0;
+        while (col < 8) and (not singular) do
+            var pivot: Index := col;
+            var r: Index := col + 1;
+            while r < 8 do
+                if absolute(nth(&m, (r * 9) + col)) > absolute(nth(&m, (pivot * 9) + col)) then
+                    pivot := r;
+                end if;
+                r := r + 1;
+            end while;
+            if absolute(nth(&m, (pivot * 9) + col)) < 0.000000001 then
+                singular := true;
+            else
+                var k: Index := 0;
+                while k < 9 do
+                    let top: Float64 := nth(&m, (col * 9) + k);
+                    let other: Float64 := nth(&m, (pivot * 9) + k);
+                    storeNth(&!m, (col * 9) + k, other);
+                    storeNth(&!m, (pivot * 9) + k, top);
+                    k := k + 1;
+                end while;
+                let lead: Float64 := nth(&m, (col * 9) + col);
+                var row: Index := 0;
+                while row < 8 do
+                    if row /= col then
+                        let factor: Float64 := nth(&m, (row * 9) + col) / lead;
+                        var c: Index := col;
+                        while c < 9 do
+                            let value: Float64 := nth(&m, (row * 9) + c) - (factor * nth(&m, (col * 9) + c));
+                            storeNth(&!m, (row * 9) + c, value);
+                            c := c + 1;
+                        end while;
+                    end if;
+                    row := row + 1;
+                end while;
+            end if;
+            col := col + 1;
+        end while;
+        if singular then
+            destroyFree(m);
+            return None();
+        else
+            let t: Transform := solved(&m);
+            destroyFree(m);
+            return Some(value => t);
+        end if;
+    end;
+
+    -- The transformation in the last column of the reduced system m.
+    generic [M: Region]
+    function solved(m: &[Buffer[Float64], M]): Transform is
+        var h: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < 8 do
+            insertBack(&!h, nth(m, (i * 9) + 8) / nth(m, (i * 9) + i));
+            i := i + 1;
+        end while;
+        let t: Transform := Transform(a => nth(&h, 0), b => nth(&h, 1), c => nth(&h, 2), d => nth(&h, 3), e => nth(&h, 4), f => nth(&h, 5),
+                                      g => nth(&h, 6), h => nth(&h, 7));
+        destroyFree(h);
+        return t;
+    end;
+
+    -- The transformation for a code of size: through the corner pattern
+    -- found nearest to where the finders put it, else the affine one.
+    generic [C: Region]
+    function transformOf(f: Finders, size: Index, candidates: &[Buffer[Candidate], C]): Transform is
+        let affine: Transform := affineOf(f, size);
+        let corner: Float64 := fl(size) - 2.5;
+        let guess: Point := project(affine, corner, corner);
+        let reach: Float64 := distance(pointOf(f.topLeft), pointOf(f.topRight)) * 0.35;
+        let cell: Float64 := ((f.topLeft.side + f.topRight.side) + f.bottomLeft.side) / 3.0;
+        var nearest: Float64 := reach;
+        var found: Bool := false;
+        var at: Point := guess;
+        var i: Index := 0;
+        while i < length(candidates) do
+            let c: Candidate := nth(candidates, i);
+            let fits: Bool := (c.side > (cell * 0.5)) and (c.side < (cell * 2.0));
+            if c.corner and fits then
+                let d: Float64 := distance(pointOf(c), guess);
+                if d < nearest then
+                    nearest := d;
+                    at := pointOf(c);
+                    found := true;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        if not found then
+            return affine;
+        end if;
+        var us: Buffer[Float64] := allocateEmpty();
+        var vs: Buffer[Float64] := allocateEmpty();
+        var ps: Buffer[Point] := allocateEmpty();
+        let far: Float64 := fl(size) - 3.5;
+        insertBack(&!us, 3.5);
+        insertBack(&!vs, 3.5);
+        insertBack(&!ps, pointOf(f.topLeft));
+        insertBack(&!us, far);
+        insertBack(&!vs, 3.5);
+        insertBack(&!ps, pointOf(f.topRight));
+        insertBack(&!us, 3.5);
+        insertBack(&!vs, far);
+        insertBack(&!ps, pointOf(f.bottomLeft));
+        insertBack(&!us, corner);
+        insertBack(&!vs, corner);
+        insertBack(&!ps, at);
+        case perspectiveOf(us, vs, ps) of
+            when Some(value as t: Transform) do
+                return t;
+            when None do
+                return affine;
+        end case;
+    end;
+
+    ---
+    --- Sampling
+    ---
+
+    -- The mean colour of the pixels within reach of p.
+    generic [R: Region]
+    function sampleAt(pixels: Span[Nat8, R], width: Index, height: Index, p: Point, reach: Index): Colour is
+        if (p.x < 0.0) or (p.y < 0.0) then
+            return Colour(red => 0, green => 0, blue => 0, inside => false);
+        end if;
+        let cx: Index := whole(p.x);
+        let cy: Index := whole(p.y);
+        if (cx >= width) or (cy >= height) then
+            return Colour(red => 0, green => 0, blue => 0, inside => false);
+        end if;
+        var r: Index := 0;
+        var g: Index := 0;
+        var b: Index := 0;
+        var n: Index := 0;
+        var y: Index := 0;
+        if cy > reach then
+            y := cy - reach;
+        end if;
+        while (y <= (cy + reach)) and (y < height) do
+            var x: Index := 0;
+            if cx > reach then
+                x := cx - reach;
+            end if;
+            while (x <= (cx + reach)) and (x < width) do
+                let at: Index := ((y * width) + x) * 3;
+                r := r + wide(pixels[at]);
+                g := g + wide(pixels[at + 1]);
+                b := b + wide(pixels[at + 2]);
+                n := n + 1;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return Colour(red => r / n, green => g / n, blue => b / n, inside => true);
+    end;
+
+    function squaredGap(a: Index, b: Index): Index is
+        if a > b then
+            return (a - b) * (a - b);
+        end if;
+        return (b - a) * (b - a);
+    end;
+
+    -- The base whose reference colour is nearest to c.
+    generic [F: Region]
+    function classify(references: &[Buffer[Colour], F], c: Colour): Nat8 is
+        var best: Index := 0;
+        var bestGap: Index := 0;
+        var k: Index := 0;
+        while k < length(references) do
+            let ref: Colour := nth(references, k);
+            let d: Index := (squaredGap(ref.red, c.red) + squaredGap(ref.green, c.green)) + squaredGap(ref.blue, c.blue);
+            if (k = 0) or (d < bestGap) then
+                best := k;
+                bestGap := d;
+            end if;
+            k := k + 1;
+        end while;
+        return narrow(best - ((best / 4) * 4));
+    end;
+
+    -- The cells of a code of size read through t; None when a cell lies
+    -- outside the picture.
+    generic [R: Region]
+    function readCells(pixels: Span[Nat8, R], width: Index, height: Index, t: Transform, size: Index, reach: Index): Option[BuntiCode] is
+        case blankBunti(size) of
+            when None do
+                return None();
+            when Some(value as blank: BuntiCode) do
+                var code: BuntiCode := blank;
+                var references: Buffer[Colour] := allocateEmpty();
+                var inside: Bool := true;
+                var k: Index := 0;
+                while k < 12 do
+                    let p: Point := project(t, fl(referenceX(size, k)) + 0.5, fl(referenceY(size, k)) + 0.5);
+                    let c: Colour := sampleAt(pixels, width, height, p, reach);
+                    inside := inside and c.inside;
+                    insertBack(&!references, c);
+                    k := k + 1;
+                end while;
+                var y: Index := 0;
+                while inside and (y < size) do
+                    var x: Index := 0;
+                    while inside and (x < size) do
+                        if isDataCell(size, x, y) then
+                            let c: Colour := sampleAt(pixels, width, height, project(t, fl(x) + 0.5, fl(y) + 0.5), reach);
+                            if c.inside then
+                                setBuntiCell(&!code, x, y, classify(&references, c));
+                            else
+                                inside := false;
+                            end if;
+                        end if;
+                        x := x + 1;
+                    end while;
+                    y := y + 1;
+                end while;
+                destroyFree(references);
+                if inside then
+                    return Some(value => code);
+                else
+                    destroyBunti(code);
+                    return None();
+                end if;
+        end case;
+    end;
+
+    function notFound(): Either[BuntiError, BuntiCode] is
+        let result: Either[BuntiError, BuntiCode] := Left(left => NotFound());
+        return result;
+    end;
+
+    -- The code of the finders f: each size near the one their distance
+    -- says, until the header of one reads.
+    generic [R: Region, C: Region]
+    function codeOf(pixels: Span[Nat8, R], width: Index, height: Index, f: Finders, candidates: &[Buffer[Candidate], C]): Either[BuntiError, BuntiCode] is
+        let side: Float64 := ((f.topLeft.side + f.topRight.side) + f.bottomLeft.side) / 3.0;
+        let across: Float64 := (distance(pointOf(f.topLeft), pointOf(f.topRight)) + distance(pointOf(f.topLeft), pointOf(f.bottomLeft))) / 2.0;
+        let cells: Float64 := (across / side) + 7.0;
+        let guess: Index := whole(((cells - 17.0) / 4.0) + 0.5);
+        let reach: Index := whole(side / 4.0);
+        var step: Index := 0;
+        while step < 7 do
+            -- 0, -1, +1, -2, +2, -3, +3 versions from the guess
+            var version: Index := guess;
+            let away: Index := (step + 1) / 2;
+            if (step - ((step / 2) * 2)) = 1 then
+                if version >= away then
+                    version := version - away;
+                else
+                    version := (0 : Index);
+                end if;
+            else
+                version := version + away;
+            end if;
+            if (version >= 1) and (version <= 60) then
+                let size: Index := (version * 4) + 17;
+                let t: Transform := transformOf(f, size, candidates);
+                case readCells(pixels, width, height, t, size, reach) of
+                    when Some(value as code: BuntiCode) do
+                        if buntiHeaderReads(&code) then
+                            return Right(right => code);
+                        else
+                            destroyBunti(code);
+                        end if;
+                    when None do
+                        skip;
+                end case;
+            end if;
+            step := step + 1;
+        end while;
+        return notFound();
+    end;
+
+    generic [R: Region]
+    function readBuntiPixels(width: Index, height: Index, pixels: Span[Nat8, R]): Either[BuntiError, BuntiCode] is
+        let count: Index := width * height;
+        if ((width < 21) or (height < 21)) or (spanLength(pixels) /= (count * 3)) then
+            return notFound();
+        end if;
+        let darkMost: Index := threshold(pixels, width, height);
+        let candidates: Buffer[Candidate] := candidatesOf(pixels, width, height, darkMost);
+        let f: Finders := findersOf(&candidates);
+        if not f.found then
+            destroyFree(candidates);
+            return notFound();
+        else
+            let result: Either[BuntiError, BuntiCode] := codeOf(pixels, width, height, f, &candidates);
+            destroyFree(candidates);
+            return result;
+        end if;
+    end;
+
+    function stringFailed(error: BuntiError): Either[BuntiError, String] is
+        let result: Either[BuntiError, String] := Left(left => error);
+        return result;
+    end;
+
+    generic [R: Region]
+    function decodeBuntiPixels(width: Index, height: Index, pixels: Span[Nat8, R]): Either[BuntiError, String] is
+        case readBuntiPixels(width, height, pixels) of
+            when Left(left as error: BuntiError) do
+                return stringFailed(error);
+            when Right(right as code: BuntiCode) do
+                let result: Either[BuntiError, String] := decodeBunti(&code);
+                destroyBunti(code);
+                return result;
+        end case;
+    end;
+
+    generic [R: Region]
+    function decodeBuntiPng(data: Span[Nat8, R], maxPixels: Index): Either[BuntiError, String] is
+        case rgbOfPng(data, maxPixels) of
+            when Left(left as error: ImageError) do
+                return stringFailed(NotFound());
+            when Right(right as image: RgbImage) do
+                let { width as w: Index, height as h: Index, pixels as p: String } := image;
+                let result: Either[BuntiError, String] := decodeBuntiPixels(w, h, asSpan(&p));
+                destroyString(p);
+                return result;
+        end case;
+    end;
+end module body.

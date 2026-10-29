@@ -1,0 +1,67 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The token endpoint of an OpenID provider (RFC 6749, section 3.2).
+
+A client proves itself first: with HTTP Basic (client_secret_basic), with
+client_id and client_secret in the form (client_secret_post), or, a native
+client, with client_id alone.  Basic together with a secret in the form is
+refused.  Then one of three grants:
+
+- authorization_code: the code, its client, its redirect URI and its code
+  verifier are checked before the code is spent, so that a stolen code
+  cannot be burnt for its owner; a code that comes twice revokes the
+  refresh family it made.
+- refresh_token: the token is spent and a new one of the same family given;
+  a token that was spent or comes from another client revokes its family.
+- client_credentials: a service client gets an access token about itself.
+
+Every answer has Cache-Control no-store and Pragma no-cache.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Wolly.OpBase (
+    OpSettings
+);
+
+module Wolly.OpGrant is
+    """
+    The CGI output of the token endpoint for request at now, with ring as
+    the signing keys and ip the address of the client, as the web server
+    resolved it.
+    No contract: the answer is the work of the database.
+    """
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region, A: Region]
+    function tokenEndpoint(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], ip: Span[Nat8, A], now: Int64): String;
+
+    """
+    The label of a native app: the printable ASCII of its User-Agent, 120
+    bytes at most.
+    """
+    generic [U: Region]
+    function deviceLabel(userAgent: Span[Nat8, U]): String
+        ensures length(&result) <= 120;
+end module.

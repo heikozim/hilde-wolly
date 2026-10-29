@@ -1,0 +1,203 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- No cryptography of its own: the cipher, the HMAC and the random bytes
+-- are Standard.Libcrypto's; what is here is the layout of the token.
+import Standard.String (
+    String,
+    makeString,
+    storeNth,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    constantTimeEqual
+);
+import Standard.Base64 (
+    encodeUrl,
+    decodeUrl
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sealXChaCha20Poly1305,
+    openXChaCha20Poly1305,
+    hmacSha3_512
+);
+
+module body Wolly.Fernet is
+    constant version: Nat8 := 204;
+    constant keyBytes: Index := 48;
+    constant signingBytes: Index := 16;
+    constant nonceBytes: Index := 24;
+    constant headBytes: Index := 9;
+    constant tagBytes: Index := 16;
+    constant macBytes: Index := 64;
+
+    function overheadBytes(): Index is
+        return 113;
+    end;
+
+    generic [K: Region]
+    function readFernetKey(keyText: Span[Nat8, K]): Option[String] is
+        case decodeUrl(keyText) of
+            when Some(value as key: String) do
+                if length(&key) = keyBytes then
+                    return Some(value => key);
+                end if;
+                destroyString(key);
+                let none: Option[String] := None();
+                return none;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function newFernetKey(): Option[String] is
+        case randomBytes(keyBytes) of
+            when Some(value as raw: String) do
+                let text: String := encodeUrl(asSpan(&raw));
+                destroyString(raw);
+                return Some(value => text);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The 9 bytes before the nonce: the version and the time, big endian.
+    function head(now: Int64): String
+        requires now >= 0 is
+        var bytes: String := makeString(headBytes, 0);
+        storeNth(&!bytes, 0, version);
+        var rest: Int64 := now;
+        var i: Index := headBytes;
+        while i > 1 do
+            i := i - 1;
+            case toNat8(rem(rest, 256)) of
+                when Some(value as byte: Nat8) do
+                    storeNth(&!bytes, i, byte);
+                when None do
+                    skip;
+            end case;
+            rest := rest / 256;
+        end while;
+        return bytes;
+    end;
+
+    generic [K: Region, V: Region]
+    function sealFernet(keyText: Span[Nat8, K], value: Span[Nat8, V], now: Int64): Option[String] is
+        case readFernetKey(keyText) of
+            when Some(value as key: String) do
+                let sealed: Option[String] := sealWith(asSpan(&key), value, now);
+                destroyString(key);
+                return sealed;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region, V: Region]
+    function sealWith(key: Span[Nat8, K], value: Span[Nat8, V], now: Int64): Option[String]
+        requires now >= 0 is
+        let signing: Span[Nat8, K] := substring(key, 0, signingBytes);
+        let encryption: Span[Nat8, K] := substring(key, signingBytes, keyBytes);
+        case randomBytes(nonceBytes) of
+            when Some(value as nonce: String) do
+                let first: String := head(now);
+                let cipher: Option[String] := sealXChaCha20Poly1305(encryption, asSpan(&nonce), value, asSpan(&first));
+                case cipher of
+                    when Some(value as ciphertext: String) do
+                        var inner: StringBuilder := makeStringBuilder();
+                        writeString(&!inner, asSpan(&first));
+                        writeString(&!inner, asSpan(&nonce));
+                        writeString(&!inner, asSpan(&ciphertext));
+                        destroyString(ciphertext);
+                        destroyString(first);
+                        destroyString(nonce);
+                        let inside: String := finalize(inner);
+                        case hmacSha3_512(signing, asSpan(&inside)) of
+                            when Some(value as mac: String) do
+                                var token: StringBuilder := makeStringBuilder();
+                                writeString(&!token, asSpan(&inside));
+                                writeString(&!token, asSpan(&mac));
+                                destroyString(mac);
+                                destroyString(inside);
+                                return Some(value => finalize(token));
+                            when None do
+                                destroyString(inside);
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                    when None do
+                        destroyString(first);
+                        destroyString(nonce);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region, T: Region]
+    function openFernet(keyText: Span[Nat8, K], token: Span[Nat8, T]): Option[String] is
+        if spanLength(token) < overheadBytes() then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if token[0] /= version then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case readFernetKey(keyText) of
+            when Some(value as key: String) do
+                let opened: Option[String] := openWith(asSpan(&key), token);
+                destroyString(key);
+                return opened;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region, T: Region]
+    function openWith(key: Span[Nat8, K], token: Span[Nat8, T]): Option[String]
+        requires spanLength(token) >= 113 is
+        let signing: Span[Nat8, K] := substring(key, 0, signingBytes);
+        let encryption: Span[Nat8, K] := substring(key, signingBytes, keyBytes);
+        let innerEnd: Index := spanLength(token) - macBytes;
+        let inner: Span[Nat8, T] := substring(token, 0, innerEnd);
+        let mac: Span[Nat8, T] := substring(token, innerEnd, spanLength(token));
+        case hmacSha3_512(signing, inner) of
+            when Some(value as expected: String) do
+                let fits: Bool := constantTimeEqual(asSpan(&expected), mac);
+                destroyString(expected);
+                if not fits then
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+                let first: Span[Nat8, T] := substring(inner, 0, headBytes);
+                let nonce: Span[Nat8, T] := substring(inner, headBytes, headBytes + nonceBytes);
+                let sealed: Span[Nat8, T] := substring(inner, headBytes + nonceBytes, spanLength(inner));
+                return openXChaCha20Poly1305(encryption, nonce, sealed, first);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+end module body.

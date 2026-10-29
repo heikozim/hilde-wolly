@@ -1,0 +1,36 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The statement for the backend of a database: Wolly's SQL is SQLite's, and the few
+statements PostgreSQL does not take as they are (STRICT tables, BLOB and INTEGER
+columns, INSERT OR IGNORE, a number used twice) have a text of their own.
+
+    let table: Span[Nat8, Static] := pick(&db, makeTable, makeTablePg);
+"""
+import Standard.Database (
+    Database
+);
+
+module Wolly.Dialect is
+    """
+    pg when db is a PostgreSQL database, plain for every other backend (SQLite and
+    SQLCipher take the plain text; MariaDB is not a backend of Wolly).
+    No contract: the result is one of the two arguments, which no relation of
+    lengths states.
+    """
+    generic [M: Free, R: Region]
+    function pick(db: &[Database[M], R], plain: Span[Nat8, Static], pg: Span[Nat8, Static]): Span[Nat8, Static];
+
+    """
+    Whether db is a PostgreSQL database, for a module that does more than choose a
+    statement on it (Wolly.LogStore keeps its full-text index in the table there).
+    No contract: the result is the backend of the database, which no relation
+    states.
+    """
+    generic [M: Free, R: Region]
+    function onPostgres(db: &[Database[M], R]): Bool;
+end module.

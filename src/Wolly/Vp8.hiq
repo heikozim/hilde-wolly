@@ -1,0 +1,1914 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The decoding follows golang.org/x/image/vp8 (Copyright 2011 The Go
+-- Authors, BSD-3-Clause; its LICENSE: Redistribution and use in source and
+-- binary forms, with or without modification, are permitted provided that
+-- the conditions of the BSD-3-Clause licence are met), and its tables,
+-- RFC 6386's, are its numbers as hex text.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    initialize,
+    nth,
+    storeNth,
+    destroyFree
+);
+
+module body Wolly.Vp8 is
+    constant sideMost: Index := 16000;
+    -- What a reader answers.
+    constant fine: Index := 0;
+    constant broken: Index := 1;
+    constant unsupported: Index := 2;
+    constant tooLarge: Index := 3;
+    -- The header values in the buffer head.
+    constant widthAt: Index := 0;
+    constant heightAt: Index := 1;
+    constant acrossAt: Index := 2;
+    constant downAt: Index := 3;
+    constant useSegmentAt: Index := 4;
+    constant updateMapAt: Index := 5;
+    constant relativeAt: Index := 6;
+    -- quantizer and filter strength of segment s at 7 + s and 11 + s,
+    -- biased by 256 as all signed values here
+    constant quantizerAt: Index := 7;
+    constant strengthAt: Index := 11;
+    constant segmentProbAt: Index := 15;
+    constant simpleAt: Index := 18;
+    constant levelAt: Index := 19;
+    constant sharpnessAt: Index := 20;
+    constant useDeltaAt: Index := 21;
+    constant refDeltaAt: Index := 22;
+    constant modeDeltaAt: Index := 26;
+    constant partitionsAt: Index := 30;
+    constant useSkipAt: Index := 31;
+    constant skipProbAt: Index := 32;
+    constant segmentAt: Index := 33;
+    constant useY16At: Index := 34;
+    constant predY16At: Index := 35;
+    constant predC8At: Index := 36;
+    constant predY4At: Index := 37;
+    constant nzDcAt: Index := 53;
+    constant nzAcAt: Index := 54;
+    -- y1 DC, y1 AC, y2 DC, y2 AC, uv DC, uv AC of segment s at 60 + s * 6
+    constant quantAt: Index := 60;
+    -- level, inner level, edge variance level, inner of segment s and
+    -- 4x4 prediction j at 90 + (s * 2 + j) * 4
+    constant filterAt: Index := 90;
+    constant headSize: Index := 128;
+    constant bias: Index := 256;
+    -- A partition p in the buffer parts from p * 6: the next byte, the end,
+    -- range less 1, the bits not used yet, their count, whether a read
+    -- went past the end.
+    constant partSize: Index := 6;
+    -- The per-macroblock state from c * 6 in up and left: the modes of the
+    -- 4 bottom or right 4x4 blocks, the mask of blocks not 0, Y2 not 0.
+    constant mbSize: Index := 6;
+    -- The work space of a macroblock, 26 rows of 32 (as Go's ybr).
+    constant workWidth: Index := 32;
+    constant bRow: Index := 18;
+    constant bColumn: Index := 8;
+    constant rColumn: Index := 24;
+    -- The coefficients: 16 luma blocks, 4 + 4 chroma, the WHT block.
+    constant bCoefficients: Index := 256;
+    constant rCoefficients: Index := 320;
+    constant whtCoefficients: Index := 384;
+    -- Modes.
+    constant predDc: Index := 0;
+    constant predTm: Index := 1;
+    constant predVe: Index := 2;
+    constant predHe: Index := 3;
+    constant predRd: Index := 4;
+    constant predVr: Index := 5;
+    constant predLd: Index := 6;
+    constant predVl: Index := 7;
+    constant predHd: Index := 8;
+    constant predHu: Index := 9;
+    constant predDcTop: Index := 10;
+    constant predDcLeft: Index := 11;
+    constant predDcTopLeft: Index := 12;
+
+    record Vp8Picture: Linear is
+        width: Index;
+        height: Index;
+        pixels: String;
+        luma: String;
+        blue: String;
+        red: String;
+        invariant (width >= 1) and (width <= 16000);
+        invariant (height >= 1) and (height <= 16000);
+        invariant length(&pixels) = ((width * height) * 3);
+        invariant length(&luma) = (width * height);
+        invariant length(&blue) = (((width + 1) / 2) * ((height + 1) / 2));
+        invariant length(&red) = (((width + 1) / 2) * ((height + 1) / 2));
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(n: Index): Nat8 is
+        case toNat8(n) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 255;
+        end case;
+    end;
+
+    function signed(n: Index): Int64 is
+        case toInt64(n) of
+            when Some(value as v: Int64) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- v held to 0..255.
+    function clip255(v: Int64): Index is
+        if v < (0 : Int64) then
+            return 0;
+        end if;
+        if v > (255 : Int64) then
+            return 255;
+        end if;
+        case toIndex(v) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function clamp(v: Int64, low: Int64, high: Int64): Int64 is
+        if v < low then
+            return low;
+        end if;
+        if v > high then
+            return high;
+        end if;
+        return v;
+    end;
+
+    function absolute(v: Int64): Int64 is
+        if v < (0 : Int64) then
+            let zero: Int64 := 0;
+            return zero - v;
+        end if;
+        return v;
+    end;
+
+    -- 2 to the n.
+    function power(n: Index): Index is
+        var p: Index := 1;
+        var i: Index := 0;
+        while i < n do
+            p := p * 2;
+            i := i + 1;
+        end while;
+        return p;
+    end;
+
+    -- v shifted right by n as C shifts a signed number: towards minus
+    -- infinity.
+    function shift(v: Int64, n: Index): Int64 is
+        let d: Int64 := signed(power(n));
+        if v >= (0 : Int64) then
+            return v / d;
+        end if;
+        let zero: Int64 := 0;
+        return zero - (((zero - v) + (d - (1 : Int64))) / d);
+    end;
+
+    -- A signed value stored biased by 256, and back.
+    function unbiased(n: Index): Int64 is
+        return signed(n) - (256 : Int64);
+    end;
+
+    function biased(v: Int64): Index is
+        case toIndex(v + (256 : Int64)) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function hexDigit(c: Nat8): Index is
+        let n: Index := wide(c);
+        if n >= 97 then
+            return n - 87;
+        end if;
+        return n - 48;
+    end;
+
+    -- The i-th entry of text in hex, digits hex digits each.
+    function hexAt(text: Span[Nat8, Static], i: Index, digits: Index): Index is
+        var v: Index := 0;
+        var k: Index := 0;
+        while k < digits do
+            v := (v * 16) + hexDigit(text[(i * digits) + k]);
+            k := k + 1;
+        end while;
+        return v;
+    end;
+
+    ---
+    --- Tables (RFC 6386, as golang.org/x/image/vp8 has them)
+    ---
+
+    function updateProb(i: Index): Index is
+        let table: Span[Nat8, Static] := "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffb0f6ffffffffffffffffffdff1fcfffffffffffffffff9fdfdfffffffffffffffffff4fcffffffffffffffffeafefefffffffffffffffffdfffffffffffffffffffffff6feffffffffffffffffeffdfefffffffffffffffffefffefffffffffffffffffff8fefffffffffffffffffbfffefffffffffffffffffffffffffffffffffffffffffdfefffffffffffffffffbfefefffffffffffffffffefffefffffffffffffffffffefdfffefffffffffffffafffefffefffffffffffffeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd9ffffffffffffffffffffe1fcf1fdfffffeffffffffeafaf1fafdfffdfefffffffffeffffffffffffffffffdffefeffffffffffffffffeefdfefefffffffffffffffff8fefffffffffffffffff9fefffffffffffffffffffffffffffffffffffffffffffdfffffffffffffffffff7fefffffffffffffffffffffffffffffffffffffffffffdfefffffffffffffffffcfffffffffffffffffffffffffffffffffffffffffffffefefffffffffffffffffdfffffffffffffffffffffffffffffffffffffffffffffefdfffffffffffffffffafffffffffffffffffffffeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffbafbfaffffffffffffffffeafbf4fefffffffffffffffbfbf3fdfefffefffffffffffdfeffffffffffffffffecfdfefffffffffffffffffbfdfdfefefffffffffffffffefefffffffffffffffffefefefffffffffffffffffffffffffffffffffffffffffefffffffffffffffffffefefffffffffffffffffffefffffffffffffffffffffffffffffffffffffffffffefffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8fffffffffffffffffffffafefcfefffffffffffffff8fef9fdfffffffffffffffffdfdfffffffffffffffff6fdfdfffffffffffffffffcfefbfefefffffffffffffffefcfffffffffffffffff8fefdfffffffffffffffffdfffefefffffffffffffffffbfefffffffffffffffff5fbfefffffffffffffffffdfdfefffffffffffffffffffbfdfffffffffffffffffcfdfefffffffffffffffffffefffffffffffffffffffffcfffffffffffffffffff9fffefffffffffffffffffffffefffffffffffffffffffffdfffffffffffffffffafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffffffffffffffffffffffffffffffffffffff";
+        return hexAt(table, i, 2);
+    end;
+
+    function defaultProb(i: Index): Index is
+        let table: Span[Nat8, Static] := "808080808080808080808080808080808080808080808080808080808080808080fd88feffe4db8080808080bd81f2ffe3d5ffdb8080806a7ee3fcd6d1ffff8080800162f8ffece2ffff808080b585eefeddeaff9a8080804e86caf7c6b4ffdb80808001b9f9fff3ff8080808080b896f7ffece080808080804d6ed8ffece680808080800165fbfff1ff8080808080aa8bf1fcecd1ffff8080802574c4f3e4ffffff80808001ccfefff5ff8080808080cfa0faffee8080808080806667e7ffd3ab80808080800198fcfff0ff8080808080b187f3ffeae180808080805081d3ffc2e080808080800101ff8080808080808080f601ff8080808080808080ff80808080808080808080c623eddfc1bba2a0919b3e832dc6ddacb0dc9dfcdd01442f92d095a7dda2ffdf800195f1ffdde0ffff808080b88deafddedcffc78080805163b5f2b0bef9caffff800181e8fdd6c5f2c4ffff806379d2fac9c6ffca808080175ba3f2aabbf7d2ffff8001c8f6ffeaff80808080806db2f1ffe7f5ffff8080802c82c9fdcdc0ffff8080800184effbdbd1ffa58080805e88e1fbdabeffff8080801664aef5baa1ffc780808001b6f9ffe8eb80808080807c8ff1ffe3ea8080808080234db5fbc1d3ffcd808080019df7ffece7ffff808080798debffe1e3ffff8080802d63bcfbc3d9ffe08080800101fbffd5ff8080808080cb01f8ffff8080808080808901b1ffe0ff8080808080fd09f8fbcfd0ffc0808080af0de0f3c1b9f9c6ffff804911abdda1b3eca7ffea80015ff7fdd4b7ffff808080ef5af4fad3d1ffff8080809b4dc3f8bcc3ffff8080800118effbdadbffcd808080c933dbffc4ba8080808080452ebeefc9daffe480808001bffbffff808080808080dfa5f9ffd5ff80808080808d7cf8ffff8080808080800110f8ffff808080808080be24e6ffecff80808080809501ff808080808080808001e2ff8080808080808080f7c0ff8080808080808080f080ff80808080808080800186fcffff808080808080d53efaffff808080808080375dff8080808080808080808080808080808080808080808080808080808080808080808080808080808080ca18d5ebbabfdca0f0afff7e26b6e8a9b8e4aeffbb803d2e8adb97b2f0aaffd8800170e6fac7bff79fffff80a66de4fcd3d7ffae808080274da2e8acb4f5b2ffff800134dcf6c6c7f9dcffff807c4abff3b7c1faddffff80184782db9aaaf3b6ffff8001b6e1f9dbf0ffe08080809596e2fcd8cdffab8080801c6caaf2b7c2fedfffff800151e6fccccbffc08080807b66d1f7bcc4ffe9808080145f99f3a4adffcb80808001def8ffd8d58080808080a8aff6fcebcdffff8080802f74d7ffd3d4ffff8080800179ecfdd4d6ffff8080808d54d5fcc9caffdb8080802a50a0f0a2b9ffcd8080800101ff8080808080808080f401ff8080808080808080ee01ff8080808080808080";
+        return hexAt(table, i, 2);
+    end;
+
+    function modeProb(above: Index, left: Index, k: Index): Index is
+        let table: Span[Nat8, Static] := "e7783059737178987098b3407eaa762e465faf458f505552489b67383a0aabdabd110d98721a11a32cc3150aad791850c31a3e2c405590470a26abd590221aaa2e371388a021ce473f14087272d00c09e251280b60b6541d102486b7598962656aa59448bb64829d6f204b504266a7634a3e28ea80293509b2f18d1a086b4a2b1a9249a631179d412669a033341f7380684f0c1bd9ff5711075744472c72330fba172f290e6eb6b71511c2422d1966c5bd171216585893962a2e2dc4cd2b61b775552623b33d2735c8571a152be8ab3822336872661d5d4d271c55ab3aa55a6240221674ce17222ba6496b36201a3301512b1f44196a1640ab24e1722213156684bc104c7c3e124e5f5539323033c165239fd76f592e6f3c941facdbe415126f70714d55b3ff267872282a01c4f5d10a196d582b1d8ca6d5252b9a3d3f1e9b432d4401d16450082b9a01331a478e4e4e10ff8022c5ab29280566d3b70401dd333211a8d1c01719528a1f24ab1ba6262ce543573aa952731a3bb33f3b5ab43ba65d499a282815748fd12227af2f0f10b722df312db72e1121b706620f20b7392e16188001361125412049731c801780cd2803097333c01206df572509733b4d40152f68372cda09363582e2405a46cd2829171a39363970b8052926a6d51e221a8598740a2086271335dd1a722049ff1f0941ea020f0176494b200c33c0ffa02b33581f2343665537ba553815176f3bcd2d25c03726467c49660122627d622a58685575af525f543559806471652d4b4f7b2f338051ab0139110547663935293126210d7939491a0155290a438a4d6e5a2f727315020a66ffa61706651d100a558065c41a39120a6666d522142b75140f24a38044011a663d472522351ff3c0453c472649771cde25442d8022012f0bf5ab3e1113469255373e46252b259a64a355a0013f095c881c4020c9554b0f090940ffb8771056061c0540ff19f8013808118489ff3774803a0f145287391a7928a4321f899a851923da33672c83837b1f069e5628408794e02db780161a1183f09a0e01d12d10155b40de0701c53815279b3c8a1766d5530c0d36c0ff442f1c551a555580802092ab120b073f90ab0404f6231b0a92aeab0c1a80be502363b4507e362d557e2f57b033291420654b808b769274805538290fb0ec5525093e471e117776ff11128a65263c8a37462b1a8e9224131eabff611b148a2d3d3edb0151bc4020291475978e1415a370130c3dc380300418";
+        return hexAt(table, (((above * 10) + left) * 9) + k, 2);
+    end;
+
+    function dequantDc(q: Index): Index is
+        let table: Span[Nat8, Static] := "000400050006000700080009000a000a000b000c000d000e000f0010001100110012001300140014001500150016001600170017001800190019001a001b001c001d001e001f00200021002200230024002500250026002700280029002a002b002c002d002e002e002f0030003100320033003400350036003700380039003a003b003c003d003e003f0040004100420043004400450046004700480049004a004b004c004c004d004e004f0050005100520053005400550056005700580059005b005d005f006000620064006500660068006a006c006e0070007200740076007a007c007e00800082008400860088008a008c008f009100940097009a009d";
+        return hexAt(table, q, 4);
+    end;
+
+    function dequantAc(q: Index): Index is
+        let table: Span[Nat8, Static] := "000400050006000700080009000a000b000c000d000e000f0010001100120013001400150016001700180019001a001b001c001d001e001f0020002100220023002400250026002700280029002a002b002c002d002e002f0030003100320033003400350036003700380039003a003c003e00400042004400460048004a004c004e00500052005400560058005a005c005e00600062006400660068006a006c006e0070007200740077007a007d0080008300860089008c008f009200950098009b009e00a100a400a700aa00ad00b100b500b900bd00c100c500c900cd00d100d500d900dd00e100e500ea00ef00f500f900fe01030108010d01120117011c";
+        return hexAt(table, q, 4);
+    end;
+
+    function categoryProb(category: Index, i: Index): Index is
+        let table: Span[Nat8, Static] := "ad948c000000000000000000b09b8c870000000000000000b49d8d868200000000000000fefef3e6c4b1998c85828100";
+        return hexAt(table, (category * 12) + i, 2);
+    end;
+
+    -- The band of the n-th coefficient (n up to 16).
+    function band(n: Index): Index is
+        let table: Span[Nat8, Static] := "0001020306040506060606060606060700";
+        return hexAt(table, n, 2);
+    end;
+
+    -- The place in the 4x4 block of the n-th coefficient.
+    function zigzag(n: Index): Index is
+        let table: Span[Nat8, Static] := "0001040805020306090c0d0a070b0e0f";
+        return hexAt(table, n, 2);
+    end;
+
+    ---
+    --- The boolean decoder (RFC 6386 7, as Go reads it)
+    ---
+
+    generic [D: Region, P: Region]
+    function readBit(data: Span[Nat8, D], parts: &![Buffer[Index], P], p: Index, prob: Index): Bool is
+        let base: Index := p * partSize;
+        let byteBits: Index := 8;
+        var bits: Index := nth(&parts, base + 3);
+        var count: Index := nth(&parts, base + 4);
+        if count < 8 then
+            let at: Index := nth(&parts, base);
+            if at >= nth(&parts, base + 1) then
+                storeNth(&~parts, base + 5, (1 : Index));
+                return false;
+            end if;
+            bits := bitwiseOr(bits, wide(data[at]) * power(byteBits - count));
+            storeNth(&~parts, base, at + 1);
+            count := count + 8;
+        end if;
+        var span: Index := nth(&parts, base + 2);
+        let split: Index := ((span * prob) / 256) + 1;
+        var bit: Bool := false;
+        if bits >= (split * 256) then
+            bit := true;
+            span := span - split;
+            bits := bits - (split * 256);
+        else
+            span := split - 1;
+        end if;
+        while span < 127 do
+            span := (span * 2) + 1;
+            bits := bits * 2;
+            count := count - 1;
+        end while;
+        storeNth(&~parts, base + 2, span);
+        storeNth(&~parts, base + 3, bits);
+        storeNth(&~parts, base + 4, count);
+        return bit;
+    end;
+
+    generic [D: Region, P: Region]
+    function readUint(data: Span[Nat8, D], parts: &![Buffer[Index], P], p: Index, prob: Index, n: Index): Index is
+        var v: Index := 0;
+        var i: Index := 0;
+        while i < n do
+            v := v * 2;
+            if readBit(data, &~parts, p, prob) then
+                v := v + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return v;
+    end;
+
+    -- An n-bit value and its sign, 0 when its flag is clear.
+    generic [D: Region, P: Region]
+    function readOptional(data: Span[Nat8, D], parts: &![Buffer[Index], P], n: Index): Int64 is
+        if not readBit(data, &~parts, 0, 128) then
+            return 0;
+        end if;
+        let v: Int64 := signed(readUint(data, &~parts, 0, 128, n));
+        if readBit(data, &~parts, 0, 128) then
+            let zero: Int64 := 0;
+            return zero - v;
+        end if;
+        return v;
+    end;
+
+    generic [P: Region]
+    function startPart(parts: &![Buffer[Index], P], p: Index, at: Index, stop: Index): Unit is
+        let base: Index := p * partSize;
+        storeNth(&~parts, base, at);
+        storeNth(&~parts, base + 1, stop);
+        storeNth(&~parts, base + 2, (254 : Index));
+        storeNth(&~parts, base + 3, (0 : Index));
+        storeNth(&~parts, base + 4, (0 : Index));
+        storeNth(&~parts, base + 5, (0 : Index));
+        return nil;
+    end;
+
+    ---
+    --- The headers
+    ---
+
+    function failedRead(code: Index): Either[Index, Vp8Picture] is
+        return Left(left => code);
+    end;
+
+    generic [D: Region]
+    function readVp8(data: Span[Nat8, D], maxPixels: Index): Either[Index, Vp8Picture] is
+        let size: Index := spanLength(data);
+        if size < 10 then
+            return failedRead(broken);
+        end if;
+        let b0: Index := wide(data[0]);
+        if bitwiseAnd(b0, (1 : Index)) /= 0 then
+            -- an inter frame
+            return failedRead(unsupported);
+        end if;
+        if (bitwiseAnd(b0 / 2, (7 : Index)) > 3) or (bitwiseAnd(b0 / 16, (1 : Index)) = 0) then
+            return failedRead(unsupported);
+        end if;
+        let firstLength: Index := ((b0 / 32) + (wide(data[1]) * 8)) + (wide(data[2]) * 2048);
+        if ((data[3] /= (157 : Nat8)) or (data[4] /= (1 : Nat8))) or (data[5] /= (42 : Nat8)) then
+            return failedRead(broken);
+        end if;
+        let width: Index := (bitwiseAnd(wide(data[7]), (63 : Index)) * 256) + wide(data[6]);
+        let height: Index := (bitwiseAnd(wide(data[9]), (63 : Index)) * 256) + wide(data[8]);
+        if (width = 0) or (height = 0) then
+            return failedRead(broken);
+        end if;
+        if ((width > sideMost) or (height > sideMost)) or ((width * height) > maxPixels) then
+            return failedRead(tooLarge);
+        end if;
+        if (firstLength + 10) > size then
+            return failedRead(broken);
+        end if;
+        let across: Index := (width + 15) / 16;
+        let down: Index := (height + 15) / 16;
+        var head: Buffer[Index] := initialize(headSize, (0 : Index));
+        storeNth(&!head, widthAt, width);
+        storeNth(&!head, heightAt, height);
+        storeNth(&!head, acrossAt, across);
+        storeNth(&!head, downAt, down);
+        var parts: Buffer[Index] := initialize(partSize * 9, (0 : Index));
+        startPart(&!parts, 0, 10, firstLength + 10);
+        var probs: Buffer[Index] := initialize(1056, (0 : Index));
+        var i: Index := 0;
+        while i < 1056 do
+            storeNth(&!probs, i, defaultProb(i));
+            i := i + 1;
+        end while;
+        var result: Index := headers(data, firstLength + 10, &!head, &!parts, &!probs);
+        var planeY: Buffer[Nat8] := initialize((across * 16) * (down * 16), (0 : Nat8));
+        var planeU: Buffer[Nat8] := initialize((across * 8) * (down * 8), (0 : Nat8));
+        var planeV: Buffer[Nat8] := initialize((across * 8) * (down * 8), (0 : Nat8));
+        var filters: Buffer[Index] := initialize((across * down) * 4, (0 : Index));
+        if result = fine then
+            result := macroblocks(data, &!head, &!parts, &probs, &!planeY, &!planeU, &!planeV, &!filters);
+        end if;
+        if result = fine then
+            if nth(&head, levelAt) /= 0 then
+                loopFilter(&head, &filters, &!planeY, &!planeU, &!planeV);
+            end if;
+        end if;
+        destroyFree(head);
+        destroyFree(parts);
+        destroyFree(probs);
+        destroyFree(filters);
+        if result /= fine then
+            destroyFree(planeY);
+            destroyFree(planeU);
+            destroyFree(planeV);
+            return failedRead(result);
+        else
+            let pixels: String := rgb(&planeY, &planeU, &planeV, width, height, across);
+            let luma: String := cropped(&planeY, across * 16, width, height);
+            let blue: String := cropped(&planeU, across * 8, (width + 1) / 2, (height + 1) / 2);
+            let red: String := cropped(&planeV, across * 8, (width + 1) / 2, (height + 1) / 2);
+            destroyFree(planeY);
+            destroyFree(planeU);
+            destroyFree(planeV);
+            let picture: Vp8Picture := Vp8Picture(width => width, height => height, pixels => pixels, luma => luma,
+                                                  blue => blue, red => red);
+            return Right(right => picture);
+        end if;
+    end;
+
+    -- The headers in the first partition and the partitions after it at
+    -- from (RFC 6386 9.2 to 9.11).
+    generic [D: Region, H: Region, P: Region, T: Region]
+    function headers(data: Span[Nat8, D], after: Index, head: &![Buffer[Index], H], parts: &![Buffer[Index], P],
+                     probs: &![Buffer[Index], T]): Index is
+        -- colour space and clamping, not used
+        let colourSpace: Bool := readBit(data, &~parts, 0, 128);
+        let clamping: Bool := readBit(data, &~parts, 0, 128);
+        -- segments
+        storeNth(&~head, segmentProbAt, (255 : Index));
+        storeNth(&~head, segmentProbAt + 1, (255 : Index));
+        storeNth(&~head, segmentProbAt + 2, (255 : Index));
+        var s: Index := 0;
+        while s < 4 do
+            storeNth(&~head, quantizerAt + s, bias);
+            storeNth(&~head, strengthAt + s, bias);
+            s := s + 1;
+        end while;
+        if readBit(data, &~parts, 0, 128) then
+            storeNth(&~head, useSegmentAt, (1 : Index));
+            if readBit(data, &~parts, 0, 128) then
+                storeNth(&~head, updateMapAt, (1 : Index));
+            end if;
+            if readBit(data, &~parts, 0, 128) then
+                if not readBit(data, &~parts, 0, 128) then
+                    storeNth(&~head, relativeAt, (1 : Index));
+                end if;
+                s := (0 : Index);
+                while s < 4 do
+                    storeNth(&~head, quantizerAt + s, biased(readOptional(data, &~parts, 7)));
+                    s := s + 1;
+                end while;
+                s := (0 : Index);
+                while s < 4 do
+                    storeNth(&~head, strengthAt + s, biased(readOptional(data, &~parts, 6)));
+                    s := s + 1;
+                end while;
+            end if;
+            if nth(&head, updateMapAt) = 1 then
+                var k: Index := 0;
+                while k < 3 do
+                    if readBit(data, &~parts, 0, 128) then
+                        storeNth(&~head, segmentProbAt + k, readUint(data, &~parts, 0, 128, 8));
+                    end if;
+                    k := k + 1;
+                end while;
+            end if;
+        end if;
+        -- the loop filter
+        if readBit(data, &~parts, 0, 128) then
+            storeNth(&~head, simpleAt, (1 : Index));
+        end if;
+        storeNth(&~head, levelAt, readUint(data, &~parts, 0, 128, 6));
+        storeNth(&~head, sharpnessAt, readUint(data, &~parts, 0, 128, 3));
+        var d: Index := 0;
+        while d < 4 do
+            storeNth(&~head, refDeltaAt + d, bias);
+            storeNth(&~head, modeDeltaAt + d, bias);
+            d := d + 1;
+        end while;
+        if readBit(data, &~parts, 0, 128) then
+            storeNth(&~head, useDeltaAt, (1 : Index));
+            if readBit(data, &~parts, 0, 128) then
+                d := (0 : Index);
+                while d < 4 do
+                    storeNth(&~head, refDeltaAt + d, biased(readOptional(data, &~parts, 6)));
+                    d := d + 1;
+                end while;
+                d := (0 : Index);
+                while d < 4 do
+                    storeNth(&~head, modeDeltaAt + d, biased(readOptional(data, &~parts, 6)));
+                    d := d + 1;
+                end while;
+            end if;
+        end if;
+        filterParams(&~head);
+        -- the partitions of coefficients
+        let count: Index := power(readUint(data, &~parts, 0, 128, 2));
+        storeNth(&~head, partitionsAt, count);
+        let size: Index := spanLength(data);
+        let sizes: Index := (count - 1) * 3;
+        if (after + sizes) > size then
+            return broken;
+        end if;
+        var at: Index := after + sizes;
+        var p: Index := 0;
+        while p < (count - 1) do
+            let n: Index := (wide(data[after + (p * 3)]) + (wide(data[(after + (p * 3)) + 1]) * 256)) + (wide(data[(after + (p * 3)) + 2]) * 65536);
+            if (at + n) > size then
+                return broken;
+            end if;
+            startPart(&~parts, p + 1, at, at + n);
+            at := at + n;
+            p := p + 1;
+        end while;
+        startPart(&~parts, count, at, size);
+        -- quantisation
+        let base: Int64 := signed(readUint(data, &~parts, 0, 128, 7));
+        let y1Dc: Int64 := readOptional(data, &~parts, 4);
+        let y2Dc: Int64 := readOptional(data, &~parts, 4);
+        let y2Ac: Int64 := readOptional(data, &~parts, 4);
+        let uvDc: Int64 := readOptional(data, &~parts, 4);
+        let uvAc: Int64 := readOptional(data, &~parts, 4);
+        s := (0 : Index);
+        while s < 4 do
+            var q: Int64 := base;
+            if nth(&head, useSegmentAt) = 1 then
+                if nth(&head, relativeAt) = 1 then
+                    q := q + unbiased(nth(&head, quantizerAt + s));
+                else
+                    q := unbiased(nth(&head, quantizerAt + s));
+                end if;
+            end if;
+            let at6: Index := quantAt + (s * 6);
+            storeNth(&~head, at6, dequantDc(clip127(q + y1Dc)));
+            storeNth(&~head, at6 + 1, dequantAc(clip127(q)));
+            storeNth(&~head, at6 + 2, dequantDc(clip127(q + y2Dc)) * 2);
+            var y2: Index := (dequantAc(clip127(q + y2Ac)) * 155) / 100;
+            if y2 < 8 then
+                y2 := (8 : Index);
+            end if;
+            storeNth(&~head, at6 + 3, y2);
+            var uv: Int64 := q + uvDc;
+            if uv > (117 : Int64) then
+                uv := (117 : Int64);
+            end if;
+            storeNth(&~head, at6 + 4, dequantDc(clip127(uv)));
+            storeNth(&~head, at6 + 5, dequantAc(clip127(q + uvAc)));
+            s := s + 1;
+        end while;
+        -- refresh_entropy_probs, not used for a single frame
+        let refresh: Bool := readBit(data, &~parts, 0, 128);
+        -- token probabilities
+        var i: Index := 0;
+        while i < 1056 do
+            if readBit(data, &~parts, 0, updateProb(i)) then
+                storeNth(&~probs, i, readUint(data, &~parts, 0, 128, 8));
+            end if;
+            i := i + 1;
+        end while;
+        if readBit(data, &~parts, 0, 128) then
+            storeNth(&~head, useSkipAt, (1 : Index));
+            storeNth(&~head, skipProbAt, readUint(data, &~parts, 0, 128, 8));
+        end if;
+        if nth(&parts, 5) = 1 then
+            return broken;
+        end if;
+        return fine;
+    end;
+
+    -- q held to 0..127 as an index of the dequantisation tables.
+    function clip127(q: Int64): Index is
+        return clip255(clamp(q, (0 : Int64), (127 : Int64)));
+    end;
+
+    -- The loop filter parameters of each segment, with and without 4x4
+    -- prediction (RFC 6386 15.4, as Go computes them).
+    generic [H: Region]
+    function filterParams(head: &![Buffer[Index], H]): Unit is
+        let level: Int64 := signed(nth(&head, levelAt));
+        let sharpness: Index := nth(&head, sharpnessAt);
+        var s: Index := 0;
+        while s < 4 do
+            var baseLevel: Int64 := level;
+            if nth(&head, useSegmentAt) = 1 then
+                baseLevel := unbiased(nth(&head, strengthAt + s));
+                if nth(&head, relativeAt) = 1 then
+                    baseLevel := baseLevel + level;
+                end if;
+            end if;
+            var j: Index := 0;
+            while j < 2 do
+                let at: Index := filterAt + (((s * 2) + j) * 4);
+                storeNth(&~head, at + 3, j);
+                var l: Int64 := baseLevel;
+                if nth(&head, useDeltaAt) = 1 then
+                    l := l + unbiased(nth(&head, refDeltaAt));
+                    if j = 1 then
+                        l := l + unbiased(nth(&head, modeDeltaAt));
+                    end if;
+                end if;
+                if l <= (0 : Int64) then
+                    storeNth(&~head, at, (0 : Index));
+                else
+                    if l > (63 : Int64) then
+                        l := (63 : Int64);
+                    end if;
+                    var inner: Int64 := l;
+                    if sharpness > 0 then
+                        if sharpness > 4 then
+                            inner := shift(inner, 2);
+                        else
+                            inner := shift(inner, 1);
+                        end if;
+                        let nine: Index := 9;
+                        let most: Int64 := signed(nine - sharpness);
+                        if inner > most then
+                            inner := most;
+                        end if;
+                    end if;
+                    if inner < (1 : Int64) then
+                        inner := (1 : Int64);
+                    end if;
+                    storeNth(&~head, at + 1, clip255(inner));
+                    storeNth(&~head, at, clip255((l * (2 : Int64)) + inner));
+                    var variance: Index := 2;
+                    if l < (40 : Int64) then
+                        variance := (1 : Index);
+                    end if;
+                    if l < (15 : Int64) then
+                        variance := (0 : Index);
+                    end if;
+                    storeNth(&~head, at + 2, variance);
+                end if;
+                j := j + 1;
+            end while;
+            s := s + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Macroblocks
+    ---
+
+    generic [D: Region, H: Region, P: Region, T: Region, Y: Region, U: Region, V: Region, F: Region]
+    function macroblocks(data: Span[Nat8, D], head: &![Buffer[Index], H], parts: &![Buffer[Index], P],
+                         probs: &[Buffer[Index], T], planeY: &![Buffer[Nat8], Y], planeU: &![Buffer[Nat8], U],
+                         planeV: &![Buffer[Nat8], V], filters: &![Buffer[Index], F]): Index is
+        let across: Index := nth(&head, acrossAt);
+        let down: Index := nth(&head, downAt);
+        var up: Buffer[Index] := initialize(across * mbSize, (0 : Index));
+        var left: Buffer[Index] := initialize(mbSize, (0 : Index));
+        let zero: Int64 := 0;
+        var coefficients: Buffer[Int64] := initialize(400, zero);
+        var work: Buffer[Index] := initialize(workWidth * 26, (0 : Index));
+        var mby: Index := 0;
+        while mby < down do
+            var k: Index := 0;
+            while k < mbSize do
+                storeNth(&!left, k, (0 : Index));
+                k := k + 1;
+            end while;
+            var mbx: Index := 0;
+            while mbx < across do
+                let quiet: Bool := macroblock(data, &~head, &~parts, probs, &!up, &!left, &!coefficients, &!work,
+                                             &~planeY, &~planeU, &~planeV, mbx, mby);
+                var j: Index := 0;
+                if nth(&head, useY16At) = 0 then
+                    j := (1 : Index);
+                end if;
+                let fp: Index := filterAt + (((nth(&head, segmentAt) * 2) + j) * 4);
+                let at: Index := ((mby * across) + mbx) * 4;
+                storeNth(&~filters, at, nth(&head, fp));
+                storeNth(&~filters, at + 1, nth(&head, fp + 1));
+                storeNth(&~filters, at + 2, nth(&head, fp + 2));
+                var inner: Index := nth(&head, fp + 3);
+                if not quiet then
+                    inner := (1 : Index);
+                end if;
+                storeNth(&~filters, at + 3, inner);
+                mbx := mbx + 1;
+            end while;
+            mby := mby + 1;
+        end while;
+        destroyFree(up);
+        destroyFree(left);
+        destroyFree(coefficients);
+        destroyFree(work);
+        var p: Index := 0;
+        while p <= nth(&head, partitionsAt) do
+            if nth(&parts, (p * partSize) + 5) = 1 then
+                return broken;
+            end if;
+            p := p + 1;
+        end while;
+        return fine;
+    end;
+
+    -- One macroblock: segment, skip, modes, residuals, prediction plus
+    -- residuals into the planes; whether its inner edges need no filter.
+    generic [D: Region, H: Region, P: Region, T: Region, A: Region, L: Region, C: Region, W: Region, Y: Region,
+             U: Region, V: Region]
+    function macroblock(data: Span[Nat8, D], head: &![Buffer[Index], H], parts: &![Buffer[Index], P],
+                        probs: &[Buffer[Index], T], up: &![Buffer[Index], A], left: &![Buffer[Index], L],
+                        coefficients: &![Buffer[Int64], C], work: &![Buffer[Index], W], planeY: &![Buffer[Nat8], Y],
+                        planeU: &![Buffer[Nat8], U], planeV: &![Buffer[Nat8], V], mbx: Index, mby: Index): Bool is
+        if nth(&head, updateMapAt) = 1 then
+            let p0: Index := nth(&head, segmentProbAt);
+            let p1: Index := nth(&head, segmentProbAt + 1);
+            let p2: Index := nth(&head, segmentProbAt + 2);
+            var segment: Index := 0;
+            if not readBit(data, &~parts, 0, p0) then
+                segment := readUint(data, &~parts, 0, p1, 1);
+            else
+                segment := readUint(data, &~parts, 0, p2, 1) + 2;
+            end if;
+            storeNth(&~head, segmentAt, segment);
+        end if;
+        var quiet: Bool := false;
+        if nth(&head, useSkipAt) = 1 then
+            quiet := readBit(data, &~parts, 0, nth(&head, skipProbAt));
+        end if;
+        let zero: Int64 := 0;
+        var i: Index := 0;
+        while i < 400 do
+            storeNth(&~coefficients, i, zero);
+            i := i + 1;
+        end while;
+        let across: Index := nth(&head, acrossAt);
+        prepare(&~work, &~planeY, &~planeU, &~planeV, mbx, mby, across);
+        let base: Index := mbx * mbSize;
+        if readBit(data, &~parts, 0, 145) then
+            storeNth(&~head, useY16At, (1 : Index));
+            var p: Index := predDc;
+            if not readBit(data, &~parts, 0, 156) then
+                if readBit(data, &~parts, 0, 163) then
+                    p := predVe;
+                end if;
+            else
+                if not readBit(data, &~parts, 0, 128) then
+                    p := predHe;
+                else
+                    p := predTm;
+                end if;
+            end if;
+            var k: Index := 0;
+            while k < 4 do
+                storeNth(&~up, base + k, p);
+                storeNth(&~left, k, p);
+                k := k + 1;
+            end while;
+            storeNth(&~head, predY16At, p);
+        else
+            storeNth(&~head, useY16At, (0 : Index));
+            var j: Index := 0;
+            while j < 4 do
+                var p: Index := nth(&left, j);
+                var x: Index := 0;
+                while x < 4 do
+                    p := subMode(data, &~parts, nth(&up, base + x), p);
+                    storeNth(&~head, (predY4At + (j * 4)) + x, p);
+                    storeNth(&~up, base + x, p);
+                    x := x + 1;
+                end while;
+                storeNth(&~left, j, p);
+                j := j + 1;
+            end while;
+        end if;
+        var c8: Index := predDc;
+        if readBit(data, &~parts, 0, 142) then
+            c8 := predVe;
+            if readBit(data, &~parts, 0, 114) then
+                c8 := predHe;
+                if readBit(data, &~parts, 0, 183) then
+                    c8 := predTm;
+                end if;
+            end if;
+        end if;
+        storeNth(&~head, predC8At, c8);
+        if not quiet then
+            quiet := residuals(data, &~head, &~parts, probs, &~up, &~left, &~coefficients, mbx, mby);
+        else
+            if nth(&head, useY16At) = 1 then
+                storeNth(&~left, 5, (0 : Index));
+                storeNth(&~up, base + 5, (0 : Index));
+            end if;
+            storeNth(&~left, 4, (0 : Index));
+            storeNth(&~up, base + 4, (0 : Index));
+            storeNth(&~head, nzDcAt, (0 : Index));
+            storeNth(&~head, nzAcAt, (0 : Index));
+        end if;
+        reconstructBlock(&head, &coefficients, &~work, mbx, mby);
+        -- the work space into the planes
+        let strideY: Index := across * 16;
+        let strideC: Index := across * 8;
+        var y: Index := 0;
+        while y < 16 do
+            var x: Index := 0;
+            while x < 16 do
+                storeNth(&~planeY, ((((mby * 16) + y) * strideY) + (mbx * 16)) + x, narrow(nth(&work, ((y + 1) * workWidth) + (x + 8))));
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        y := (0 : Index);
+        while y < 8 do
+            var x: Index := 0;
+            while x < 8 do
+                let at: Index := ((((mby * 8) + y) * strideC) + (mbx * 8)) + x;
+                storeNth(&~planeU, at, narrow(nth(&work, ((bRow + y) * workWidth) + (bColumn + x))));
+                storeNth(&~planeV, at, narrow(nth(&work, ((bRow + y) * workWidth) + (rColumn + x))));
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return quiet;
+    end;
+
+    -- The mode of a 4x4 block from the modes above and left of it (RFC
+    -- 6386 11.3).
+    generic [D: Region, P: Region]
+    function subMode(data: Span[Nat8, D], parts: &![Buffer[Index], P], above: Index, left: Index): Index is
+        if not readBit(data, &~parts, 0, modeProb(above, left, 0)) then
+            return predDc;
+        end if;
+        if not readBit(data, &~parts, 0, modeProb(above, left, 1)) then
+            return predTm;
+        end if;
+        if not readBit(data, &~parts, 0, modeProb(above, left, 2)) then
+            return predVe;
+        end if;
+        if not readBit(data, &~parts, 0, modeProb(above, left, 3)) then
+            if not readBit(data, &~parts, 0, modeProb(above, left, 4)) then
+                return predHe;
+            end if;
+            if not readBit(data, &~parts, 0, modeProb(above, left, 5)) then
+                return predRd;
+            end if;
+            return predVr;
+        end if;
+        if not readBit(data, &~parts, 0, modeProb(above, left, 6)) then
+            return predLd;
+        end if;
+        if not readBit(data, &~parts, 0, modeProb(above, left, 7)) then
+            return predVl;
+        end if;
+        if not readBit(data, &~parts, 0, modeProb(above, left, 8)) then
+            return predHd;
+        end if;
+        return predHu;
+    end;
+
+    -- The borders of the work space from the macroblocks left and above
+    -- (Go's prepareYBR).
+    generic [W: Region, Y: Region, U: Region, V: Region]
+    function prepare(work: &![Buffer[Index], W], planeY: &![Buffer[Nat8], Y], planeU: &![Buffer[Nat8], U],
+                     planeV: &![Buffer[Nat8], V], mbx: Index, mby: Index, across: Index): Unit is
+        var y: Index := 0;
+        if mbx = 0 then
+            while y < 17 do
+                storeNth(&~work, (y * workWidth) + 7, (129 : Index));
+                y := y + 1;
+            end while;
+            y := (17 : Index);
+            while y < 26 do
+                storeNth(&~work, (y * workWidth) + 7, (129 : Index));
+                storeNth(&~work, (y * workWidth) + 23, (129 : Index));
+                y := y + 1;
+            end while;
+        else
+            while y < 17 do
+                let v: Index := nth(&work, (y * workWidth) + 23);
+                storeNth(&~work, (y * workWidth) + 7, v);
+                y := y + 1;
+            end while;
+            y := (17 : Index);
+            while y < 26 do
+                let b: Index := nth(&work, (y * workWidth) + 15);
+                let r: Index := nth(&work, (y * workWidth) + 31);
+                storeNth(&~work, (y * workWidth) + 7, b);
+                storeNth(&~work, (y * workWidth) + 23, r);
+                y := y + 1;
+            end while;
+        end if;
+        let strideY: Index := across * 16;
+        let strideC: Index := across * 8;
+        if mby = 0 then
+            var x: Index := 7;
+            while x < 28 do
+                storeNth(&~work, x, (127 : Index));
+                x := x + 1;
+            end while;
+            x := (7 : Index);
+            while x < 16 do
+                storeNth(&~work, (workWidth * 17) + x, (127 : Index));
+                x := x + 1;
+            end while;
+            x := (23 : Index);
+            while x < 32 do
+                storeNth(&~work, (workWidth * 17) + x, (127 : Index));
+                x := x + 1;
+            end while;
+        else
+            let rowY: Index := ((mby * 16) - 1) * strideY;
+            let rowC: Index := ((mby * 8) - 1) * strideC;
+            var i: Index := 0;
+            while i < 16 do
+                storeNth(&~work, i + 8, wide(nth(&planeY, (rowY + (mbx * 16)) + i)));
+                i := i + 1;
+            end while;
+            i := (0 : Index);
+            while i < 8 do
+                storeNth(&~work, ((workWidth * 17) + 8) + i, wide(nth(&planeU, (rowC + (mbx * 8)) + i)));
+                storeNth(&~work, ((workWidth * 17) + 24) + i, wide(nth(&planeV, (rowC + (mbx * 8)) + i)));
+                i := i + 1;
+            end while;
+            i := (16 : Index);
+            while i < 20 do
+                var source: Index := (rowY + (mbx * 16)) + i;
+                if mbx = (across - 1) then
+                    source := (rowY + (mbx * 16)) + 15;
+                end if;
+                storeNth(&~work, i + 8, wide(nth(&planeY, source)));
+                i := i + 1;
+            end while;
+        end if;
+        y := (4 : Index);
+        while y < 16 do
+            var k: Index := 24;
+            while k < 28 do
+                let v: Index := nth(&work, k);
+                storeNth(&~work, (y * workWidth) + k, v);
+                k := k + 1;
+            end while;
+            y := y + 4;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Residuals (RFC 6386 13)
+    ---
+
+    function probAt(plane: Index, bandOf: Index, context: Index): Index is
+        return ((((plane * 8) + bandOf) * 3) + context) * 11;
+    end;
+
+    -- The coefficients of a 4x4 block into coefficients from at; 1 when
+    -- one is not 0.
+    generic [D: Region, P: Region, T: Region, C: Region]
+    function block4(data: Span[Nat8, D], parts: &![Buffer[Index], P], part: Index, probs: &[Buffer[Index], T],
+                    plane: Index, context: Index, quantDc: Index, quantAc: Index, skipFirst: Bool,
+                    coefficients: &![Buffer[Int64], C], at: Index): Index is
+        var n: Index := 0;
+        if skipFirst then
+            n := (1 : Index);
+        end if;
+        var p: Index := probAt(plane, band(n), context);
+        if not readBit(data, &~parts, part, nth(probs, p)) then
+            return 0;
+        end if;
+        while n < 16 do
+            n := n + 1;
+            if not readBit(data, &~parts, part, nth(probs, p + 1)) then
+                p := probAt(plane, band(n), 0);
+            else
+                var v: Index := 0;
+                if not readBit(data, &~parts, part, nth(probs, p + 2)) then
+                    v := (1 : Index);
+                    p := probAt(plane, band(n), 1);
+                else
+                    if not readBit(data, &~parts, part, nth(probs, p + 3)) then
+                        if not readBit(data, &~parts, part, nth(probs, p + 4)) then
+                            v := (2 : Index);
+                        else
+                            v := readUint(data, &~parts, part, nth(probs, p + 5), 1) + 3;
+                        end if;
+                    else
+                        if not readBit(data, &~parts, part, nth(probs, p + 6)) then
+                            if not readBit(data, &~parts, part, nth(probs, p + 7)) then
+                                v := readUint(data, &~parts, part, 159, 1) + 5;
+                            else
+                                let high: Index := readUint(data, &~parts, part, 165, 1) * 2;
+                                v := (high + readUint(data, &~parts, part, 145, 1)) + 7;
+                            end if;
+                        else
+                            let b1: Index := readUint(data, &~parts, part, nth(probs, p + 8), 1);
+                            let b0: Index := readUint(data, &~parts, part, nth(probs, (p + 9) + b1), 1);
+                            let category: Index := (b1 * 2) + b0;
+                            var i: Index := 0;
+                            while categoryProb(category, i) /= 0 do
+                                v := (v * 2) + readUint(data, &~parts, part, categoryProb(category, i), 1);
+                                i := i + 1;
+                            end while;
+                            v := (v + 3) + (power(category) * 8);
+                        end if;
+                    end if;
+                    p := probAt(plane, band(n), 2);
+                end if;
+                let z: Index := zigzag(n - 1);
+                var q: Index := quantAc;
+                if z = 0 then
+                    q := quantDc;
+                end if;
+                var c: Int64 := signed(v * q);
+                if readBit(data, &~parts, part, 128) then
+                    let zero: Int64 := 0;
+                    c := zero - c;
+                end if;
+                storeNth(&~coefficients, at + z, c);
+                if n = 16 then
+                    return 1;
+                end if;
+                if not readBit(data, &~parts, part, nth(probs, p)) then
+                    return 1;
+                end if;
+            end if;
+        end while;
+        return 1;
+    end;
+
+    -- The residuals of a macroblock; whether none is coded (Go's
+    -- parseResiduals).
+    generic [D: Region, H: Region, P: Region, T: Region, A: Region, L: Region, C: Region]
+    function residuals(data: Span[Nat8, D], head: &![Buffer[Index], H], parts: &![Buffer[Index], P],
+                       probs: &[Buffer[Index], T], up: &![Buffer[Index], A], left: &![Buffer[Index], L],
+                       coefficients: &![Buffer[Int64], C], mbx: Index, mby: Index): Bool is
+        let part: Index := (mby - ((mby / nth(&head, partitionsAt)) * nth(&head, partitionsAt))) + 1;
+        let q: Index := quantAt + (nth(&head, segmentAt) * 6);
+        let base: Index := mbx * mbSize;
+        var plane: Index := 3;
+        let y16: Bool := nth(&head, useY16At) = 1;
+        if y16 then
+            let nz: Index := block4(data, &~parts, part, probs, 1, nth(&left, 5) + nth(&up, base + 5), nth(&head, q + 2),
+                                    nth(&head, q + 3), false, &~coefficients, whtCoefficients);
+            storeNth(&~left, 5, nz);
+            storeNth(&~up, base + 5, nz);
+            inverseWht(&~coefficients);
+            plane := (0 : Index);
+        end if;
+        var dcMask: Index := 0;
+        var acMask: Index := 0;
+        var at: Index := 0;
+        var leftMask: Index := bitwiseAnd(nth(&left, 4), (15 : Index));
+        var upMask: Index := bitwiseAnd(nth(&up, base + 4), (15 : Index));
+        var y: Index := 0;
+        while y < 4 do
+            var nz: Index := bitwiseAnd(leftMask / power(y), (1 : Index));
+            var x: Index := 0;
+            while x < 4 do
+                let context: Index := nz + bitwiseAnd(upMask / power(x), (1 : Index));
+                nz := block4(data, &~parts, part, probs, plane, context, nth(&head, q), nth(&head, q + 1), y16,
+                             &~coefficients, at);
+                upMask := setBit(upMask, x, nz);
+                acMask := setBit(acMask, (y * 4) + x, nz);
+                if nth(&coefficients, at) /= (0 : Int64) then
+                    dcMask := setBit(dcMask, (y * 4) + x, 1);
+                end if;
+                at := at + 16;
+                x := x + 1;
+            end while;
+            leftMask := setBit(leftMask, y, nz);
+            y := y + 1;
+        end while;
+        var leftChroma: Index := nth(&left, 4) / 16;
+        var upChroma: Index := nth(&up, base + 4) / 16;
+        var c: Index := 0;
+        while c < 4 do
+            var row: Index := 0;
+            while row < 2 do
+                var nz: Index := bitwiseAnd(leftChroma / power(row + c), (1 : Index));
+                var x: Index := 0;
+                while x < 2 do
+                    let context: Index := nz + bitwiseAnd(upChroma / power(x + c), (1 : Index));
+                    nz := block4(data, &~parts, part, probs, 2, context, nth(&head, q + 4), nth(&head, q + 5), false,
+                                 &~coefficients, at);
+                    upChroma := setBit(upChroma, x + c, nz);
+                    acMask := setBit(acMask, ((c * 2) + 16) + ((row * 2) + x), nz);
+                    if nth(&coefficients, at) /= (0 : Int64) then
+                        dcMask := setBit(dcMask, ((c * 2) + 16) + ((row * 2) + x), 1);
+                    end if;
+                    at := at + 16;
+                    x := x + 1;
+                end while;
+                leftChroma := setBit(leftChroma, row + c, nz);
+                row := row + 1;
+            end while;
+            c := c + 2;
+        end while;
+        storeNth(&~left, 4, leftMask + (leftChroma * 16));
+        storeNth(&~up, base + 4, upMask + (upChroma * 16));
+        storeNth(&~head, nzDcAt, dcMask);
+        storeNth(&~head, nzAcAt, acMask);
+        return (dcMask = 0) and (acMask = 0);
+    end;
+
+    -- mask with bit k set to v (0 or 1).
+    function setBit(mask: Index, k: Index, v: Index): Index is
+        let bit: Index := power(k);
+        var cleared: Index := mask;
+        if bitwiseAnd(mask, bit) /= 0 then
+            cleared := mask - bit;
+        end if;
+        return cleared + (v * bit);
+    end;
+
+    ---
+    --- Transforms (RFC 6386 14)
+    ---
+
+    generic [C: Region]
+    function inverseWht(coefficients: &![Buffer[Int64], C]): Unit is
+        let zero: Int64 := 0;
+        var m: Buffer[Int64] := initialize(16, zero);
+        var i: Index := 0;
+        while i < 4 do
+            let a0: Int64 := nth(&coefficients, whtCoefficients + i) + nth(&coefficients, (whtCoefficients + 12) + i);
+            let a1: Int64 := nth(&coefficients, (whtCoefficients + 4) + i) + nth(&coefficients, (whtCoefficients + 8) + i);
+            let a2: Int64 := nth(&coefficients, (whtCoefficients + 4) + i) - nth(&coefficients, (whtCoefficients + 8) + i);
+            let a3: Int64 := nth(&coefficients, whtCoefficients + i) - nth(&coefficients, (whtCoefficients + 12) + i);
+            storeNth(&!m, i, a0 + a1);
+            storeNth(&!m, i + 8, a0 - a1);
+            storeNth(&!m, i + 4, a3 + a2);
+            storeNth(&!m, i + 12, a3 - a2);
+            i := i + 1;
+        end while;
+        var out: Index := 0;
+        i := (0 : Index);
+        while i < 4 do
+            let dc: Int64 := nth(&m, i * 4) + (3 : Int64);
+            let a0: Int64 := dc + nth(&m, (i * 4) + 3);
+            let a1: Int64 := nth(&m, (i * 4) + 1) + nth(&m, (i * 4) + 2);
+            let a2: Int64 := nth(&m, (i * 4) + 1) - nth(&m, (i * 4) + 2);
+            let a3: Int64 := dc - nth(&m, (i * 4) + 3);
+            storeNth(&~coefficients, out, shift(a0 + a1, 3));
+            storeNth(&~coefficients, out + 16, shift(a3 + a2, 3));
+            storeNth(&~coefficients, out + 32, shift(a0 - a1, 3));
+            storeNth(&~coefficients, out + 48, shift(a3 - a2, 3));
+            out := out + 64;
+            i := i + 1;
+        end while;
+        destroyFree(m);
+        return nil;
+    end;
+
+    -- (v times c) shifted right by 16.
+    function times(v: Int64, c: Int64): Int64 is
+        return shift(v * c, 16);
+    end;
+
+    -- The inverse DCT of the 4x4 block at at added to the work space at
+    -- row y, column x.
+    generic [C: Region, W: Region]
+    function inverseDct(coefficients: &[Buffer[Int64], C], work: &![Buffer[Index], W], y: Index, x: Index, at: Index): Unit is
+        let c1: Int64 := 85627;
+        let c2: Int64 := 35468;
+        let zero: Int64 := 0;
+        var m: Buffer[Int64] := initialize(16, zero);
+        var i: Index := 0;
+        while i < 4 do
+            let k: Index := at + i;
+            let a: Int64 := nth(coefficients, k) + nth(coefficients, k + 8);
+            let b: Int64 := nth(coefficients, k) - nth(coefficients, k + 8);
+            let c: Int64 := times(nth(coefficients, k + 4), c2) - times(nth(coefficients, k + 12), c1);
+            let d: Int64 := times(nth(coefficients, k + 4), c1) + times(nth(coefficients, k + 12), c2);
+            storeNth(&!m, i * 4, a + d);
+            storeNth(&!m, (i * 4) + 1, b + c);
+            storeNth(&!m, (i * 4) + 2, b - c);
+            storeNth(&!m, (i * 4) + 3, a - d);
+            i := i + 1;
+        end while;
+        var j: Index := 0;
+        while j < 4 do
+            let dc: Int64 := nth(&m, j) + (4 : Int64);
+            let a: Int64 := dc + nth(&m, j + 8);
+            let b: Int64 := dc - nth(&m, j + 8);
+            let c: Int64 := times(nth(&m, j + 4), c2) - times(nth(&m, j + 12), c1);
+            let d: Int64 := times(nth(&m, j + 4), c1) + times(nth(&m, j + 12), c2);
+            let row: Index := (y + j) * workWidth;
+            addTo(&~work, (row + x), shift(a + d, 3));
+            addTo(&~work, (row + x) + 1, shift(b + c, 3));
+            addTo(&~work, (row + x) + 2, shift(b - c, 3));
+            addTo(&~work, (row + x) + 3, shift(a - d, 3));
+            j := j + 1;
+        end while;
+        destroyFree(m);
+        return nil;
+    end;
+
+    generic [W: Region]
+    function addTo(work: &![Buffer[Index], W], at: Index, v: Int64): Unit is
+        let sum: Index := clip255(signed(nth(&work, at)) + v);
+        storeNth(&~work, at, sum);
+        return nil;
+    end;
+
+    generic [C: Region, W: Region]
+    function inverseDcOnly(coefficients: &[Buffer[Int64], C], work: &![Buffer[Index], W], y: Index, x: Index, at: Index): Unit is
+        let dc: Int64 := shift(nth(coefficients, at) + (4 : Int64), 3);
+        var j: Index := 0;
+        while j < 4 do
+            var i: Index := 0;
+            while i < 4 do
+                addTo(&~work, ((y + j) * workWidth) + (x + i), dc);
+                i := i + 1;
+            end while;
+            j := j + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The block of 4x4 n with its residuals, by the masks.
+    generic [H: Region, C: Region, W: Region]
+    function residual4(head: &[Buffer[Index], H], coefficients: &[Buffer[Int64], C], work: &![Buffer[Index], W],
+                       n: Index, y: Index, x: Index, at: Index): Unit is
+        if bitwiseAnd(nth(head, nzAcAt) / power(n), (1 : Index)) = 1 then
+            inverseDct(coefficients, &~work, y, x, at);
+        else
+            if bitwiseAnd(nth(head, nzDcAt) / power(n), (1 : Index)) = 1 then
+                inverseDcOnly(coefficients, &~work, y, x, at);
+            end if;
+        end if;
+        return nil;
+    end;
+
+    -- The mode for the DC prediction of a block at the top or left edge.
+    function edgeMode(mbx: Index, mby: Index, p: Index): Index is
+        if p /= predDc then
+            return p;
+        end if;
+        if mbx = 0 then
+            if mby = 0 then
+                return predDcTopLeft;
+            end if;
+            return predDcLeft;
+        end if;
+        if mby = 0 then
+            return predDcTop;
+        end if;
+        return predDc;
+    end;
+
+    -- Prediction plus residuals in the work space (Go's
+    -- reconstructMacroblock).
+    generic [H: Region, C: Region, W: Region]
+    function reconstructBlock(head: &[Buffer[Index], H], coefficients: &[Buffer[Int64], C], work: &![Buffer[Index], W],
+                              mbx: Index, mby: Index): Unit is
+        if nth(head, useY16At) = 1 then
+            predictWide(&~work, edgeMode(mbx, mby, nth(head, predY16At)), 1, 8, 16);
+            var n: Index := 0;
+            while n < 16 do
+                residual4(head, coefficients, &~work, n, ((n / 4) * 4) + 1, (bitwiseAnd(n, (3 : Index)) * 4) + 8, n * 16);
+                n := n + 1;
+            end while;
+        else
+            var n: Index := 0;
+            while n < 16 do
+                let y: Index := ((n / 4) * 4) + 1;
+                let x: Index := (bitwiseAnd(n, (3 : Index)) * 4) + 8;
+                predict4(&~work, nth(head, predY4At + n), y, x);
+                residual4(head, coefficients, &~work, n, y, x, n * 16);
+                n := n + 1;
+            end while;
+        end if;
+        let c: Index := edgeMode(mbx, mby, nth(head, predC8At));
+        predictWide(&~work, c, bRow, bColumn, 8);
+        residual8(head, coefficients, &~work, 16, bRow, bColumn, bCoefficients);
+        predictWide(&~work, c, bRow, rColumn, 8);
+        residual8(head, coefficients, &~work, 20, bRow, rColumn, rCoefficients);
+        return nil;
+    end;
+
+    -- An 8x8 chroma block as four 4x4 ones, mask bits from bit on.
+    generic [H: Region, C: Region, W: Region]
+    function residual8(head: &[Buffer[Index], H], coefficients: &[Buffer[Int64], C], work: &![Buffer[Index], W],
+                       bit: Index, y: Index, x: Index, at: Index): Unit is
+        let ac: Bool := bitwiseAnd(nth(head, nzAcAt) / power(bit), (15 : Index)) /= 0;
+        let dc: Bool := bitwiseAnd(nth(head, nzDcAt) / power(bit), (15 : Index)) /= 0;
+        var k: Index := 0;
+        while k < 4 do
+            let by: Index := y + ((k / 2) * 4);
+            let bx: Index := x + (bitwiseAnd(k, (1 : Index)) * 4);
+            if ac then
+                inverseDct(coefficients, &~work, by, bx, at + (k * 16));
+            else
+                if dc then
+                    inverseDcOnly(coefficients, &~work, by, bx, at + (k * 16));
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Prediction (RFC 6386 12)
+    ---
+
+    generic [W: Region]
+    function get(work: &[Buffer[Index], W], y: Index, x: Index): Index is
+        return nth(work, (y * workWidth) + x);
+    end;
+
+    generic [W: Region]
+    function put(work: &![Buffer[Index], W], y: Index, x: Index, v: Index): Unit is
+        storeNth(&~work, (y * workWidth) + x, v);
+        return nil;
+    end;
+
+    -- A 16x16 or 8x8 block of side size at row y, column x: DC (and its
+    -- edge forms), TM, VE, HE.
+    generic [W: Region]
+    function predictWide(work: &![Buffer[Index], W], mode: Index, y: Index, x: Index, size: Index): Unit is
+        var value: Index := 128;
+        var fill: Bool := false;
+        if mode = predDc then
+            var sum: Index := size;
+            var i: Index := 0;
+            while i < size do
+                sum := (sum + get(&work, y - 1, x + i)) + get(&work, y + i, x - 1);
+                i := i + 1;
+            end while;
+            value := sum / (size * 2);
+            fill := true;
+        end if;
+        if mode = predDcTop then
+            var sum: Index := size / 2;
+            var j: Index := 0;
+            while j < size do
+                sum := sum + get(&work, y + j, x - 1);
+                j := j + 1;
+            end while;
+            value := sum / size;
+            fill := true;
+        end if;
+        if mode = predDcLeft then
+            var sum: Index := size / 2;
+            var i: Index := 0;
+            while i < size do
+                sum := sum + get(&work, y - 1, x + i);
+                i := i + 1;
+            end while;
+            value := sum / size;
+            fill := true;
+        end if;
+        if mode = predDcTopLeft then
+            value := (128 : Index);
+            fill := true;
+        end if;
+        var j: Index := 0;
+        while j < size do
+            var i: Index := 0;
+            while i < size do
+                var v: Index := value;
+                if not fill then
+                    if mode = predTm then
+                        v := clip255((signed(get(&work, y + j, x - 1)) + signed(get(&work, y - 1, x + i))) - signed(get(&work, y - 1, x - 1)));
+                    end if;
+                    if mode = predVe then
+                        v := get(&work, y - 1, x + i);
+                    end if;
+                    if mode = predHe then
+                        v := get(&work, y + j, x - 1);
+                    end if;
+                end if;
+                put(&~work, y + j, x + i, v);
+                i := i + 1;
+            end while;
+            j := j + 1;
+        end while;
+        return nil;
+    end;
+
+    function avg3(a: Index, b: Index, c: Index): Index is
+        return (((a + (b * 2)) + c) + 2) / 4;
+    end;
+
+    function avg2(a: Index, b: Index): Index is
+        return ((a + b) + 1) / 2;
+    end;
+
+    -- A 4x4 block at row y, column x in one of the ten modes (Go's
+    -- predFunc4*).
+    generic [W: Region]
+    function predict4(work: &![Buffer[Index], W], mode: Index, y: Index, x: Index): Unit is
+        -- the border: a top left, b..i above and to the right, p..s left
+        let a: Index := get(&work, y - 1, x - 1);
+        let b: Index := get(&work, y - 1, x);
+        let c: Index := get(&work, y - 1, x + 1);
+        let d: Index := get(&work, y - 1, x + 2);
+        let e: Index := get(&work, y - 1, x + 3);
+        let f: Index := get(&work, y - 1, x + 4);
+        let g: Index := get(&work, y - 1, x + 5);
+        let h: Index := get(&work, y - 1, x + 6);
+        let k: Index := get(&work, y - 1, x + 7);
+        let p: Index := get(&work, y, x - 1);
+        let q: Index := get(&work, y + 1, x - 1);
+        let r: Index := get(&work, y + 2, x - 1);
+        let s: Index := get(&work, y + 3, x - 1);
+        if mode = predDc then
+            let v: Index := ((((b + c) + (d + e)) + ((p + q) + (r + s))) + 4) / 8;
+            fill4(&~work, y, x, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v);
+        end if;
+        if mode = predTm then
+            var j: Index := 0;
+            while j < 4 do
+                let l: Int64 := signed(get(&work, y + j, x - 1)) - signed(a);
+                var i: Index := 0;
+                while i < 4 do
+                    let above: Index := get(&work, y - 1, x + i);
+                    put(&~work, y + j, x + i, clip255(l + signed(above)));
+                    i := i + 1;
+                end while;
+                j := j + 1;
+            end while;
+        end if;
+        if mode = predVe then
+            let v0: Index := avg3(a, b, c);
+            let v1: Index := avg3(b, c, d);
+            let v2: Index := avg3(c, d, e);
+            let v3: Index := avg3(d, e, f);
+            fill4(&~work, y, x, v0, v1, v2, v3, v0, v1, v2, v3, v0, v1, v2, v3, v0, v1, v2, v3);
+        end if;
+        if mode = predHe then
+            let v0: Index := avg3(a, p, q);
+            let v1: Index := avg3(p, q, r);
+            let v2: Index := avg3(q, r, s);
+            let v3: Index := avg3(r, s, s);
+            fill4(&~work, y, x, v0, v0, v0, v0, v1, v1, v1, v1, v2, v2, v2, v2, v3, v3, v3, v3);
+        end if;
+        if mode = predRd then
+            let srq: Index := avg3(s, r, q);
+            let rqp: Index := avg3(r, q, p);
+            let qpa: Index := avg3(q, p, a);
+            let pab: Index := avg3(p, a, b);
+            let abc: Index := avg3(a, b, c);
+            let bcd: Index := avg3(b, c, d);
+            let cde: Index := avg3(c, d, e);
+            fill4(&~work, y, x, pab, abc, bcd, cde, qpa, pab, abc, bcd, rqp, qpa, pab, abc, srq, rqp, qpa, pab);
+        end if;
+        if mode = predVr then
+            let ab: Index := avg2(a, b);
+            let bc: Index := avg2(b, c);
+            let cd: Index := avg2(c, d);
+            let de: Index := avg2(d, e);
+            let rqp: Index := avg3(r, q, p);
+            let qpa: Index := avg3(q, p, a);
+            let pab: Index := avg3(p, a, b);
+            let abc: Index := avg3(a, b, c);
+            let bcd: Index := avg3(b, c, d);
+            let cde: Index := avg3(c, d, e);
+            fill4(&~work, y, x, ab, bc, cd, de, pab, abc, bcd, cde, qpa, ab, bc, cd, rqp, pab, abc, bcd);
+        end if;
+        if mode = predLd then
+            -- above from b: b c d e f g h k (Go's a..h)
+            let v0: Index := avg3(b, c, d);
+            let v1: Index := avg3(c, d, e);
+            let v2: Index := avg3(d, e, f);
+            let v3: Index := avg3(e, f, g);
+            let v4: Index := avg3(f, g, h);
+            let v5: Index := avg3(g, h, k);
+            let v6: Index := avg3(h, k, k);
+            fill4(&~work, y, x, v0, v1, v2, v3, v1, v2, v3, v4, v2, v3, v4, v5, v3, v4, v5, v6);
+        end if;
+        if mode = predVl then
+            let ab: Index := avg2(b, c);
+            let bc: Index := avg2(c, d);
+            let cd: Index := avg2(d, e);
+            let de: Index := avg2(e, f);
+            let abc: Index := avg3(b, c, d);
+            let bcd: Index := avg3(c, d, e);
+            let cde: Index := avg3(d, e, f);
+            let def: Index := avg3(e, f, g);
+            let efg: Index := avg3(f, g, h);
+            let fgh: Index := avg3(g, h, k);
+            fill4(&~work, y, x, ab, bc, cd, de, abc, bcd, cde, def, bc, cd, de, efg, bcd, cde, def, fgh);
+        end if;
+        if mode = predHd then
+            let sr: Index := avg2(s, r);
+            let rq: Index := avg2(r, q);
+            let qp: Index := avg2(q, p);
+            let pa: Index := avg2(p, a);
+            let srq: Index := avg3(s, r, q);
+            let rqp: Index := avg3(r, q, p);
+            let qpa: Index := avg3(q, p, a);
+            let pab: Index := avg3(p, a, b);
+            let abc: Index := avg3(a, b, c);
+            let bcd: Index := avg3(b, c, d);
+            fill4(&~work, y, x, pa, pab, abc, bcd, qp, qpa, pa, pab, rq, rqp, qp, qpa, sr, srq, rq, rqp);
+        end if;
+        if mode = predHu then
+            let pq: Index := avg2(p, q);
+            let qr: Index := avg2(q, r);
+            let rs: Index := avg2(r, s);
+            let pqr: Index := avg3(p, q, r);
+            let qrs: Index := avg3(q, r, s);
+            let rss: Index := avg3(r, s, s);
+            fill4(&~work, y, x, pq, pqr, qr, qrs, qr, qrs, rs, rss, rs, rss, s, s, s, s, s, s);
+        end if;
+        return nil;
+    end;
+
+    generic [W: Region]
+    function fill4(work: &![Buffer[Index], W], y: Index, x: Index, v00: Index, v01: Index, v02: Index, v03: Index,
+                   v10: Index, v11: Index, v12: Index, v13: Index, v20: Index, v21: Index, v22: Index, v23: Index,
+                   v30: Index, v31: Index, v32: Index, v33: Index): Unit is
+        put(&~work, y, x, v00);
+        put(&~work, y, x + 1, v01);
+        put(&~work, y, x + 2, v02);
+        put(&~work, y, x + 3, v03);
+        put(&~work, y + 1, x, v10);
+        put(&~work, y + 1, x + 1, v11);
+        put(&~work, y + 1, x + 2, v12);
+        put(&~work, y + 1, x + 3, v13);
+        put(&~work, y + 2, x, v20);
+        put(&~work, y + 2, x + 1, v21);
+        put(&~work, y + 2, x + 2, v22);
+        put(&~work, y + 2, x + 3, v23);
+        put(&~work, y + 3, x, v30);
+        put(&~work, y + 3, x + 1, v31);
+        put(&~work, y + 3, x + 2, v32);
+        put(&~work, y + 3, x + 3, v33);
+        return nil;
+    end;
+
+    ---
+    --- The loop filter (RFC 6386 15, as Go filters)
+    ---
+
+    generic [L: Region]
+    function sample(plane: &![Buffer[Nat8], L], at: Index): Int64 is
+        return signed(wide(nth(&plane, at)));
+    end;
+
+    generic [L: Region]
+    function setSample(plane: &![Buffer[Nat8], L], at: Index, v: Int64): Unit is
+        storeNth(&~plane, at, narrow(clip255(v)));
+        return nil;
+    end;
+
+    -- Whether the edge between p0 and q0 is below level.
+    function edgeBelow(p1: Int64, p0: Int64, q0: Int64, q1: Int64, level: Index): Bool is
+        let mark: Int64 := (absolute(p0 - q0) * (2 : Int64)) + shift(absolute(p1 - q1), 1);
+        return mark <= signed(level);
+    end;
+
+    -- The filter of 2 pixels on n positions from at.
+    generic [L: Region]
+    function filter2(plane: &![Buffer[Nat8], L], n: Index, level: Index, at: Index, along: Index, across: Index): Unit is
+        var k: Index := 0;
+        var i: Index := at;
+        while k < n do
+            let p1: Int64 := sample(&~plane, i - (across * 2));
+            let p0: Int64 := sample(&~plane, i - across);
+            let q0: Int64 := sample(&~plane, i);
+            let q1: Int64 := sample(&~plane, i + across);
+            if edgeBelow(p1, p0, q0, q1, level) then
+                let a: Int64 := ((q0 - p0) * (3 : Int64)) + clamp(p1 - q1, (-128 : Int64), (127 : Int64));
+                let a1: Int64 := clamp(shift(a + (4 : Int64), 3), (-16 : Int64), (15 : Int64));
+                let a2: Int64 := clamp(shift(a + (3 : Int64), 3), (-16 : Int64), (15 : Int64));
+                setSample(&~plane, i - across, p0 + a2);
+                setSample(&~plane, i, q0 - a1);
+            end if;
+            k := k + 1;
+            i := i + along;
+        end while;
+        return nil;
+    end;
+
+    -- The filter of 2, 4 or 6 pixels on n positions from at.
+    generic [L: Region]
+    function filter246(plane: &![Buffer[Nat8], L], n: Index, level: Index, innerLevel: Index, variance: Index,
+                       at: Index, along: Index, across: Index, four: Bool): Unit is
+        let il: Int64 := signed(innerLevel);
+        let hl: Int64 := signed(variance);
+        var k: Index := 0;
+        var i: Index := at;
+        while k < n do
+            let p3: Int64 := sample(&~plane, i - (across * 4));
+            let p2: Int64 := sample(&~plane, i - (across * 3));
+            let p1: Int64 := sample(&~plane, i - (across * 2));
+            let p0: Int64 := sample(&~plane, i - across);
+            let q0: Int64 := sample(&~plane, i);
+            let q1: Int64 := sample(&~plane, i + across);
+            let q2: Int64 := sample(&~plane, i + (across * 2));
+            let q3: Int64 := sample(&~plane, i + (across * 3));
+            var filtering: Bool := edgeBelow(p1, p0, q0, q1, level);
+            if filtering then
+                let steep: Bool := ((absolute(p3 - p2) > il) or (absolute(p2 - p1) > il)) or (absolute(p1 - p0) > il);
+                let steepQ: Bool := ((absolute(q1 - q0) > il) or (absolute(q2 - q1) > il)) or (absolute(q3 - q2) > il);
+                if steep or steepQ then
+                    filtering := false;
+                end if;
+            end if;
+            if filtering then
+                if (absolute(p1 - p0) > hl) or (absolute(q1 - q0) > hl) then
+                    let a: Int64 := ((q0 - p0) * (3 : Int64)) + clamp(p1 - q1, (-128 : Int64), (127 : Int64));
+                    let a1: Int64 := clamp(shift(a + (4 : Int64), 3), (-16 : Int64), (15 : Int64));
+                    let a2: Int64 := clamp(shift(a + (3 : Int64), 3), (-16 : Int64), (15 : Int64));
+                    setSample(&~plane, i - across, p0 + a2);
+                    setSample(&~plane, i, q0 - a1);
+                else
+                    if four then
+                        let a: Int64 := (q0 - p0) * (3 : Int64);
+                        let a1: Int64 := clamp(shift(a + (4 : Int64), 3), (-16 : Int64), (15 : Int64));
+                        let a2: Int64 := clamp(shift(a + (3 : Int64), 3), (-16 : Int64), (15 : Int64));
+                        let a3: Int64 := shift(a1 + (1 : Int64), 1);
+                        setSample(&~plane, i - (across * 2), p1 + a3);
+                        setSample(&~plane, i - across, p0 + a2);
+                        setSample(&~plane, i, q0 - a1);
+                        setSample(&~plane, i + across, q1 - a3);
+                    else
+                        let a: Int64 := clamp(((q0 - p0) * (3 : Int64)) + clamp(p1 - q1, (-128 : Int64), (127 : Int64)), (-128 : Int64), (127 : Int64));
+                        let a1: Int64 := shift((a * (27 : Int64)) + (63 : Int64), 7);
+                        let a2: Int64 := shift((a * (18 : Int64)) + (63 : Int64), 7);
+                        let a3: Int64 := shift((a * (9 : Int64)) + (63 : Int64), 7);
+                        setSample(&~plane, i - (across * 3), p2 + a3);
+                        setSample(&~plane, i - (across * 2), p1 + a2);
+                        setSample(&~plane, i - across, p0 + a1);
+                        setSample(&~plane, i, q0 - a1);
+                        setSample(&~plane, i + across, q1 - a2);
+                        setSample(&~plane, i + (across * 2), q2 - a3);
+                    end if;
+                end if;
+            end if;
+            k := k + 1;
+            i := i + along;
+        end while;
+        return nil;
+    end;
+
+    generic [H: Region, F: Region, Y: Region, U: Region, V: Region]
+    function loopFilter(head: &[Buffer[Index], H], filters: &[Buffer[Index], F], planeY: &![Buffer[Nat8], Y],
+                        planeU: &![Buffer[Nat8], U], planeV: &![Buffer[Nat8], V]): Unit is
+        let across: Index := nth(head, acrossAt);
+        let down: Index := nth(head, downAt);
+        let strideY: Index := across * 16;
+        let strideC: Index := across * 8;
+        let simple: Bool := nth(head, simpleAt) = 1;
+        var mby: Index := 0;
+        while mby < down do
+            var mbx: Index := 0;
+            while mbx < across do
+                let at: Index := ((mby * across) + mbx) * 4;
+                let level: Index := nth(filters, at);
+                if level > 0 then
+                    let il: Index := nth(filters, at + 1);
+                    let hl: Index := nth(filters, at + 2);
+                    let inner: Bool := nth(filters, at + 3) = 1;
+                    let y: Index := ((mby * strideY) + mbx) * 16;
+                    let c: Index := ((mby * strideC) + mbx) * 8;
+                    if simple then
+                        if mbx > 0 then
+                            filter2(&~planeY, 16, level + 4, y, strideY, 1);
+                        end if;
+                        if inner then
+                            filter2(&~planeY, 16, level, y + 4, strideY, 1);
+                            filter2(&~planeY, 16, level, y + 8, strideY, 1);
+                            filter2(&~planeY, 16, level, y + 12, strideY, 1);
+                        end if;
+                        if mby > 0 then
+                            filter2(&~planeY, 16, level + 4, y, 1, strideY);
+                        end if;
+                        if inner then
+                            filter2(&~planeY, 16, level, y + (strideY * 4), 1, strideY);
+                            filter2(&~planeY, 16, level, y + (strideY * 8), 1, strideY);
+                            filter2(&~planeY, 16, level, y + (strideY * 12), 1, strideY);
+                        end if;
+                    else
+                        if mbx > 0 then
+                            filter246(&~planeY, 16, level + 4, il, hl, y, strideY, 1, false);
+                            filter246(&~planeU, 8, level + 4, il, hl, c, strideC, 1, false);
+                            filter246(&~planeV, 8, level + 4, il, hl, c, strideC, 1, false);
+                        end if;
+                        if inner then
+                            filter246(&~planeY, 16, level, il, hl, y + 4, strideY, 1, true);
+                            filter246(&~planeY, 16, level, il, hl, y + 8, strideY, 1, true);
+                            filter246(&~planeY, 16, level, il, hl, y + 12, strideY, 1, true);
+                            filter246(&~planeU, 8, level, il, hl, c + 4, strideC, 1, true);
+                            filter246(&~planeV, 8, level, il, hl, c + 4, strideC, 1, true);
+                        end if;
+                        if mby > 0 then
+                            filter246(&~planeY, 16, level + 4, il, hl, y, 1, strideY, false);
+                            filter246(&~planeU, 8, level + 4, il, hl, c, 1, strideC, false);
+                            filter246(&~planeV, 8, level + 4, il, hl, c, 1, strideC, false);
+                        end if;
+                        if inner then
+                            filter246(&~planeY, 16, level, il, hl, y + (strideY * 4), 1, strideY, true);
+                            filter246(&~planeY, 16, level, il, hl, y + (strideY * 8), 1, strideY, true);
+                            filter246(&~planeY, 16, level, il, hl, y + (strideY * 12), 1, strideY, true);
+                            filter246(&~planeU, 8, level, il, hl, c + (strideC * 4), 1, strideC, true);
+                            filter246(&~planeV, 8, level, il, hl, c + (strideC * 4), 1, strideC, true);
+                        end if;
+                    end if;
+                end if;
+                mbx := mbx + 1;
+            end while;
+            mby := mby + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Colours (libwebp's fancy upsampling and YUV to RGB)
+    ---
+
+    -- (v times c) shifted right by 8, as libwebp's MultHi.
+    function multHigh(v: Index, c: Index): Index is
+        return (v * c) / 256;
+    end;
+
+    -- libwebp's VP8Clip8 of base + plus - minus: 0 below 0, 255 at 16384
+    -- and above, else shifted right by 6.
+    function clip8(base: Index, plus: Index, minus: Index): Nat8 is
+        let sum: Index := base + plus;
+        if sum < minus then
+            return 0;
+        end if;
+        let v: Index := sum - minus;
+        if v >= 16384 then
+            return 255;
+        end if;
+        return narrow(v / 64);
+    end;
+
+    -- The pixels of the planes: each pair of rows with the chroma rows
+    -- above and below them, weighted 9, 3, 3, 1 (libwebp's
+    -- UpsampleRgbLinePair), the first row and an even last one alone.
+    generic [Y: Region, U: Region, V: Region]
+    function rgb(planeY: &[Buffer[Nat8], Y], planeU: &[Buffer[Nat8], U], planeV: &[Buffer[Nat8], V], width: Index,
+                 height: Index, across: Index): String is
+        let strideY: Index := across * 16;
+        let strideC: Index := across * 8;
+        var out: Buffer[Nat8] := initialize((width * height) * 3, (0 : Nat8));
+        -- the first row: its chroma row as above and below
+        pairRow(planeY, planeU, planeV, &!out, width, strideY, strideC, 0, 0, 0, height, true);
+        var k: Index := 1;
+        while ((k * 2) - 1) < height do
+            pairRow(planeY, planeU, planeV, &!out, width, strideY, strideC, (k * 2) - 1, k - 1, k, height, false);
+            k := k + 1;
+        end while;
+        var text: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < ((width * height) * 3) do
+            writeByte(&!text, nth(&out, i));
+            i := i + 1;
+        end while;
+        destroyFree(out);
+        return finalize(text);
+    end;
+
+    -- The row top (and top + 1 when it is in the picture and not alone)
+    -- with chroma rows above and below.
+    generic [Y: Region, U: Region, V: Region, O: Region]
+    function pairRow(planeY: &[Buffer[Nat8], Y], planeU: &[Buffer[Nat8], U], planeV: &[Buffer[Nat8], V],
+                     out: &![Buffer[Nat8], O], width: Index, strideY: Index, strideC: Index, top: Index,
+                     above: Index, below: Index, height: Index, alone: Bool): Unit is
+        let bottom: Index := top + 1;
+        let withBottom: Bool := (not alone) and (bottom < height);
+        var lastBelow: Index := below;
+        if not withBottom then
+            -- an even last row alone: its chroma row as above and below
+            lastBelow := above;
+        end if;
+        var x: Index := 0;
+        while x < width do
+            let i: Index := x / 2;
+            -- the chroma columns left and right of the pixel
+            var near: Index := i;
+            var far: Index := i;
+            if bitwiseAnd(x, (1 : Index)) = 1 then
+                if (i + 1) < ((width + 1) / 2) then
+                    far := i + 1;
+                end if;
+            else
+                if i > 0 then
+                    far := i - 1;
+                end if;
+            end if;
+            let topU: Index := mix(planeU, strideC, above, lastBelow, near, far, x, width);
+            let topV: Index := mix(planeV, strideC, above, lastBelow, near, far, x, width);
+            convert(&~out, (((top * width) + x) * 3), wide(nth(planeY, (top * strideY) + x)), topU, topV);
+            if withBottom then
+                let bottomU: Index := mix(planeU, strideC, below, above, near, far, x, width);
+                let bottomV: Index := mix(planeV, strideC, below, above, near, far, x, width);
+                convert(&~out, (((bottom * width) + x) * 3), wide(nth(planeY, (bottom * strideY) + x)), bottomU, bottomV);
+            end if;
+            x := x + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The chroma of a pixel from the rows near (3 parts) and far (1 part)
+    -- and the columns nearColumn and farColumn, rounded as libwebp rounds.
+    generic [C: Region]
+    function mix(plane: &[Buffer[Nat8], C], stride: Index, nearRow: Index, farRow: Index, nearColumn: Index,
+                 farColumn: Index, x: Index, width: Index): Index is
+        let a: Index := wide(nth(plane, (nearRow * stride) + nearColumn));
+        let b: Index := wide(nth(plane, (nearRow * stride) + farColumn));
+        let c: Index := wide(nth(plane, (farRow * stride) + nearColumn));
+        let d: Index := wide(nth(plane, (farRow * stride) + farColumn));
+        let lastPair: Index := (width - 1) / 2;
+        let i: Index := x / 2;
+        let edge: Bool := (x = 0) or (((bitwiseAnd(x, (1 : Index)) = 1) and ((i + 1) > lastPair)) and (bitwiseAnd(width, (1 : Index)) = 0));
+        if edge or (nearColumn = farColumn) then
+            -- the first column, and the last of an even width: rows only
+            return (((a * 3) + c) + 2) / 4;
+        end if;
+        -- libwebp: avg = a + b + c + d + 8, diagonal = (avg + 2 (b + c)) / 8,
+        -- the pixel (diagonal + a) / 2
+        let average: Index := (((a + b) + (c + d)) + 8);
+        let diagonal: Index := (average + ((b + c) * 2)) / 8;
+        return (diagonal + a) / 2;
+    end;
+
+    -- y, u, v as red, green and blue into out at at (libwebp's
+    -- VP8YuvToRgb).
+    generic [O: Region]
+    function convert(out: &![Buffer[Nat8], O], at: Index, y: Index, u: Index, v: Index): Unit is
+        let luma: Index := multHigh(y, 19077);
+        storeNth(&~out, at, clip8(luma, multHigh(v, 26149), 14234));
+        storeNth(&~out, at + 1, clip8(luma + 8708, 0, multHigh(u, 6419) + multHigh(v, 13320)));
+        storeNth(&~out, at + 2, clip8(luma, multHigh(u, 33050), 17685));
+        return nil;
+    end;
+
+    -- width by height of the plane of stride samples a row.
+    generic [L: Region]
+    function cropped(plane: &[Buffer[Nat8], L], stride: Index, width: Index, height: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var y: Index := 0;
+        while y < height do
+            var x: Index := 0;
+            while x < width do
+                writeByte(&!out, nth(plane, (y * stride) + x));
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function vp8Luma(picture: &[Vp8Picture, P]): Span[Nat8, P] is
+        return asSpan(&(picture->luma));
+    end;
+
+    generic [P: Region]
+    function vp8Blue(picture: &[Vp8Picture, P]): Span[Nat8, P] is
+        return asSpan(&(picture->blue));
+    end;
+
+    generic [P: Region]
+    function vp8Red(picture: &[Vp8Picture, P]): Span[Nat8, P] is
+        return asSpan(&(picture->red));
+    end;
+
+    generic [P: Region]
+    function vp8Width(picture: &[Vp8Picture, P]): Index is
+        return picture->width;
+    end;
+
+    generic [P: Region]
+    function vp8Height(picture: &[Vp8Picture, P]): Index is
+        return picture->height;
+    end;
+
+    generic [P: Region]
+    function vp8Pixels(picture: &[Vp8Picture, P]): Span[Nat8, P] is
+        return asSpan(&(picture->pixels));
+    end;
+
+    function destroyVp8(picture: Vp8Picture): Unit is
+        let { width as w: Index, height as h: Index, pixels as p: String, luma as y: String, blue as u: String,
+              red as v: String } := picture;
+        destroyString(p);
+        destroyString(y);
+        destroyString(u);
+        destroyString(v);
+        return nil;
+    end;
+end module body.

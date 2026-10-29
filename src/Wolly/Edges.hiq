@@ -1,0 +1,488 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Wolly.Limit: every statement is a
+-- constant, every value is bound, the table is strict.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    destroyFree
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Values,
+    noValues,
+    withInt64,
+    withText,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+import Standard.Graph (
+    Graph,
+    NodeId,
+    EdgeId,
+    NoPath,
+    makeGraph,
+    addNode,
+    addEdge as addGraphEdge,
+    edgeSource,
+    edgeTarget,
+    nodeValue,
+    lightestPath,
+    shortestPath,
+    findCycle,
+    destroyFree as destroyGraph
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.Edges is
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_edges (source TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL, weight INTEGER NOT NULL CHECK (weight >= 0), PRIMARY KEY (source, target, kind)) STRICT";
+    constant makeTablePg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_edges (source TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL, weight BIGINT NOT NULL CHECK (weight >= 0), PRIMARY KEY (source, target, kind))";
+    constant makeIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_edges_target ON wolly_edges (target, kind)";
+    constant putEdge: Span[Nat8, Static] := "INSERT INTO wolly_edges (source, target, kind, weight) VALUES (?, ?, ?, ?) ON CONFLICT (source, target, kind) DO UPDATE SET weight = excluded.weight";
+    constant dropEdge: Span[Nat8, Static] := "DELETE FROM wolly_edges WHERE source = ? AND target = ? AND kind = ?";
+    -- UNION, not UNION ALL: a node found again is not walked again, so a
+    -- cycle ends the recursion.  The LIMIT bounds it in any case.
+    constant downwards: Span[Nat8, Static] := "WITH RECURSIVE r(node) AS (SELECT target FROM wolly_edges WHERE source = ? AND kind = ? UNION SELECT e.target FROM wolly_edges e JOIN r ON e.source = r.node WHERE e.kind = ? LIMIT 10000) SELECT node FROM r ORDER BY node";
+    constant downwardsPg: Span[Nat8, Static] := "WITH RECURSIVE r(node) AS (SELECT target FROM wolly_edges WHERE source = ? AND kind = ? UNION SELECT e.target FROM wolly_edges e JOIN r ON e.source = r.node WHERE e.kind = ?) SELECT node FROM r ORDER BY node LIMIT 10000";
+    constant upwards: Span[Nat8, Static] := "WITH RECURSIVE r(node) AS (SELECT source FROM wolly_edges WHERE target = ? AND kind = ? UNION SELECT e.source FROM wolly_edges e JOIN r ON e.target = r.node WHERE e.kind = ? LIMIT 10000) SELECT node FROM r ORDER BY node";
+    constant upwardsPg: Span[Nat8, Static] := "WITH RECURSIVE r(node) AS (SELECT source FROM wolly_edges WHERE target = ? AND kind = ? UNION SELECT e.source FROM wolly_edges e JOIN r ON e.target = r.node WHERE e.kind = ?) SELECT node FROM r ORDER BY node LIMIT 10000";
+    -- The nodes of a kind numbered from 0 in the order of their names: the
+    -- slots of the graph that is loaded.
+    constant countNodes: Span[Nat8, Static] := "SELECT count(*) FROM (SELECT source FROM wolly_edges WHERE kind = ? UNION SELECT target FROM wolly_edges WHERE kind = ?)";
+    constant loadEdges: Span[Nat8, Static] := "WITH n(name, pos) AS (SELECT name, row_number() OVER (ORDER BY name) - 1 FROM (SELECT source AS name FROM wolly_edges WHERE kind = ? UNION SELECT target FROM wolly_edges WHERE kind = ?)) SELECT s.pos, t.pos, e.weight FROM wolly_edges e JOIN n s ON s.name = e.source JOIN n t ON t.name = e.target WHERE e.kind = ? ORDER BY s.pos, t.pos";
+    constant positionOf: Span[Nat8, Static] := "WITH n(name, pos) AS (SELECT name, row_number() OVER (ORDER BY name) - 1 FROM (SELECT source AS name FROM wolly_edges WHERE kind = ? UNION SELECT target FROM wolly_edges WHERE kind = ?)) SELECT pos FROM n WHERE name = ?";
+    constant nameOf: Span[Nat8, Static] := "WITH n(name, pos) AS (SELECT name, row_number() OVER (ORDER BY name) - 1 FROM (SELECT source AS name FROM wolly_edges WHERE kind = ? UNION SELECT target FROM wolly_edges WHERE kind = ?)) SELECT name FROM n WHERE pos = ?";
+    constant unknown: Int64 := -1;
+
+    function mostNodes(): Int64 is
+        return 10000;
+    end;
+
+    generic [N: Region]
+    function isNodeName(name: Span[Nat8, N]): Bool is
+        if (spanLength(name) = 0) or (spanLength(name) > 128) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            let lower: Bool := (byte >= 'a') and (byte <= 'z');
+            let upper: Bool := (byte >= 'A') and (byte <= 'Z');
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let mark: Bool := (((byte = '.') or (byte = ':')) or (byte = '-')) or (byte = '_');
+            if not (((lower or upper) or digit) or mark) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function prepareEdges(db: &![Database[Writing], R]): Option[DbError] is
+        let makeTableSql: Span[Nat8, Static] := pick(&db, makeTable, makeTablePg);
+        case execute(&~db, makeTableSql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                case execute(&~db, makeIndex, noValues()) of
+                    when Left(left as failure: DbError) do
+                        return Some(value => failure);
+                    when Right(right as indexed: Nat64) do
+                        return None();
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, S: Region, T: Region, K: Region]
+    function addEdge(db: &![Database[Writing], R], source: Span[Nat8, S], target: Span[Nat8, T], kind: Span[Nat8, K],
+                     weight: Int64): Either[DbError, Bool] is
+        if not ((isNodeName(source) and isNodeName(target)) and isNodeName(kind)) then
+            return Right(right => false);
+        end if;
+        let values: Values := withInt64(withText(withText(withText(noValues(), source), target), kind), weight);
+        case execute(&~db, putEdge, values) of
+            when Right(right as changed: Nat64) do
+                return Right(right => true);
+            when Left(left as error: DbError) do
+                return Left(left => error);
+        end case;
+    end;
+
+    generic [R: Region, S: Region, T: Region, K: Region]
+    function removeEdge(db: &![Database[Writing], R], source: Span[Nat8, S], target: Span[Nat8, T],
+                        kind: Span[Nat8, K]): Either[DbError, Bool] is
+        case execute(&~db, dropEdge, withText(withText(withText(noValues(), source), target), kind)) of
+            when Right(right as changed: Nat64) do
+                let removed: Bool := changed > 0;
+                return Right(right => removed);
+            when Left(left as error: DbError) do
+                return Left(left => error);
+        end case;
+    end;
+
+    -- The first column of every row of sql, one a line.
+    generic [M: Free, R: Region]
+    function namesOf(db: &![Database[M], R], sql: Span[Nat8, Static], values: Values): Either[DbError, String] is
+        var cursor: Cursor := start(&~db, sql, values);
+        var out: StringBuilder := makeStringBuilder();
+        while advance(&!cursor) do
+            writeString(&!out, columnText(&cursor, 0));
+            writeByte(&!out, '\n');
+        end while;
+        let names: String := finalize(out);
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyString(names);
+                return Left(left => error);
+            when None do
+                return Right(right => names);
+        end case;
+    end;
+
+    generic [M: Free, R: Region, S: Region, K: Region]
+    function reachable(db: &![Database[M], R], origin: Span[Nat8, S], kind: Span[Nat8, K]): Either[DbError, String] is
+        let downwardsSql: Span[Nat8, Static] := pick(&db, downwards, downwardsPg);
+        return namesOf(&~db, downwardsSql, withText(withText(withText(noValues(), origin), kind), kind));
+    end;
+
+    generic [M: Free, R: Region, N: Region, K: Region]
+    function ancestors(db: &![Database[M], R], node: Span[Nat8, N], kind: Span[Nat8, K]): Either[DbError, String] is
+        let upwardsSql: Span[Nat8, Static] := pick(&db, upwards, upwardsPg);
+        return namesOf(&~db, upwardsSql, withText(withText(withText(noValues(), node), kind), kind));
+    end;
+
+    -- The one number sql gives with values, or unknown for no row.
+    generic [M: Free, R: Region]
+    function numberOf(db: &![Database[M], R], sql: Span[Nat8, Static], values: Values): Either[DbError, Int64] is
+        var cursor: Cursor := start(&~db, sql, values);
+        var number: Int64 := unknown;
+        if advance(&!cursor) then
+            number := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => number);
+        end case;
+    end;
+
+    -- The graph of the edges of kind, its node values their positions,
+    -- its edge values their weights, and the node of each position.
+    generic [M: Free, R: Region, K: Region, H: Region, J: Region]
+    function loaded(db: &![Database[M], R], kind: Span[Nat8, K], graph: &![Graph[Index, Nat64], H],
+                    ids: &![Buffer[NodeId], J]): Option[DbError] is
+        case numberOf(&~db, countNodes, withText(withText(noValues(), kind), kind)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as count: Int64) do
+                var i: Int64 := 0;
+                while i < count do
+                    case toIndex(i) of
+                        when Some(value as position: Index) do
+                            insertBack(&~ids, addNode(&~graph, position));
+                        when None do
+                            skip;
+                    end case;
+                    i := i + 1;
+                end while;
+        end case;
+        var cursor: Cursor := start(&~db, loadEdges, withText(withText(withText(noValues(), kind), kind), kind));
+        while advance(&!cursor) do
+            case toIndex(columnInt64(&cursor, 0)) of
+                when Some(value as sourceAt: Index) do
+                    case toIndex(columnInt64(&cursor, 1)) of
+                        when Some(value as targetAt: Index) do
+                            case toNat64(columnInt64(&cursor, 2)) of
+                                when Some(value as weight: Nat64) do
+                                    let known: Index := lengthMut(&~ids);
+                                    if (sourceAt < known) and (targetAt < known) then
+                                        let tail: NodeId := nthMut(&~ids, sourceAt);
+                                        let head: NodeId := nthMut(&~ids, targetAt);
+                                        let added: Either[Nat64, EdgeId] := addGraphEdge(&~graph, tail, head, weight);
+                                    end if;
+                                when None do
+                                    skip;
+                            end case;
+                        when None do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+        end while;
+        return finish(&~db, cursor);
+    end;
+
+    -- The node of name among the nodes of kind, None when it has no edge
+    -- of kind.
+    generic [M: Free, R: Region, N: Region, K: Region, H: Region]
+    function nodeOf(db: &![Database[M], R], kind: Span[Nat8, K], name: Span[Nat8, N], ids: &[Buffer[NodeId], H]): Either[DbError, Option[NodeId]] is
+        case numberOf(&~db, positionOf, withText(withText(withText(noValues(), kind), kind), name)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as position: Int64) do
+                let none: Option[NodeId] := None();
+                if position < 0 then
+                    return Right(right => none);
+                end if;
+                case toIndex(position) of
+                    when Some(value as at: Index) do
+                        if at < length(ids) then
+                            let found: Option[NodeId] := Some(value => nth(ids, at));
+                            return Right(right => found);
+                        else
+                            return Right(right => none);
+                        end if;
+                    when None do
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    -- Writes the name at position of the nodes of kind, and a line feed.
+    generic [M: Free, R: Region, K: Region, B: Region]
+    function writeName(db: &![Database[M], R], kind: Span[Nat8, K], position: Index, out: &![StringBuilder, B]): Option[DbError] is
+        case toInt64(position) of
+            when Some(value as at: Int64) do
+                case namesOf(&~db, nameOf, withInt64(withText(withText(noValues(), kind), kind), at)) of
+                    when Left(left as error: DbError) do
+                        return Some(value => error);
+                    when Right(right as name: String) do
+                        writeString(&~out, asSpan(&name));
+                        destroyString(name);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The names along edges, one a line: the source of the first, then the
+    -- target of each.
+    generic [M: Free, R: Region, K: Region, G: Region, E: Region]
+    function namesAlong(db: &![Database[M], R], kind: Span[Nat8, K], graph: &[Graph[Index, Nat64], G],
+                        edges: &[Buffer[EdgeId], E]): Either[DbError, String] is
+        var out: StringBuilder := makeStringBuilder();
+        var failed: Option[DbError] := None();
+        var i: Index := 0;
+        while i < length(edges) do
+            let edge: EdgeId := nth(edges, i);
+            if i = 0 then
+                case edgeSource(graph, edge) of
+                    when Some(value as first: NodeId) do
+                        case nodeValue(graph, first) of
+                            when Some(value as at: Index) do
+                                failed := writeName(&~db, kind, at, &!out);
+                            when None do
+                                skip;
+                        end case;
+                    when None do
+                        skip;
+                end case;
+            end if;
+            case edgeTarget(graph, edge) of
+                when Some(value as next: NodeId) do
+                    case nodeValue(graph, next) of
+                        when Some(value as at: Index) do
+                            failed := writeName(&~db, kind, at, &!out);
+                        when None do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        let names: String := finalize(out);
+        case failed of
+            when Some(value as error: DbError) do
+                destroyString(names);
+                return Left(left => error);
+            when None do
+                return Right(right => names);
+        end case;
+    end;
+
+    -- The route from origin to goal along edges of kind: the lightest when
+    -- weighted, else the one of fewest edges.  The graph and the node of
+    -- each position live here, so that the searches read them.
+    generic [M: Free, R: Region, S: Region, G: Region, K: Region]
+    function searched(db: &![Database[M], R], kind: Span[Nat8, K], origin: Span[Nat8, S], goal: Span[Nat8, G],
+                   weighted: Bool): Either[DbError, EdgeRoute] is
+        var graph: Graph[Index, Nat64] := makeGraph();
+        var ids: Buffer[NodeId] := allocateEmpty();
+        let failed: Option[DbError] := loaded(&~db, kind, &!graph, &!ids);
+        let fromNode: Either[DbError, Option[NodeId]] := nodeOf(&~db, kind, origin, &ids);
+        let toNode: Either[DbError, Option[NodeId]] := nodeOf(&~db, kind, goal, &ids);
+        destroyFree(ids);
+        let found: Either[DbError, EdgeRoute] := decided(&~db, kind, &graph, failed, fromNode, toNode, weighted);
+        destroyGraph(graph);
+        return found;
+    end;
+
+    generic [M: Free, R: Region, K: Region, H: Region]
+    function decided(db: &![Database[M], R], kind: Span[Nat8, K], graph: &[Graph[Index, Nat64], H], failed: Option[DbError],
+                     fromNode: Either[DbError, Option[NodeId]], toNode: Either[DbError, Option[NodeId]], weighted: Bool): Either[DbError, EdgeRoute] is
+        case failed of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        case fromNode of
+            when Left(left as fromError: DbError) do
+                return Left(left => fromError);
+            when Right(right as first: Option[NodeId]) do
+                case toNode of
+                    when Left(left as toError: DbError) do
+                        return Left(left => toError);
+                    when Right(right as last: Option[NodeId]) do
+                        case first of
+                            when Some(value as a: NodeId) do
+                                case last of
+                                    when Some(value as b: NodeId) do
+                                        return pathBetween(&~db, kind, graph, a, b, weighted);
+                                    when None do
+                                        let none: EdgeRoute := NoRoute();
+                                        return Right(right => none);
+                                end case;
+                            when None do
+                                let nothing: EdgeRoute := NoRoute();
+                                return Right(right => nothing);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [M: Free, R: Region, K: Region, H: Region]
+    function pathBetween(db: &![Database[M], R], kind: Span[Nat8, K], graph: &[Graph[Index, Nat64], H], a: NodeId, b: NodeId,
+                         weighted: Bool): Either[DbError, EdgeRoute] is
+        if weighted then
+            case lightestPath(graph, a, b) of
+                when Left(left as why: NoPath) do
+                    let none: EdgeRoute := NoRoute();
+                    return Right(right => none);
+                when Right(right as path: Pair[Nat64, Buffer[EdgeId]]) do
+                    let { first as weight: Nat64, second as edges: Buffer[EdgeId] } := path;
+                    let named: Either[DbError, String] := namesAlong(&~db, kind, graph, &edges);
+                    destroyFree(edges);
+                    return asRoute(named, weight);
+            end case;
+        else
+            case shortestPath(graph, a, b) of
+                when None do
+                    let nothing: EdgeRoute := NoRoute();
+                    return Right(right => nothing);
+                when Some(value as edges: Buffer[EdgeId]) do
+                    case toNat64(length(&edges)) of
+                        when Some(value as hops: Nat64) do
+                            let named: Either[DbError, String] := namesAlong(&~db, kind, graph, &edges);
+                            destroyFree(edges);
+                            return asRoute(named, hops);
+                        when None do
+                            destroyFree(edges);
+                            let neither: EdgeRoute := NoRoute();
+                            return Right(right => neither);
+                    end case;
+            end case;
+        end if;
+    end;
+
+    function asRoute(named: Either[DbError, String], weight: Nat64): Either[DbError, EdgeRoute] is
+        case named of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as nodes: String) do
+                let found: EdgeRoute := Found(weight => weight, nodes => nodes);
+                return Right(right => found);
+        end case;
+    end;
+
+    generic [M: Free, R: Region, S: Region, G: Region, K: Region]
+    function lightestRoute(db: &![Database[M], R], kind: Span[Nat8, K], origin: Span[Nat8, S],
+                           goal: Span[Nat8, G]): Either[DbError, EdgeRoute] is
+        return searched(&~db, kind, origin, goal, true);
+    end;
+
+    generic [M: Free, R: Region, S: Region, G: Region, K: Region]
+    function fewestEdges(db: &![Database[M], R], kind: Span[Nat8, K], origin: Span[Nat8, S],
+                         goal: Span[Nat8, G]): Either[DbError, EdgeRoute] is
+        return searched(&~db, kind, origin, goal, false);
+    end;
+
+    generic [M: Free, R: Region, K: Region]
+    function findCycleOf(db: &![Database[M], R], kind: Span[Nat8, K]): Either[DbError, Option[String]] is
+        var graph: Graph[Index, Nat64] := makeGraph();
+        var ids: Buffer[NodeId] := allocateEmpty();
+        let failed: Option[DbError] := loaded(&~db, kind, &!graph, &!ids);
+        destroyFree(ids);
+        case failed of
+            when Some(value as error: DbError) do
+                destroyGraph(graph);
+                return Left(left => error);
+            when None do
+                case findCycle(&graph) of
+                    when Some(value as edges: Buffer[EdgeId]) do
+                        let named: Either[DbError, String] := namesAlong(&~db, kind, &graph, &edges);
+                        destroyFree(edges);
+                        destroyGraph(graph);
+                        case named of
+                            when Left(left as failure: DbError) do
+                                return Left(left => failure);
+                            when Right(right as nodes: String) do
+                                let some: Option[String] := Some(value => nodes);
+                                return Right(right => some);
+                        end case;
+                    when None do
+                        destroyGraph(graph);
+                        return Right(right => None());
+                end case;
+        end case;
+    end;
+
+    function destroyRoute(route: EdgeRoute): Unit is
+        case route of
+            when NoRoute do
+                skip;
+            when Found(weight: Nat64, nodes: String) do
+                destroyString(nodes);
+        end case;
+        return nil;
+    end;
+end module body.

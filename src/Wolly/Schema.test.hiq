@@ -1,0 +1,171 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The tables of every module that keeps them, made in one database (SQLite in memory, or the test
+-- server of PostgreSQL, see Wolly.TestDb): all are made, and on PostgreSQL none has a column of the
+-- 32 bit type integer, which SQLite's INTEGER (64 bit) must not become there.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    start,
+    advance,
+    columnInt64,
+    finish,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Dialect (
+    pick
+);
+import Wolly.Auth (
+    AuthError,
+    prepareAuth
+);
+import Wolly.Bearer (
+    prepareTokens
+);
+import Wolly.Blob (
+    prepareBlobs
+);
+import Wolly.Cache (
+    prepareCache
+);
+import Wolly.Edges (
+    prepareEdges
+);
+import Wolly.Entity (
+    prepareEntities
+);
+import Wolly.FormGuard (
+    prepareFormGuard
+);
+import Wolly.Limit (
+    prepareLimits
+);
+import Wolly.LogTail (
+    prepareTail
+);
+import Wolly.Metrics (
+    prepareMetrics
+);
+import Wolly.Passkey (
+    preparePasskeys
+);
+import Wolly.Rambo (
+    prepareRambo
+);
+import Wolly.Role (
+    prepareRoles
+);
+import Wolly.SoundSearch (
+    prepareSounds
+);
+import Wolly.Totp (
+    prepareTotp
+);
+
+module body Wolly.Schema.Test is
+    function made(problem: Option[DbError], message: Span[Nat8, Static]): Unit is
+        case problem of
+            when Some(value as error: DbError) do
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    -- The number the statement counts, -1 when it fails.
+    generic [R: Region]
+    function counted(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Int64 is
+        var cursor: Cursor := start(&~db, sql, noValues());
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return 0 - 1;
+            when None do
+                return count;
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepareAll(db: &![Database[Writing], R]): Unit is
+        let prepareCacheDone: Option[DbError] := prepareCache(&~db);
+        made(prepareCacheDone, "the cache");
+        let prepareLimitsDone: Option[DbError] := prepareLimits(&~db);
+        made(prepareLimitsDone, "the limits");
+        let prepareTokensDone: Option[DbError] := prepareTokens(&~db);
+        made(prepareTokensDone, "the tokens");
+        let prepareRolesDone: Option[DbError] := prepareRoles(&~db);
+        made(prepareRolesDone, "the roles");
+        let prepareFormGuardDone: Option[DbError] := prepareFormGuard(&~db);
+        made(prepareFormGuardDone, "the form guard");
+        let prepareTotpDone: Option[DbError] := prepareTotp(&~db);
+        made(prepareTotpDone, "the second factors");
+        let prepareSoundsDone: Option[DbError] := prepareSounds(&~db);
+        made(prepareSoundsDone, "the sounds");
+        let prepareTailDone: Option[DbError] := prepareTail(&~db);
+        made(prepareTailDone, "the tail of a log");
+        let prepareEdgesDone: Option[DbError] := prepareEdges(&~db);
+        made(prepareEdgesDone, "the edges");
+        let prepareMetricsDone: Option[DbError] := prepareMetrics(&~db);
+        made(prepareMetricsDone, "the metrics");
+        let prepareBlobsDone: Option[DbError] := prepareBlobs(&~db);
+        made(prepareBlobsDone, "the blobs");
+        let prepareRamboDone: Option[DbError] := prepareRambo(&~db);
+        made(prepareRamboDone, "the logins at the identity provider");
+        let preparePasskeysDone: Option[DbError] := preparePasskeys(&~db);
+        made(preparePasskeysDone, "the passkeys");
+        let prepareEntitiesDone: Option[DbError] := prepareEntities(&~db);
+        made(prepareEntitiesDone, "the entities");
+        case prepareAuth(&~db) of
+            when Left(left as error: AuthError) do
+                assertTrue(false, "the users");
+            when Right(right as done: Unit) do
+                assertTrue(true, "the users");
+        end case;
+        return nil;
+    end;
+
+    function testTables(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                prepareAll(&!db);
+                let tables: Span[Nat8, Static] := pick(&db, "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'wolly\\_%' ESCAPE '\\'", "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'wolly\\_%'");
+                assertTrue(counted(&!db, tables) = 26, "the 26 tables of the modules");
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no test database");
+        end case;
+        return nil;
+    end;
+
+    function testNoThirtyTwoBitColumn(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                prepareAll(&!db);
+                let narrow: Span[Nat8, Static] := pick(&db, "SELECT 0", "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND data_type IN ('integer', 'smallint')");
+                assertTrue(counted(&!db, narrow) = 0, "no column of 32 bits or less on PostgreSQL");
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no test database");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,169 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Templates of Hilde's Jinja dialect for tenants, read from directories
+while the programme runs and rendered with a Wolly.ViewData: the run-time
+counterpart of @template, with the same syntax, the same refusals and the
+same escaping.
+
+An engine holds a list of directories, the tenant's first and the shared
+one after it, and looks for a name in each in turn; the functions a
+template may call and the catalogs it may translate with; and the
+templates it has loaded.  One engine serves one tenant, so nothing it
+keeps is another tenant's.
+
+Loading checks the whole template, and everything it extends, includes
+and imports, before anything is rendered: a mistake of the text is an
+error with the template's name and line then (Wolly.ViewCompile).  What
+only the data can tell is an error of the render, with the line: a name
+the data does not have, a value that cannot be printed (a list, a map, a
+missing value not asked with is none), a number where a text is asked,
+HTML outside HTML text.  Every error is a Left; nothing a template does
+stops the programme, and out gets a page only when it rendered whole.
+
+A loaded template is kept.  Standard.Watch reports a change of a file
+read or of a directory searched, and the next render drops all that was
+kept.  Where watching is not built, nothing is kept.
+
+A function is Fn[ViewData, Either[String, ViewData]]: its arguments come
+as a list, its result is the root of what it gives back, and a Left is an
+error of the render.  A catalog is the same kind of function, given a map
+with lang, key, count and arguments; it gives back the text.
+
+The limits of a render: mostLoopTurns turns of all loops, mostMadeBytes
+bytes of text made (kept or not), mostMadeNodes nodes given to functions
+and given back, mostComparedBytes bytes searched by in and |replace (the
+text and the part, since both search in linear time),
+mostOutputBytes
+bytes written.
+"""
+import Standard.String (
+    String
+);
+import Standard.StringBuilder (
+    StringBuilder
+);
+import Wolly.ViewData (
+    ViewData
+);
+
+module Wolly.View is
+    """
+    A template engine.  Linear: destroyViewEngine gives it back.
+    """
+    type ViewEngine: Linear;
+
+    """
+    The limits of a render: 1000000 turns of all loops together, 16 MiB
+    written.
+    """
+    function mostLoopTurns(): Index
+        ensures result = 1000000;
+    function mostOutputBytes(): Index
+        ensures result = 16777216;
+    function mostMadeBytes(): Index
+        ensures result = 67108864;
+    function mostMadeNodes(): Index
+        ensures result = 4194304;
+    function mostComparedBytes(): Index
+        ensures result = 67108864;
+
+    """
+    An engine without directories, functions or catalogs, with the
+    whitespace options off.
+    """
+    function makeViewEngine(): ViewEngine
+        ensures directoryCount(&result) = 0;
+
+    """
+    Gives the engine and all it keeps back.
+    No contract: nothing is left to ask.
+    """
+    function destroyViewEngine(engine: ViewEngine): Unit;
+
+    """
+    One more directory, searched after those added before.  What was kept
+    is dropped: a name may now be found elsewhere.
+    """
+    generic [R: Region, D: Region]
+    function addDirectory(engine: &![ViewEngine, R], directory: Span[Nat8, D]): Unit
+        ensures directoryCount(&engine) = (old(directoryCount(&engine)) + 1)
+        ensures keptViews(&engine) = 0;
+
+    """
+    How many directories the engine searches.
+    No contract: any number.
+    """
+    generic [R: Region]
+    function directoryCount(engine: &[ViewEngine, R]): Index;
+
+    """
+    A function a template may call by name; a name given twice keeps the
+    first.  What was kept is dropped, unless the name was given before.
+    No contract: which of the two happened is not asked cheaply.
+    """
+    generic [R: Region, N: Region]
+    function addFunction(engine: &![ViewEngine, R], name: Span[Nat8, N], callable: Fn[ViewData, Either[String, ViewData]]): Unit;
+
+    """
+    A catalog a template may name with {% catalog name %}.  What was kept is
+    dropped, unless the name was given before.
+    No contract: as addFunction.
+    """
+    generic [R: Region, N: Region]
+    function addCatalog(engine: &![ViewEngine, R], name: Span[Nat8, N], catalog: Fn[ViewData, Either[String, ViewData]]): Unit;
+
+    """
+    Jinja2's options trim_blocks and lstrip_blocks, for every template the
+    engine loads from now on.  What was kept is dropped.
+    """
+    generic [R: Region]
+    function setWhitespace(engine: &![ViewEngine, R], trimBlocks: Bool, lstripBlocks: Bool): Unit
+        ensures keptViews(&engine) = 0;
+
+    """
+    The template name loaded and checked, and kept; Left with the first
+    mistake.
+    No contract: it reads files.
+    """
+    generic [R: Region, N: Region]
+    function loadView(engine: &![ViewEngine, R], name: Span[Nat8, N]): Either[String, Unit];
+
+    """
+    The template name rendered with data into out.  Left with the first
+    error, of the load or of the render, and nothing written to out then.
+    No contract: it reads files.
+    """
+    generic [R: Region, N: Region, D: Region, B: Region]
+    function renderView(engine: &![ViewEngine, R], name: Span[Nat8, N], data: &[ViewData, D],
+        out: &![StringBuilder, B]): Either[String, Unit];
+
+    """
+    The page rendered inside the layout, as the Go templates the view
+    replaces render a page: the page loaded as if {% extends layout %} stood at its head, so that its
+    blocks fill the layout's.  As renderView otherwise.
+    No contract: it reads files.
+    """
+    generic [R: Region, P: Region, L: Region, D: Region, B: Region]
+    function renderPage(engine: &![ViewEngine, R], page: Span[Nat8, P], layout: Span[Nat8, L], data: &[ViewData, D],
+        out: &![StringBuilder, B]): Either[String, Unit];
+
+    """
+    How many templates the engine keeps loaded.
+    """
+    generic [R: Region]
+    function keptViews(engine: &[ViewEngine, R]): Index
+        ensures keepsViews(engine) or (result = 0);
+
+    """
+    Whether the engine keeps what it loads: where Standard.Watch is built.
+    A template whose files cannot all be watched is not kept even then.
+    No contract: a truth of the platform.
+    """
+    generic [R: Region]
+    function keepsViews(engine: &[ViewEngine, R]): Bool;
+end module.

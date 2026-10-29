@@ -1,0 +1,314 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each pixel of the result is the mean of the source pixels from x0 to
+-- before x1 and y0 to before y1, x0 = x * W / w and x1 = (x + 1) * W / w,
+-- at least one pixel wide: a box filter, in whole numbers.
+import Standard.String (
+    String,
+    destroyString,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Png (
+    Image,
+    PngColor,
+    PngError,
+    NotPng,
+    BadChecksum,
+    BadData,
+    Unsupported,
+    TooLarge,
+    bytesPerPixel,
+    makeImage,
+    imageWidth,
+    imageHeight,
+    imageColor,
+    imagePixels,
+    Rgb,
+    encodePng,
+    decodePng,
+    destroyImage
+);
+
+module body Wolly.Image is
+    constant sideMost: Index := 16000;
+    constant tries: Index := 8;
+
+    function mostSide(): Index is
+        return sideMost;
+    end;
+
+    function atMost(side: Index): Index is
+        if side > sideMost then
+            return sideMost;
+        end if;
+        return side;
+    end;
+
+    function fittedWidth(width: Index, height: Index, maxWidth: Index, maxHeight: Index): Index is
+        -- A side above sideMost counts as sideMost, so that no product of
+        -- two sides overflows; no image of Standard.Png that vacuumPng takes
+        -- has one.
+        var w: Index := atMost(width);
+        var h: Index := atMost(height);
+        let boxWidth: Index := atMost(maxWidth);
+        let boxHeight: Index := atMost(maxHeight);
+        if w > boxWidth then
+            h := (h * boxWidth) / w;
+            if h = 0 then
+                h := (1 : Index);
+            end if;
+            w := boxWidth;
+        end if;
+        if h > boxHeight then
+            w := (w * boxHeight) / h;
+            if w = 0 then
+                w := (1 : Index);
+            end if;
+        end if;
+        return w;
+    end;
+
+    function fittedHeight(width: Index, height: Index, maxWidth: Index, maxHeight: Index): Index is
+        -- A side above sideMost counts as sideMost, so that no product of
+        -- two sides overflows; no image of Standard.Png that vacuumPng takes
+        -- has one.
+        var w: Index := atMost(width);
+        var h: Index := atMost(height);
+        let boxWidth: Index := atMost(maxWidth);
+        let boxHeight: Index := atMost(maxHeight);
+        if w > boxWidth then
+            h := (h * boxWidth) / w;
+            if h = 0 then
+                h := (1 : Index);
+            end if;
+            w := boxWidth;
+        end if;
+        if h > boxHeight then
+            h := boxHeight;
+        end if;
+        return h;
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as number: Index) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 255;
+        end case;
+    end;
+
+    -- The pixels of image scaled to w by h, row after row.
+    generic [R: Region]
+    function scaled(image: &[Image, R], w: Index, h: Index): String is
+        let sourceWidth: Index := imageWidth(image);
+        let sourceHeight: Index := imageHeight(image);
+        let size: Index := bytesPerPixel(imageColor(image));
+        let source: Span[Nat8, R] := imagePixels(image);
+        var out: StringBuilder := makeStringBuilder();
+        var oy: Index := 0;
+        while oy < h do
+            let y0: Index := (oy * sourceHeight) / h;
+            var y1: Index := ((oy + 1) * sourceHeight) / h;
+            if y1 <= y0 then
+                y1 := y0 + 1;
+            end if;
+            var ox: Index := 0;
+            while ox < w do
+                let x0: Index := (ox * sourceWidth) / w;
+                var x1: Index := ((ox + 1) * sourceWidth) / w;
+                if x1 <= x0 then
+                    x1 := x0 + 1;
+                end if;
+                let count: Index := (x1 - x0) * (y1 - y0);
+                var c: Index := 0;
+                while c < size do
+                    var sum: Index := 0;
+                    var y: Index := y0;
+                    while y < y1 do
+                        var x: Index := x0;
+                        while x < x1 do
+                            sum := sum + wide(source[(((y * sourceWidth) + x) * size) + c]);
+                            x := x + 1;
+                        end while;
+                        y := y + 1;
+                    end while;
+                    writeByte(&!out, narrow(sum / count));
+                    c := c + 1;
+                end while;
+                ox := ox + 1;
+            end while;
+            oy := oy + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The PNG of image scaled to fit boxWidth by boxHeight; None when the
+    -- pixels make no image, which they always do.
+    generic [R: Region]
+    function written(image: &[Image, R], boxWidth: Index, boxHeight: Index): Option[String] is
+        let sourceWidth: Index := imageWidth(image);
+        let sourceHeight: Index := imageHeight(image);
+        let w: Index := fittedWidth(sourceWidth, sourceHeight, boxWidth, boxHeight);
+        let h: Index := fittedHeight(sourceWidth, sourceHeight, boxWidth, boxHeight);
+        let pixels: String := scaled(image, w, h);
+        case makeImage(w, h, imageColor(image), pixels) of
+            when Right(right as made: Image) do
+                let png: String := encodePng(&made);
+                destroyImage(made);
+                return Some(value => png);
+            when Left(left as back: String) do
+                destroyString(back);
+                return None();
+        end case;
+    end;
+
+    generic [R: Region]
+    function shrunk(image: &[Image, R], maxWidth: Index, maxHeight: Index, maxBytes: Index): Either[ImageError, String] is
+        var boxWidth: Index := maxWidth;
+        var boxHeight: Index := maxHeight;
+        var n: Index := 0;
+        while n <= tries do
+            case written(image, boxWidth, boxHeight) of
+                when None do
+                    return Left(left => NotAnImage());
+                when Some(value as png: String) do
+                    let fits: Bool := length(&png) <= maxBytes;
+                    if fits then
+                        return Right(right => png);
+                    else
+                        destroyString(png);
+                    end if;
+            end case;
+            let w: Index := fittedWidth(imageWidth(image), imageHeight(image), boxWidth, boxHeight);
+            let h: Index := fittedHeight(imageWidth(image), imageHeight(image), boxWidth, boxHeight);
+            boxWidth := (w * 3) / 4;
+            boxHeight := (h * 3) / 4;
+            if boxWidth = 0 then
+                boxWidth := (1 : Index);
+            end if;
+            if boxHeight = 0 then
+                boxHeight := (1 : Index);
+            end if;
+            n := n + 1;
+        end while;
+        return Left(left => ImageTooManyBytes());
+    end;
+
+    function pngOfRgb(width: Index, height: Index, pixels: String): Option[String] is
+        case makeImage(width, height, Rgb(), pixels) of
+            when Right(right as made: Image) do
+                let png: String := encodePng(&made);
+                destroyImage(made);
+                return Some(value => png);
+            when Left(left as back: String) do
+                destroyString(back);
+                return None();
+        end case;
+    end;
+
+    function imageErrorOf(error: PngError): ImageError is
+        case error of
+            when TooLarge do
+                return ImageTooLarge();
+            when NotPng do
+                return NotAnImage();
+            when BadChecksum do
+                return NotAnImage();
+            when BadData do
+                return NotAnImage();
+            when Unsupported do
+                return NotAnImage();
+        end case;
+    end;
+
+    -- The pixels of image as red, green and blue.
+    generic [R: Region]
+    function rgbOf(image: &[Image, R]): String is
+        let size: Index := bytesPerPixel(imageColor(image));
+        let source: Span[Nat8, R] := imagePixels(image);
+        let count: Index := imageWidth(image) * imageHeight(image);
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            let at: Index := i * size;
+            if size < 3 then
+                writeByte(&!out, source[at]);
+                writeByte(&!out, source[at]);
+                writeByte(&!out, source[at]);
+            else
+                writeByte(&!out, source[at]);
+                writeByte(&!out, source[at + 1]);
+                writeByte(&!out, source[at + 2]);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function rgbOfPng(data: Span[Nat8, R], maxPixels: Index): Either[ImageError, RgbImage] is
+        case decodePng(data, maxPixels) of
+            when Left(left as error: PngError) do
+                return Left(left => imageErrorOf(error));
+            when Right(right as image: Image) do
+                let made: RgbImage := RgbImage(width => imageWidth(&image), height => imageHeight(&image), pixels => rgbOf(&image));
+                destroyImage(image);
+                return Right(right => made);
+        end case;
+    end;
+
+    function destroyRgb(image: RgbImage): Unit is
+        let { width as w: Index, height as h: Index, pixels as p: String } := image;
+        destroyString(p);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function vacuumPng(data: Span[Nat8, R], maxPixels: Index, maxWidth: Index, maxHeight: Index, maxBytes: Index): Either[ImageError, String] is
+        case decodePng(data, maxPixels) of
+            when Left(left as error: PngError) do
+                case error of
+                    when TooLarge do
+                        return Left(left => ImageTooLarge());
+                    when NotPng do
+                        return Left(left => NotAnImage());
+                    when BadChecksum do
+                        return Left(left => NotAnImage());
+                    when BadData do
+                        return Left(left => NotAnImage());
+                    when Unsupported do
+                        return Left(left => NotAnImage());
+                end case;
+            when Right(right as image: Image) do
+                let tooWide: Bool := (imageWidth(&image) > sideMost) or (imageHeight(&image) > sideMost);
+                if tooWide then
+                    destroyImage(image);
+                    return Left(left => ImageTooLarge());
+                else
+                    let result: Either[ImageError, String] := shrunk(&image, maxWidth, maxHeight, maxBytes);
+                    destroyImage(image);
+                    return result;
+                end if;
+        end case;
+    end;
+end module body.

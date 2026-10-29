@@ -1,0 +1,148 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A CA, a machine under it and another CA with its own machine, made here;
+-- every check has a case that must fail beside the one that must pass.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Time (
+    wallNanos
+);
+import Wolly.Pki (
+    authorityDays,
+    machineDays,
+    newKey,
+    authorityCertificate,
+    issueMachine,
+    verifies,
+    fingerprint
+);
+
+module body Wolly.Pki.Test is
+    function now(): Int64 is
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                abort("the clock does not fit");
+                return 0;
+        end case;
+    end;
+
+    function isSome(value: Option[String]): Bool is
+        case value of
+            when Some(value as text: String) do
+                destroyString(text);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function testLimits(): Unit is
+        assertTrue(authorityDays() = 3650, "an authority: 10 years");
+        assertTrue(machineDays() = 825, "a machine: 825 days");
+        return nil;
+    end;
+
+    function testKeysAreNew(): Unit is
+        case newKey() of
+            when Some(value as a: String) do
+                case newKey() of
+                    when Some(value as b: String) do
+                        assertTrue(length(&a) > 100, "a key is PEM text");
+                        assertFalse(length(&a) = 0, "not empty");
+                        destroyString(b);
+                    when None do
+                        assertTrue(false, "a second key");
+                end case;
+                destroyString(a);
+            when None do
+                assertTrue(false, "a key");
+        end case;
+        return nil;
+    end;
+
+    function testChain(): Unit is
+        case newKey() of
+            when Some(value as caKey: String) do
+            case newKey() of
+            when Some(value as otherKey: String) do
+            case newKey() of
+            when Some(value as machineKey: String) do
+                assertFalse(isSome(authorityCertificate(asSpan(&caKey), "Test CA", 0)), "0 days refused");
+                assertFalse(isSome(authorityCertificate(asSpan(&caKey), "Test CA", authorityDays() + 1)), "one day too many refused");
+                assertFalse(isSome(authorityCertificate("not a key", "Test CA", 30)), "no key, no authority");
+                assertFalse(isSome(authorityCertificate(asSpan(&caKey), "", 30)), "no common name");
+                case authorityCertificate(asSpan(&caKey), "Test CA", authorityDays()) of
+                when Some(value as ca: String) do
+                case authorityCertificate(asSpan(&otherKey), "Other CA", 30) of
+                when Some(value as other: String) do
+                    assertFalse(isSome(issueMachine(asSpan(&ca), asSpan(&caKey), asSpan(&machineKey), "m1", "m1.example.org", 0)), "0 days refused");
+                    assertFalse(isSome(issueMachine(asSpan(&ca), asSpan(&caKey), asSpan(&machineKey), "m1", "m1.example.org", machineDays() + 1)), "826 days refused");
+                    assertFalse(isSome(issueMachine(asSpan(&ca), asSpan(&otherKey), asSpan(&machineKey), "m1", "m1.example.org", 30)), "a key that is not the authority's");
+                    assertFalse(isSome(issueMachine(asSpan(&ca), asSpan(&caKey), asSpan(&machineKey), "m1", "bad name", 30)), "a name that is no name");
+                    case issueMachine(asSpan(&ca), asSpan(&caKey), asSpan(&machineKey), "m1", "m1.example.org", machineDays()) of
+                    when Some(value as machine: String) do
+                        assertFalse(isSome(issueMachine(asSpan(&machine), asSpan(&machineKey), asSpan(&machineKey), "m2", "", 30)), "a machine is no authority");
+                        let at: Int64 := now();
+                        assertTrue(verifies(asSpan(&machine), asSpan(&ca), "m1.example.org", at), "the machine verifies for its name");
+                        assertTrue(verifies(asSpan(&machine), asSpan(&ca), "", at), "and without a name");
+                        assertFalse(verifies(asSpan(&machine), asSpan(&ca), "m2.example.org", at), "not for another name");
+                        assertFalse(verifies(asSpan(&machine), asSpan(&other), "", at), "not under another authority");
+                        assertFalse(verifies(asSpan(&machine), asSpan(&ca), "", at + 71366400), "not after its 825 days");
+                        assertFalse(verifies(asSpan(&machine), asSpan(&ca), "", at - 86400), "not before it begins");
+                        assertFalse(verifies("not a certificate", asSpan(&ca), "", at), "no certificate");
+                        case fingerprint(asSpan(&machine)) of
+                        when Some(value as print: String) do
+                            assertTrue(length(&print) = 64, "a SHA-256 in hex");
+                            case fingerprint(asSpan(&ca)) of
+                            when Some(value as caPrint: String) do
+                                assertTrue(length(&caPrint) = 64, "the authority has one too");
+                                destroyString(caPrint);
+                            when None do
+                                assertTrue(false, "a fingerprint of the authority");
+                            end case;
+                            destroyString(print);
+                        when None do
+                            assertTrue(false, "a fingerprint");
+                        end case;
+                        assertFalse(isSome(fingerprint("nothing")), "no fingerprint of no certificate");
+                        destroyString(machine);
+                    when None do
+                        assertTrue(false, "a machine certificate");
+                    end case;
+                    destroyString(other);
+                when None do
+                    assertTrue(false, "the other authority");
+                end case;
+                destroyString(ca);
+                when None do
+                    assertTrue(false, "an authority");
+                end case;
+                destroyString(machineKey);
+            when None do
+                assertTrue(false, "a machine key");
+            end case;
+                destroyString(otherKey);
+            when None do
+                assertTrue(false, "another key");
+            end case;
+                destroyString(caKey);
+            when None do
+                assertTrue(false, "a CA key");
+        end case;
+        return nil;
+    end;
+end module body.

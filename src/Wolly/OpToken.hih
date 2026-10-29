@@ -1,0 +1,191 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The JSON an OpenID provider writes, member for member as an earlier
+provider written in Go writes it, and the small checks of an authorization request.
+
+Claims stand in the order iss, sub, aud, exp, iat, nbf, jti, client_id,
+azp, auth_time, sid, scope, amr, nonce, email, name, roles; an empty text,
+a zero and an empty list are left out, and aud is a text when it holds one
+value.  The discovery document has its members sorted by name.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Wolly.OpToken is
+    """
+    The typ of an ID token and of an access token.
+    """
+    function idTokenType(): Span[Nat8, Static]
+        ensures spanLength(result) = 3;
+
+    function accessTokenType(): Span[Nat8, Static]
+        ensures spanLength(result) = 6;
+
+    """
+    Whether text is a state: 1 to 512 bytes of printable ASCII without a
+    blank.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Region]
+    function isState(text: Span[Nat8, T]): Bool;
+
+    """
+    Whether text is a code verifier or an S256 challenge: 43 to 128 bytes of
+    letters, digits and - . _ ~ (RFC 7636, section 4.1).
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Region]
+    function isVerifier(text: Span[Nat8, T]): Bool;
+
+    """
+    The S256 challenge of verifier: the base64url of its SHA-256 (RFC 7636,
+    section 4.2), 43 characters.
+    """
+    generic [V: Region]
+    function s256(verifier: Span[Nat8, V]): String
+        ensures length(&result) = 43;
+
+    """
+    Whether verifier is a verifier and its S256 challenge is challenge,
+    compared in constant time.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [V: Region, C: Region]
+    function pkceHolds(verifier: Span[Nat8, V], challenge: Span[Nat8, C]): Bool;
+
+    """
+    The scope of text in a fixed order: openid, then email and profile when
+    named.  None when a scope is unknown or openid is missing.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function normalScope(text: Span[Nat8, T]): Option[String];
+
+    """
+    Whether the blank-separated scope names name.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [S: Region, N: Region]
+    function scopeHas(scope: Span[Nat8, S], name: Span[Nat8, N]): Bool;
+
+    """
+    What an ID token says.
+    """
+    record IdClaims: Linear is
+        issuer: String;
+        subject: String;
+        clientId: String;
+        issuedAt: Int64;
+        expiry: Int64;
+        authTime: Int64;
+        sessionId: String;
+        amr: String;
+        nonce: String;
+        email: String;
+        name: String;
+        roles: Buffer[String];
+    end;
+
+    """
+    Frees claims.
+    No contract: it only frees.
+    """
+    function destroyIdClaims(claims: IdClaims): Unit;
+
+    """
+    The payload of an ID token of claims: aud and azp the client, amr the
+    blank-separated methods as a list.
+    """
+    generic [C: Region]
+    function idTokenPayload(claims: &[IdClaims, C]): String
+        ensures length(&result) > 0;
+
+    """
+    What an access token says.  authTime is 0 and sessionId empty for a
+    token of a machine.
+    """
+    record AccessClaims: Linear is
+        issuer: String;
+        subject: String;
+        audience: Buffer[String];
+        clientId: String;
+        issuedAt: Int64;
+        expiry: Int64;
+        tokenId: String;
+        authTime: Int64;
+        sessionId: String;
+        scope: String;
+        roles: Buffer[String];
+    end;
+
+    """
+    Frees claims.
+    No contract: it only frees.
+    """
+    function destroyAccessClaims(claims: AccessClaims): Unit;
+
+    """
+    The payload of an access token of claims (RFC 9068).
+    """
+    generic [C: Region]
+    function accessTokenPayload(claims: &[AccessClaims, C]): String
+        ensures length(&result) > 0;
+
+    """
+    The answer of the token endpoint (RFC 6749, section 5.1): the access
+    token, Bearer, expiresIn seconds, and the ID token, refresh token and
+    scope when they are not empty.
+    """
+    generic [A: Region, I: Region, R: Region, S: Region]
+    function tokenAnswer(accessToken: Span[Nat8, A], expiresIn: Int64, idToken: Span[Nat8, I], refreshToken: Span[Nat8, R],
+        scope: Span[Nat8, S]): String
+        ensures length(&result) > 0;
+
+    """
+    An OAuth error (RFC 6749, section 5.2): error and error_description.
+    """
+    generic [C: Region, D: Region]
+    function errorAnswer(code: Span[Nat8, C], description: Span[Nat8, D]): String
+        ensures length(&result) > 0;
+
+    """
+    The discovery document of issuer; tokens are signed with ML-DSA-44 or ML-DSA-44-Ed25519.
+    """
+    generic [I: Region]
+    function discoveryDocument(issuer: Span[Nat8, I]): String
+        ensures length(&result) > 0;
+
+    """
+    What a logout reads from the payload of an ID token given as hint: its
+    issuer, its first audience, its subject and its session.
+    """
+    record Hint: Linear is
+        issuer: String;
+        audience: String;
+        subject: String;
+        sessionId: String;
+    end;
+
+    """
+    Frees hint.
+    No contract: it only frees.
+    """
+    function destroyHint(hint: Hint): Unit;
+
+    """
+    The hint of payload.  None when it is no JSON object or has no audience.
+    No contract: an Option read from text.
+    """
+    generic [P: Region]
+    function readHint(payload: Span[Nat8, P]): Option[Hint];
+end module.

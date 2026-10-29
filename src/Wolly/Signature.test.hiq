@@ -1,0 +1,275 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Keys are made here, the signing string is signed here, and each
+-- refusal changes one thing of a request that passes.  The date is
+-- Tue, 14 Oct 2025 12:00:00 GMT, which is 1760443200 (Python's datetime).
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Base64 (
+    encode
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.X509 (
+    KeyKind,
+    Ed25519Key,
+    Rsa2048,
+    PrivateKey,
+    generateKey,
+    publicKeyDer,
+    signMessage,
+    destroyPrivateKey
+);
+import Wolly.Signature (
+    SignatureCheck,
+    Verified,
+    NotSigned,
+    Malformed,
+    Stale,
+    DigestMismatch,
+    Forged,
+    freshSeconds,
+    checkParts,
+    httpDate,
+    derOfPem,
+    destroyCheck
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Signature.Test is
+    constant date: Span[Nat8, Static] := "Tue, 14 Oct 2025 12:00:00 GMT";
+    constant now: Int64 := 1760443200;
+    constant payload: Span[Nat8, Static] := "{\"type\":\"Follow\"}";
+    constant keyId: Span[Nat8, Static] := "https://a.example/actor#main-key";
+
+    -- The number of the case of check, which it gives back.
+    function caseOf(check: SignatureCheck): Index is
+        case check of
+            when Verified(keyId as named: String) do
+                let right: Bool := equal(asSpan(&named), keyId);
+                destroyString(named);
+                if right then
+                    return 0;
+                else
+                    return 9;
+                end if;
+            when NotSigned do
+                return 1;
+            when Malformed do
+                return 2;
+            when Stale do
+                return 3;
+            when DigestMismatch do
+                return 4;
+            when Forged do
+                return 5;
+        end case;
+    end;
+
+    -- SHA-256= and the base64 of the SHA-256 of text.
+    generic [T: Region]
+    function digestOf(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "SHA-256=");
+        case sha256(text) of
+            when Some(value as sum: String) do
+                let coded: String := encode(asSpan(&sum));
+                writeString(&!out, asSpan(&coded));
+                destroyString(coded);
+                destroyString(sum);
+            when None do
+                skip;
+        end case;
+        return finalize(out);
+    end;
+
+    -- The signing string of a POST of body to /inbox.
+    generic [D: Region]
+    function signingOf(digest: Span[Nat8, D]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "(request-target): post /inbox\nhost: b.example\ndate: ");
+        writeString(&!out, date);
+        writeString(&!out, "\ndigest: ");
+        writeString(&!out, digest);
+        return finalize(out);
+    end;
+
+    -- A Signature header of algorithm over headers with signature.
+    generic [S: Region]
+    function headerOf(algorithm: Span[Nat8, Static], headers: Span[Nat8, Static], signature: Span[Nat8, S]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "keyId=\"");
+        writeString(&!out, keyId);
+        writeString(&!out, "\",algorithm=\"");
+        writeString(&!out, algorithm);
+        writeString(&!out, "\",headers=\"");
+        writeString(&!out, headers);
+        writeString(&!out, "\",signature=\"");
+        writeString(&!out, signature);
+        writeString(&!out, "\"");
+        return finalize(out);
+    end;
+
+    -- Every verdict of one key, signed by it.
+    function runKey(kind: KeyKind, algorithm: Span[Nat8, Static]): Unit is
+        case generateKey(kind) of
+            when Some(value as key: PrivateKey) do
+                let digest: String := digestOf(payload);
+                let signing: String := signingOf(asSpan(&digest));
+                let made: Option[String] := signMessage(&key, asSpan(&signing));
+                let der: Option[String] := publicKeyDer(&key);
+                destroyPrivateKey(key);
+                case made of
+                    when Some(value as raw: String) do
+                        case der of
+                            when Some(value as public: String) do
+                                let signature: String := encode(asSpan(&raw));
+                                let all: Span[Nat8, Static] := "(request-target) host date digest";
+                                let header: String := headerOf(algorithm, all, asSpan(&signature));
+                                let p: Span[Nat8, Static] := "";
+                                assertTrue(caseOf(checkParts(asSpan(&header), asSpan(&signing), date, asSpan(&digest), payload, asSpan(&public), now)) = 0, "a signed request passes and names its keyId");
+                                assertTrue(caseOf(checkParts(asSpan(&header), "(request-target): post /other", date, asSpan(&digest), payload, asSpan(&public), now)) = 5, "another signing string is forged");
+                                assertTrue(caseOf(checkParts(asSpan(&header), asSpan(&signing), date, asSpan(&digest), "{\"type\":\"Delete\"}", asSpan(&public), now)) = 4, "another body does not fit the digest");
+                                assertTrue(caseOf(checkParts(asSpan(&header), asSpan(&signing), date, p, payload, asSpan(&public), now)) = 4, "a body without a digest");
+                                assertTrue(caseOf(checkParts(asSpan(&header), asSpan(&signing), date, asSpan(&digest), payload, asSpan(&public), now + freshSeconds())) = 0, "300 seconds late still passes");
+                                assertTrue(caseOf(checkParts(asSpan(&header), asSpan(&signing), date, asSpan(&digest), payload, asSpan(&public), (now + freshSeconds()) + 1)) = 3, "301 seconds late is stale");
+                                assertTrue(caseOf(checkParts(asSpan(&header), asSpan(&signing), date, asSpan(&digest), payload, asSpan(&public), (now - freshSeconds()) - 1)) = 3, "301 seconds early is stale");
+                                assertTrue(caseOf(checkParts(asSpan(&header), asSpan(&signing), p, asSpan(&digest), payload, asSpan(&public), now)) = 3, "no date is stale");
+                                assertTrue(caseOf(checkParts(p, asSpan(&signing), date, asSpan(&digest), payload, asSpan(&public), now)) = 1, "no Signature header");
+                                let unsignedDate: String := headerOf(algorithm, "(request-target) host digest", asSpan(&signature));
+                                assertTrue(caseOf(checkParts(asSpan(&unsignedDate), asSpan(&signing), date, asSpan(&digest), payload, asSpan(&public), now)) = 2, "date not signed");
+                                destroyString(unsignedDate);
+                                let noDigest: String := headerOf(algorithm, "(request-target) host date", asSpan(&signature));
+                                assertTrue(caseOf(checkParts(asSpan(&noDigest), asSpan(&signing), date, asSpan(&digest), payload, asSpan(&public), now)) = 2, "digest not signed for a body");
+                                assertTrue(caseOf(checkParts(asSpan(&noDigest), asSpan(&signing), date, p, "", asSpan(&public), now)) = 0, "the control: without a body digest need not be signed, and the signature over the same string passes");
+                                destroyString(noDigest);
+                                let sha1: String := headerOf("rsa-sha1", all, asSpan(&signature));
+                                assertTrue(caseOf(checkParts(asSpan(&sha1), asSpan(&signing), date, asSpan(&digest), payload, asSpan(&public), now)) = 2, "rsa-sha1 is refused");
+                                destroyString(sha1);
+                                destroyString(header);
+                                destroyString(signature);
+                                destroyString(public);
+                            when None do
+                                assertTrue(false, "the public key");
+                        end case;
+                        destroyString(raw);
+                    when None do
+                        case der of
+                            when Some(value as unused: String) do
+                                destroyString(unused);
+                            when None do
+                                skip;
+                        end case;
+                        assertTrue(false, "the signature is made");
+                end case;
+                destroyString(signing);
+                destroyString(digest);
+            when None do
+                assertTrue(false, "a key is made");
+        end case;
+        return nil;
+    end;
+
+    function testEd25519(): Unit is
+        runKey(Ed25519Key(), "hs2019");
+        return nil;
+    end;
+
+    function testRsa(): Unit is
+        runKey(Rsa2048(), "rsa-sha256");
+        return nil;
+    end;
+
+    function dateIs(text: Span[Nat8, Static], wanted: Int64, message: Span[Nat8, Static]): Unit is
+        case httpDate(text) of
+            when Some(value as seconds: Int64) do
+                assertTrue(seconds = wanted, message);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function noDate(text: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case httpDate(text) of
+            when Some(value as seconds: Int64) do
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function testDates(): Unit is
+        dateIs("Sun, 06 Nov 1994 08:49:37 GMT", 784111777, "the example of RFC 9110");
+        dateIs(date, now, "the date of the tests");
+        noDate("Sunday, 06-Nov-94 08:49:37 GMT", "the obsolete form of RFC 850");
+        noDate("Sun Nov  6 08:49:37 1994", "the form of asctime");
+        noDate("Sun, 06 Nov 1994 08:49:37 UTC", "another zone");
+        noDate("Sun, 06 Xyz 1994 08:49:37 GMT", "no month");
+        noDate("Sun, 30 Feb 1994 08:49:37 GMT", "a day the month has not");
+        noDate("Sun, 06 Nov 1994 24:49:37 GMT", "hour 24");
+        noDate("", "empty");
+        return nil;
+    end;
+
+    function testPem(): Unit is
+        case generateKey(Ed25519Key()) of
+            when Some(value as key: PrivateKey) do
+                case publicKeyDer(&key) of
+                    when Some(value as der: String) do
+                        let coded: String := encode(asSpan(&der));
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, "-----BEGIN PUBLIC KEY-----\n");
+                        writeString(&!out, asSpan(&coded));
+                        writeString(&!out, "\n-----END PUBLIC KEY-----\n");
+                        let pem: String := finalize(out);
+                        case derOfPem(asSpan(&pem)) of
+                            when Some(value as back: String) do
+                                assertTrue(equal(asSpan(&back), asSpan(&der)), "the DER of the PEM is the DER");
+                                destroyString(back);
+                            when None do
+                                assertTrue(false, "the PEM is read");
+                        end case;
+                        destroyString(pem);
+                        destroyString(coded);
+                        destroyString(der);
+                    when None do
+                        assertTrue(false, "the public key");
+                end case;
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key is made");
+        end case;
+        case derOfPem("no key at all") of
+            when Some(value as nothing: String) do
+                destroyString(nothing);
+                assertTrue(false, "text without the markers is no key");
+            when None do
+                assertTrue(true, "text without the markers is no key");
+        end case;
+        return nil;
+    end;
+end module body.

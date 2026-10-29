@@ -1,0 +1,104 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The words and codes are the textbook examples of both codes.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Wolly.Phonetic (
+    lettersOf,
+    cologne,
+    soundex
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Phonetic.Test is
+
+    function cologneIs(word: Span[Nat8, Static], wanted: Span[Nat8, Static]): Bool is
+        let code: String := cologne(word);
+        let same: Bool := equal(asSpan(&code), wanted);
+        destroyString(code);
+        return same;
+    end;
+
+    function soundexIs(word: Span[Nat8, Static], wanted: Span[Nat8, Static]): Bool is
+        let code: String := soundex(word);
+        let same: Bool := equal(asSpan(&code), wanted);
+        destroyString(code);
+        return same;
+    end;
+
+    function lettersAre(word: Span[Nat8, Static], wanted: Span[Nat8, Static]): Bool is
+        let letters: String := lettersOf(word);
+        let same: Bool := equal(asSpan(&letters), wanted);
+        destroyString(letters);
+        return same;
+    end;
+
+    function testLetters(): Unit is
+        assertTrue(lettersAre("Müller-Lüdenscheidt", "mullerludenscheidt"), "umlauts, case and a hyphen");
+        assertTrue(lettersAre("ÄÖÜ äöü ß Åå", "aouaousaa"), "both cases of the umlauts, ß and Å");
+        assertTrue(lettersAre("Çédille Ñoño Ýves ÿ", "cedillenonoyvesy"), "other letters of Latin-1");
+        assertTrue(lettersAre("Æther × Þorn", "therorn"), "letters without a base letter are left out");
+        assertTrue(lettersAre("R2-D2", "rd"), "digits are left out");
+        assertTrue(lettersAre("Москва", ""), "another script is left out");
+        assertTrue(lettersAre("", ""), "nothing");
+        return nil;
+    end;
+
+    function testCologne(): Unit is
+        assertTrue(cologneIs("Meier", "67"), "Meier");
+        assertTrue(cologneIs("Maier", "67"), "Maier");
+        assertTrue(cologneIs("Mayer", "67"), "Mayer");
+        assertTrue(cologneIs("Mair", "67"), "Mair");
+        assertTrue(cologneIs("Meyer", "67"), "Meyer");
+        assertTrue(cologneIs("Müller", "657"), "Müller");
+        assertTrue(cologneIs("Mueller", "657"), "Mueller");
+        assertTrue(cologneIs("MÜLLER", "657"), "MÜLLER, Ü in capitals");
+        assertTrue(cologneIs("Miller", "657"), "Miller");
+        assertTrue(cologneIs("Schmidt", "862"), "Schmidt");
+        assertTrue(cologneIs("Schmitt", "862"), "Schmitt");
+        assertTrue(cologneIs("Schmied", "862"), "Schmied");
+        assertTrue(cologneIs("Müller-Lüdenscheidt", "65752682"), "Müller-Lüdenscheidt");
+        assertTrue(cologneIs("Breschnew", "17863"), "Breschnew");
+        assertTrue(cologneIs("Wikipedia", "3412"), "Wikipedia");
+        assertTrue(cologneIs("Axel", "0485"), "Axel: x is 48, and a leading 0 stays");
+        assertTrue(cologneIs("Hexe", "048"), "x after a vowel is 48");
+        assertTrue(cologneIs("Max", "648"), "and at the end");
+        assertTrue(cologneIs("Dachs", "248"), "c before h is 4, s is 8");
+        assertTrue(cologneIs("Christ", "4782"), "c at the start before h is 4");
+        assertTrue(cologneIs("Celle", "85"), "c at the start before e is 8");
+        assertTrue(cologneIs("Philipp", "351"), "ph is 3");
+        assertTrue(cologneIs("Matz", "68"), "t before z is 8");
+        assertTrue(cologneIs("", ""), "nothing has no code");
+        assertTrue(cologneIs("   ", ""), "nor blanks");
+        assertTrue(cologneIs("hhh", ""), "nor h alone");
+        return nil;
+    end;
+
+    function testSoundex(): Unit is
+        assertTrue(soundexIs("Robert", "R163"), "Robert");
+        assertTrue(soundexIs("Rupert", "R163"), "Rupert");
+        assertTrue(soundexIs("Rubin", "R150"), "Rubin");
+        assertTrue(soundexIs("Ashcraft", "A261"), "Ashcraft: h does not part s and c");
+        assertTrue(soundexIs("Ashcroft", "A261"), "Ashcroft");
+        assertTrue(soundexIs("Tymczak", "T522"), "Tymczak: a vowel parts c and k");
+        assertTrue(soundexIs("Pfister", "P236"), "Pfister: f has the code of P");
+        assertTrue(soundexIs("Honeyman", "H555"), "Honeyman: y parts like a vowel");
+        assertTrue(soundexIs("A", "A000"), "one letter, filled up");
+        assertTrue(soundexIs("Lloyd-Webber", "L316"), "four characters at most, w does not part d and b");
+        assertTrue(soundexIs("", ""), "nothing");
+        return nil;
+    end;
+end module body.

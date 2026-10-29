@@ -1,0 +1,127 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Signed HTTP requests as servers of the fediverse send them: a Signature
+header (draft-cavage-http-signatures) over named headers, checked against
+the public key of its keyId.
+
+The application takes the keyId (signatureKeyId), fetches the key of it,
+and asks verifySignature.  A request passes only when all of this holds:
+
+- the Signature header has keyId, headers and signature, and algorithm,
+  when it is there, is rsa-sha256, hs2019 or ed25519 (never rsa-sha1,
+  a broken hash);
+- the signed headers include (request-target), host and date, and digest
+  when the request has a body;
+- Date is an IMF-fixdate within 300 seconds of now;
+- a body has a Digest of SHA-256 that fits it;
+- the signature is one of the signing string under the key (RSA PKCS 1
+  v1.5 over SHA-256 or Ed25519, Standard.X509.verifyMessage).
+
+Anything else is refused with the reason, and the reason is the
+application's to log, not the client's to read.  A signature says who sent
+the request, not that the sender may do what it asks.
+"""
+import Standard.String (
+    String
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Signature is
+    """
+    The verdict on a request.
+    """
+    union SignatureCheck: Linear is
+        """
+        The signature fits the key of keyId.
+        """
+        case Verified is
+            keyId: String;
+        """
+        No Signature header.
+        """
+        case NotSigned;
+        """
+        The Signature header cannot be read, an algorithm is not taken, a
+        required header is not signed, or a signed header is missing.
+        """
+        case Malformed;
+        """
+        No Date, or one more than freshSeconds away from now.
+        """
+        case Stale;
+        """
+        A body without a Digest of SHA-256 that fits it.
+        """
+        case DigestMismatch;
+        """
+        The signature is not one of the signing string under the key.
+        """
+        case Forged;
+    end;
+
+    """
+    The seconds Date may be away from now: 300.
+    """
+    function freshSeconds(): Int64
+        ensures result = 300;
+
+    """
+    The keyId of the Signature header of request.
+    No contract: an Option read from the request.
+    """
+    generic [R: Region]
+    function signatureKeyId(request: &[Request, R]): Option[String];
+
+    """
+    The verdict on request with body, under the public key publicDer (a DER
+    SubjectPublicKeyInfo), at now.
+    No contract: a verdict over outside input, and a union has no equality
+    to state it.
+    """
+    generic [R: Region, B: Region, P: Region]
+    function verifySignature(request: &[Request, R], content: Span[Nat8, B], publicDer: Span[Nat8, P], now: Int64): SignatureCheck;
+
+    """
+    The verdict on the parts of a request: the value of its Signature
+    header, the signing string the headers it names make, its Date and
+    Digest (empty when missing), its body, the key and now.  What
+    verifySignature does after it read the request; here for a caller
+    that holds the parts.
+    No contract: a verdict over outside input, and a union has no equality
+    to state it.
+    """
+    generic [S: Region, G: Region, D: Region, H: Region, B: Region, P: Region]
+    function checkParts(signature: Span[Nat8, S], signing: Span[Nat8, G], date: Span[Nat8, D], digest: Span[Nat8, H],
+                        content: Span[Nat8, B], publicDer: Span[Nat8, P], now: Int64): SignatureCheck;
+
+    """
+    The seconds since 1970 of an IMF-fixdate, Sun, 06 Nov 1994 08:49:37
+    GMT; None for anything else.
+    No contract: an Option over outside input; None is its answer for a bad
+    one.
+    """
+    generic [D: Region]
+    function httpDate(date: Span[Nat8, D]): Option[Int64];
+
+    """
+    The DER of a public key in PEM, between -----BEGIN PUBLIC KEY----- and
+    -----END PUBLIC KEY-----, as an actor of the fediverse publishes it.
+    No contract: an Option over outside input; None is its answer for a bad
+    one.
+    """
+    generic [P: Region]
+    function derOfPem(pem: Span[Nat8, P]): Option[String];
+
+    """
+    Gives back what a verdict holds.
+    No contract: it only gives the value back.
+    """
+    function destroyCheck(check: SignatureCheck): Unit;
+end module.

@@ -1,0 +1,153 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal
+);
+import Standard.File (
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    statusOf
+);
+import Standard.Vault (
+    VaultError,
+    describeVaultError
+);
+import Wolly.Response (
+    decimalText
+);
+import Wolly.Vault (
+    Conversion,
+    convertVault
+);
+
+import Wolly.Version (
+    answerAbout,
+    library,
+    destroyLibraries
+);
+import Standard.Libcrypto (
+    libraryVersion as cryptoVersion
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack
+);
+
+module body Wolly.Example.VaultCommand is
+    function count(n: Index): Int64 is
+        case toInt64(n) of
+            when Some(value as number: Int64) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Each refused name of names (one a line) printed on a line of its own.
+    generic [L: Region]
+    function printRefused(names: Span[Nat8, L]): Unit is
+        var start: Index := 0;
+        var at: Index := 0;
+        while at < spanLength(names) do
+            if names[at] = '\n' then
+                var line: StringBuilder := makeStringBuilder();
+                writeString(&!line, "vault: refused ");
+                var i: Index := start;
+                while i < at do
+                    writeByte(&!line, names[i]);
+                    i := i + 1;
+                end while;
+                writeString(&!line, " (a name that starts with a digit)");
+                let text: String := finalize(line);
+                printLn(asSpan(&text));
+                destroyString(text);
+                start := at + 1;
+            end if;
+            at := at + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Whether a file is at path; a missing old vault is a wrong path, not an empty vault, and nothing is written for it.
+    generic [P: Region]
+    function there(path: Span[Nat8, P]): Bool is
+        case statusOf(path) of
+            when FileFound(status as found: FileStatus) do
+                return true;
+            when FileMissing do
+                return false;
+            when FileUnreadable do
+                return true;
+        end case;
+    end;
+
+    function convert(): ExitCode is
+        if not there(nthArgument(2)) then
+            print("vault: no old vault at ");
+            printLn(nthArgument(2));
+            return ExitFailure();
+        end if;
+        case convertVault(nthArgument(2), nthArgument(3), nthArgument(4), nthArgument(5), nthArgument(6)) of
+            when Right(right as done: Conversion) do
+                let { converted as converted: Index, refused as names: String } := done;
+                var line: StringBuilder := makeStringBuilder();
+                writeString(&!line, "vault: converted ");
+                let number: String := decimalText(count(converted));
+                writeString(&!line, asSpan(&number));
+                destroyString(number);
+                let text: String := finalize(line);
+                printLn(asSpan(&text));
+                destroyString(text);
+                printRefused(asSpan(&names));
+                destroyString(names);
+                return ExitSuccess();
+            when Left(left as error: VaultError) do
+                let why: String := describeVaultError(error);
+                print("vault: nothing converted: ");
+                printLn(asSpan(&why));
+                destroyString(why);
+                return ExitFailure();
+        end case;
+    end;
+
+    function command(): ExitCode is
+        var libraries: Buffer[String] := allocateEmpty();
+        insertBack(&!libraries, library("libcrypto", cryptoVersion()));
+        let answered: Bool := answerAbout("vault", &libraries);
+        destroyLibraries(libraries);
+        if answered then
+            return ExitSuccess();
+        end if;
+        if (argumentCount() = 7) and equal(nthArgument(1), "convert") then
+            return convert();
+        end if;
+        printLn("usage: vault convert OLD_VAULT OLD_KEY NEW_ENV NEW_PEPPER KEY_NAME");
+        return ExitFailure();
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        let code: ExitCode := command();
+        surrenderRoot(power);
+        return code;
+    end;
+end module body.

@@ -1,0 +1,306 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth
+);
+import Standard.Text (
+    substring
+);
+import Standard.Html (
+    escapeHtml
+);
+import Wolly.Response (
+    decimalText
+);
+import Wolly.Chart (
+    readableNumber,
+    barHeight,
+    changeTenths
+);
+
+module body Wolly.Svg is
+    constant pointsMost: Index := 1000;
+    constant labelsMost: Index := 31;
+    -- The plot: x from 40 to 590, y from 10 (top) to 170 (the baseline).
+    constant left: Int64 := 40;
+    constant plotWidth: Int64 := 550;
+    constant baseline: Int64 := 170;
+    constant plotHeight: Int64 := 160;
+    constant middleY: Int64 := 90;
+    constant middleX: Int64 := 315;
+    constant topY: Int64 := 20;
+    constant zero: Int64 := 0;
+    constant one: Int64 := 1;
+
+    function mostPoints(): Index is
+        return pointsMost;
+    end;
+
+    generic [B: Region]
+    function writeNumber(out: &![StringBuilder, B], value: Int64): Unit is
+        var shown: Int64 := value;
+        if shown < 0 then
+            shown := zero;
+        end if;
+        let digits: String := decimalText(shown);
+        writeString(&~out, asSpan(&digits));
+        destroyString(digits);
+        return nil;
+    end;
+
+    generic [B: Region, T: Region]
+    function writeEscaped(out: &![StringBuilder, B], text: Span[Nat8, T]): Unit is
+        let escaped: String := escapeHtml(text);
+        writeString(&~out, asSpan(&escaped));
+        destroyString(escaped);
+        return nil;
+    end;
+
+    generic [B: Region, T: Region]
+    function openSvg(out: &![StringBuilder, B], box: Span[Nat8, Static], kind: Span[Nat8, Static], title: Span[Nat8, T]): Unit is
+        writeString(&~out, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"");
+        writeString(&~out, box);
+        writeString(&~out, "\" class=\"");
+        writeString(&~out, kind);
+        writeString(&~out, "\" role=\"img\" aria-label=\"");
+        writeEscaped(&~out, title);
+        writeString(&~out, "\"><title>");
+        writeEscaped(&~out, title);
+        writeString(&~out, "</title>");
+        return nil;
+    end;
+
+    -- A value of the chart: below 0 counts as 0.
+    function counted(value: Int64): Int64 is
+        if value < 0 then
+            return zero;
+        end if;
+        return value;
+    end;
+
+    -- How many values are drawn.
+    generic [R: Region]
+    function drawn(values: &[Buffer[Int64], R]): Index is
+        let all: Index := length(values);
+        if all > pointsMost then
+            return pointsMost;
+        end if;
+        return all;
+    end;
+
+    generic [B: Region]
+    function axisLabel(out: &![StringBuilder, B], value: Int64, y: Int64): Unit is
+        writeString(&~out, "<text class=\"wolly-axis\" x=\"0\" y=\"");
+        writeNumber(&~out, y);
+        writeString(&~out, "\" font-size=\"12\" fill=\"currentColor\">");
+        let readable: String := readableNumber(counted(value));
+        writeString(&~out, asSpan(&readable));
+        destroyString(readable);
+        writeString(&~out, "</text>");
+        return nil;
+    end;
+
+    generic [R: Region, T: Region]
+    function lineChart(values: &[Buffer[Int64], R], title: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        openSvg(&!out, "0 0 600 200", "wolly-chart", title);
+        let n: Index := drawn(values);
+        if n > 0 then
+            var lowest: Int64 := counted(nth(values, 0));
+            var highest: Int64 := lowest;
+            var i: Index := 1;
+            while i < n do
+                let v: Int64 := counted(nth(values, i));
+                if v < lowest then
+                    lowest := v;
+                end if;
+                if v > highest then
+                    highest := v;
+                end if;
+                i := i + 1;
+            end while;
+            axisLabel(&!out, highest, topY);
+            axisLabel(&!out, lowest, baseline);
+            if n = 1 then
+                writeString(&!out, "<circle class=\"wolly-line\" cx=\"");
+                writeNumber(&!out, middleX);
+                writeString(&!out, "\" cy=\"");
+                writeNumber(&!out, middleY);
+                writeString(&!out, "\" r=\"3\" fill=\"currentColor\"/>");
+            else
+                writeString(&!out, "<polyline class=\"wolly-line\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" points=\"");
+                var last: Int64 := 0;
+                var j: Index := 1;
+                while j < n do
+                    last := last + 1;
+                    j := j + 1;
+                end while;
+                var k: Int64 := 0;
+                var p: Index := 0;
+                while p < n do
+                    let v: Int64 := counted(nth(values, p));
+                    let x: Int64 := left + ((plotWidth * k) / last);
+                    var y: Int64 := middleY;
+                    if highest > lowest then
+                        y := baseline - ((plotHeight * barHeight(v - lowest, highest - lowest)) / 100);
+                    end if;
+                    if p > 0 then
+                        writeByte(&!out, ' ');
+                    end if;
+                    writeNumber(&!out, x);
+                    writeByte(&!out, ',');
+                    writeNumber(&!out, y);
+                    k := k + 1;
+                    p := p + 1;
+                end while;
+                writeString(&!out, "\"/>");
+            end if;
+        end if;
+        writeString(&!out, "</svg>");
+        return finalize(out);
+    end;
+
+    -- The label of bar number n: line n of labels, or empty.
+    generic [L: Region]
+    function labelOf(labels: Span[Nat8, L], n: Index): Span[Nat8, L] is
+        let size: Index := spanLength(labels);
+        var start: Index := 0;
+        var line: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (labels[i] = 10) then
+                if line = n then
+                    return substring(labels, start, i);
+                end if;
+                line := line + 1;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return substring(labels, 0, 0);
+    end;
+
+    generic [R: Region, L: Region, T: Region]
+    function barChart(values: &[Buffer[Int64], R], labels: Span[Nat8, L], title: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        openSvg(&!out, "0 0 600 200", "wolly-chart", title);
+        let n: Index := drawn(values);
+        if n > 0 then
+            var highest: Int64 := 0;
+            var count: Int64 := 0;
+            var i: Index := 0;
+            while i < n do
+                let v: Int64 := counted(nth(values, i));
+                if v > highest then
+                    highest := v;
+                end if;
+                count := count + 1;
+                i := i + 1;
+            end while;
+            axisLabel(&!out, highest, topY);
+            axisLabel(&!out, zero, baseline);
+            let slot: Int64 := plotWidth / count;
+            var width: Int64 := (slot * 8) / 10;
+            if width < 1 then
+                width := one;
+            end if;
+            var k: Int64 := 0;
+            var p: Index := 0;
+            while p < n do
+                let v: Int64 := counted(nth(values, p));
+                let height: Int64 := (plotHeight * barHeight(v, highest)) / 100;
+                let x: Int64 := (left + (k * slot)) + ((slot - width) / 2);
+                writeString(&!out, "<rect class=\"wolly-bar\" x=\"");
+                writeNumber(&!out, x);
+                writeString(&!out, "\" y=\"");
+                writeNumber(&!out, baseline - height);
+                writeString(&!out, "\" width=\"");
+                writeNumber(&!out, width);
+                writeString(&!out, "\" height=\"");
+                writeNumber(&!out, height);
+                writeString(&!out, "\" fill=\"currentColor\"><title>");
+                writeEscaped(&!out, labelOf(labels, p));
+                writeString(&!out, ": ");
+                writeNumber(&!out, v);
+                writeString(&!out, "</title></rect>");
+                if n <= labelsMost then
+                    writeString(&!out, "<text class=\"wolly-axis\" x=\"");
+                    writeNumber(&!out, (left + (k * slot)) + (slot / 2));
+                    writeString(&!out, "\" y=\"190\" font-size=\"12\" text-anchor=\"middle\" fill=\"currentColor\">");
+                    writeEscaped(&!out, labelOf(labels, p));
+                    writeString(&!out, "</text>");
+                end if;
+                k := k + 1;
+                p := p + 1;
+            end while;
+        end if;
+        writeString(&!out, "</svg>");
+        return finalize(out);
+    end;
+
+    generic [B: Region, L: Region]
+    function tileBody(out: &![StringBuilder, B], label: Span[Nat8, L], value: Int64): Unit is
+        let readable: String := readableNumber(value);
+        writeString(&~out, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 200 100\" class=\"wolly-tile\" role=\"img\" aria-label=\"");
+        writeEscaped(&~out, label);
+        writeString(&~out, ": ");
+        writeString(&~out, asSpan(&readable));
+        writeString(&~out, "\"><title>");
+        writeEscaped(&~out, label);
+        writeString(&~out, "</title><text x=\"100\" y=\"55\" font-size=\"36\" text-anchor=\"middle\" fill=\"currentColor\">");
+        writeString(&~out, asSpan(&readable));
+        writeString(&~out, "</text><text x=\"100\" y=\"85\" font-size=\"14\" text-anchor=\"middle\" fill=\"currentColor\">");
+        writeEscaped(&~out, label);
+        writeString(&~out, "</text>");
+        destroyString(readable);
+        return nil;
+    end;
+
+    generic [L: Region]
+    function tile(label: Span[Nat8, L], value: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        tileBody(&!out, label, value);
+        writeString(&!out, "</svg>");
+        return finalize(out);
+    end;
+
+    generic [L: Region]
+    function tileWithChange(label: Span[Nat8, L], value: Int64, middle: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        tileBody(&!out, label, value);
+        let tenths: Int64 := changeTenths(value, middle);
+        if tenths /= 0 then
+            var size: Int64 := tenths;
+            if tenths > 0 then
+                writeString(&!out, "<text class=\"wolly-up\" x=\"190\" y=\"20\" font-size=\"14\" text-anchor=\"end\" fill=\"currentColor\">+");
+            else
+                size := zero - tenths;
+                writeString(&!out, "<text class=\"wolly-down\" x=\"190\" y=\"20\" font-size=\"14\" text-anchor=\"end\" fill=\"currentColor\">-");
+            end if;
+            writeNumber(&!out, size / 10);
+            writeByte(&!out, '.');
+            writeNumber(&!out, size - ((size / 10) * 10));
+            writeString(&!out, "</text>");
+        end if;
+        writeString(&!out, "</svg>");
+        return finalize(out);
+    end;
+end module body.

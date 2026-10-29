@@ -1,0 +1,57 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Failures counted per key within a window, kept in the database, to say when
+a key has earned a ban: strike answers true at the failure that reaches the
+limit within the window, and only at that one.
+
+A series starts with the first failure of a key, and a failure more than
+window seconds after the first of its series starts a new one.  The caller
+clears the key when it has acted, and after a success when a success is to
+start the count again.  What a ban is, Wolly.Ban for one, is the caller's.
+"""
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Strikes is
+    """
+    Makes the table wolly_strikes, when it is not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareStrikes(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Counts a failure of key at now and says whether it is the limit-th of a
+    series of window seconds.  Right false for an empty key and for a limit
+    below 1, which counts nothing.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region]
+    function strike(db: &![Database[Writing], R], key: Span[Nat8, K], limit: Int64, window: Int64,
+        now: Int64): Either[DbError, Bool]
+        requires (now > 0) and (window > 0);
+
+    """
+    Forgets the series of key.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region]
+    function clearStrikes(db: &![Database[Writing], R], key: Span[Nat8, K]): Option[DbError];
+
+    """
+    Removes the series that began more than window seconds before now.  The
+    rows removed.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function pruneStrikes(db: &![Database[Writing], R], window: Int64, now: Int64): Either[DbError, Int64]
+        requires (now > 0) and (window > 0);
+end module.

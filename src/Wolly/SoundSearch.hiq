@@ -1,0 +1,410 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Wolly.Limit: every statement is a
+-- constant, every value is bound, the table is strict.  A code of the
+-- Kölner Phonetik is digits and one of Soundex starts with a letter, so the
+-- two never meet in the one column.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    lengthMut,
+    remove,
+    nthRef,
+    destroyEmpty
+);
+import Standard.Text (
+    substring
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withText,
+    withInt64,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    begin,
+    commit,
+    rollback
+);
+import Wolly.Phonetic (
+    cologne,
+    soundex
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.SoundSearch is
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_sounds (key TEXT NOT NULL, code TEXT NOT NULL, PRIMARY KEY (key, code)) STRICT";
+    constant makeTablePg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_sounds (key TEXT NOT NULL, code TEXT NOT NULL, PRIMARY KEY (key, code))";
+    constant makeIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_sounds_code ON wolly_sounds (code, key)";
+    constant dropKey: Span[Nat8, Static] := "DELETE FROM wolly_sounds WHERE key = ?";
+    constant putCode: Span[Nat8, Static] := "INSERT INTO wolly_sounds (key, code) VALUES (?, ?) ON CONFLICT (key, code) DO NOTHING";
+    constant keysOf: Span[Nat8, Static] := "SELECT DISTINCT key FROM wolly_sounds WHERE code = ? OR code = ? ORDER BY key LIMIT 1000";
+    constant hasCode: Span[Nat8, Static] := "SELECT count(*) FROM wolly_sounds WHERE key = ? AND (code = ? OR code = ?)";
+
+    function mostWords(): Index is
+        return 16;
+    end;
+
+    function mostKey(): Index is
+        return 256;
+    end;
+
+    function isLetter(byte: Nat8): Bool is
+        return (((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'))) or (byte >= 128);
+    end;
+
+    -- The words of text, at most mostWords.
+    generic [T: Region]
+    function wordsOf(text: Span[Nat8, T]): Buffer[String] is
+        var words: Buffer[String] := allocateEmpty();
+        var count: Index := 0;
+        var i: Index := 0;
+        while (i < spanLength(text)) and (count < mostWords()) do
+            if isLetter(text[i]) then
+                var j: Index := i;
+                while (j < spanLength(text)) and isLetter(text[j]) do
+                    j := j + 1;
+                end while;
+                insertBack(&!words, fromSpan(substring(text, i, j)));
+                count := count + 1;
+                i := j;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        return words;
+    end;
+
+    function destroyKeys(keys: Buffer[String]): Unit is
+        var rest: Buffer[String] := keys;
+        while lengthMut(&!rest) > 0 do
+            let last: Index := lengthMut(&!rest) - 1;
+            destroyString(remove(&!rest, last));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- The code of word, empty when it has none.
+    generic [W: Region]
+    function codeOf(word: Span[Nat8, W], german: Bool): String is
+        if german then
+            return cologne(word);
+        else
+            return soundex(word);
+        end if;
+    end;
+
+    -- The first and the second code of word in mode; for one code both are
+    -- the same.
+    generic [W: Region]
+    function firstCode(word: Span[Nat8, W], mode: SoundMode): String is
+        case mode of
+            when German do
+                return codeOf(word, true);
+            when English do
+                return codeOf(word, false);
+            when Both do
+                return codeOf(word, true);
+        end case;
+    end;
+
+    generic [W: Region]
+    function secondCode(word: Span[Nat8, W], mode: SoundMode): String is
+        case mode of
+            when German do
+                return codeOf(word, true);
+            when English do
+                return codeOf(word, false);
+            when Both do
+                return codeOf(word, false);
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepareSounds(db: &![Database[Writing], R]): Option[DbError] is
+        let makeTableSql: Span[Nat8, Static] := pick(&db, makeTable, makeTablePg);
+        case execute(&~db, makeTableSql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, makeIndex, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                return None();
+        end case;
+    end;
+
+    -- Keeps code under key, when it is not empty.
+    generic [R: Region, K: Region, C: Region]
+    function keep(db: &![Database[Writing], R], key: Span[Nat8, K], code: Span[Nat8, C]): Option[DbError] is
+        if spanLength(code) = 0 then
+            return None();
+        end if;
+        case execute(&~db, putCode, withText(withText(noValues(), key), code)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as put: Nat64) do
+                return None();
+        end case;
+    end;
+
+    -- indexSounds inside its transaction.
+    generic [R: Region, K: Region, T: Region]
+    function indexIn(db: &![Database[Writing], R], key: Span[Nat8, K], text: Span[Nat8, T], mode: SoundMode): Option[DbError] is
+        case execute(&~db, dropKey, withText(noValues(), key)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        var words: Buffer[String] := wordsOf(text);
+        var failed: Option[DbError] := None();
+        var i: Index := 0;
+        while i < lengthMut(&!words) do
+            let first: String := firstCodeAt(&words, i, mode);
+            let second: String := secondCodeAt(&words, i, mode);
+            case keep(&~db, key, asSpan(&first)) of
+                when Some(value as error: DbError) do
+                    failed := Some(value => error);
+                when None do
+                    skip;
+            end case;
+            case keep(&~db, key, asSpan(&second)) of
+                when Some(value as error: DbError) do
+                    failed := Some(value => error);
+                when None do
+                    skip;
+            end case;
+            destroyString(first);
+            destroyString(second);
+            i := i + 1;
+        end while;
+        destroyKeys(words);
+        return failed;
+    end;
+
+    generic [R: Region]
+    function firstCodeAt(words: &[Buffer[String], R], i: Index, mode: SoundMode): String is
+        let word: &[String, R] := nthRef(words, i);
+        return firstCode(asSpan(word), mode);
+    end;
+
+    generic [R: Region]
+    function secondCodeAt(words: &[Buffer[String], R], i: Index, mode: SoundMode): String is
+        let word: &[String, R] := nthRef(words, i);
+        return secondCode(asSpan(word), mode);
+    end;
+
+    generic [R: Region, K: Region, T: Region]
+    function indexSounds(db: &![Database[Writing], R], key: Span[Nat8, K], text: Span[Nat8, T],
+                         mode: SoundMode): Either[DbError, Bool] is
+        if (spanLength(key) = 0) or (spanLength(key) > mostKey()) then
+            return Right(right => false);
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                case indexIn(&~db, key, text, mode) of
+                    when Some(value as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Left(left => error);
+                    when None do
+                        case commit(&~db, transaction) of
+                            when Left(left as failure: DbError) do
+                                return Left(left => failure);
+                            when Right(right as done: Unit) do
+                                return Right(right => true);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, T: Region]
+    function indexSoundsWithin(db: &![Database[Writing], R], key: Span[Nat8, K], text: Span[Nat8, T],
+                               mode: SoundMode): Either[DbError, Bool] is
+        if (spanLength(key) = 0) or (spanLength(key) > mostKey()) then
+            return Right(right => false);
+        end if;
+        case indexIn(&~db, key, text, mode) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => true);
+        end case;
+    end;
+
+    generic [R: Region, K: Region]
+    function removeSounds(db: &![Database[Writing], R], key: Span[Nat8, K]): Either[DbError, Bool] is
+        case execute(&~db, dropKey, withText(noValues(), key)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                let there: Bool := dropped > 0;
+                return Right(right => there);
+        end case;
+    end;
+
+    -- The keys of first or second, ascending, at most 1000.
+    generic [M: Free, R: Region, F: Region, S: Region]
+    function keysWith(db: &![Database[M], R], first: Span[Nat8, F], second: Span[Nat8, S]): Either[DbError, Buffer[String]] is
+        var cursor: Cursor := start(&~db, keysOf, withText(withText(noValues(), first), second));
+        var keys: Buffer[String] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!keys, fromSpan(columnText(&cursor, 0)));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyKeys(keys);
+                return Left(left => error);
+            when None do
+                return Right(right => keys);
+        end case;
+    end;
+
+    -- Whether key has first or second.
+    generic [M: Free, R: Region, K: Region, F: Region, S: Region]
+    function keyHas(db: &![Database[M], R], key: Span[Nat8, K], first: Span[Nat8, F], second: Span[Nat8, S]): Either[DbError, Bool] is
+        var cursor: Cursor := start(&~db, hasCode, withText(withText(withText(noValues(), key), first), second));
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                let found: Bool := count > 0;
+                return Right(right => found);
+        end case;
+    end;
+
+    -- Of keys, those that have one of the two codes; the others are given
+    -- back.
+    generic [M: Free, R: Region, F: Region, S: Region]
+    function narrowed(db: &![Database[M], R], keys: Buffer[String], first: Span[Nat8, F], second: Span[Nat8, S]): Either[DbError, Buffer[String]] is
+        var rest: Buffer[String] := keys;
+        var kept: Buffer[String] := allocateEmpty();
+        var failed: Option[DbError] := None();
+        while lengthMut(&!rest) > 0 do
+            let key: String := remove(&!rest, 0);
+            case keyHas(&~db, asSpan(&key), first, second) of
+                when Right(right as found: Bool) do
+                    if found then
+                        insertBack(&!kept, key);
+                    else
+                        destroyString(key);
+                    end if;
+                when Left(left as error: DbError) do
+                    destroyString(key);
+                    failed := Some(value => error);
+            end case;
+        end while;
+        destroyEmpty(rest);
+        case failed of
+            when Some(value as error: DbError) do
+                destroyKeys(kept);
+                return Left(left => error);
+            when None do
+                return Right(right => kept);
+        end case;
+    end;
+
+    generic [M: Free, R: Region, T: Region]
+    function findBySound(db: &![Database[M], R], text: Span[Nat8, T], mode: SoundMode,
+                         limit: Int64): Either[DbError, Buffer[String]] is
+        var words: Buffer[String] := wordsOf(text);
+        let none: Buffer[String] := allocateEmpty();
+        var found: Either[DbError, Buffer[String]] := Right(right => none);
+        var started: Bool := false;
+        var i: Index := 0;
+        while i < lengthMut(&!words) do
+            let first: String := firstCodeAt(&words, i, mode);
+            let second: String := secondCodeAt(&words, i, mode);
+            if (length(&first) > 0) or (length(&second) > 0) then
+                found := step(&~db, found, started, asSpan(&first), asSpan(&second));
+                started := true;
+            end if;
+            destroyString(first);
+            destroyString(second);
+            i := i + 1;
+        end while;
+        destroyKeys(words);
+        return cut(found, limit);
+    end;
+
+    -- One word of a search: the keys of its codes when it is the first,
+    -- else those of so far that have one of them.
+    generic [M: Free, R: Region, F: Region, S: Region]
+    function step(db: &![Database[M], R], sofar: Either[DbError, Buffer[String]], started: Bool, first: Span[Nat8, F],
+                  second: Span[Nat8, S]): Either[DbError, Buffer[String]] is
+        case sofar of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as keys: Buffer[String]) do
+                if started then
+                    return narrowed(&~db, keys, first, second);
+                else
+                    destroyKeys(keys);
+                    return keysWith(&~db, first, second);
+                end if;
+        end case;
+    end;
+
+    -- At most limit of keys; a limit below 1 or above 100 is taken as 100.
+    function cut(found: Either[DbError, Buffer[String]], limit: Int64): Either[DbError, Buffer[String]] is
+        case found of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as keys: Buffer[String]) do
+                var most: Index := 100;
+                if (limit >= 1) and (limit < 100) then
+                    case toIndex(limit) of
+                        when Some(value as wanted: Index) do
+                            most := wanted;
+                        when None do
+                            skip;
+                    end case;
+                end if;
+                var rest: Buffer[String] := keys;
+                while lengthMut(&!rest) > most do
+                    let last: Index := lengthMut(&!rest) - 1;
+                    destroyString(remove(&!rest, last));
+                end while;
+                return Right(right => rest);
+        end case;
+    end;
+end module body.

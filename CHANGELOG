@@ -1,0 +1,78 @@
+wolly (0.2.0) stable; urgency=low
+
+  * An OpenID provider for a fixed set of first-party clients, Wolly.Op
+    with its parts (OpBase, OpClient, OpGrant, OpKey, OpRandom, OpStore,
+    OpToken, OpUrl): discovery, the key set, authorization with a code
+    challenge (S256 only), the token endpoint with refresh tokens in
+    families and client credentials, logout, ID tokens signed with
+    ML-DSA-44 or the composite ML-DSA-44-Ed25519, in a task of its own
+    with 1 MiB of stack. The tables match those of an earlier provider
+    written in Go, column for column.
+
+  * Around it: accounts that sign in with an e-mail address, a password
+    and a second factor (Wolly.Account), a delay per key after failed
+    attempts and failures counted in a window to ban (Wolly.Backoff,
+    Wolly.Strikes), a proof of work in front of an expensive step
+    (Wolly.Pow), values sealed in the Fernet form that Go implementations
+    write (Wolly.Fernet), and an HTTP server for development without a web
+    server in front (Wolly.DevServer). TOTP takes the hash of a code as a
+    choice; a passkey login may name nobody, and a user registers one
+    passkey at a time.
+
+  * Every programme answers version --full with the C libraries it links
+    and info with its system report; the example servers and the tools
+    qruri, buntipng, view and acme run in a sandbox (pledge and unveil,
+    Landlock and seccomp) and print it on sandbox or -s.
+
+  * Searches of the log store: a search takes no write lock; host: uses
+    an index on the lower-case host and the time; an equal term under and
+    filters the set of its sibling; a word in a window of at most 100 000
+    lines reads only the hits of that window (an hour of a million lines
+    in 2.5 ms instead of 244 ms).
+
+  * Wolly.Account reads its two flags as integers on PostgreSQL as well.
+
+  * scripts/test.sh also runs hilde test --contracts over each module
+    with a contract.
+
+ -- Heiko Zimmermann <code@heiko-zimmermann.com>  Thu, 29 Oct 2026 00:00:00 +0100
+
+wolly (0.1.0) stable; urgency=low
+
+  * First release. Wolly is a web framework in Hilde: an application is a
+    FastCGI responder on a Unix socket behind Hiawatha, on the server loop
+    of Hilde's Standard.FcgiServer. 63 modules under src/Wolly, each with
+    the contracts of its public functions or the reason why not.
+
+  * Requests and answers: the life of the process with SIGTERM and SIGINT,
+    request with decoded query and cookies, answer with checked headers,
+    a router of method and pattern with 404, 405 and 400, steps before and
+    after the router, security headers and one access-log line with a
+    request id per request.
+
+  * Sign-in and protection: users with Argon2id hashes, sessions rotated at
+    login, throttling per client and per name, the __Host-wolly cookie, an
+    audit log, roles, request forgery guards of form token and origin, a
+    form guard with honeypot and time window, bans, limits, bearer tokens,
+    passkeys, TOTP as second factor and a client of RAMBO (OpenID Connect
+    with PKCE, ID tokens checked against ML-DSA keys).
+
+  * Data: SQLite and PostgreSQL behind one dialect, entities and edges,
+    a cache, metrics, a log store with full-text and sound index and its
+    query, sealed secrets, pseudonyms and a vault for the keys of a server.
+
+  * Pages: views with templates of the tenant read at run time and searched
+    in linear time, Markdown, Atom feeds, charts, code highlighted, a
+    dashboard, QR and Bunti codes, GIF, JPEG and WebP read in Hilde, and
+    asset versions from the SHA-256 of the content.
+
+  * Programmes under cli/ (acme, buntipng, qruri, sshrun, vault, view) and
+    the examples hello, login and contact; each example is tested behind
+    its own Hiawatha over HTTP and TLS. Each programme prints its version
+    line on version, -V or --version; the release number comes from
+    Wolly.Version, which scripts/check-version.pl holds equal to this file.
+
+  * Built and tested in a container image on Linux (arm64 and amd64), and
+    on OpenBSD 8.0.
+
+ -- Heiko Zimmermann <code@heiko-zimmermann.com>  Tue, 27 Oct 2026 00:00:00 +0100

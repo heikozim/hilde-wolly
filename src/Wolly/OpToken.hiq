@@ -1,0 +1,510 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    removeLast,
+    nthRef,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    equal,
+    constantTimeEqual
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonKind,
+    JsonNull,
+    JsonBoolean,
+    JsonNumber,
+    JsonString,
+    JsonArray,
+    JsonObject,
+    JsonWriter,
+    readJson,
+    destroyJson,
+    kindAt,
+    stringAt,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeString as writeJsonString,
+    writeInteger,
+    writeBool,
+    finishJson
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.Jws (
+    base64UrlEncode
+);
+
+module body Wolly.OpToken is
+    function idTokenType(): Span[Nat8, Static] is
+        return "JWT";
+    end;
+
+    function accessTokenType(): Span[Nat8, Static] is
+        return "at+jwt";
+    end;
+
+    generic [T: Region]
+    function isState(text: Span[Nat8, T]): Bool is
+        if (spanLength(text) = 0) or (spanLength(text) > 512) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] < 33) or (text[i] > 126) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Region]
+    function isVerifier(text: Span[Nat8, T]): Bool is
+        if (spanLength(text) < 43) or (spanLength(text) > 128) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            let letter: Bool := ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'));
+            if not (letter or ((c >= '0') and (c <= '9')) or (c = '-') or (c = '.') or (c = '_') or (c = '~')) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [V: Region]
+    function s256(verifier: Span[Nat8, V]): String is
+        case sha256(verifier) of
+            when Some(value as sum: String) do
+                let text: String := base64UrlEncode(asSpan(&sum));
+                destroyString(sum);
+                if length(&text) = 43 then
+                    return text;
+                end if;
+                destroyString(text);
+                return fromSpan("0000000000000000000000000000000000000000000");
+            when None do
+                -- No digest: a challenge no verifier gives, so that nothing holds.
+                return fromSpan("0000000000000000000000000000000000000000000");
+        end case;
+    end;
+
+    generic [V: Region, C: Region]
+    function pkceHolds(verifier: Span[Nat8, V], challenge: Span[Nat8, C]): Bool is
+        if not isVerifier(verifier) then
+            return false;
+        end if;
+        let made: String := s256(verifier);
+        let holds: Bool := constantTimeEqual(asSpan(&made), challenge);
+        destroyString(made);
+        return holds;
+    end;
+
+    -- Whether the blank-separated text names word.
+    generic [T: Region, W: Region]
+    function names(text: Span[Nat8, T], word: Span[Nat8, W]): Bool is
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(text) do
+            if (i = spanLength(text)) or (text[i] = ' ') then
+                if (i > start) and equal(substring(text, start, i), word) then
+                    return true;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [T: Region]
+    function normalScope(text: Span[Nat8, T]): Option[String] is
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(text) do
+            if (i = spanLength(text)) or (text[i] = ' ') or (text[i] = 9) or (text[i] = 10) or (text[i] = 13) then
+                if i > start then
+                    let word: Span[Nat8, T] := substring(text, start, i);
+                    if not (equal(word, "openid") or equal(word, "email") or equal(word, "profile")) then
+                        let none: Option[String] := None();
+                        return none;
+                    end if;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        if not names(text, "openid") then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "openid");
+        if names(text, "email") then
+            writeString(&!out, " email");
+        end if;
+        if names(text, "profile") then
+            writeString(&!out, " profile");
+        end if;
+        return Some(value => finalize(out));
+    end;
+
+    generic [S: Region, N: Region]
+    function scopeHas(scope: Span[Nat8, S], name: Span[Nat8, N]): Bool is
+        return names(scope, name);
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var all: Buffer[String] := strings;
+        while bufferLength(&all) > 0 do
+            destroyString(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    function destroyIdClaims(claims: IdClaims): Unit is
+        let { issuer: String, subject: String, clientId: String, issuedAt: Int64, expiry: Int64, authTime: Int64,
+            sessionId: String, amr: String, nonce: String, email: String, name: String, roles: Buffer[String] } := claims;
+        destroyString(issuer);
+        destroyString(subject);
+        destroyString(clientId);
+        destroyString(sessionId);
+        destroyString(amr);
+        destroyString(nonce);
+        destroyString(email);
+        destroyString(name);
+        destroyStrings(roles);
+        return nil;
+    end;
+
+    function destroyAccessClaims(claims: AccessClaims): Unit is
+        let { issuer: String, subject: String, audience: Buffer[String], clientId: String, issuedAt: Int64, expiry: Int64,
+            tokenId: String, authTime: Int64, sessionId: String, scope: String, roles: Buffer[String] } := claims;
+        destroyString(issuer);
+        destroyString(subject);
+        destroyStrings(audience);
+        destroyString(clientId);
+        destroyString(tokenId);
+        destroyString(sessionId);
+        destroyString(scope);
+        destroyStrings(roles);
+        return nil;
+    end;
+
+    generic [W: Region, V: Region]
+    function textMember(writer: &![JsonWriter, W], name: Span[Nat8, Static], value: Span[Nat8, V]): Unit is
+        if spanLength(value) > 0 then
+            writeName(&~writer, name);
+            writeJsonString(&~writer, value);
+        end if;
+        return nil;
+    end;
+
+    generic [W: Region]
+    function numberMember(writer: &![JsonWriter, W], name: Span[Nat8, Static], value: Int64): Unit is
+        if value /= 0 then
+            writeName(&~writer, name);
+            writeInteger(&~writer, value);
+        end if;
+        return nil;
+    end;
+
+    generic [W: Region, B: Region]
+    function listMember(writer: &![JsonWriter, W], name: Span[Nat8, Static], values: &[Buffer[String], B]): Unit is
+        if bufferLength(values) = 0 then
+            return nil;
+        end if;
+        writeName(&~writer, name);
+        beginArray(&~writer);
+        var i: Index := 0;
+        while i < bufferLength(values) do
+            writeJsonString(&~writer, asSpan(nthRef(values, i)));
+            i := i + 1;
+        end while;
+        endArray(&~writer);
+        return nil;
+    end;
+
+    -- The blank-separated words of text as a JSON list, when there are any.
+    generic [W: Region, T: Region]
+    function wordsMember(writer: &![JsonWriter, W], name: Span[Nat8, Static], text: Span[Nat8, T]): Unit is
+        var any: Bool := false;
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(text) do
+            if (i = spanLength(text)) or (text[i] = ' ') then
+                if i > start then
+                    if not any then
+                        writeName(&~writer, name);
+                        beginArray(&~writer);
+                        any := true;
+                    end if;
+                    writeJsonString(&~writer, substring(text, start, i));
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        if any then
+            endArray(&~writer);
+        end if;
+        return nil;
+    end;
+
+    function finished(writer: JsonWriter): String is
+        case finishJson(writer) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("{}");
+        end case;
+    end;
+
+    generic [C: Region]
+    function idTokenPayload(claims: &[IdClaims, C]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        textMember(&!writer, "iss", asSpan(&(claims->issuer)));
+        textMember(&!writer, "sub", asSpan(&(claims->subject)));
+        writeName(&!writer, "aud");
+        writeJsonString(&!writer, asSpan(&(claims->clientId)));
+        writeName(&!writer, "exp");
+        writeInteger(&!writer, claims->expiry);
+        numberMember(&!writer, "iat", claims->issuedAt);
+        textMember(&!writer, "azp", asSpan(&(claims->clientId)));
+        numberMember(&!writer, "auth_time", claims->authTime);
+        textMember(&!writer, "sid", asSpan(&(claims->sessionId)));
+        wordsMember(&!writer, "amr", asSpan(&(claims->amr)));
+        textMember(&!writer, "nonce", asSpan(&(claims->nonce)));
+        textMember(&!writer, "email", asSpan(&(claims->email)));
+        textMember(&!writer, "name", asSpan(&(claims->name)));
+        listMember(&!writer, "roles", &(claims->roles));
+        endObject(&!writer);
+        return finished(writer);
+    end;
+
+    generic [C: Region]
+    function accessTokenPayload(claims: &[AccessClaims, C]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        textMember(&!writer, "iss", asSpan(&(claims->issuer)));
+        textMember(&!writer, "sub", asSpan(&(claims->subject)));
+        let audience: &[Buffer[String], C] := &(claims->audience);
+        writeName(&!writer, "aud");
+        if bufferLength(audience) = 1 then
+            writeJsonString(&!writer, asSpan(nthRef(audience, 0)));
+        else
+            beginArray(&!writer);
+            var i: Index := 0;
+            while i < bufferLength(audience) do
+                writeJsonString(&!writer, asSpan(nthRef(audience, i)));
+                i := i + 1;
+            end while;
+            endArray(&!writer);
+        end if;
+        writeName(&!writer, "exp");
+        writeInteger(&!writer, claims->expiry);
+        numberMember(&!writer, "iat", claims->issuedAt);
+        textMember(&!writer, "jti", asSpan(&(claims->tokenId)));
+        textMember(&!writer, "client_id", asSpan(&(claims->clientId)));
+        numberMember(&!writer, "auth_time", claims->authTime);
+        textMember(&!writer, "sid", asSpan(&(claims->sessionId)));
+        textMember(&!writer, "scope", asSpan(&(claims->scope)));
+        listMember(&!writer, "roles", &(claims->roles));
+        endObject(&!writer);
+        return finished(writer);
+    end;
+
+    generic [A: Region, I: Region, R: Region, S: Region]
+    function tokenAnswer(accessToken: Span[Nat8, A], expiresIn: Int64, idToken: Span[Nat8, I], refreshToken: Span[Nat8, R],
+        scope: Span[Nat8, S]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "access_token");
+        writeJsonString(&!writer, accessToken);
+        writeName(&!writer, "token_type");
+        writeJsonString(&!writer, "Bearer");
+        writeName(&!writer, "expires_in");
+        writeInteger(&!writer, expiresIn);
+        textMember(&!writer, "id_token", idToken);
+        textMember(&!writer, "refresh_token", refreshToken);
+        textMember(&!writer, "scope", scope);
+        endObject(&!writer);
+        return finished(writer);
+    end;
+
+    generic [C: Region, D: Region]
+    function errorAnswer(code: Span[Nat8, C], description: Span[Nat8, D]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "error");
+        writeJsonString(&!writer, code);
+        writeName(&!writer, "error_description");
+        writeJsonString(&!writer, description);
+        endObject(&!writer);
+        return finished(writer);
+    end;
+
+    generic [W: Region]
+    function texts(writer: &![JsonWriter, W], name: Span[Nat8, Static], a: Span[Nat8, Static], b: Span[Nat8, Static],
+        c: Span[Nat8, Static]): Unit is
+        writeName(&~writer, name);
+        beginArray(&~writer);
+        writeJsonString(&~writer, a);
+        if spanLength(b) > 0 then
+            writeJsonString(&~writer, b);
+        end if;
+        if spanLength(c) > 0 then
+            writeJsonString(&~writer, c);
+        end if;
+        endArray(&~writer);
+        return nil;
+    end;
+
+    generic [W: Region, I: Region]
+    function endpoint(writer: &![JsonWriter, W], name: Span[Nat8, Static], issuer: Span[Nat8, I], path: Span[Nat8, Static]): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, issuer);
+        writeString(&!out, path);
+        let url: String := finalize(out);
+        writeName(&~writer, name);
+        writeJsonString(&~writer, asSpan(&url));
+        destroyString(url);
+        return nil;
+    end;
+
+    generic [I: Region]
+    function discoveryDocument(issuer: Span[Nat8, I]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        endpoint(&!writer, "authorization_endpoint", issuer, "/authorize");
+        writeName(&!writer, "authorization_response_iss_parameter_supported");
+        writeBool(&!writer, true);
+        writeName(&!writer, "claims_parameter_supported");
+        writeBool(&!writer, false);
+        writeName(&!writer, "claims_supported");
+        beginArray(&!writer);
+        writeJsonString(&!writer, "iss");
+        writeJsonString(&!writer, "sub");
+        writeJsonString(&!writer, "aud");
+        writeJsonString(&!writer, "exp");
+        writeJsonString(&!writer, "iat");
+        writeJsonString(&!writer, "auth_time");
+        writeJsonString(&!writer, "nonce");
+        writeJsonString(&!writer, "sid");
+        writeJsonString(&!writer, "amr");
+        writeJsonString(&!writer, "azp");
+        writeJsonString(&!writer, "email");
+        writeJsonString(&!writer, "name");
+        writeJsonString(&!writer, "roles");
+        endArray(&!writer);
+        texts(&!writer, "code_challenge_methods_supported", "S256", "", "");
+        endpoint(&!writer, "end_session_endpoint", issuer, "/logout");
+        texts(&!writer, "grant_types_supported", "authorization_code", "refresh_token", "client_credentials");
+        texts(&!writer, "id_token_signing_alg_values_supported", "ML-DSA-44", "ML-DSA-44-Ed25519", "");
+        writeName(&!writer, "issuer");
+        writeJsonString(&!writer, issuer);
+        endpoint(&!writer, "jwks_uri", issuer, "/jwks");
+        texts(&!writer, "prompt_values_supported", "none", "login", "");
+        writeName(&!writer, "request_parameter_supported");
+        writeBool(&!writer, false);
+        writeName(&!writer, "request_uri_parameter_supported");
+        writeBool(&!writer, false);
+        texts(&!writer, "response_modes_supported", "query", "", "");
+        texts(&!writer, "response_types_supported", "code", "", "");
+        texts(&!writer, "scopes_supported", "openid", "email", "profile");
+        texts(&!writer, "subject_types_supported", "public", "", "");
+        endpoint(&!writer, "token_endpoint", issuer, "/token");
+        texts(&!writer, "token_endpoint_auth_methods_supported", "client_secret_basic", "client_secret_post", "none");
+        endObject(&!writer);
+        return finished(writer);
+    end;
+
+    function destroyHint(hint: Hint): Unit is
+        let { issuer: String, audience: String, subject: String, sessionId: String } := hint;
+        destroyString(issuer);
+        destroyString(audience);
+        destroyString(subject);
+        destroyString(sessionId);
+        return nil;
+    end;
+
+    generic [D: Region]
+    function textOr(document: &[Json, D], pointer: Span[Nat8, Static]): String is
+        case stringAt(document, pointer) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [P: Region]
+    function readHint(payload: Span[Nat8, P]): Option[Hint] is
+        case readJson(payload) of
+            when Right(right as document: Json) do
+                var audience: String := fromSpan("");
+                case kindAt(&document, "/aud") of
+                    when Some(value as kind: JsonKind) do
+                        case kind of
+                            when JsonString do
+                                destroyString(audience);
+                                audience := textOr(&document, "/aud");
+                            when JsonArray do
+                                destroyString(audience);
+                                audience := textOr(&document, "/aud/0");
+                            when JsonNull | JsonBoolean | JsonNumber | JsonObject do
+                                skip;
+                        end case;
+                    when None do
+                        skip;
+                end case;
+                if length(&audience) = 0 then
+                    destroyString(audience);
+                    destroyJson(document);
+                    let none: Option[Hint] := None();
+                    return none;
+                end if;
+                let hint: Hint := Hint(issuer => textOr(&document, "/iss"), audience => audience,
+                    subject => textOr(&document, "/sub"), sessionId => textOr(&document, "/sid"));
+                destroyJson(document);
+                return Some(value => hint);
+            when Left(left as error: JsonError) do
+                let none: Option[Hint] := None();
+                return none;
+        end case;
+    end;
+end module body.

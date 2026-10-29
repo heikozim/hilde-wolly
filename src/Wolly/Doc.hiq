@@ -1,0 +1,586 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    contains,
+    equal
+);
+import Standard.Html (
+    Document,
+    TokenKind,
+    TextToken,
+    StartTag,
+    EndTag,
+    CommentToken,
+    DoctypeToken,
+    parseHtml,
+    destroyDocument,
+    tokenCount,
+    tokenKind,
+    tokenText,
+    attributeOf,
+    textOf
+);
+import Wolly.Response (
+    decimalText
+);
+import Wolly.Markdown (
+    markdownToHtml,
+    isSafeLink
+);
+
+module body Wolly.Doc is
+    constant htmlMost: Index := 1048576;
+    constant noList: Index := 0;
+    constant bullets: Index := 1;
+    constant numbers: Index := 2;
+    constant firstNumber: Int64 := 1;
+    -- What a run of white space left to write: nothing, a space, a line.
+    constant noSpace: Index := 0;
+    constant aSpace: Index := 1;
+    constant aLine: Index := 2;
+
+    -- Where the writing stands on the current line.
+    record Line: Free is
+        -- Nothing written on the line yet.
+        atStart: Bool;
+        -- The white space waiting for the next byte.
+        pending: Index;
+        -- The line so far holds only digits (then a dot would number it).
+        digits: Bool;
+        -- The current block holds something.
+        open: Bool;
+    end;
+
+    function freshLine(): Line is
+        return Line(atStart => true, pending => noSpace, digits => false, open => false);
+    end;
+
+    function mostHtmlBytes(): Index is
+        return htmlMost;
+    end;
+
+    function isSpace(byte: Nat8): Bool is
+        return ((byte = 32) or (byte = 9)) or (((byte = 10) or (byte = 13)) or (byte = 12));
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= 48) and (byte <= 57);
+    end;
+
+    -- 1 to 6 for h1 to h6, 0 otherwise.
+    generic [N: Region]
+    function headingOf(name: Span[Nat8, N]): Index is
+        if spanLength(name) /= 2 then
+            return 0;
+        end if;
+        if (name[0] /= 'h') or ((name[1] < '1') or (name[1] > '6')) then
+            return 0;
+        end if;
+        let digit: Nat8 := name[1] - 48;
+        var level: Index := 1;
+        var k: Nat8 := 1;
+        while k < digit do
+            level := level + 1;
+            k := k + 1;
+        end while;
+        return level;
+    end;
+
+    -- The elements that make a block of their own.
+    generic [N: Region]
+    function isBlockTag(name: Span[Nat8, N]): Bool is
+        let a: Bool := (equal(name, "p") or equal(name, "div")) or (equal(name, "section") or equal(name, "article"));
+        let b: Bool := (equal(name, "header") or equal(name, "footer")) or (equal(name, "main") or equal(name, "nav"));
+        let c: Bool := (equal(name, "aside") or equal(name, "table")) or (equal(name, "tr") or equal(name, "form"));
+        let d: Bool := (equal(name, "figure") or equal(name, "dl")) or ((equal(name, "dt") or equal(name, "dd")) or equal(name, "address"));
+        return (a or b) or (c or d);
+    end;
+
+    -- The elements whose text is never shown.
+    generic [N: Region]
+    function isHidden(name: Span[Nat8, N]): Bool is
+        return (equal(name, "script") or equal(name, "style")) or (equal(name, "textarea") or equal(name, "title"));
+    end;
+
+    -- Whether byte would be read as a mark by Wolly.Markdown anywhere.
+    function marksAnywhere(byte: Nat8): Bool is
+        return ((byte = 92) or (byte = '`')) or (((byte = '*') or (byte = '[')) or (byte = ']'));
+    end;
+
+    -- Whether byte would be read as a mark at the start of a line.
+    function marksAtStart(byte: Nat8): Bool is
+        return ((byte = '#') or (byte = '>')) or ((byte = '-') or (byte = '+'));
+    end;
+
+    -- Writes the white space waiting.  newlines: a line may be written;
+    -- quote: a new line starts with "> ".
+    generic [B: Region]
+    function flushSpace(out: &![StringBuilder, B], line: Line, newlines: Bool, quote: Bool): Line is
+        if line.pending = noSpace then
+            return line;
+        end if;
+        if (line.pending = aLine) and newlines then
+            writeByte(&~out, '\n');
+            if quote then
+                writeString(&~out, "> ");
+                return Line(atStart => false, pending => noSpace, digits => false, open => true);
+            end if;
+            return Line(atStart => true, pending => noSpace, digits => false, open => true);
+        end if;
+        writeByte(&~out, ' ');
+        return Line(atStart => false, pending => noSpace, digits => line.digits, open => true);
+    end;
+
+    -- Writes text: white space runs as one space or one line, the marks
+    -- escaped when escape is true (not in a code span).
+    generic [B: Region, T: Region]
+    function writeText(out: &![StringBuilder, B], text: Span[Nat8, T], start: Line, escape: Bool, newlines: Bool,
+                       quote: Bool): Line is
+        var atStart: Bool := start.atStart;
+        var pending: Index := start.pending;
+        var digits: Bool := start.digits;
+        var open: Bool := start.open;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if isSpace(byte) then
+                if not atStart then
+                    if (byte = 10) or (pending = aLine) then
+                        pending := aLine;
+                    else
+                        pending := aSpace;
+                    end if;
+                end if;
+            else
+                let flushed: Line := flushSpace(&~out, Line(atStart => atStart, pending => pending, digits => digits, open => open), newlines, quote);
+                atStart := flushed.atStart;
+                pending := noSpace;
+                digits := flushed.digits;
+                if escape then
+                    let mark: Bool := (marksAnywhere(byte) or (atStart and marksAtStart(byte))) or (digits and (byte = '.'));
+                    if mark then
+                        writeByte(&~out, 92);
+                    end if;
+                end if;
+                writeByte(&~out, byte);
+                digits := (atStart or digits) and isDigit(byte);
+                atStart := false;
+                open := true;
+            end if;
+            i := i + 1;
+        end while;
+        return Line(atStart => atStart, pending => pending, digits => digits, open => open);
+    end;
+
+    -- Ends the block: a blank line when it held something.
+    generic [B: Region]
+    function endBlock(out: &![StringBuilder, B], line: Line): Line is
+        if line.open then
+            writeString(&~out, "\n\n");
+        end if;
+        return freshLine();
+    end;
+
+    -- A mark such as ** written inline, after the white space waiting.
+    generic [B: Region]
+    function writeMark(out: &![StringBuilder, B], line: Line, mark: Span[Nat8, Static], newlines: Bool, quote: Bool): Line is
+        let flushed: Line := flushSpace(&~out, line, newlines, quote);
+        writeString(&~out, mark);
+        return Line(atStart => false, pending => noSpace, digits => false, open => true);
+    end;
+
+    -- Whether the code element opened at token n holds a backtick.
+    generic [R: Region]
+    function codeHasTick(doc: &[Document, R], n: Index): Bool is
+        var i: Index := n + 1;
+        while i < tokenCount(doc) do
+            case tokenKind(doc, i) of
+                when Some(value as kind: TokenKind) do
+                    case kind of
+                        when TextToken do
+                            if contains(tokenText(doc, i), "`") then
+                                return true;
+                            end if;
+                        when EndTag do
+                            if equal(tokenText(doc, i), "code") then
+                                return false;
+                            end if;
+                        when StartTag do
+                            skip;
+                        when CommentToken do
+                            skip;
+                        when DoctypeToken do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Whether token n + 1 ends the element token n opens.
+    generic [R: Region]
+    function closesAtOnce(doc: &[Document, R], n: Index): Bool is
+        case tokenKind(doc, n + 1) of
+            when Some(value as kind: TokenKind) do
+                case kind of
+                    when EndTag do
+                        return equal(tokenText(doc, n + 1), tokenText(doc, n));
+                    when TextToken do
+                        return false;
+                    when StartTag do
+                        return false;
+                    when CommentToken do
+                        return false;
+                    when DoctypeToken do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the a element at token n has a target Markdown can carry.
+    generic [R: Region]
+    function hasTarget(doc: &[Document, R], n: Index): Bool is
+        case attributeOf(doc, n, "href") of
+            when Some(value as href: String) do
+                let fit: Bool := isSafeLink(asSpan(&href)) and (not contains(asSpan(&href), ")"));
+                destroyString(href);
+                return fit;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [B: Region, R: Region]
+    function writeTarget(out: &![StringBuilder, B], doc: &[Document, R], n: Index): Unit is
+        case attributeOf(doc, n, "href") of
+            when Some(value as href: String) do
+                writeString(&~out, asSpan(&href));
+                destroyString(href);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The alt text of the image at token n, as text.
+    generic [B: Region, R: Region]
+    function writeAlt(out: &![StringBuilder, B], doc: &[Document, R], n: Index, line: Line, newlines: Bool, quote: Bool): Line is
+        case attributeOf(doc, n, "alt") of
+            when Some(value as alt: String) do
+                let after: Line := writeText(&~out, asSpan(&alt), line, true, newlines, quote);
+                destroyString(alt);
+                return after;
+            when None do
+                return line;
+        end case;
+    end;
+
+    generic [B: Region, R: Region]
+    function convert(out: &![StringBuilder, B], doc: &[Document, R]): Unit is
+        var line: Line := freshLine();
+        var list: Index := noList;
+        var depth: Index := 0;
+        var number: Int64 := 1;
+        var heading: Bool := false;
+        var quote: Bool := false;
+        var pre: Bool := false;
+        var lastNewline: Bool := true;
+        var hidden: Bool := false;
+        var code: Bool := false;
+        var link: Bool := false;
+        var linkAt: Index := 0;
+        let count: Index := tokenCount(doc);
+        var n: Index := 0;
+        while n < count do
+            -- Text may run over lines only in a paragraph or a quote.
+            let newlines: Bool := (not heading) and (list = noList);
+            case tokenKind(doc, n) of
+                when Some(value as kind: TokenKind) do
+                    case kind of
+                        when TextToken do
+                            if not hidden then
+                                if pre then
+                                    let raw: Span[Nat8, R] := tokenText(doc, n);
+                                    writeString(&~out, raw);
+                                    if spanLength(raw) > 0 then
+                                        lastNewline := raw[spanLength(raw) - 1] = 10;
+                                    end if;
+                                else
+                                    line := writeText(&~out, tokenText(doc, n), line, not code, newlines and (not code), quote);
+                                end if;
+                            end if;
+                        when StartTag do
+                            let name: Span[Nat8, R] := tokenText(doc, n);
+                            let level: Index := headingOf(name);
+                            if isHidden(name) then
+                                hidden := true;
+                            else
+                                if pre then
+                                    skip;
+                                else
+                                    if equal(name, "pre") then
+                                        line := endBlock(&~out, line);
+                                        writeString(&~out, "```\n");
+                                        pre := true;
+                                        lastNewline := true;
+                                    else
+                                        if level > 0 then
+                                            line := endBlock(&~out, line);
+                                            var k: Index := 0;
+                                            while k < level do
+                                                writeByte(&~out, '#');
+                                                k := k + 1;
+                                            end while;
+                                            writeByte(&~out, ' ');
+                                            line := Line(atStart => false, pending => noSpace, digits => false, open => true);
+                                            heading := true;
+                                        else
+                                            if equal(name, "ul") or equal(name, "ol") then
+                                                if depth = 0 then
+                                                    line := endBlock(&~out, line);
+                                                    number := firstNumber;
+                                                end if;
+                                                depth := depth + 1;
+                                                if equal(name, "ul") then
+                                                    list := bullets;
+                                                else
+                                                    list := numbers;
+                                                end if;
+                                            else
+                                                if equal(name, "li") then
+                                                    if line.open then
+                                                        writeByte(&~out, '\n');
+                                                    end if;
+                                                    if list = numbers then
+                                                        let digits: String := decimalText(number);
+                                                        writeString(&~out, asSpan(&digits));
+                                                        destroyString(digits);
+                                                        writeString(&~out, ". ");
+                                                        number := number + 1;
+                                                    else
+                                                        writeString(&~out, "- ");
+                                                    end if;
+                                                    if list = noList then
+                                                        list := bullets;
+                                                    end if;
+                                                    line := Line(atStart => false, pending => noSpace, digits => false, open => true);
+                                                else
+                                                    if equal(name, "blockquote") then
+                                                        line := endBlock(&~out, line);
+                                                        writeString(&~out, "> ");
+                                                        line := Line(atStart => false, pending => noSpace, digits => false, open => true);
+                                                        quote := true;
+                                                    else
+                                                        if equal(name, "hr") then
+                                                            line := endBlock(&~out, line);
+                                                            writeString(&~out, "---\n\n");
+                                                        else
+                                                            if equal(name, "br") then
+                                                                if line.open then
+                                                                    if newlines then
+                                                                        line := Line(atStart => line.atStart, pending => aLine, digits => line.digits, open => true);
+                                                                    else
+                                                                        line := Line(atStart => line.atStart, pending => aSpace, digits => line.digits, open => true);
+                                                                    end if;
+                                                                end if;
+                                                            else
+                                                                if isBlockTag(name) then
+                                                                    if ((list = noList) and (not heading)) and (not quote) then
+                                                                        line := endBlock(&~out, line);
+                                                                    end if;
+                                                                else
+                                                                    if (equal(name, "strong") or equal(name, "b")) and (not code) then
+                                                                        if closesAtOnce(doc, n) then
+                                                                            n := n + 1;
+                                                                        else
+                                                                            line := writeMark(&~out, line, "**", newlines, quote);
+                                                                        end if;
+                                                                    else
+                                                                        if (equal(name, "em") or equal(name, "i")) and (not code) then
+                                                                            if closesAtOnce(doc, n) then
+                                                                                n := n + 1;
+                                                                            else
+                                                                                line := writeMark(&~out, line, "*", newlines, quote);
+                                                                            end if;
+                                                                        else
+                                                                            if equal(name, "code") and (not code) then
+                                                                                if (not codeHasTick(doc, n)) and (not closesAtOnce(doc, n)) then
+                                                                                    line := writeMark(&~out, line, "`", newlines, quote);
+                                                                                    code := true;
+                                                                                end if;
+                                                                            else
+                                                                                if equal(name, "a") and (not link) then
+                                                                                    if hasTarget(doc, n) and (not closesAtOnce(doc, n)) then
+                                                                                        line := writeMark(&~out, line, "[", newlines, quote);
+                                                                                        link := true;
+                                                                                        linkAt := n;
+                                                                                    end if;
+                                                                                else
+                                                                                    if equal(name, "img") then
+                                                                                        line := writeAlt(&~out, doc, n, line, newlines, quote);
+                                                                                    else
+                                                                                        if equal(name, "td") or equal(name, "th") then
+                                                                                            if line.open then
+                                                                                                line := Line(atStart => line.atStart, pending => aSpace, digits => line.digits, open => true);
+                                                                                            end if;
+                                                                                        end if;
+                                                                                    end if;
+                                                                                end if;
+                                                                            end if;
+                                                                        end if;
+                                                                    end if;
+                                                                end if;
+                                                            end if;
+                                                        end if;
+                                                    end if;
+                                                end if;
+                                            end if;
+                                        end if;
+                                    end if;
+                                end if;
+                            end if;
+                        when EndTag do
+                            let name: Span[Nat8, R] := tokenText(doc, n);
+                            if isHidden(name) then
+                                hidden := false;
+                            else
+                                if pre then
+                                    if equal(name, "pre") then
+                                        if not lastNewline then
+                                            writeByte(&~out, '\n');
+                                        end if;
+                                        writeString(&~out, "```\n\n");
+                                        pre := false;
+                                        line := freshLine();
+                                    end if;
+                                else
+                                    if headingOf(name) > 0 then
+                                        line := endBlock(&~out, line);
+                                        heading := false;
+                                    else
+                                        if equal(name, "ul") or equal(name, "ol") then
+                                            if depth > 0 then
+                                                depth := depth - 1;
+                                            end if;
+                                            if depth = 0 then
+                                                line := endBlock(&~out, line);
+                                                list := noList;
+                                            end if;
+                                        else
+                                            if equal(name, "blockquote") then
+                                                line := endBlock(&~out, line);
+                                                quote := false;
+                                            else
+                                                if isBlockTag(name) then
+                                                    if ((list = noList) and (not heading)) and (not quote) then
+                                                        line := endBlock(&~out, line);
+                                                    end if;
+                                                else
+                                                    if (equal(name, "strong") or equal(name, "b")) and (not code) then
+                                                        writeString(&~out, "**");
+                                                    else
+                                                        if (equal(name, "em") or equal(name, "i")) and (not code) then
+                                                            writeString(&~out, "*");
+                                                        else
+                                                            if equal(name, "code") and code then
+                                                                writeString(&~out, "`");
+                                                                code := false;
+                                                            else
+                                                                if equal(name, "a") and link then
+                                                                    writeString(&~out, "](");
+                                                                    writeTarget(&~out, doc, linkAt);
+                                                                    writeByte(&~out, ')');
+                                                                    link := false;
+                                                                end if;
+                                                            end if;
+                                                        end if;
+                                                    end if;
+                                                end if;
+                                            end if;
+                                        end if;
+                                    end if;
+                                end if;
+                            end if;
+                        when CommentToken do
+                            skip;
+                        when DoctypeToken do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+            n := n + 1;
+        end while;
+        if pre then
+            if not lastNewline then
+                writeByte(&~out, '\n');
+            end if;
+            writeString(&~out, "```\n");
+        else
+            if line.open then
+                writeByte(&~out, '\n');
+            end if;
+        end if;
+        return nil;
+    end;
+
+    generic [H: Region]
+    function htmlToMarkdown(html: Span[Nat8, H]): String is
+        var read: Index := spanLength(html);
+        if read > htmlMost then
+            read := htmlMost;
+        end if;
+        let doc: Document := parseHtml(substring(html, 0, read));
+        var out: StringBuilder := makeStringBuilder();
+        convert(&!out, &doc);
+        destroyDocument(doc);
+        let made: String := finalize(out);
+        let trimmed: String := oneLineEnd(asSpan(&made));
+        destroyString(made);
+        return trimmed;
+    end;
+
+    -- text with its line ends at the end cut to one; empty stays empty.
+    generic [T: Region]
+    function oneLineEnd(text: Span[Nat8, T]): String is
+        var stop: Index := spanLength(text);
+        while (stop > 0) and (text[stop - 1] = 10) do
+            stop := stop - 1;
+        end while;
+        if stop = 0 then
+            return fromSpan(substring(text, 0, 0));
+        end if;
+        return fromSpan(substring(text, 0, stop + 1));
+    end;
+
+    generic [M: Region]
+    function markdownText(markdown: Span[Nat8, M]): String is
+        let html: String := markdownToHtml(markdown);
+        let text: String := textOf(asSpan(&html));
+        destroyString(html);
+        return text;
+    end;
+end module body.

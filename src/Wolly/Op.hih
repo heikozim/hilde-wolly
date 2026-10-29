@@ -1,0 +1,237 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+An OpenID provider for a fixed set of first-party clients: Discovery, the
+key set, the authorization endpoint with a code challenge (S256 only), logout started by a client
+logout, and what the login page of the application needs to hand a
+sign-in over.  The token endpoint is Wolly.OpGrant's.
+
+A request that asks for a sign-in waits as a login request (Wolly.OpStore)
+bound to the browser by the flow cookie; the application's login page
+reads it with pending, checks the person and calls finish, which starts or
+renews the session and sends the browser on with a code, or to the page a
+login at the provider itself returns to.
+
+The session cookie is SameSite=Strict: a browser that comes from another
+site does not send it.  The authorization endpoint answers such a first
+request without the cookie with a page that navigates to the same request
+once more (a meta refresh, no script); that navigation starts on this site
+and brings the cookie.  The parameter _rs stops a second round.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.OpKey (
+    RingKey
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Wolly.OpStore (
+    OpSession,
+    RequestProblem
+);
+
+module Wolly.Op is
+    """
+    The CGI output of the discovery document of the provider.
+    No contract: the answer depends on the clients in the database.
+    """
+    generic [R: Region, S: Region]
+    function discoveryEndpoint(db: &![Database[Writing], R], settings: &[OpSettings, S]): String;
+
+    """
+    The CGI output of the key set of ring.
+    """
+    generic [K: Region]
+    function jwksEndpoint(ring: &[Buffer[RingKey], K]): String
+        ensures length(&result) > 0;
+
+    """
+    The CGI output of the authorization endpoint for request at now; ip is
+    the address of the browser as the web server resolved it.
+    No contract: the answer is the work of the database.
+    """
+    generic [Q: Region, R: Region, S: Region, L: Region, A: Region]
+    function authorizeEndpoint(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        log: &![Log, L], ip: Span[Nat8, A], now: Int64): String;
+
+    """
+    The CGI output of the logout endpoint for request at now: with an ID
+    token as hint its session ends and the browser goes to a registered
+    post_logout_redirect_uri; without one a POST with the form token of
+    the action logout ends the browser's own session; anything else goes
+    to the page that asks.
+    """
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region]
+    function logoutEndpoint(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], now: Int64): String
+        requires now > 0;
+
+    """
+    What the login page may know of a waiting request.
+    """
+    record Pending: Linear is
+        id: String;
+        clientId: String;
+        clientName: String;
+        reauth: Bool;
+        restarted: Bool;
+    end;
+
+    """
+    Frees waiting.
+    No contract: it only frees.
+    """
+    function destroyPending(waiting: Pending): Unit;
+
+    """
+    The request id when it belongs to the browser of request and is alive
+    at now; its client named.  Right Left when it is unknown, ran out, or
+    belongs to another browser.
+    """
+    generic [Q: Region, R: Region, S: Region, I: Region]
+    function pending(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], id: Span[Nat8, I],
+        now: Int64): Either[DbError, Either[RequestProblem, Pending]]
+        requires now > 0;
+
+    """
+    What the application sends after a step of the login: a status and the
+    location, with the cookies to set, or an error.
+    """
+    record Handover: Linear is
+        status: Nat16;
+        location: String;
+        cookies: Buffer[String];
+    end;
+
+    """
+    Frees the record.
+    No contract: it only frees.
+    """
+    function destroyHandover(handover: Handover): Unit;
+
+    """
+    The CGI output of the answer of a login step.
+    """
+    generic [H: Region]
+    function handoverOutput(handover: &[Handover, H]): String
+        ensures length(&result) > 0;
+
+    """
+    Starts a login at the provider itself that returns to returnTo, a local
+    path: the answer sends the browser to the login page with the new
+    request and sets its flow cookie.  Right None when returnTo is not a
+    local path or the random source fails.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function beginDirect(db: &![Database[Writing], R], settings: &[OpSettings, S], returnTo: Span[Nat8, T],
+        now: Int64): Either[DbError, Option[Handover]]
+        requires now > 0;
+
+    """
+    Why finish did not hand over.
+    """
+    union FinishProblem: Free is
+        case FinishRequest is
+            problem: RequestProblem;
+        case SubjectInactive;
+        case NoMethods;
+        case ClientGone;
+        case NoRandom;
+    end;
+
+    """
+    Completes the login of the request id for subject, who proved amr
+    (RFC 8176, blank-separated): starts or renews the session, ends the
+    request, and hands the browser on with a code to the client, or to the
+    path of a login at the provider itself.
+    """
+    generic [Q: Region, R: Region, S: Region, L: Region, I: Region, U: Region, M: Region, A: Region]
+    function finish(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        id: Span[Nat8, I], subject: Span[Nat8, U], amr: Span[Nat8, M], ip: Span[Nat8, A],
+        now: Int64): Either[DbError, Either[FinishProblem, Handover]]
+        requires now > 0;
+
+    """
+    What restart found for a login page that outlived its request.  url is
+    where the login ends: the start page of the client, or fallback; id is
+    the new request, empty when the browser holds a live session already;
+    cookies the flow cookie of the new request.
+    """
+    record Restarted: Linear is
+        id: String;
+        name: String;
+        url: String;
+        cookies: Buffer[String];
+    end;
+
+    """
+    Frees restarted.
+    No contract: it only frees.
+    """
+    function destroyRestarted(restarted: Restarted): Unit;
+
+    """
+    A way on for the login page of the request id that ran out, was used,
+    or was taken over by another tab: a new login request that ends at the
+    client's start page.  Right Left when the request is unknown, its client
+    is gone, or it was a restart itself that is still alive.
+    """
+    generic [Q: Region, R: Region, S: Region, I: Region, F: Region]
+    function restart(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], id: Span[Nat8, I],
+        fallback: Span[Nat8, F], now: Int64): Either[DbError, Either[RequestProblem, Restarted]]
+        requires now > 0;
+
+    """
+    The live session of the browser of request, its activity recorded at
+    now.  Right None when it has none.
+    """
+    generic [Q: Region, R: Region, S: Region, A: Region]
+    function currentSession(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ip: Span[Nat8, A], now: Int64): Either[DbError, Option[OpSession]]
+        requires now > 0;
+
+    """
+    The form token of action for the browser of request: the HMAC-SHA256 of
+    action under the SHA-256 of its session cookie, in base64url.  Empty
+    when it has no session cookie.
+    """
+    generic [Q: Region, S: Region, A: Region]
+    function csrfToken(request: &[Request, Q], settings: &[OpSettings, S], action: Span[Nat8, A]): String
+        ensures (length(&result) = 43) or (length(&result) = 0);
+
+    """
+    Whether token is the form token of action for the browser of request,
+    compared in constant time.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [Q: Region, S: Region, A: Region, T: Region]
+    function csrfHolds(request: &[Request, Q], settings: &[OpSettings, S], action: Span[Nat8, A], token: Span[Nat8, T]): Bool;
+
+    """
+    The Set-Cookie value that removes the session cookie.
+    """
+    generic [S: Region]
+    function sessionCookieGone(settings: &[OpSettings, S]): String
+        ensures length(&result) > 0;
+end module.

@@ -1,0 +1,386 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- No cryptography of its own: the HMAC, SHA-256 and the random bytes are
+-- Standard.Libcrypto's.  SQL of its own over Standard.Database: every
+-- statement is a constant and every value is bound.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    nthRef,
+    length as bufferLength,
+    removeLast,
+    destroyEmpty
+);
+import Standard.Text (
+    split,
+    equal,
+    parseInt,
+    formatInt,
+    constantTimeEqual
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha256,
+    hmacSha256
+);
+import Standard.Jws (
+    base64UrlEncode,
+    base64UrlDecode
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    noValues,
+    withInt64,
+    withText,
+    execute,
+    isUniqueViolation
+);
+
+module body Wolly.Pow is
+    constant makeSpent: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS pow_spent (id TEXT PRIMARY KEY, until INTEGER NOT NULL)";
+    constant makeSpentIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS pow_spent_until ON pow_spent (until)";
+    constant insertSpent: Span[Nat8, Static] := "INSERT INTO pow_spent (id, until) VALUES (?, ?)";
+    constant deleteOld: Span[Nat8, Static] := "DELETE FROM pow_spent WHERE until < ?";
+
+    constant mostBindingBytes: Index := 256;
+    constant mostTokenBytes: Index := 512;
+    constant mostNonceDigits: Index := 20;
+
+    function mostBits(): Int64 is
+        return 32;
+    end;
+
+    function fewestKeyBytes(): Index is
+        return 32;
+    end;
+
+    function destroyPuzzle(puzzle: Puzzle): Unit is
+        let { token: String, id: String, bits: Int64, expires: Int64 } := puzzle;
+        destroyString(token);
+        destroyString(id);
+        return nil;
+    end;
+
+    -- The HMAC-SHA256 of payload under key in base64url.
+    generic [K: Region, P: Region]
+    function signature(key: Span[Nat8, K], payload: Span[Nat8, P]): Option[String] is
+        case hmacSha256(key, payload) of
+            when Some(value as mac: String) do
+                let text: String := base64UrlEncode(asSpan(&mac));
+                destroyString(mac);
+                return Some(value => text);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region, B: Region]
+    function issuePuzzle(key: Span[Nat8, K], binding: Span[Nat8, B], bits: Int64, now: Int64,
+        ttl: Int64): Option[Puzzle] is
+        if (spanLength(key) < fewestKeyBytes()) or (bits < 1) or (bits > mostBits()) then
+            let none: Option[Puzzle] := None();
+            return none;
+        end if;
+        if (spanLength(binding) = 0) or (spanLength(binding) > mostBindingBytes) then
+            let none: Option[Puzzle] := None();
+            return none;
+        end if;
+        case randomBytes(16) of
+            when Some(value as raw: String) do
+                let id: String := base64UrlEncode(asSpan(&raw));
+                destroyString(raw);
+                let expires: Int64 := now + ttl;
+                var payload: StringBuilder := makeStringBuilder();
+                writeString(&!payload, "1.");
+                writeString(&!payload, asSpan(&id));
+                writeByte(&!payload, '.');
+                let b: String := formatInt(bits);
+                writeString(&!payload, asSpan(&b));
+                destroyString(b);
+                writeByte(&!payload, '.');
+                let e: String := formatInt(expires);
+                writeString(&!payload, asSpan(&e));
+                destroyString(e);
+                writeByte(&!payload, '.');
+                let bound: String := base64UrlEncode(binding);
+                writeString(&!payload, asSpan(&bound));
+                destroyString(bound);
+                let text: String := finalize(payload);
+                case signature(key, asSpan(&text)) of
+                    when Some(value as sig: String) do
+                        var token: StringBuilder := makeStringBuilder();
+                        writeString(&!token, asSpan(&text));
+                        writeByte(&!token, '.');
+                        writeString(&!token, asSpan(&sig));
+                        destroyString(sig);
+                        destroyString(text);
+                        return Some(value => Puzzle(token => finalize(token), id => id, bits => bits, expires => expires));
+                    when None do
+                        destroyString(text);
+                        destroyString(id);
+                        let none: Option[Puzzle] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Puzzle] := None();
+                return none;
+        end case;
+    end;
+
+    function powReason(check: PowCheck): Span[Nat8, Static] is
+        case check of
+            when PowMalformed do
+                return "malformed";
+            when PowForged do
+                return "forged";
+            when PowExpired do
+                return "expired";
+            when PowOtherFlow do
+                return "other_flow";
+            when PowTooEasy do
+                return "too_easy";
+            when PowWrong do
+                return "wrong";
+            when PowReused do
+                return "reused";
+            when PowSolved do
+                return "";
+        end case;
+    end;
+
+    -- The leading zero bits of digest.
+    generic [D: Region]
+    function zeroBits(digest: Span[Nat8, D]): Int64 is
+        var zeros: Int64 := 0;
+        var i: Index := 0;
+        while i < spanLength(digest) do
+            let b: Nat8 := digest[i];
+            if b = 0 then
+                zeros := zeros + 8;
+            else
+                var mask: Nat8 := 128;
+                while (mask > 0) and ((b / mask) = 0) do
+                    zeros := zeros + 1;
+                    mask := mask / 2;
+                end while;
+                return zeros;
+            end if;
+            i := i + 1;
+        end while;
+        return zeros;
+    end;
+
+    generic [T: Region, N: Region]
+    function solves(token: Span[Nat8, T], nonce: Span[Nat8, N], bits: Int64): Bool is
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, token);
+        writeByte(&!text, ':');
+        writeString(&!text, nonce);
+        let joined: String := finalize(text);
+        let digest: Option[String] := sha256(asSpan(&joined));
+        destroyString(joined);
+        case digest of
+            when Some(value as sum: String) do
+                let zeros: Int64 := zeroBits(asSpan(&sum));
+                destroyString(sum);
+                return zeros >= bits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [N: Region]
+    function isNonce(nonce: Span[Nat8, N]): Bool is
+        if (spanLength(nonce) = 0) or (spanLength(nonce) > mostNonceDigits) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(nonce) do
+            if (nonce[i] < '0') or (nonce[i] > '9') then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function preparePow(db: &![Database[Writing], R]): Option[DbError] is
+        case execute(&~db, makeSpent, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as done: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, makeSpentIndex, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as done: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+        end case;
+    end;
+
+    -- The parts of a puzzle read from its text, before the signature is
+    -- checked.
+    record Parts: Linear is
+        id: String;
+        bits: Int64;
+        expires: Int64;
+        binding: String;
+    end;
+
+    function destroyParts(parts: Parts): Unit is
+        let { id: String, bits: Int64, expires: Int64, binding: String } := parts;
+        destroyString(id);
+        destroyString(binding);
+        return nil;
+    end;
+
+    generic [R: Region, K: Region, T: Region, N: Region, B: Region]
+    function checkPuzzle(db: &![Database[Writing], R], key: Span[Nat8, K], token: Span[Nat8, T], nonce: Span[Nat8, N],
+        binding: Span[Nat8, B], minBits: Int64, now: Int64): Either[DbError, PowCheck] is
+        if spanLength(token) > mostTokenBytes then
+            return Right(right => PowMalformed());
+        end if;
+        var pieces: Buffer[Span[Nat8, T]] := split(token, ".");
+        if bufferLength(&pieces) /= 6 then
+            dropPieces(pieces);
+            return Right(right => PowMalformed());
+        end if;
+        let version: Span[Nat8, T] := pieceAt(&pieces, 0);
+        let id: Span[Nat8, T] := pieceAt(&pieces, 1);
+        let bitsText: Span[Nat8, T] := pieceAt(&pieces, 2);
+        let expiresText: Span[Nat8, T] := pieceAt(&pieces, 3);
+        let boundText: Span[Nat8, T] := pieceAt(&pieces, 4);
+        let sigText: Span[Nat8, T] := pieceAt(&pieces, 5);
+        dropPieces(pieces);
+        if (not equal(version, "1")) or (spanLength(id) = 0) then
+            return Right(right => PowMalformed());
+        end if;
+        let bits: Option[Int64] := parseInt(bitsText);
+        let expires: Option[Int64] := parseInt(expiresText);
+        let bound: Option[String] := base64UrlDecode(boundText);
+        case bits of
+            when Some(value as b: Int64) do
+                case expires of
+                    when Some(value as e: Int64) do
+                        case bound of
+                            when Some(value as boundBytes: String) do
+                                if (b < 1) or (b > mostBits()) then
+                                    destroyString(boundBytes);
+                                    return Right(right => PowMalformed());
+                                end if;
+                                -- The signed payload: the token up to its last dot.
+                                let payloadLength: Index := (spanLength(token) - spanLength(sigText)) - 1;
+                                let payload: Span[Nat8, T] := spanPart(token, 0, payloadLength);
+                                var forged: Bool := true;
+                                case signature(key, payload) of
+                                    when Some(value as want: String) do
+                                        forged := not constantTimeEqual(asSpan(&want), sigText);
+                                        destroyString(want);
+                                    when None do
+                                        skip;
+                                end case;
+                                if forged then
+                                    destroyString(boundBytes);
+                                    return Right(right => PowForged());
+                                end if;
+                                if now >= e then
+                                    destroyString(boundBytes);
+                                    return Right(right => PowExpired());
+                                end if;
+                                let sameFlow: Bool := constantTimeEqual(asSpan(&boundBytes), binding);
+                                destroyString(boundBytes);
+                                if not sameFlow then
+                                    return Right(right => PowOtherFlow());
+                                end if;
+                                if b < minBits then
+                                    return Right(right => PowTooEasy());
+                                end if;
+                                if (not isNonce(nonce)) or (not solves(token, nonce, b)) then
+                                    return Right(right => PowWrong());
+                                end if;
+                                case execute(&~db, insertSpent, withInt64(withText(noValues(), id), e)) of
+                                    when Left(left as error: DbError) do
+                                        if isUniqueViolation(error) then
+                                            return Right(right => PowReused());
+                                        end if;
+                                        return Left(left => error);
+                                    when Right(right as rows: Nat64) do
+                                        return Right(right => PowSolved());
+                                end case;
+                            when None do
+                                return Right(right => PowMalformed());
+                        end case;
+                    when None do
+                        case bound of
+                            when Some(value as boundBytes: String) do
+                                destroyString(boundBytes);
+                            when None do
+                                skip;
+                        end case;
+                        return Right(right => PowMalformed());
+                end case;
+            when None do
+                case bound of
+                    when Some(value as boundBytes: String) do
+                        destroyString(boundBytes);
+                    when None do
+                        skip;
+                end case;
+                return Right(right => PowMalformed());
+        end case;
+    end;
+
+    generic [T: Region, B: Region]
+    function pieceAt(pieces: &[Buffer[Span[Nat8, T]], B], i: Index): Span[Nat8, T] is
+        let p: &[Span[Nat8, T], B] := nthRef(pieces, i);
+        return !p;
+    end;
+
+    generic [T: Region]
+    function dropPieces(pieces: Buffer[Span[Nat8, T]]): Unit is
+        var all: Buffer[Span[Nat8, T]] := pieces;
+        while bufferLength(&all) > 0 do
+            let gone: Span[Nat8, T] := removeLast(&!all);
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function prunePow(db: &![Database[Writing], R], now: Int64): Either[DbError, Int64] is
+        case execute(&~db, deleteOld, withInt64(noValues(), now)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Nat64) do
+                case toInt64(rows) of
+                    when Some(value as n: Int64) do
+                        return Right(right => n);
+                    when None do
+                        return Right(right => 0);
+                end case;
+        end case;
+    end;
+end module body.

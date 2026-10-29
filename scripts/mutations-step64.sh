@@ -1,0 +1,25 @@
+# The mutations of Wolly.Webp (WebP lossless read in Hilde),
+# sourced by scripts/mutate.sh and scripts/mutate-target.sh.
+mutations+=(
+	"Webp.hiq|s/((width \* height) > maxPixels)/((width * height) >= maxPixels)/|exactly maxPixels pixels are refused"
+	"Webp.hiq|s/                if bitwiseAnd(wide(data\[at\]) \/ power(bit), (1 : Index)) = 1 then/                if bitwiseAnd(wide(data[at]) \/ power(bit), (1 : Index)) = 0 then/|the bits read inverted"
+	"Webp.hiq|s/                    code := (code + nth(\&counts, l)) \* 2;/                    code := code + nth(\&counts, l);/|the first codes of the next length not shifted"
+	"Webp.hiq|s/            code := (code \* 2) + readBits(data, \&~bits, 1);/            code := code + readBits(data, \&~bits, 1);/|a code read without its earlier bits"
+	"Webp.hiq|s/                    value := previous;/                    skip;/|code 16 repeats 0, not the previous length"
+	"Webp.hiq|s/                    repeat := readBits(data, \&~bits, 7) + 11;/                    repeat := readBits(data, \&~bits, 7) + 3;/|code 18 repeats 8 zeros too few"
+	"Webp.hiq|s/        let offset: Index := (bitwiseAnd(prefix, (1 : Index)) + 2) \* power(extra);/        let offset: Index := (bitwiseAnd(prefix, (1 : Index)) + 1) * power(extra);/|lengths and distances of a prefix with extra bits too short"
+	"Webp.hiq|s/        if code > 120 then/        if code > 121 then/|distance code 121 looked up in the plane table"
+	"Webp.hiq|s/        let d: Index := (((v \/ 16) \* width) + 8) - bitwiseAnd(v, (15 : Index));/        let d: Index := (((v \/ 16) * width) + 7) - bitwiseAnd(v, (15 : Index));/|the plane distances one column off"
+	"Webp.hiq|s/(506832829 : Index)/(506832828 : Index)/|the colour cache hashed with another factor"
+	"Webp.hiq|s/                group := bitwiseAnd(nth(entropy, cell) \/ 256, (65535 : Index));/                group := (0 : Index);/|every pixel coded with the codes of group 0"
+	"Webp.hiq|s/            return select(left, top, topLeft);/            return select(top, left, topLeft);/|mode 11 picks the other neighbour"
+	"Webp.hiq|s/                x := ca + ((ca - cb) \/ 2);/                x := ca + (ca - cb);/|mode 13 adds the whole difference"
+	"Webp.hiq|s/        return zero - (((zero - p) + (31 : Int64)) \/ (32 : Int64));/        return zero - ((zero - p) \/ (32 : Int64));/|a negative colour delta rounded towards 0"
+	"Webp.hiq|s/colourDelta(channel(element, 2), red));/colourDelta(channel(element, 2), channel(argb, 2)));/|red to blue from the red before its own correction"
+	"Webp.hiq|s/                                          bitwiseAnd(channel(argb, 0) + green, (255 : Index))));/                                          channel(argb, 0)));/|green not added back to blue"
+	"Webp.hiq|s/                        let colour: Index := addPixels(nth(\&side, off + i), nth(\&side, (off + i) - 1));/                        let colour: Index := nth(\&side, off + i);/|the palette not delta-decoded"
+	"Webp.hiq|s/                    if count <= 4 then/                    if count <= 3 then/|4 colours bundled 2 a byte, not 4"
+	"Webp.hiq|s/                let shift: Index := bitwiseAnd(x, power(bundle) - 1) \* bitsEach;/                let shift: Index := (0 : Index);/|every bundled pixel the first index of its byte"
+	"Webp.hiq|s/                if bitwiseAnd(wide(data\[at + 8\]), (2 : Index)) = 2 then/                if false then/|an animation read as its first frame"
+	"Webp.hiq|s/            at := ((at + 8) + chunkSize) + bitwiseAnd(chunkSize, (1 : Index));/            at := (at + 8) + chunkSize;/|a chunk of odd length without its pad byte"
+)

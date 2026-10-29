@@ -1,0 +1,228 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth
+);
+import Standard.Text (
+    indexOfByte,
+    substring,
+    urlDecode,
+    equal
+);
+import Standard.FcgiServer (
+    Request,
+    destroyRequest
+);
+import Wolly.Request (
+    requestMethod,
+    requestPath
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish
+);
+
+module body Wolly.Router is
+    -- What walking a pattern along a path found: whether it fits, and the
+    -- bytes start up to stop of the path that the wanted segment fits.
+    record Walk: Free is
+        fits: Bool;
+        found: Bool;
+        start: Index;
+        stop: Index;
+    end;
+
+    function noFit(): Walk is
+        return Walk(fits => false, found => false, start => 0, stop => 0);
+    end;
+
+    -- Where the segment that begins at first ends: at the next slash or at
+    -- the end.
+    generic [S: Region]
+    function segmentEnd(text: Span[Nat8, S], first: Index): Index is
+        case indexOfByte(substring(text, first, spanLength(text)), '/') of
+            when Some(value as at: Index) do
+                return first + at;
+            when None do
+                return spanLength(text);
+        end case;
+    end;
+
+    generic [P: Region, A: Region, N: Region]
+    function walk(pattern: Span[Nat8, P], path: Span[Nat8, A], name: Span[Nat8, N]): Walk is
+        let plen: Index := spanLength(pattern);
+        let alen: Index := spanLength(path);
+        if (plen = 0) or (alen = 0) then
+            return noFit();
+        end if;
+        if (pattern[0] /= '/') or (path[0] /= '/') then
+            return noFit();
+        end if;
+        var found: Bool := false;
+        var start: Index := 0;
+        var stop: Index := 0;
+        var pi: Index := 1;
+        var ai: Index := 1;
+        while true do
+            let pend: Index := segmentEnd(pattern, pi);
+            let segment: Span[Nat8, P] := substring(pattern, pi, pend);
+            if equal(segment, "*") and (pend = plen) then
+                if equal(name, "*") then
+                    found := true;
+                    start := ai;
+                    stop := alen;
+                end if;
+                return Walk(fits => true, found => found, start => start, stop => stop);
+            end if;
+            let aend: Index := segmentEnd(path, ai);
+            if (spanLength(segment) > 1) and (segment[0] = ':') then
+                if aend = ai then
+                    return noFit();
+                end if;
+                if equal(substring(segment, 1, spanLength(segment)), name) then
+                    found := true;
+                    start := ai;
+                    stop := aend;
+                end if;
+            else
+                if not equal(segment, substring(path, ai, aend)) then
+                    return noFit();
+                end if;
+            end if;
+            if pend = plen then
+                if aend = alen then
+                    return Walk(fits => true, found => found, start => start, stop => stop);
+                end if;
+                return noFit();
+            end if;
+            if aend = alen then
+                return noFit();
+            end if;
+            pi := pend + 1;
+            ai := aend + 1;
+        end while;
+        return noFit();
+    end;
+
+    generic [P: Region, A: Region]
+    function matches(pattern: Span[Nat8, P], path: Span[Nat8, A]): Bool is
+        let w: Walk := walk(pattern, path, "");
+        return w.fits;
+    end;
+
+    generic [P: Region, A: Region, N: Region]
+    function param(pattern: Span[Nat8, P], path: Span[Nat8, A], name: Span[Nat8, N]): Option[String] is
+        let w: Walk := walk(pattern, path, name);
+        if w.fits and w.found then
+            return Some(value => urlDecode(substring(path, w.start, w.stop)));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, P: Region, N: Region]
+    function routeParam(request: &[Request, R], pattern: Span[Nat8, P], name: Span[Nat8, N]): Option[String] is
+        case requestPath(request) of
+            when Some(value as p: String) do
+                let result: Option[String] := param(pattern, asSpan(&p), name);
+                destroyString(p);
+                return result;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [V: Region, M: Region]
+    function methodFits(verb: Span[Nat8, V], wanted: Span[Nat8, M]): Bool is
+        if equal(verb, wanted) then
+            return true;
+        end if;
+        return equal(verb, "HEAD") and equal(wanted, "GET");
+    end;
+
+    function plain(status: Nat16, text: Span[Nat8, Static]): String is
+        return finish(makeResponse(status, "text/plain; charset=utf-8"), text);
+    end;
+
+    generic [R: Region]
+    function dispatch(request: Request, routes: &[Buffer[Route], R]): String is
+        case requestMethod(&request) of
+            when Some(value as verb: String) do
+                case requestPath(&request) of
+                    when Some(value as p: String) do
+                        return dispatchPath(request, routes, verb, p);
+                    when None do
+                        destroyString(verb);
+                        destroyRequest(request);
+                        return plain(400, "bad request\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                return plain(400, "bad request\n");
+        end case;
+    end;
+
+    generic [R: Region]
+    function dispatchPath(request: Request, routes: &[Buffer[Route], R], verb: String, p: String): String is
+        -- The first route that fits both, and the methods of the routes
+        -- whose pattern fits, for a 405.
+        var chosen: Index := 0;
+        var hit: Bool := false;
+        var pathFits: Bool := false;
+        var allow: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while (i < length(routes)) and (not hit) do
+            let r: Route := nth(routes, i);
+            if matches(r.pattern, asSpan(&p)) then
+                if methodFits(asSpan(&verb), r.verb) then
+                    hit := true;
+                    chosen := i;
+                else
+                    if pathFits then
+                        writeString(&!allow, ", ");
+                    end if;
+                    writeString(&!allow, r.verb);
+                    pathFits := true;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(p);
+        destroyString(verb);
+        let allowed: String := finalize(allow);
+        if hit then
+            destroyString(allowed);
+            let r: Route := nth(routes, chosen);
+            let handler: Fn[Request, String] := r.handler;
+            return handler(request);
+        else
+            destroyRequest(request);
+            if pathFits then
+                let refusal: Response := addHeader(makeResponse(405, "text/plain; charset=utf-8"), "Allow", asSpan(&allowed));
+                destroyString(allowed);
+                return finish(refusal, "method not allowed\n");
+            else
+                destroyString(allowed);
+                return plain(404, "not found\n");
+            end if;
+        end if;
+    end;
+end module body.

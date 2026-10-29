@@ -1,0 +1,26 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A Bunti code (Wolly.Bunti) of a text as a PNG file, read back from the file
+as a check:
+
+    buntipng FILE TEXT
+
+It encodes TEXT at level M in mode 1, draws the code at 8 pixels a cell
+with Wolly.Image, writes the PNG to FILE (an old FILE is replaced), reads
+the file again and decodes the PNG with Wolly.BuntiScan.  It prints the
+size of the code in cells, the bytes of the PNG and the verdict, and exits
+0 only when the text read back from the file is TEXT; otherwise it says
+why not and exits 1.
+"""
+module Wolly.Example.BuntiPng is
+    """
+    The command of the arguments.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

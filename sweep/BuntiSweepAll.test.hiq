@@ -1,0 +1,488 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Every payload length from 0 to 4096 with all 256 byte values, in both
+-- modes and at all four levels, encoded by Wolly.Bunti and decoded again:
+-- 32776 codes.  A test takes every 8th length of a mode and level, so that
+-- none comes near the 600 seconds hilde test gives a test function;
+-- together they take most of an hour and a half.  No part of
+-- scripts/test.sh: scripts/bunti-sweep.sh runs it.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    contains
+);
+import Wolly.Bunti (
+    BuntiCode,
+    BuntiMode,
+    Plain,
+    Dna,
+    BuntiLevel,
+    LevelL,
+    LevelM,
+    LevelQ,
+    LevelH,
+    BuntiError,
+    TooLong,
+    NoSeed,
+    NotFound,
+    BadHeader,
+    Damaged,
+    BadChecksum,
+    blackCell,
+    whiteCell,
+    isBuntiSize,
+    basesOfBytes,
+    buntiCapacity,
+    encodeBunti,
+    decodeBunti,
+    buntiSize,
+    buntiCell,
+    setBuntiCell,
+    isDataCell,
+    referenceX,
+    referenceY,
+    buntiSequence,
+    pixelSide,
+    buntiPixels,
+    buntiSvg,
+    buntiPng,
+    destroyBunti
+);
+import Wolly.BuntiDna (
+    segmentBytes,
+    longestRun
+);
+
+module body Wolly.BuntiSweepAll.Test is
+    function next(state: Nat32): Nat32 is
+        return modularAdd(modularMultiply(state, (1664525 : Nat32)), (1013904223 : Nat32));
+    end;
+
+    function below(state: Nat32, bound: Index): Index is
+        case toIndex(state / 65536) of
+            when Some(value as high: Index) do
+                return high - ((high / bound) * bound);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The payload of length count: byte i is (7 i + count) mod 256, so a
+    -- payload of 256 bytes and more holds every byte value.
+    function payloadOf(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            let value: Index := (i * 7) + count;
+            writeByte(&!out, narrow(value - ((value / 256) * 256)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Whether payload comes back from its code at mode and level.
+    function roundTrip(count: Index, mode: BuntiMode, level: BuntiLevel): Bool is
+        let payload: String := payloadOf(count);
+        var good: Bool := false;
+        case encodeBunti(asSpan(&payload), mode, level) of
+            when Right(right as code: BuntiCode) do
+                case decodeBunti(&code) of
+                    when Right(right as back: String) do
+                        good := equal(asSpan(&back), asSpan(&payload));
+                        destroyString(back);
+                    when Left(left as error: BuntiError) do
+                        skip;
+                end case;
+                destroyBunti(code);
+            when Left(left as error: BuntiError) do
+                skip;
+        end case;
+        destroyString(payload);
+        return good;
+    end;
+
+    -- The lengths from first to 4096 in steps of 8.
+    function roundTrips(mode: BuntiMode, level: BuntiLevel, first: Index, message: Span[Nat8, Static]): Unit is
+        var good: Index := 0;
+        var tried: Index := 0;
+        var count: Index := first;
+        while count <= 4096 do
+            if roundTrip(count, mode, level) then
+                good := good + 1;
+            end if;
+            tried := tried + 1;
+            count := count + 8;
+        end while;
+        if good /= tried then
+            print(message);
+            print(": ");
+            print(good);
+            print(" of ");
+            printLn(tried);
+        end if;
+        assertTrue(good = tried, message);
+        return nil;
+    end;
+
+    function testPlainL0(): Unit is
+        roundTrips(Plain(), LevelL(), 0, "mode 1 level L: lengths 0, 8, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainL1(): Unit is
+        roundTrips(Plain(), LevelL(), 1, "mode 1 level L: lengths 1, 9, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainL2(): Unit is
+        roundTrips(Plain(), LevelL(), 2, "mode 1 level L: lengths 2, 10, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainL3(): Unit is
+        roundTrips(Plain(), LevelL(), 3, "mode 1 level L: lengths 3, 11, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainL4(): Unit is
+        roundTrips(Plain(), LevelL(), 4, "mode 1 level L: lengths 4, 12, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainL5(): Unit is
+        roundTrips(Plain(), LevelL(), 5, "mode 1 level L: lengths 5, 13, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainL6(): Unit is
+        roundTrips(Plain(), LevelL(), 6, "mode 1 level L: lengths 6, 14, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainL7(): Unit is
+        roundTrips(Plain(), LevelL(), 7, "mode 1 level L: lengths 7, 15, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainM0(): Unit is
+        roundTrips(Plain(), LevelM(), 0, "mode 1 level M: lengths 0, 8, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainM1(): Unit is
+        roundTrips(Plain(), LevelM(), 1, "mode 1 level M: lengths 1, 9, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainM2(): Unit is
+        roundTrips(Plain(), LevelM(), 2, "mode 1 level M: lengths 2, 10, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainM3(): Unit is
+        roundTrips(Plain(), LevelM(), 3, "mode 1 level M: lengths 3, 11, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainM4(): Unit is
+        roundTrips(Plain(), LevelM(), 4, "mode 1 level M: lengths 4, 12, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainM5(): Unit is
+        roundTrips(Plain(), LevelM(), 5, "mode 1 level M: lengths 5, 13, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainM6(): Unit is
+        roundTrips(Plain(), LevelM(), 6, "mode 1 level M: lengths 6, 14, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainM7(): Unit is
+        roundTrips(Plain(), LevelM(), 7, "mode 1 level M: lengths 7, 15, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainQ0(): Unit is
+        roundTrips(Plain(), LevelQ(), 0, "mode 1 level Q: lengths 0, 8, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainQ1(): Unit is
+        roundTrips(Plain(), LevelQ(), 1, "mode 1 level Q: lengths 1, 9, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainQ2(): Unit is
+        roundTrips(Plain(), LevelQ(), 2, "mode 1 level Q: lengths 2, 10, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainQ3(): Unit is
+        roundTrips(Plain(), LevelQ(), 3, "mode 1 level Q: lengths 3, 11, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainQ4(): Unit is
+        roundTrips(Plain(), LevelQ(), 4, "mode 1 level Q: lengths 4, 12, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainQ5(): Unit is
+        roundTrips(Plain(), LevelQ(), 5, "mode 1 level Q: lengths 5, 13, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainQ6(): Unit is
+        roundTrips(Plain(), LevelQ(), 6, "mode 1 level Q: lengths 6, 14, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainQ7(): Unit is
+        roundTrips(Plain(), LevelQ(), 7, "mode 1 level Q: lengths 7, 15, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainH0(): Unit is
+        roundTrips(Plain(), LevelH(), 0, "mode 1 level H: lengths 0, 8, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainH1(): Unit is
+        roundTrips(Plain(), LevelH(), 1, "mode 1 level H: lengths 1, 9, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainH2(): Unit is
+        roundTrips(Plain(), LevelH(), 2, "mode 1 level H: lengths 2, 10, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainH3(): Unit is
+        roundTrips(Plain(), LevelH(), 3, "mode 1 level H: lengths 3, 11, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainH4(): Unit is
+        roundTrips(Plain(), LevelH(), 4, "mode 1 level H: lengths 4, 12, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainH5(): Unit is
+        roundTrips(Plain(), LevelH(), 5, "mode 1 level H: lengths 5, 13, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainH6(): Unit is
+        roundTrips(Plain(), LevelH(), 6, "mode 1 level H: lengths 6, 14, ... to 4096");
+        return nil;
+    end;
+
+    function testPlainH7(): Unit is
+        roundTrips(Plain(), LevelH(), 7, "mode 1 level H: lengths 7, 15, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaL0(): Unit is
+        roundTrips(Dna(), LevelL(), 0, "mode 2 level L: lengths 0, 8, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaL1(): Unit is
+        roundTrips(Dna(), LevelL(), 1, "mode 2 level L: lengths 1, 9, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaL2(): Unit is
+        roundTrips(Dna(), LevelL(), 2, "mode 2 level L: lengths 2, 10, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaL3(): Unit is
+        roundTrips(Dna(), LevelL(), 3, "mode 2 level L: lengths 3, 11, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaL4(): Unit is
+        roundTrips(Dna(), LevelL(), 4, "mode 2 level L: lengths 4, 12, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaL5(): Unit is
+        roundTrips(Dna(), LevelL(), 5, "mode 2 level L: lengths 5, 13, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaL6(): Unit is
+        roundTrips(Dna(), LevelL(), 6, "mode 2 level L: lengths 6, 14, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaL7(): Unit is
+        roundTrips(Dna(), LevelL(), 7, "mode 2 level L: lengths 7, 15, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaM0(): Unit is
+        roundTrips(Dna(), LevelM(), 0, "mode 2 level M: lengths 0, 8, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaM1(): Unit is
+        roundTrips(Dna(), LevelM(), 1, "mode 2 level M: lengths 1, 9, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaM2(): Unit is
+        roundTrips(Dna(), LevelM(), 2, "mode 2 level M: lengths 2, 10, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaM3(): Unit is
+        roundTrips(Dna(), LevelM(), 3, "mode 2 level M: lengths 3, 11, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaM4(): Unit is
+        roundTrips(Dna(), LevelM(), 4, "mode 2 level M: lengths 4, 12, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaM5(): Unit is
+        roundTrips(Dna(), LevelM(), 5, "mode 2 level M: lengths 5, 13, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaM6(): Unit is
+        roundTrips(Dna(), LevelM(), 6, "mode 2 level M: lengths 6, 14, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaM7(): Unit is
+        roundTrips(Dna(), LevelM(), 7, "mode 2 level M: lengths 7, 15, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaQ0(): Unit is
+        roundTrips(Dna(), LevelQ(), 0, "mode 2 level Q: lengths 0, 8, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaQ1(): Unit is
+        roundTrips(Dna(), LevelQ(), 1, "mode 2 level Q: lengths 1, 9, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaQ2(): Unit is
+        roundTrips(Dna(), LevelQ(), 2, "mode 2 level Q: lengths 2, 10, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaQ3(): Unit is
+        roundTrips(Dna(), LevelQ(), 3, "mode 2 level Q: lengths 3, 11, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaQ4(): Unit is
+        roundTrips(Dna(), LevelQ(), 4, "mode 2 level Q: lengths 4, 12, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaQ5(): Unit is
+        roundTrips(Dna(), LevelQ(), 5, "mode 2 level Q: lengths 5, 13, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaQ6(): Unit is
+        roundTrips(Dna(), LevelQ(), 6, "mode 2 level Q: lengths 6, 14, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaQ7(): Unit is
+        roundTrips(Dna(), LevelQ(), 7, "mode 2 level Q: lengths 7, 15, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaH0(): Unit is
+        roundTrips(Dna(), LevelH(), 0, "mode 2 level H: lengths 0, 8, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaH1(): Unit is
+        roundTrips(Dna(), LevelH(), 1, "mode 2 level H: lengths 1, 9, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaH2(): Unit is
+        roundTrips(Dna(), LevelH(), 2, "mode 2 level H: lengths 2, 10, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaH3(): Unit is
+        roundTrips(Dna(), LevelH(), 3, "mode 2 level H: lengths 3, 11, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaH4(): Unit is
+        roundTrips(Dna(), LevelH(), 4, "mode 2 level H: lengths 4, 12, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaH5(): Unit is
+        roundTrips(Dna(), LevelH(), 5, "mode 2 level H: lengths 5, 13, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaH6(): Unit is
+        roundTrips(Dna(), LevelH(), 6, "mode 2 level H: lengths 6, 14, ... to 4096");
+        return nil;
+    end;
+
+    function testDnaH7(): Unit is
+        roundTrips(Dna(), LevelH(), 7, "mode 2 level H: lengths 7, 15, ... to 4096");
+        return nil;
+    end;
+end module body.

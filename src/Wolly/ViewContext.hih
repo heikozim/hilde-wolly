@@ -1,0 +1,130 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Where in the HTML the text of a template has left off, followed byte by
+byte through the template's own text, and what a value written there is
+escaped with.  Wolly.View runs it when a template is loaded; the values
+never move it.
+
+It is the state machine Hilde's compiler runs for @template, taken over
+state by state: HTML text, a tag and its attributes, an attribute's value
+quoted or not and what it holds (a URL by its parts, JavaScript for an
+on... attribute, CSS for style), comments and declarations, and the
+elements whose content is not HTML (script, style, title, textarea).
+JavaScript is followed far enough to know a string, a template literal, a
+comment and a regular expression from code, and whether a slash there
+begins a regular expression; CSS far enough to know a string, a comment
+and url( ).
+
+A place where no escaping makes a value safe (a tag name, a comment, an
+unquoted attribute value, a template literal, a regular expression, CSS
+url( ), right after a JavaScript name) has no writer: writerOf gives
+None there, and describeContext says where it is, in the words the
+compiler uses.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.ViewContext is
+    """
+    The function of Standard.Template a value is written with.  The two
+    script writers are not functions there: a value where a JavaScript
+    expression goes is written as a string literal, a number or a truth
+    value, by its kind, as raw text in a script element and escaped as
+    HTML in an attribute.
+    """
+    union Writer: Free is
+        case HtmlWriter;
+        case UrlWriter;
+        case UrlPathWriter;
+        case UrlQueryWriter;
+        case ScriptWriter;
+        case ScriptAttributeWriter;
+        case JsStringWriter;
+        case JsStringAttributeWriter;
+        case CssValueWriter;
+        case CssValueAttributeWriter;
+        case CssStringWriter;
+        case CssStringAttributeWriter;
+    end;
+
+    """
+    A place in the HTML.  Linear: it holds the names of the tag and the
+    attribute it is in.
+    """
+    type Context: Linear;
+
+    """
+    HTML text, where a template begins.
+    """
+    function textContext(): Context
+        ensures isHtmlText(&result);
+
+    """
+    The place after one more byte of template text.
+    No contract: the next state is the table itself.
+    """
+    function stepContext(context: Context, byte: Nat8): Context;
+
+    """
+    The place after the bytes of text, one after the other.
+    No contract: the place follows from every byte, more than O(1).
+    """
+    generic [T: Region]
+    function advanceContext(context: Context, text: Span[Nat8, T]): Context;
+
+    """
+    Whether two places are the same, names included.
+    No contract: it compares the names byte by byte.
+    """
+    generic [A: Region, B: Region]
+    function sameContext(left: &[Context, A], right: &[Context, B]): Bool;
+
+    """
+    A copy of a place.
+    No contract: sameContext compares names, more than O(1).
+    """
+    generic [R: Region]
+    function copyContext(context: &[Context, R]): Context;
+
+    """
+    Gives the place and its names back.
+    No contract: nothing is left to ask.
+    """
+    function destroyContext(context: Context): Unit;
+
+    """
+    Whether the place is HTML text, outside every tag.
+    No contract: the answer is the state itself.
+    """
+    generic [R: Region]
+    function isHtmlText(context: &[Context, R]): Bool;
+
+    """
+    What a value is written with at this place; None where no escaping
+    makes a value safe.
+    No contract: an Option of a union has no equality to state it with.
+    """
+    generic [R: Region]
+    function writerOf(context: &[Context, R]): Option[Writer];
+
+    """
+    The place in words, as in: a value cannot stand in an HTML comment.
+    No contract: the words depend on the names.
+    """
+    generic [R: Region]
+    function describeContext(context: &[Context, R]): String;
+
+    """
+    The place after a value written where a JavaScript expression goes:
+    the script stands behind an expression then, so a slash divides.
+    Every other place stays as it is.
+    No contract: as stepContext.
+    """
+    function afterScriptValue(context: Context): Context;
+end module.

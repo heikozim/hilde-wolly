@@ -1,0 +1,292 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The sequence of a seed is a linear congruential generator mod 2^32
+-- (1664525, 1013904223), started at (seed + 1) * 2654435761 + (segment
+-- + 1) * 40503, its byte the highest eight bits after each step.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    destroyFree
+);
+
+module body Wolly.BuntiDna is
+    constant bytesOfSegment: Index := 32;
+    constant seedCopies: Index := 3;
+    constant runMost: Index := 3;
+
+    function segmentBytes(): Index is
+        return bytesOfSegment;
+    end;
+
+    function dnaBaseCount(count: Index): Index is
+        let segments: Index := (count + (bytesOfSegment - 1)) / bytesOfSegment;
+        return (count * 4) + (segments * (seedCopies * 4));
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as number: Index) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function natOf(number: Index): Nat32 is
+        case toNat32(number) of
+            when Some(value as n: Nat32) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function step(state: Nat32): Nat32 is
+        return modularAdd(modularMultiply(state, (1664525 : Nat32)), (1013904223 : Nat32));
+    end;
+
+    function start(seed: Index, segment: Index): Nat32 is
+        return modularAdd(modularMultiply(natOf(seed + 1), (2654435761 : Nat32)), modularMultiply(natOf(segment + 1), (40503 : Nat32)));
+    end;
+
+    function high(state: Nat32): Index is
+        case toIndex(state / 16777216) of
+            when Some(value as byte: Index) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The four bases of a byte, its highest two bits first.
+    generic [O: Region]
+    function putByte(out: &![Buffer[Nat8], O], byte: Index): Unit is
+        insertBack(&~out, narrow(byte / 64));
+        insertBack(&~out, narrow((byte / 16) - ((byte / 64) * 4)));
+        insertBack(&~out, narrow((byte / 4) - ((byte / 16) * 4)));
+        insertBack(&~out, narrow(byte - ((byte / 4) * 4)));
+        return nil;
+    end;
+
+    -- The bases of segment number segment, count bytes of codewords from
+    -- first on, under seed.
+    generic [C: Region]
+    function segmentOf(codewords: &[Buffer[Nat8], C], first: Index, count: Index, segment: Index, seed: Index): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        let half: Index := count / 2;
+        var state: Nat32 := start(seed, segment);
+        putByte(&!out, seed);
+        var j: Index := 0;
+        while j < count do
+            if j = half then
+                putByte(&!out, seed);
+            end if;
+            state := step(state);
+            putByte(&!out, bitwiseXor(wide(nth(codewords, first + j)), high(state)));
+            j := j + 1;
+        end while;
+        putByte(&!out, seed);
+        return out;
+    end;
+
+    function isGc(base: Nat8): Bool is
+        return (base = 1) or (base = 2);
+    end;
+
+    generic [B: Region]
+    function gcInRange(bases: &[Buffer[Nat8], B], first: Index, stop: Index): Bool is
+        var gc: Index := 0;
+        var i: Index := first;
+        while i < stop do
+            if isGc(nth(bases, i)) then
+                gc := gc + 1;
+            end if;
+            i := i + 1;
+        end while;
+        let size: Index := stop - first;
+        return ((gc * 100) >= (size * 45)) and ((gc * 100) <= (size * 55));
+    end;
+
+    generic [B: Region]
+    function longestRun(bases: &[Buffer[Nat8], B]): Index is
+        var longest: Index := 0;
+        var run: Index := 0;
+        var i: Index := 0;
+        while i < length(bases) do
+            if (i > 0) and (nth(bases, i) = nth(bases, i - 1)) then
+                run := run + 1;
+            else
+                run := (1 : Index);
+            end if;
+            if run > longest then
+                longest := run;
+            end if;
+            i := i + 1;
+        end while;
+        return longest;
+    end;
+
+    -- Whether segment keeps the rule of runs after the bases before, whose
+    -- last base is last and whose last run is run long (0 for none).
+    generic [S: Region]
+    function runsKept(segment: &[Buffer[Nat8], S], last: Nat8, run: Index): Bool is
+        var current: Nat8 := last;
+        var count: Index := run;
+        var i: Index := 0;
+        while i < length(segment) do
+            let base: Nat8 := nth(segment, i);
+            if (count > 0) and (base = current) then
+                count := count + 1;
+            else
+                current := base;
+                count := (1 : Index);
+            end if;
+            if count > runMost then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The run at the end of out: its base and its length (0 when empty).
+    generic [O: Region]
+    function tailRun(out: &[Buffer[Nat8], O]): Index is
+        let size: Index := length(out);
+        if size = 0 then
+            return 0;
+        end if;
+        let base: Nat8 := nth(out, size - 1);
+        var run: Index := 1;
+        while (run < size) and (nth(out, (size - 1) - run) = base) do
+            run := run + 1;
+        end while;
+        return run;
+    end;
+
+    generic [O: Region]
+    function lastBase(out: &[Buffer[Nat8], O]): Nat8 is
+        if length(out) = 0 then
+            return 0;
+        end if;
+        return nth(out, length(out) - 1);
+    end;
+
+    generic [C: Region]
+    function dnaEncode(codewords: &[Buffer[Nat8], C]): Option[Buffer[Nat8]] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        let total: Index := length(codewords);
+        var first: Index := 0;
+        var segment: Index := 0;
+        var failed: Bool := false;
+        while (first < total) and (not failed) do
+            var count: Index := total - first;
+            if count > bytesOfSegment then
+                count := bytesOfSegment;
+            end if;
+            let run: Index := tailRun(&out);
+            let last: Nat8 := lastBase(&out);
+            var seed: Index := 0;
+            var placed: Bool := false;
+            while (seed < 256) and (not placed) do
+                let candidate: Buffer[Nat8] := segmentOf(codewords, first, count, segment, seed);
+                let fits: Bool := runsKept(&candidate, last, run) and gcInRange(&candidate, 0, length(&candidate));
+                if fits then
+                    var i: Index := 0;
+                    while i < length(&candidate) do
+                        insertBack(&!out, nth(&candidate, i));
+                        i := i + 1;
+                    end while;
+                    placed := true;
+                end if;
+                destroyFree(candidate);
+                seed := seed + 1;
+            end while;
+            if not placed then
+                failed := true;
+            end if;
+            first := first + count;
+            segment := segment + 1;
+        end while;
+        if failed then
+            destroyFree(out);
+            return None();
+        else
+            return Some(value => out);
+        end if;
+    end;
+
+    -- The byte of the four bases from at on.
+    generic [B: Region]
+    function byteAt(bases: &[Buffer[Nat8], B], at: Index): Index is
+        return (((wide(nth(bases, at)) * 64) + (wide(nth(bases, at + 1)) * 16)) + (wide(nth(bases, at + 2)) * 4)) + wide(nth(bases, at + 3));
+    end;
+
+    -- The base the most copies say; the first copy when all differ.
+    function vote(a: Nat8, b: Nat8, c: Nat8): Index is
+        if (a = b) or (a = c) then
+            return wide(a);
+        end if;
+        if b = c then
+            return wide(b);
+        end if;
+        return wide(a);
+    end;
+
+    generic [B: Region]
+    function dnaDecode(bases: &[Buffer[Nat8], B], first: Index, count: Index): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var at: Index := first;
+        var done: Index := 0;
+        var segment: Index := 0;
+        while done < count do
+            var size: Index := count - done;
+            if size > bytesOfSegment then
+                size := bytesOfSegment;
+            end if;
+            let half: Index := size / 2;
+            -- The three copies of the seed: at the start, after half bytes,
+            -- and at the end.
+            let one: Index := at;
+            let two: Index := (at + 4) + (half * 4);
+            let three: Index := (at + 8) + (size * 4);
+            var seed: Index := 0;
+            var k: Index := 0;
+            while k < 4 do
+                seed := (seed * 4) + vote(nth(bases, one + k), nth(bases, two + k), nth(bases, three + k));
+                k := k + 1;
+            end while;
+            var state: Nat32 := start(seed, segment);
+            var j: Index := 0;
+            while j < size do
+                var place: Index := (at + 4) + (j * 4);
+                if j >= half then
+                    place := place + 4;
+                end if;
+                state := step(state);
+                insertBack(&!out, narrow(bitwiseXor(byteAt(bases, place), high(state))));
+                j := j + 1;
+            end while;
+            at := at + ((size * 4) + 12);
+            done := done + size;
+            segment := segment + 1;
+        end while;
+        return out;
+    end;
+end module body.

@@ -1,0 +1,772 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Text (
+    parseNat,
+    split,
+    formatNat,
+    equal
+);
+import Standard.Base64 (
+    encode
+);
+import Standard.Cookie (
+    strictOptions
+);
+import Standard.FcgiServer (
+    Request,
+    defaultLimits,
+    requestBody,
+    destroyRequest
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile
+);
+import Standard.Time (
+    wallNanos
+);
+import Wolly.Request (
+    cookie,
+    query
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    addCookie,
+    finish,
+    decimalText
+);
+import Wolly.Router (
+    Route,
+    routeParam,
+    dispatch
+);
+import Wolly.Page (
+    Page,
+    makePage,
+    pageFrom,
+    pageNumber,
+    pageSize,
+    pageCount,
+    offset
+);
+import Wolly.Asset (
+    assetVersion
+);
+import Wolly.Qr (
+    qrDataUri
+);
+import Wolly.Bunti (
+    BuntiError,
+    BuntiCode,
+    Plain,
+    LevelM,
+    encodeBunti,
+    buntiSize,
+    buntiPng,
+    destroyBunti
+);
+import Wolly.BuntiScan (
+    decodeBuntiPng
+);
+import Wolly.Chart (
+    readableNumber,
+    median,
+    barHeight
+);
+import Wolly.Signature (
+    SignatureCheck,
+    Verified,
+    NotSigned,
+    Malformed,
+    Stale,
+    DigestMismatch,
+    Forged,
+    verifySignature,
+    derOfPem
+);
+import Wolly.Highlight (
+    Language,
+    languageOf,
+    highlight,
+    escapeCode
+);
+import Wolly.Phonetic (
+    cologne,
+    soundex
+);
+import Wolly.Feed (
+    beginFeed,
+    writeEntry,
+    endFeed,
+    feedType
+);
+import Wolly.Markdown (
+    markdownToHtml
+);
+import Wolly.Field (
+    isEmail,
+    isDate
+);
+import Wolly.Server (
+    Outcome,
+    Stopped,
+    NoSocket,
+    NotStarted,
+    serve
+);
+
+import Wolly.Version (
+    answerAbout,
+    library,
+    destroyLibraries
+);
+import Standard.Libcrypto (
+    libraryVersion as cryptoVersion
+);
+
+import Wolly.Confine (
+    sandboxAsked,
+    printSandbox,
+    confineServer
+);
+
+module body Wolly.Example.Hello is
+    -- A count above this is taken for a forged cookie and starts again.
+    constant mostVisits: Nat64 := 1000000;
+    -- The numbers /numbers lists, 20 a page.
+    constant numberCount: Nat64 := 45;
+    constant numbersAPage: Nat64 := 20;
+    -- Where Hiawatha serves /static/ from, beside the programme.
+    constant assetRoot: Span[Nat8, Static] := "www";
+
+    -- Plain text that a browser must not read as anything else.
+    function plain(status: Nat16): Response is
+        return addHeader(makeResponse(status, "text/plain; charset=utf-8"), "X-Content-Type-Options", "nosniff");
+    end;
+
+    function home(request: Request): String is
+        destroyRequest(request);
+        return finish(plain(200), "hello, world\n");
+    end;
+
+    -- The name is a segment of the path, decoded; it goes into plain text
+    -- only, never into HTML.
+    function greet(request: Request): String is
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, "hello, ");
+        case routeParam(&request, "/hello/:name", "name") of
+            when Some(value as name: String) do
+                writeString(&!text, asSpan(&name));
+                destroyString(name);
+            when None do
+                writeString(&!text, "nobody");
+        end case;
+        writeByte(&!text, '\n');
+        destroyRequest(request);
+        let greeting: String := finalize(text);
+        let output: String := finish(plain(200), asSpan(&greeting));
+        destroyString(greeting);
+        return output;
+    end;
+
+    -- The rest of the path after /files/, as the wildcard gives it.
+    function files(request: Request): String is
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, "rest=");
+        case routeParam(&request, "/files/*", "*") of
+            when Some(value as rest: String) do
+                writeString(&!text, asSpan(&rest));
+                destroyString(rest);
+            when None do
+                skip;
+        end case;
+        writeByte(&!text, '\n');
+        destroyRequest(request);
+        let shown: String := finalize(text);
+        let output: String := finish(plain(200), asSpan(&shown));
+        destroyString(shown);
+        return output;
+    end;
+
+    -- The count of the cookie visits, 0 when there is none, when it is no
+    -- number or when it is above mostVisits.
+    generic [R: Region]
+    function visitsSoFar(request: &[Request, R]): Nat64 is
+        var count: Nat64 := 0;
+        case cookie(request, "visits") of
+            when Some(value as raw: String) do
+                case parseNat(asSpan(&raw)) of
+                    when Some(value as n: Nat64) do
+                        if n <= mostVisits then
+                            count := n;
+                        end if;
+                    when None do
+                        skip;
+                end case;
+                destroyString(raw);
+            when None do
+                skip;
+        end case;
+        return count;
+    end;
+
+    -- Counts the visits of one browser in a cookie: Secure, HttpOnly,
+    -- SameSite=Strict, ending with the browser session.
+    function visits(request: Request): String is
+        let count: Nat64 := visitsSoFar(&request) + 1;
+        destroyRequest(request);
+        var digits: StringBuilder := makeStringBuilder();
+        let digits1: String := formatNat(count);
+        writeString(&!digits, asSpan(&digits1));
+        destroyString(digits1);
+        let value: String := finalize(digits);
+        let response: Response := addCookie(plain(200), "visits", asSpan(&value), "/", strictOptions());
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, "visits=");
+        writeString(&!text, asSpan(&value));
+        writeByte(&!text, '\n');
+        destroyString(value);
+        let shown: String := finalize(text);
+        let output: String := finish(response, asSpan(&shown));
+        destroyString(shown);
+        return output;
+    end;
+
+    -- The numbers 1 to numberCount, one page of them: the page from the
+    -- query parameter page, and a last line that names it.
+    function numbers(request: Request): String is
+        var requested: Nat64 := 1;
+        case query(&request, "page") of
+            when Some(value as text: String) do
+                requested := pageFrom(asSpan(&text));
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        destroyRequest(request);
+        let page: Page := makePage(requested, numberCount, numbersAPage);
+        var out: StringBuilder := makeStringBuilder();
+        var n: Nat64 := offset(page) + 1;
+        while (n <= (offset(page) + pageSize(page))) and (n <= numberCount) do
+            let digits2: String := formatNat(n);
+            writeString(&!out, asSpan(&digits2));
+            destroyString(digits2);
+            writeByte(&!out, '\n');
+            n := n + 1;
+        end while;
+        writeString(&!out, "page ");
+        let digits3: String := formatNat(pageNumber(page));
+        writeString(&!out, asSpan(&digits3));
+        destroyString(digits3);
+        writeString(&!out, " of ");
+        let digits4: String := formatNat(pageCount(page));
+        writeString(&!out, asSpan(&digits4));
+        destroyString(digits4);
+        writeByte(&!out, '\n');
+        let shown: String := finalize(out);
+        let output: String := finish(plain(200), asSpan(&shown));
+        destroyString(shown);
+        return output;
+    end;
+
+    -- The version of the asset the query parameter path names, below
+    -- assetRoot: what a page puts after the asset's URL.  404 for a path
+    -- that is no asset path or names no file, 400 without the parameter.
+    function asset(request: Request): String is
+        case query(&request, "path") of
+            when Some(value as path: String) do
+                destroyRequest(request);
+                case assetVersion(assetRoot, asSpan(&path)) of
+                    when Some(value as version: String) do
+                        destroyString(path);
+                        let output: String := finish(plain(200), asSpan(&version));
+                        destroyString(version);
+                        return output;
+                    when None do
+                        destroyString(path);
+                        return finish(plain(404), "no such asset\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                return finish(plain(400), "the parameter path is missing\n");
+        end case;
+    end;
+
+    -- The QR code of the query parameter text as a data URI, for an img
+    -- src; 400 without it, 413 when it does not fit a code.
+    function qr(request: Request): String is
+        case query(&request, "text") of
+            when Some(value as text: String) do
+                destroyRequest(request);
+                case qrDataUri(asSpan(&text)) of
+                    when Some(value as uri: String) do
+                        destroyString(text);
+                        let output: String := finish(plain(200), asSpan(&uri));
+                        destroyString(uri);
+                        return output;
+                    when None do
+                        destroyString(text);
+                        return finish(plain(413), "the text does not fit a code\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                return finish(plain(400), "the parameter text is missing\n");
+        end case;
+    end;
+
+    -- The digits of n; a question mark for an n no Nat64 holds.
+    function indexText(n: Index): String is
+        case toNat64(n) of
+            when Some(value as m: Nat64) do
+                return formatNat(m);
+            when None do
+                return fromSpan("?");
+        end case;
+    end;
+
+    -- The page of /bunti: text (escaped), its Bunti code as a PNG in a data
+    -- URI, the cells on a side, and whether Wolly.BuntiScan reads text back
+    -- from that very PNG.
+    generic [T: Region, P: Region]
+    function buntiPage(text: Span[Nat8, T], png: Span[Nat8, P], cells: Index): String is
+        let limit: Index := 16000000;
+        var readBack: Bool := false;
+        case decodeBuntiPng(png, limit) of
+            when Right(right as payload: String) do
+                readBack := equal(asSpan(&payload), text);
+                destroyString(payload);
+            when Left(left as error: BuntiError) do
+                skip;
+        end case;
+        let shown: String := escapeCode(text);
+        let base64: String := encode(png);
+        let side: String := indexText(cells);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<h1>Bunti</h1>\n<p class=\"text\">");
+        writeString(&!out, asSpan(&shown));
+        writeString(&!out, "</p>\n<img alt=\"the Bunti code of the text\" src=\"data:image/png;base64,");
+        writeString(&!out, asSpan(&base64));
+        writeString(&!out, "\">\n<p class=\"cells\">cells on a side: ");
+        writeString(&!out, asSpan(&side));
+        if readBack then
+            writeString(&!out, "</p>\n<p class=\"read\">read back from the picture: yes</p>\n");
+        else
+            writeString(&!out, "</p>\n<p class=\"read\">read back from the picture: no</p>\n");
+        end if;
+        destroyString(shown);
+        destroyString(base64);
+        destroyString(side);
+        let html: String := finalize(out);
+        let head: Response := addHeader(makeResponse(200, "text/html; charset=utf-8"), "Content-Security-Policy", "default-src 'none'; img-src data:");
+        let output: String := finish(addHeader(head, "X-Content-Type-Options", "nosniff"), asSpan(&html));
+        destroyString(html);
+        return output;
+    end;
+
+    -- GET /bunti?text=...: the Bunti code (Wolly.Bunti) of the query
+    -- parameter text at level M, drawn at 8 pixels a cell, as a page; 400
+    -- without text, 413 when it does not fit a code, 500 when the picture
+    -- cannot be made.
+    function bunti(request: Request): String is
+        case query(&request, "text") of
+            when Some(value as text: String) do
+                destroyRequest(request);
+                case encodeBunti(asSpan(&text), Plain(), LevelM()) of
+                    when Left(left as error: BuntiError) do
+                        destroyString(text);
+                        return finish(plain(413), "the text does not fit a Bunti code\n");
+                    when Right(right as bc: BuntiCode) do
+                        let scale: Index := 8;
+                        let made: Option[String] := buntiPng(&bc, scale);
+                        let cells: Index := buntiSize(&bc);
+                        destroyBunti(bc);
+                        case made of
+                            when Some(value as png: String) do
+                                let output: String := buntiPage(asSpan(&text), asSpan(&png), cells);
+                                destroyString(png);
+                                destroyString(text);
+                                return output;
+                            when None do
+                                destroyString(text);
+                                return finish(plain(500), "the picture of the code could not be made\n");
+                        end case;
+                end case;
+            when None do
+                destroyRequest(request);
+                return finish(plain(400), "the parameter text is missing\n");
+        end case;
+    end;
+
+
+    -- One line of /check: name, then yes, no, or none for a parameter
+    -- that is not there.
+    generic [R: Region, B: Region]
+    function verdictLine(request: &[Request, R], name: Span[Nat8, Static], email: Bool, out: &![StringBuilder, B]): Unit is
+        writeString(&~out, name);
+        writeString(&~out, ": ");
+        case query(request, name) of
+            when Some(value as given: String) do
+                var fits: Bool := false;
+                if email then
+                    fits := isEmail(asSpan(&given));
+                else
+                    fits := isDate(asSpan(&given));
+                end if;
+                destroyString(given);
+                if fits then
+                    writeString(&~out, "yes\n");
+                else
+                    writeString(&~out, "no\n");
+                end if;
+            when None do
+                writeString(&~out, "none\n");
+        end case;
+        return nil;
+    end;
+
+    -- Whether the query parameters email and date hold an address and a
+    -- date (Wolly.Field), one line each.
+    function check(request: Request): String is
+        var out: StringBuilder := makeStringBuilder();
+        verdictLine(&request, "email", true, &!out);
+        verdictLine(&request, "date", false, &!out);
+        destroyRequest(request);
+        let shown: String := finalize(out);
+        let output: String := finish(plain(200), asSpan(&shown));
+        destroyString(shown);
+        return output;
+    end;
+
+    -- GET /sound?name=...: the Kölner Phonetik and the Soundex of name, one a
+    -- line; 400 without a name, 413 for one of more than 100 bytes.
+    function sound(request: Request): String is
+        case query(&request, "name") of
+            when Some(value as name: String) do
+                destroyRequest(request);
+                if spanLength(asSpan(&name)) > 100 then
+                    destroyString(name);
+                    return finish(plain(413), "the name is too long\n");
+                else
+                    let german: String := cologne(asSpan(&name));
+                    let english: String := soundex(asSpan(&name));
+                    destroyString(name);
+                    var out: StringBuilder := makeStringBuilder();
+                    writeString(&!out, "cologne: ");
+                    writeString(&!out, asSpan(&german));
+                    writeString(&!out, "\nsoundex: ");
+                    writeString(&!out, asSpan(&english));
+                    writeByte(&!out, '\n');
+                    destroyString(german);
+                    destroyString(english);
+                    let shown: String := finalize(out);
+                    let output: String := finish(plain(200), asSpan(&shown));
+                    destroyString(shown);
+                    return output;
+                end if;
+            when None do
+                destroyRequest(request);
+                return finish(plain(400), "the parameter name is missing\n");
+        end case;
+    end;
+
+    -- The counts of the query parameter values, numbers between commas, at
+    -- most 100 of them; the ones that are no number are left out.
+    generic [Q: Region]
+    function countsOf(text: Span[Nat8, Q]): Buffer[Int64] is
+        var counts: Buffer[Int64] := allocateEmpty();
+        let pieces: Buffer[Span[Nat8, Q]] := split(text, ",");
+        var i: Index := 0;
+        while (i < length(&pieces)) and (i < 100) do
+            case parseNat(nth(&pieces, i)) of
+                when Some(value as count: Nat64) do
+                    case toInt64(count) of
+                        when Some(value as signed: Int64) do
+                            insertBack(&!counts, signed);
+                        when None do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        destroyFree(pieces);
+        return counts;
+    end;
+
+    -- A bar chart as text (Wolly.Chart): the median of the counts, then
+    -- each count as people read it and the height of its bar in percent
+    -- of the largest.
+    function stats(request: Request): String is
+        var counts: Buffer[Int64] := allocateEmpty();
+        case query(&request, "values") of
+            when Some(value as given: String) do
+                destroyFree(counts);
+                counts := countsOf(asSpan(&given));
+                destroyString(given);
+            when None do
+                skip;
+        end case;
+        destroyRequest(request);
+        var most: Int64 := 0;
+        var i: Index := 0;
+        while i < length(&counts) do
+            if nth(&counts, i) > most then
+                most := nth(&counts, i);
+            end if;
+            i := i + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "median ");
+        let middle: String := decimalText(median(&counts));
+        writeString(&!out, asSpan(&middle));
+        destroyString(middle);
+        writeByte(&!out, '\n');
+        var k: Index := 0;
+        while k < length(&counts) do
+            let shown: String := readableNumber(nth(&counts, k));
+            writeString(&!out, asSpan(&shown));
+            destroyString(shown);
+            writeByte(&!out, ' ');
+            let height: String := decimalText(barHeight(nth(&counts, k), most));
+            writeString(&!out, asSpan(&height));
+            destroyString(height);
+            writeString(&!out, "%\n");
+            k := k + 1;
+        end while;
+        destroyFree(counts);
+        let text: String := finalize(out);
+        let output: String := finish(plain(200), asSpan(&text));
+        destroyString(text);
+        return output;
+    end;
+
+    -- The query parameter text, Markdown, as a page of HTML (Wolly.Markdown)
+    -- that may run no script and load nothing.
+    function markdown(request: Request): String is
+        case query(&request, "text") of
+            when Some(value as given: String) do
+                destroyRequest(request);
+                let html: String := markdownToHtml(asSpan(&given));
+                destroyString(given);
+                let page: Response := addHeader(makeResponse(200, "text/html; charset=utf-8"), "Content-Security-Policy", "default-src 'none'");
+                let output: String := finish(addHeader(page, "X-Content-Type-Options", "nosniff"), asSpan(&html));
+                destroyString(html);
+                return output;
+            when None do
+                destroyRequest(request);
+                return finish(plain(400), "the parameter text is missing\n");
+        end case;
+    end;
+
+    -- GET /code?file=...&text=...: text highlighted for the language of the
+    -- file name (Wolly.Highlight), in a pre; only escaped for a name of no
+    -- language.
+    function code(request: Request): String is
+        let file: String := orEmpty(query(&request, "file"));
+        case query(&request, "text") of
+            when Some(value as text: String) do
+                destroyRequest(request);
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "<pre class=\"code\">");
+                case languageOf(asSpan(&file)) of
+                    when Some(value as language: Language) do
+                        let lit: String := highlight(asSpan(&text), language);
+                        writeString(&!out, asSpan(&lit));
+                        destroyString(lit);
+                    when None do
+                        let plainText: String := escapeCode(asSpan(&text));
+                        writeString(&!out, asSpan(&plainText));
+                        destroyString(plainText);
+                end case;
+                writeString(&!out, "</pre>\n");
+                destroyString(text);
+                destroyString(file);
+                let html: String := finalize(out);
+                let page: Response := addHeader(makeResponse(200, "text/html; charset=utf-8"), "Content-Security-Policy", "default-src 'none'");
+                let output: String := finish(addHeader(page, "X-Content-Type-Options", "nosniff"), asSpan(&html));
+                destroyString(html);
+                return output;
+            when None do
+                destroyRequest(request);
+                destroyString(file);
+                return finish(plain(400), "the parameter text is missing\n");
+        end case;
+    end;
+
+    function orEmpty(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The news of the example as an Atom feed (Wolly.Feed): two entries,
+    -- one with a title that must be escaped.
+    function feed(request: Request): String is
+        destroyRequest(request);
+        var out: StringBuilder := makeStringBuilder();
+        beginFeed(&!out, "https://hello.example/", "Hello & news", "/", 1760443200);
+        writeEntry(&!out, "https://hello.example/numbers", "Numbers <in pages>", "/numbers", 1760443200, "45 numbers, 20 a page");
+        writeEntry(&!out, "https://hello.example/visits", "Visits", "/visits", 1760356800, "a count in a cookie");
+        endFeed(&!out);
+        let text: String := finalize(out);
+        let output: String := finish(addHeader(makeResponse(200, feedType()), "X-Content-Type-Options", "nosniff"), asSpan(&text));
+        destroyString(text);
+        return output;
+    end;
+
+    -- The seconds of the wall clock; 0 when it cannot be read.
+    function now(): Int64 is
+        let ten9: Nat64 := 1000000000;
+        case toInt64(wallNanos() / ten9) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The public key of the one actor this example takes, from actor.pem
+    -- beside the programme, as DER; None when there is none.
+    function actorKey(): Option[String] is
+        case openRead("actor.pem") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case read of
+                    when Some(value as pem: String) do
+                        let der: Option[String] := derOfPem(asSpan(&pem));
+                        destroyString(pem);
+                        return der;
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The answer to a verdict: 202 and the keyId for a request that
+    -- passes, 401 and the reason for one that does not.
+    function verdictAnswer(verdict: SignatureCheck): String is
+        case verdict of
+            when Verified(keyId: String) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "signed by ");
+                writeString(&!out, asSpan(&keyId));
+                writeByte(&!out, '\n');
+                destroyString(keyId);
+                let text: String := finalize(out);
+                let output: String := finish(plain(202), asSpan(&text));
+                destroyString(text);
+                return output;
+            when NotSigned do
+                return finish(plain(401), "not signed\n");
+            when Malformed do
+                return finish(plain(401), "malformed\n");
+            when Stale do
+                return finish(plain(401), "stale\n");
+            when DigestMismatch do
+                return finish(plain(401), "digest mismatch\n");
+            when Forged do
+                return finish(plain(401), "forged\n");
+        end case;
+    end;
+
+    -- An inbox of the fediverse that takes signed requests of one actor
+    -- (Wolly.Signature).
+    function inbox(request: Request): String is
+        case actorKey() of
+            when Some(value as der: String) do
+                let verdict: SignatureCheck := verifySignature(&request, requestBody(&request), asSpan(&der), now());
+                destroyString(der);
+                destroyRequest(request);
+                return verdictAnswer(verdict);
+            when None do
+                destroyRequest(request);
+                return finish(plain(500), "actor.pem is missing\n");
+        end case;
+    end;
+
+    function handle(request: Request): String is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/", handler => home));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/hello/:name", handler => greet));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/visits", handler => visits));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/files/*", handler => files));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/numbers", handler => numbers));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/asset", handler => asset));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/qr", handler => qr));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/bunti", handler => bunti));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/check", handler => check));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/sound", handler => sound));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/code", handler => code));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/stats", handler => stats));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/markdown", handler => markdown));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/feed.atom", handler => feed));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/inbox", handler => inbox));
+        let output: String := dispatch(request, &routes);
+        destroyFree(routes);
+        return output;
+    end;
+
+    function main(): ExitCode is
+        var libraries: Buffer[String] := allocateEmpty();
+        insertBack(&!libraries, library("libcrypto", cryptoVersion()));
+        let answered: Bool := answerAbout("hello", &libraries);
+        destroyLibraries(libraries);
+        if answered then
+            return ExitSuccess();
+        end if;
+        if sandboxAsked() then
+            printSandbox("hello");
+            return ExitSuccess();
+        end if;
+        confineServer("hello");
+        case serve("hello.sock", handle, defaultLimits()) of
+            when Stopped(accepted: Index) do
+                print("hello: stopped, connections accepted: ");
+                printLn(accepted);
+                return ExitSuccess();
+            when NoSocket do
+                printLn("hello: the socket hello.sock could not be made");
+                return ExitFailure();
+            when NotStarted do
+                printLn("hello: the server did not start");
+                return ExitFailure();
+        end case;
+    end;
+end module body.

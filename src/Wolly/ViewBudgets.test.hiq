@@ -1,0 +1,280 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Checks: View
+--
+-- The budgets of a render of Wolly.View for the text it makes, each asked
+-- at the value it allows and one past it where the value can be reached
+-- exactly: the bytes of text made, a filter refused before it is tried, and
+-- nothing written to the caller when a page fails.  The budgets of calls
+-- are in ViewCalls.test.hiq, the limits of a load in ViewLimits.test.hiq.
+-- The templates are written below view-budgets-root in the working
+-- directory of the test.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    Listener,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory,
+    listenUnix,
+    closeListener
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData,
+    makeMapData,
+    rootNode,
+    putList,
+    putText,
+    addInteger
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    renderView,
+    mostMadeBytes
+);
+import Standard.Template (
+    displayIndex
+);
+import Wolly.ViewFunctions (
+    addStandardFunctions
+);
+
+module body Wolly.ViewBudgets.Test is
+    constant root: Span[Nat8, Static] := "view-budgets-root";
+
+    function prepared(): Bool is
+        let made: Bool := createDirectory(root);
+        return true;
+    end;
+
+    generic [N: Region]
+    function pathOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, root);
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [N: Region, T: Region]
+    function written(name: Span[Nat8, N], text: Span[Nat8, T]): Bool is
+        let path: String := pathOf(name);
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                destroyString(path);
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                destroyString(path);
+                return false;
+        end case;
+    end;
+
+    generic [T: Region]
+    function repeated(text: Span[Nat8, T], count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeString(&!out, text);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The template name rendered with data by an engine of the directory
+    -- and the functions of Wolly.ViewFunctions: Right with the length of
+    -- the output, Left with the error.
+    generic [N: Region]
+    function outcome(name: Span[Nat8, N], data: ViewData): Either[String, Index] is
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, root);
+        addStandardFunctions(&!engine);
+        var out: StringBuilder := makeStringBuilder();
+        let result: Either[String, Unit] := renderView(&!engine, name, &data, &!out);
+        destroyViewData(data);
+        destroyViewEngine(engine);
+        let text: String := finalize(out);
+        let length: Index := spanLength(asSpan(&text));
+        destroyString(text);
+        case result of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as done: Unit) do
+                return Right(right => length);
+        end case;
+    end;
+
+    -- {"x": "v"}.
+    function small(): ViewData is
+        case readViewJson("{\"x\": \"v\"}") of
+            when Right(right as data: ViewData) do
+                return data;
+            when Left(left as message: String) do
+                destroyString(message);
+                return makeMapData();
+        end case;
+    end;
+
+    -- {"xs": [1, ...], "big": "x..."}: count elements, a text of size bytes.
+    function listData(count: Index, size: Index): ViewData is
+        var data: ViewData := makeMapData();
+        let list: Index := putList(&!data, rootNode(), "xs");
+        var i: Index := 0;
+        while i < count do
+            let added: Index := addInteger(&!data, list, 1);
+            i := i + 1;
+        end while;
+        let big: String := repeated("x", size);
+        let put: Index := putText(&!data, rootNode(), "big", asSpan(&big));
+        destroyString(big);
+        return data;
+    end;
+
+    generic [N: Region]
+    function rendersLength(name: Span[Nat8, N], data: ViewData, expected: Index, message: Span[Nat8, Static]): Unit is
+        case outcome(name, data) of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, message);
+            when Right(right as length: Index) do
+                if length /= expected then
+                    print("length ");
+                    printLn(length);
+                end if;
+                assertTrue(length = expected, message);
+        end case;
+        return nil;
+    end;
+
+    generic [N: Region]
+    function refuses(name: Span[Nat8, N], data: ViewData, code: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case outcome(name, data) of
+            when Left(left as failure: String) do
+                let found: Bool := contains(asSpan(&failure), code);
+                if not found then
+                    printLn(asSpan(&failure));
+                end if;
+                destroyString(failure);
+                assertTrue(found, message);
+            when Right(right as length: Index) do
+                printLn("rendered where an error was asked for");
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- {% set y = "a"|center(width) %}ok
+    function centered(width: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{% set y = \"a\"|center(");
+        let number: String := displayIndex(width);
+        writeString(&!out, asSpan(&number));
+        destroyString(number);
+        writeString(&!out, ") %}ok");
+        return finalize(out);
+    end;
+
+    -- {{ "aaaaaaaaaa"|replace("a", "aaaaaaaaaa") ... }}, count times: ten
+    -- to the count + 1 bytes.
+    function replaces(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{{ \"aaaaaaaaaa\"");
+        let filters: String := repeated("|replace(\"a\", \"aaaaaaaaaa\")", count);
+        writeString(&!out, asSpan(&filters));
+        destroyString(filters);
+        writeString(&!out, " }}");
+        return finalize(out);
+    end;
+
+    function testMade(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        let most: String := centered(mostMadeBytes() - 1);
+        assertTrue(written("most.jinja", asSpan(&most)), "a center of 64 MiB less a byte is written");
+        destroyString(most);
+        let more: String := centered(mostMadeBytes() + 1);
+        assertTrue(written("more.jinja", asSpan(&more)), "a center of 64 MiB and a byte is written");
+        destroyString(more);
+        let six: String := replaces(6);
+        assertTrue(written("six.jinja", asSpan(&six)), "six replaces are written");
+        destroyString(six);
+        let seven: String := replaces(7);
+        assertTrue(written("seven.jinja", asSpan(&seven)), "seven replaces are written");
+        destroyString(seven);
+        rendersLength("most.jinja", small(), 2, "64 MiB made, the literal and the center, are allowed");
+        refuses("more.jinja", small(), "V1018", "a center wider than 64 MiB is refused before it is made");
+        let absurd: String := centered(4611686018427387903);
+        assertTrue(written("absurd.jinja", asSpan(&absurd)), "a center of 2 ^ 62 - 1, the largest number, is written");
+        destroyString(absurd);
+        refuses("absurd.jinja", small(), "V1018", "a center of 2 ^ 62 - 1 is refused, not tried");
+        rendersLength("six.jinja", small(), 10000000, "six replaces make ten million bytes");
+        refuses("seven.jinja", small(), "V1018", "seven replaces, a hundred million bytes, are refused");
+        return nil;
+    end;
+
+    function testMadeInLoop(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        assertTrue(written("loop.jinja", "{% for a in xs %}{% set y = big ~ \"\" %}{% endfor %}"),
+            "the loop is written");
+        rendersLength("loop.jinja", listData(64, 1048576), 0, "64 texts of 1 MiB made, 64 MiB, are allowed");
+        refuses("loop.jinja", listData(65, 1048576), "V1018", "65 texts of 1 MiB made are refused");
+        return nil;
+    end;
+
+    function testNothingOnError(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        assertTrue(written("half.jinja", "<a title=\"{{ x }}{{ nobody }}\">"), "a page that fails halfway is written");
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, root);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "before");
+        let data: ViewData := small();
+        let result: Either[String, Unit] := renderView(&!engine, "half.jinja", &data, &!out);
+        destroyViewData(data);
+        destroyViewEngine(engine);
+        let text: String := finalize(out);
+        let untouched: Bool := equal(asSpan(&text), "before");
+        if not untouched then
+            printLn(asSpan(&text));
+        end if;
+        destroyString(text);
+        case result of
+            when Left(left as message: String) do
+                destroyString(message);
+                assertTrue(untouched, "a page that fails writes nothing to out");
+            when Right(right as done: Unit) do
+                assertTrue(false, "a name the data lacks is an error");
+        end case;
+        return nil;
+    end;
+end module body.

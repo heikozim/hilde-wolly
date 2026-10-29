@@ -1,0 +1,424 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Text (
+    substring,
+    startsWith,
+    lines
+);
+
+module body Wolly.Markdown is
+    -- The kinds of an open list.
+    constant noList: Index := 0;
+    constant bullets: Index := 1;
+    constant numbers: Index := 2;
+
+    function mostMarkdownBytes(): Index is
+        return 1048576;
+    end;
+
+    -- Writes span with & < > " ' as entities.
+    generic [B: Region, S: Region]
+    function writeEscaped(out: &![StringBuilder, B], span: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(span) do
+            let byte: Nat8 := span[i];
+            if byte = '&' then
+                writeString(&~out, "&amp;");
+            else
+                if byte = '<' then
+                    writeString(&~out, "&lt;");
+                else
+                    if byte = '>' then
+                        writeString(&~out, "&gt;");
+                    else
+                        if byte = '"' then
+                            writeString(&~out, "&#34;");
+                        else
+                            if byte = 39 then
+                                writeString(&~out, "&#39;");
+                            else
+                                writeByte(&~out, byte);
+                            end if;
+                        end if;
+                    end if;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [U: Region]
+    function isSafeLink(url: Span[Nat8, U]): Bool is
+        let size: Index := spanLength(url);
+        if (size = 0) or (size > 2048) then
+            return false;
+        end if;
+        let scheme: Bool := (startsWith(url, "https://") or startsWith(url, "http://")) or startsWith(url, "mailto:");
+        let path: Bool := (url[0] = '/') and ((size = 1) or (url[1] /= '/'));
+        let anchor: Bool := url[0] = '#';
+        if not ((scheme or path) or anchor) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := url[i];
+            let bad: Bool := ((byte <= 32) or (byte = 127)) or ((((byte = '<') or (byte = '>')) or ((byte = '"') or (byte = 39))) or (byte = 92));
+            if bad then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The first index from start at which span holds mark, or the length
+    -- of span when it holds none.
+    generic [S: Region, M: Region]
+    function findFrom(span: Span[Nat8, S], start: Index, mark: Span[Nat8, M]): Index is
+        let size: Index := spanLength(span);
+        let width: Index := spanLength(mark);
+        var i: Index := start;
+        while (i + width) <= size do
+            var j: Index := 0;
+            var same: Bool := true;
+            while (j < width) and same do
+                if span[i + j] /= mark[j] then
+                    same := false;
+                end if;
+                j := j + 1;
+            end while;
+            if same then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return size;
+    end;
+
+    -- Whether byte is ASCII punctuation, which a backslash escapes.
+    function isPunctuation(byte: Nat8): Bool is
+        let low: Bool := (byte >= 33) and (byte <= 47);
+        let middle: Bool := (byte >= 58) and (byte <= 64);
+        let high: Bool := ((byte >= 91) and (byte <= 96)) or ((byte >= 123) and (byte <= 126));
+        return (low or middle) or high;
+    end;
+
+    -- Writes span with its inline marks as HTML.
+    generic [B: Region, S: Region]
+    function writeInline(out: &![StringBuilder, B], span: Span[Nat8, S]): Unit is
+        let size: Index := spanLength(span);
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := span[i];
+            var done: Bool := false;
+            if (byte = 92) and ((i + 1) < size) then
+                if isPunctuation(span[i + 1]) then
+                    writeEscaped(&~out, substring(span, i + 1, i + 2));
+                    i := i + 2;
+                    done := true;
+                end if;
+            end if;
+            if (not done) and (byte = '`') then
+                let close: Index := findFrom(span, i + 1, "`");
+                if close < size then
+                    writeString(&~out, "<code>");
+                    writeEscaped(&~out, substring(span, i + 1, close));
+                    writeString(&~out, "</code>");
+                    i := close + 1;
+                    done := true;
+                end if;
+            end if;
+            if (not done) and (((byte = '*') and ((i + 1) < size)) and (span[i + 1] = '*')) then
+                let close: Index := findFrom(span, i + 2, "**");
+                if (close < size) and (close > (i + 2)) then
+                    writeString(&~out, "<strong>");
+                    writeInline(&~out, substring(span, i + 2, close));
+                    writeString(&~out, "</strong>");
+                    i := close + 2;
+                    done := true;
+                end if;
+            end if;
+            if (not done) and (byte = '*') then
+                let close: Index := findFrom(span, i + 1, "*");
+                if (close < size) and (close > (i + 1)) then
+                    writeString(&~out, "<em>");
+                    writeInline(&~out, substring(span, i + 1, close));
+                    writeString(&~out, "</em>");
+                    i := close + 1;
+                    done := true;
+                end if;
+            end if;
+            if (not done) and (byte = '[') then
+                let middle: Index := findFrom(span, i + 1, "](");
+                if middle < size then
+                    let stop: Index := findFrom(span, middle + 2, ")");
+                    if stop < size then
+                        let url: Span[Nat8, S] := substring(span, middle + 2, stop);
+                        if isSafeLink(url) then
+                            writeString(&~out, "<a href=\"");
+                            writeEscaped(&~out, url);
+                            writeString(&~out, "\">");
+                            writeInline(&~out, substring(span, i + 1, middle));
+                            writeString(&~out, "</a>");
+                            i := stop + 1;
+                            done := true;
+                        end if;
+                    end if;
+                end if;
+            end if;
+            if not done then
+                writeEscaped(&~out, substring(span, i, i + 1));
+                i := i + 1;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    -- Whether line holds nothing but spaces and tabs.
+    generic [L: Region]
+    function isBlank(line: Span[Nat8, L]): Bool is
+        var i: Index := 0;
+        while i < spanLength(line) do
+            if (line[i] /= ' ') and (line[i] /= 9) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The level of a heading: the number of # before a space, 1 to 6; 0
+    -- when line is no heading.
+    generic [L: Region]
+    function headingLevel(line: Span[Nat8, L]): Index is
+        var level: Index := 0;
+        while (level < spanLength(line)) and (line[level] = '#') do
+            level := level + 1;
+        end while;
+        if ((level >= 1) and (level <= 6)) and ((level < spanLength(line)) and (line[level] = ' ')) then
+            return level;
+        end if;
+        return 0;
+    end;
+
+    -- Whether line is a rule: three or more hyphens and nothing else.
+    generic [L: Region]
+    function isRule(line: Span[Nat8, L]): Bool is
+        if spanLength(line) < 3 then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(line) do
+            if line[i] /= '-' then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The index after the marker of an item of a numbered list, 1. to
+    -- 999999999., and its space; 0 when line is none.
+    generic [L: Region]
+    function numberedItem(line: Span[Nat8, L]): Index is
+        var i: Index := 0;
+        while ((i < spanLength(line)) and (i < 9)) and ((line[i] >= '0') and (line[i] <= '9')) do
+            i := i + 1;
+        end while;
+        if ((i >= 1) and ((i + 1) < spanLength(line))) and ((line[i] = '.') and (line[i + 1] = ' ')) then
+            return i + 2;
+        end if;
+        return 0;
+    end;
+
+    -- Writes the end of the open paragraph, list and quote.
+    generic [B: Region]
+    function closeBlocks(out: &![StringBuilder, B], paragraph: Bool, list: Index, quote: Bool): Unit is
+        if paragraph then
+            writeString(&~out, "</p>\n");
+        end if;
+        if list = bullets then
+            writeString(&~out, "</ul>\n");
+        end if;
+        if list = numbers then
+            writeString(&~out, "</ol>\n");
+        end if;
+        if quote then
+            writeString(&~out, "</p></blockquote>\n");
+        end if;
+        return nil;
+    end;
+
+    -- The name of the tag of a heading of level, 1 to 6.
+    function headingTag(level: Index): Span[Nat8, Static] is
+        if level = 1 then
+            return "h1";
+        end if;
+        if level = 2 then
+            return "h2";
+        end if;
+        if level = 3 then
+            return "h3";
+        end if;
+        if level = 4 then
+            return "h4";
+        end if;
+        if level = 5 then
+            return "h5";
+        end if;
+        return "h6";
+    end;
+
+    generic [T: Region]
+    function markdownToHtml(text: Span[Nat8, T]): String is
+        var read: Index := spanLength(text);
+        if read > mostMarkdownBytes() then
+            read := mostMarkdownBytes();
+        end if;
+        let all: Buffer[Span[Nat8, T]] := lines(substring(text, 0, read));
+        var out: StringBuilder := makeStringBuilder();
+        var paragraph: Bool := false;
+        var list: Index := noList;
+        var quote: Bool := false;
+        var code: Bool := false;
+        var n: Index := 0;
+        while n < length(&all) do
+            let line: Span[Nat8, T] := nth(&all, n);
+            let level: Index := headingLevel(line);
+            let item: Index := numberedItem(line);
+            if code then
+                if startsWith(line, "```") then
+                    writeString(&!out, "</code></pre>\n");
+                    code := false;
+                else
+                    writeEscaped(&!out, line);
+                    writeByte(&!out, '\n');
+                end if;
+            else
+                if startsWith(line, "```") then
+                    closeBlocks(&!out, paragraph, list, quote);
+                    paragraph := false;
+                    list := noList;
+                    quote := false;
+                    writeString(&!out, "<pre><code>");
+                    code := true;
+                else
+                    if isBlank(line) then
+                        closeBlocks(&!out, paragraph, list, quote);
+                        paragraph := false;
+                        list := noList;
+                        quote := false;
+                    else
+                        if level > 0 then
+                            closeBlocks(&!out, paragraph, list, quote);
+                            paragraph := false;
+                            list := noList;
+                            quote := false;
+                            writeByte(&!out, '<');
+                            writeString(&!out, headingTag(level));
+                            writeByte(&!out, '>');
+                            writeInline(&!out, substring(line, level + 1, spanLength(line)));
+                            writeString(&!out, "</");
+                            writeString(&!out, headingTag(level));
+                            writeString(&!out, ">\n");
+                        else
+                            if isRule(line) then
+                                closeBlocks(&!out, paragraph, list, quote);
+                                paragraph := false;
+                                list := noList;
+                                quote := false;
+                                writeString(&!out, "<hr>\n");
+                            else
+                                if startsWith(line, "- ") or startsWith(line, "* ") then
+                                    if list /= bullets then
+                                        closeBlocks(&!out, paragraph, list, quote);
+                                        paragraph := false;
+                                        list := noList;
+                                        quote := false;
+                                        writeString(&!out, "<ul>\n");
+                                        list := bullets;
+                                    end if;
+                                    writeString(&!out, "<li>");
+                                    writeInline(&!out, substring(line, 2, spanLength(line)));
+                                    writeString(&!out, "</li>\n");
+                                else
+                                    if item > 0 then
+                                        if list /= numbers then
+                                            closeBlocks(&!out, paragraph, list, quote);
+                                            paragraph := false;
+                                            list := noList;
+                                            quote := false;
+                                            writeString(&!out, "<ol>\n");
+                                            list := numbers;
+                                        end if;
+                                        writeString(&!out, "<li>");
+                                        writeInline(&!out, substring(line, item, spanLength(line)));
+                                        writeString(&!out, "</li>\n");
+                                    else
+                                        if startsWith(line, ">") then
+                                            var rest: Index := 1;
+                                            if (spanLength(line) > 1) and (line[1] = ' ') then
+                                                rest := rest + 1;
+                                            end if;
+                                            if quote then
+                                                writeByte(&!out, '\n');
+                                            else
+                                                closeBlocks(&!out, paragraph, list, quote);
+                                                paragraph := false;
+                                                list := noList;
+                                                quote := false;
+                                                writeString(&!out, "<blockquote><p>");
+                                                quote := true;
+                                            end if;
+                                            writeInline(&!out, substring(line, rest, spanLength(line)));
+                                        else
+                                            if paragraph then
+                                                writeByte(&!out, '\n');
+                                            else
+                                                closeBlocks(&!out, paragraph, list, quote);
+                                                paragraph := false;
+                                                list := noList;
+                                                quote := false;
+                                                writeString(&!out, "<p>");
+                                                paragraph := true;
+                                            end if;
+                                            writeInline(&!out, line);
+                                        end if;
+                                    end if;
+                                end if;
+                            end if;
+                        end if;
+                    end if;
+                end if;
+            end if;
+            n := n + 1;
+        end while;
+        if code then
+            writeString(&!out, "</code></pre>\n");
+        end if;
+        closeBlocks(&!out, paragraph, list, quote);
+        destroyFree(all);
+        return finalize(out);
+    end;
+end module body.

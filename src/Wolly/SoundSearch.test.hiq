@@ -1,0 +1,235 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database in memory.  a is Meier Schmidt, b Mayer, c
+-- Miller, d Smith, e Müller-Lüdenscheidt.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nthRef
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction,
+    begin,
+    commit,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.SoundSearch (
+    SoundMode,
+    German,
+    English,
+    Both,
+    mostWords,
+    mostKey,
+    prepareSounds,
+    indexSounds,
+    indexSoundsWithin,
+    removeSounds,
+    findBySound,
+    destroyKeys
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.SoundSearch.Test is
+
+    generic [R: Region]
+    function keysAre(keys: &[Buffer[String], R], wanted: Span[Nat8, Static]): Bool is
+        if length(keys) /= spanLength(wanted) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(keys) do
+            let key: &[String, R] := nthRef(keys, i);
+            let one: Span[Nat8, Static] := substring1(wanted, i);
+            if not equal(asSpan(key), one) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function substring1(text: Span[Nat8, Static], at: Index): Span[Nat8, Static] is
+        if text[at] = 'a' then
+            return "a";
+        end if;
+        if text[at] = 'b' then
+            return "b";
+        end if;
+        if text[at] = 'c' then
+            return "c";
+        end if;
+        if text[at] = 'd' then
+            return "d";
+        end if;
+        return "e";
+    end;
+
+    generic [R: Region]
+    function found(db: &![Database[Writing], R], text: Span[Nat8, Static], mode: SoundMode, limit: Int64,
+                   wanted: Span[Nat8, Static]): Bool is
+        case findBySound(&~db, text, mode, limit) of
+            when Right(right as keys: Buffer[String]) do
+                let fits: Bool := keysAre(&keys, wanted);
+                destroyKeys(keys);
+                return fits;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function yes(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertTrue(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function no(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertFalse(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R], mode: SoundMode): Unit is
+        case prepareSounds(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table is made");
+            when None do
+                skip;
+        end case;
+        yes(indexSounds(&~db, "a", "Meier Schmidt", mode), "a is kept");
+        yes(indexSounds(&~db, "b", "Mayer", mode), "b is kept");
+        yes(indexSounds(&~db, "c", "Miller", mode), "c is kept");
+        yes(indexSounds(&~db, "d", "Smith", mode), "d is kept");
+        yes(indexSounds(&~db, "e", "Müller-Lüdenscheidt", mode), "e is kept");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runGerman(db: &![Database[Writing], R]): Unit is
+        prepared(&~db, German());
+        assertTrue(found(&~db, "Maier", German(), 10, "ab"), "Maier finds Meier and Mayer");
+        assertTrue(found(&~db, "Schmitt", German(), 10, "ad"), "Schmitt finds Schmidt, and Smith with the same 862");
+        assertTrue(found(&~db, "Meyer Schmied", German(), 10, "a"), "two words, both must sound");
+        assertTrue(found(&~db, "Mueller", German(), 10, "ce"), "Mueller finds Miller and Müller");
+        assertTrue(found(&~db, "Lüdenscheid", German(), 10, "e"), "Lüdenscheid sounds like Lüdenscheidt: d and t are both 2");
+        assertTrue(found(&~db, "Ludenscheidt", German(), 10, "e"), "a word of a hyphenated name is a word of its own");
+        assertTrue(found(&~db, "Maier 42", German(), 10, "ab"), "a word without a code asks nothing");
+        assertTrue(found(&~db, "42 !", German(), 10, ""), "nothing with a code finds nothing");
+        assertTrue(found(&~db, "Maier", German(), 1, "a"), "at most limit keys");
+        assertTrue(found(&~db, "Maier", German(), 0, "ab"), "a limit of 0 is taken as 100");
+        assertTrue(found(&~db, "Smyth", German(), 10, "ad"), "Smyth sounds like Smith and Schmidt in Cologne codes, 862");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runEnglish(db: &![Database[Writing], R]): Unit is
+        prepared(&~db, English());
+        assertTrue(found(&~db, "Smyth", English(), 10, "ad"), "Smyth finds Smith and Schmidt, S530");
+        assertTrue(found(&~db, "Mayer", English(), 10, "ab"), "Mayer finds Meier and Mayer");
+        assertTrue(found(&~db, "Maier", German(), 10, ""), "Cologne codes were not kept");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runChanges(db: &![Database[Writing], R]): Unit is
+        prepared(&~db, Both());
+        assertTrue(found(&~db, "Maier", German(), 10, "ab"), "Both keeps the Cologne codes");
+        assertTrue(found(&~db, "Maier", English(), 10, "ab"), "and Soundex");
+        assertTrue(found(&~db, "Maier", Both(), 10, "ab"), "either code fits in Both");
+        yes(indexSounds(&~db, "b", "Fischer", Both()), "b is kept anew");
+        assertTrue(found(&~db, "Maier", Both(), 10, "a"), "and no longer sounds like Maier");
+        assertTrue(found(&~db, "Fisher", Both(), 10, "b"), "but like Fisher");
+        yes(removeSounds(&~db, "b"), "b is removed");
+        no(removeSounds(&~db, "b"), "a second time finds nothing");
+        assertTrue(found(&~db, "Fisher", Both(), 10, ""), "and b is gone");
+        no(indexSounds(&~db, "", "Meier", Both()), "an empty key is no key");
+        -- Within the transaction of the caller: the same work.
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                yes(indexSoundsWithin(&~db, "d", "Fischer", Both()), "d is kept anew within a transaction of the caller");
+                no(indexSoundsWithin(&~db, "", "Meier", Both()), "an empty key is no key there either");
+                case commit(&~db, open) of
+                    when Right(right as done: Unit) do
+                        assertTrue(true, "the caller commits");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the caller commits");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction of the caller");
+        end case;
+        assertTrue(found(&~db, "Fisher", Both(), 10, "d"), "d sounds like Fisher after the commit");
+        assertTrue(found(&~db, "Smith", Both(), 10, "a"), "and no longer like Smith: its codes were replaced");
+        return nil;
+    end;
+
+    function withDatabase(run: Int64): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                if run = 0 then
+                    runGerman(&!db);
+                end if;
+                if run = 1 then
+                    runEnglish(&!db);
+                end if;
+                if run = 2 then
+                    runChanges(&!db);
+                end if;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testGerman(): Unit is
+        withDatabase(0);
+        return nil;
+    end;
+
+    function testEnglish(): Unit is
+        withDatabase(1);
+        return nil;
+    end;
+
+    function testChanges(): Unit is
+        withDatabase(2);
+        return nil;
+    end;
+
+    function testBounds(): Unit is
+        assertTrue(mostWords() = 16, "16 words count");
+        assertTrue(mostKey() = 256, "a key of 256 bytes");
+        return nil;
+    end;
+end module body.

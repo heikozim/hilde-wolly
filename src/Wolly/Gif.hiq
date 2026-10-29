@@ -1,0 +1,430 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    length as bufferLength,
+    nth,
+    storeNth,
+    removeLast,
+    destroyFree
+);
+
+module body Wolly.Gif is
+    constant sideMost: Index := 16000;
+    constant tableMost: Index := 4096;
+
+    record GifPicture: Linear is
+        width: Index;
+        height: Index;
+        pixels: String;
+        invariant (width >= 1) and (width <= 16000);
+        invariant (height >= 1) and (height <= 16000);
+        invariant length(&pixels) = ((width * height) * 3);
+    end;
+
+    function gifSideMost(): Index is
+        return sideMost;
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(n: Index): Nat8 is
+        case toNat8(n) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The little-endian 16 bits at at.
+    generic [D: Region]
+    function word(data: Span[Nat8, D], at: Index): Index is
+        return wide(data[at]) + (wide(data[at + 1]) * 256);
+    end;
+
+    generic [D: Region]
+    function isGif(data: Span[Nat8, D]): Bool is
+        if spanLength(data) < 13 then
+            return false;
+        end if;
+        let head: Bool := ((data[0] = 'G') and (data[1] = 'I')) and ((data[2] = 'F') and (data[3] = '8'));
+        let version: Bool := ((data[4] = '7') or (data[4] = '9')) and (data[5] = 'a');
+        return head and version;
+    end;
+
+    -- The position after the sub-blocks that begin at at, or the length of
+    -- data plus one when they run past its end.
+    generic [D: Region]
+    function afterBlocks(data: Span[Nat8, D], at: Index): Index is
+        var i: Index := at;
+        let size: Index := spanLength(data);
+        while i < size do
+            let n: Index := wide(data[i]);
+            if n = 0 then
+                return i + 1;
+            end if;
+            i := (i + n) + 1;
+        end while;
+        return size + 1;
+    end;
+
+    -- The bytes of the sub-blocks that begin at at, joined.
+    generic [D: Region]
+    function blockData(data: Span[Nat8, D], at: Index): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var i: Index := at;
+        let size: Index := spanLength(data);
+        var going: Bool := true;
+        while going and (i < size) do
+            let n: Index := wide(data[i]);
+            if (n = 0) or (((i + n) + 1) > size) then
+                going := false;
+            else
+                var k: Index := 1;
+                while k <= n do
+                    insertBack(&!out, data[i + k]);
+                    k := k + 1;
+                end while;
+                i := (i + n) + 1;
+            end if;
+        end while;
+        return out;
+    end;
+
+    -- The colour indices of a picture of count pixels from its LZW codes
+    -- of minimum code size least; None when the codes are not LZW, or end
+    -- before count pixels (the indices given are kept, the rest 0, as
+    -- decoders do with a short last block: Some with those).
+    generic [C: Region]
+    function lzw(codes: &[Buffer[Nat8], C], least: Index, count: Index): Option[Buffer[Nat8]] is
+        let clear: Index := power(least);
+        let finish: Index := clear + 1;
+        var prefix: Buffer[Index] := initialize(tableMost, (0 : Index));
+        var suffix: Buffer[Nat8] := initialize(tableMost, (0 : Nat8));
+        var i: Index := 0;
+        while i < clear do
+            storeNth(&!suffix, i, narrow(i));
+            i := i + 1;
+        end while;
+        var stack: Buffer[Nat8] := allocateEmpty();
+        var out: Buffer[Nat8] := initialize(count, (0 : Nat8));
+        var written: Index := 0;
+        var next: Index := clear + 2;
+        var width: Index := least + 1;
+        var old: Index := 0;
+        var hasOld: Bool := false;
+        var first: Nat8 := 0;
+        var bit: Index := 0;
+        let bits: Index := bufferLength(codes) * 8;
+        var broken: Bool := false;
+        var done: Bool := false;
+        while ((not done) and (not broken)) and ((bit + width) <= bits) do
+            -- the code of width bits at bit, least significant bit first
+            var code: Index := 0;
+            var k: Index := 0;
+            while k < width do
+                let at: Index := bit + k;
+                let byte: Index := wide(nth(codes, at / 8));
+                let shift: Index := at - ((at / 8) * 8);
+                if bitwiseAnd(byte / power(shift), (1 : Index)) = 1 then
+                    code := code + power(k);
+                end if;
+                k := k + 1;
+            end while;
+            bit := bit + width;
+            if code = clear then
+                next := clear + 2;
+                width := least + 1;
+                hasOld := false;
+            else
+                if code = finish then
+                    done := true;
+                else
+                    if not hasOld then
+                        if code >= clear then
+                            broken := true;
+                        else
+                            first := narrow(code);
+                            if written < count then
+                                storeNth(&!out, written, first);
+                                written := written + 1;
+                            end if;
+                            old := code;
+                            hasOld := true;
+                        end if;
+                    else
+                        let incoming: Index := code;
+                        var walk: Index := code;
+                        if walk > next then
+                            broken := true;
+                        else
+                            if walk = next then
+                                insertBack(&!stack, first);
+                                walk := old;
+                            end if;
+                            while walk >= clear do
+                                insertBack(&!stack, nth(&suffix, walk));
+                                walk := nth(&prefix, walk);
+                            end while;
+                            first := narrow(walk);
+                            insertBack(&!stack, first);
+                            while bufferLength(&stack) > 0 do
+                                let value: Nat8 := removeLast(&!stack);
+                                if written < count then
+                                    storeNth(&!out, written, value);
+                                    written := written + 1;
+                                end if;
+                            end while;
+                            if next < tableMost then
+                                storeNth(&!prefix, next, old);
+                                storeNth(&!suffix, next, first);
+                                next := next + 1;
+                                if (next = power(width)) and (width < 12) then
+                                    width := width + 1;
+                                end if;
+                            end if;
+                            old := incoming;
+                        end if;
+                    end if;
+                end if;
+            end if;
+        end while;
+        destroyFree(prefix);
+        destroyFree(suffix);
+        destroyFree(stack);
+        if broken then
+            destroyFree(out);
+            return None();
+        else
+            return Some(value => out);
+        end if;
+    end;
+
+    -- 2 to the n, n at most 16.
+    function power(n: Index): Index is
+        var p: Index := 1;
+        var i: Index := 0;
+        while i < n do
+            p := p * 2;
+            i := i + 1;
+        end while;
+        return p;
+    end;
+
+    -- The row of the picture that the r-th row of an interlaced picture of
+    -- height rows is: passes from row 0 every 8th, from 4 every 8th, from 2
+    -- every 4th, from 1 every 2nd.
+    function interlacedRow(r: Index, height: Index): Index is
+        let pass1: Index := (height + 7) / 8;
+        let pass2: Index := (height + 3) / 8;
+        let pass3: Index := (height + 1) / 4;
+        if r < pass1 then
+            return r * 8;
+        end if;
+        if r < (pass1 + pass2) then
+            return ((r - pass1) * 8) + 4;
+        end if;
+        if r < ((pass1 + pass2) + pass3) then
+            return (((r - pass1) - pass2) * 4) + 2;
+        end if;
+        return ((((r - pass1) - pass2) - pass3) * 2) + 1;
+    end;
+
+    -- A failed read.
+    function failed(error: GifError): Either[GifError, GifPicture] is
+        return Left(left => error);
+    end;
+
+    generic [D: Region]
+    function readGif(data: Span[Nat8, D], maxPixels: Index): Either[GifError, GifPicture] is
+        if not isGif(data) then
+            return failed(NotGif());
+        end if;
+        let size: Index := spanLength(data);
+        let screenWidth: Index := word(data, 6);
+        let screenHeight: Index := word(data, 8);
+        if (screenWidth = 0) or (screenHeight = 0) then
+            return failed(Broken());
+        end if;
+        if ((screenWidth > sideMost) or (screenHeight > sideMost)) or ((screenWidth * screenHeight) > maxPixels) then
+            return failed(GifTooLarge());
+        end if;
+        let flags: Index := wide(data[10]);
+        let background: Index := wide(data[11]);
+        var globalAt: Index := 0;
+        var globalSize: Index := 0;
+        var at: Index := 13;
+        if bitwiseAnd(flags, (128 : Index)) = 128 then
+            globalSize := power(bitwiseAnd(flags, (7 : Index)) + 1);
+            globalAt := (13 : Index);
+            at := (globalSize * 3) + 13;
+        end if;
+        if at > size then
+            return failed(Broken());
+        end if;
+        var transparent: Index := 256;
+        var found: Bool := false;
+        var broken: Bool := false;
+        while ((not found) and (not broken)) and (at < size) do
+            let kind: Nat8 := data[at];
+            if kind = (44 : Nat8) then
+                found := true;
+            else
+                if (kind = (33 : Nat8)) and ((at + 1) < size) then
+                    -- a graphic control extension: 21 F9 04 flags delay(2) index 00
+                    if (data[at + 1] = (249 : Nat8)) and ((at + 7) < size) then
+                        if (data[at + 2] = (4 : Nat8)) and (bitwiseAnd(wide(data[at + 3]), (1 : Index)) = 1) then
+                            transparent := wide(data[at + 6]);
+                        end if;
+                    end if;
+                    at := afterBlocks(data, at + 2);
+                else
+                    broken := true;
+                end if;
+            end if;
+        end while;
+        if (not found) or ((at + 10) > size) then
+            return failed(Broken());
+        end if;
+        let left: Index := word(data, at + 1);
+        let top: Index := word(data, at + 3);
+        let frameWidth: Index := word(data, at + 5);
+        let frameHeight: Index := word(data, at + 7);
+        let frameFlags: Index := wide(data[at + 9]);
+        if ((frameWidth = 0) or (frameHeight = 0)) or ((frameWidth > sideMost) or (frameHeight > sideMost)) then
+            return failed(Broken());
+        end if;
+        var tableAt: Index := globalAt;
+        var tableSize: Index := globalSize;
+        var codesAt: Index := at + 10;
+        if bitwiseAnd(frameFlags, (128 : Index)) = 128 then
+            tableSize := power(bitwiseAnd(frameFlags, (7 : Index)) + 1);
+            tableAt := at + 10;
+            codesAt := (at + 10) + (tableSize * 3);
+        end if;
+        if (tableSize = 0) or ((codesAt + 1) >= size) then
+            return failed(Broken());
+        end if;
+        let least: Index := wide(data[codesAt]);
+        if (least < 2) or (least > 8) then
+            return failed(Broken());
+        end if;
+        let codes: Buffer[Nat8] := blockData(data, codesAt + 1);
+        let read: Option[Buffer[Nat8]] := lzw(&codes, least, frameWidth * frameHeight);
+        destroyFree(codes);
+        case read of
+            when Some(value as indices: Buffer[Nat8]) do
+                let interlaced: Bool := bitwiseAnd(frameFlags, (64 : Index)) = 64;
+                let pixels: String := painted(data, &indices, tableAt, tableSize, globalAt, globalSize, background, transparent,
+                                              screenWidth, screenHeight, left, top, frameWidth, frameHeight, interlaced);
+                destroyFree(indices);
+                let picture: GifPicture := GifPicture(width => screenWidth, height => screenHeight, pixels => pixels);
+                return Right(right => picture);
+            when None do
+                return failed(Broken());
+        end case;
+    end;
+
+    -- The screen painted: the background colour, then the picture's pixels
+    -- that are not transparent at their place.
+    generic [D: Region, I: Region]
+    function painted(data: Span[Nat8, D], indices: &[Buffer[Nat8], I], tableAt: Index, tableSize: Index, globalAt: Index,
+                     globalSize: Index, background: Index, transparent: Index, screenWidth: Index, screenHeight: Index,
+                     left: Index, top: Index, frameWidth: Index, frameHeight: Index, interlaced: Bool): String is
+        var red: Nat8 := 0;
+        var green: Nat8 := 0;
+        var blue: Nat8 := 0;
+        if (globalSize > 0) and (background < globalSize) then
+            red := data[globalAt + (background * 3)];
+            green := data[(globalAt + (background * 3)) + 1];
+            blue := data[(globalAt + (background * 3)) + 2];
+        end if;
+        -- rows[fy] is the coded row that holds picture row fy.
+        var rows: Buffer[Index] := initialize(frameHeight, (0 : Index));
+        var coded: Index := 0;
+        while coded < frameHeight do
+            if interlaced then
+                storeNth(&!rows, interlacedRow(coded, frameHeight), coded);
+            else
+                storeNth(&!rows, coded, coded);
+            end if;
+            coded := coded + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        var y: Index := 0;
+        while y < screenHeight do
+            var x: Index := 0;
+            while x < screenWidth do
+                var r: Nat8 := red;
+                var g: Nat8 := green;
+                var b: Nat8 := blue;
+                if (((x >= left) and (x < (left + frameWidth))) and (y >= top)) and (y < (top + frameHeight)) then
+                    let fx: Index := x - left;
+                    let fy: Index := y - top;
+                    let row: Index := nth(&rows, fy);
+                    let index: Index := wide(nth(indices, (row * frameWidth) + fx));
+                    if (index /= transparent) and (index < tableSize) then
+                        r := data[tableAt + (index * 3)];
+                        g := data[(tableAt + (index * 3)) + 1];
+                        b := data[(tableAt + (index * 3)) + 2];
+                    end if;
+                end if;
+                writeByte(&!out, r);
+                writeByte(&!out, g);
+                writeByte(&!out, b);
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        destroyFree(rows);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function gifWidth(picture: &[GifPicture, P]): Index is
+        return picture->width;
+    end;
+
+    generic [P: Region]
+    function gifHeight(picture: &[GifPicture, P]): Index is
+        return picture->height;
+    end;
+
+    generic [P: Region]
+    function gifPixels(picture: &[GifPicture, P]): Span[Nat8, P] is
+        return asSpan(&(picture->pixels));
+    end;
+
+    function destroyGif(picture: GifPicture): Unit is
+        let { width as w: Index, height as h: Index, pixels as p: String } := picture;
+        destroyString(p);
+        return nil;
+    end;
+end module body.

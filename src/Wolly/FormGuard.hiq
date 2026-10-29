@@ -1,0 +1,287 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Wolly.Auth: every statement is a
+-- constant, every value is bound, the table is strict.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    hexDigitValue,
+    parseInt,
+    bytesToHex,
+    constantTimeEqual,
+    formatInt
+);
+import Standard.Libcrypto (
+    randomBytes,
+    hmacSha256
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    noValues,
+    withInt64,
+    withText,
+    execute
+);
+import Wolly.Limit (
+    Verdict,
+    Allowed,
+    Limited,
+    prepareLimits,
+    hit
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.FormGuard is
+    constant makeUsed: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_used_stamps (mac TEXT PRIMARY KEY NOT NULL, until INTEGER NOT NULL) STRICT";
+    constant makeUsedPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_used_stamps (mac TEXT PRIMARY KEY NOT NULL, until BIGINT NOT NULL)";
+    constant dropExpired: Span[Nat8, Static] := "DELETE FROM wolly_used_stamps WHERE until <= ?";
+    constant useStamp: Span[Nat8, Static] := "INSERT OR IGNORE INTO wolly_used_stamps (mac, until) VALUES (?, ?)";
+    constant useStampPg: Span[Nat8, Static] := "INSERT INTO wolly_used_stamps (mac, until) VALUES (?, ?) ON CONFLICT DO NOTHING";
+    constant nonceBytes: Index := 16;
+
+    function honeypotField(): Span[Nat8, Static] is
+        return "website";
+    end;
+
+    function timeField(): Span[Nat8, Static] is
+        return "form_time";
+    end;
+
+    function nonceField(): Span[Nat8, Static] is
+        return "form_nonce";
+    end;
+
+    function macField(): Span[Nat8, Static] is
+        return "form_mac";
+    end;
+
+    function fastestSeconds(): Int64 is
+        return 3;
+    end;
+
+    function slowestSeconds(): Int64 is
+        return 1800;
+    end;
+
+    function formKeyBytes(): Index is
+        return 32;
+    end;
+
+    -- The message the signature covers: time, a bar, nonce.
+    generic [T: Region, N: Region]
+    function signed(time: Span[Nat8, T], nonce: Span[Nat8, N]): String is
+        var message: StringBuilder := makeStringBuilder();
+        writeString(&!message, time);
+        writeString(&!message, "|");
+        writeString(&!message, nonce);
+        return finalize(message);
+    end;
+
+    -- The signature of time and nonce under key in hexadecimal, None when
+    -- libcrypto fails.
+    generic [K: Region, T: Region, N: Region]
+    function signature(key: Span[Nat8, K], time: Span[Nat8, T], nonce: Span[Nat8, N]): Option[String] is
+        let message: String := signed(time, nonce);
+        let raw: Option[String] := hmacSha256(key, asSpan(&message));
+        destroyString(message);
+        case raw of
+            when Some(value as bytes: String) do
+                let hex: String := bytesToHex(asSpan(&bytes));
+                destroyString(bytes);
+                return Some(value => hex);
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [K: Region]
+    function makeStamp(key: Span[Nat8, K], now: Int64): Option[Stamp] is
+        if spanLength(key) < formKeyBytes() then
+            return None();
+        else
+            case randomBytes(nonceBytes) of
+                when Some(value as raw: String) do
+                    let nonce: String := bytesToHex(asSpan(&raw));
+                    destroyString(raw);
+                    var digits: StringBuilder := makeStringBuilder();
+                    let digits1: String := formatInt(now);
+                    writeString(&!digits, asSpan(&digits1));
+                    destroyString(digits1);
+                    let time: String := finalize(digits);
+                    case signature(key, asSpan(&time), asSpan(&nonce)) of
+                        when Some(value as mac: String) do
+                            return Some(value => Stamp(time => time, nonce => nonce, mac => mac));
+                        when None do
+                            destroyString(time);
+                            destroyString(nonce);
+                            return None();
+                    end case;
+                when None do
+                    return None();
+            end case;
+        end if;
+    end;
+
+    function destroyStamp(stamp: Stamp): Unit is
+        let { time as t: String, nonce as n: String, mac as m: String } := stamp;
+        destroyString(t);
+        destroyString(n);
+        destroyString(m);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function prepareFormGuard(db: &![Database[Writing], R]): Option[DbError] is
+        let makeUsedSql: Span[Nat8, Static] := pick(&db, makeUsed, makeUsedPg);
+        case execute(&~db, makeUsedSql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as changed: Nat64) do
+                return prepareLimits(&~db);
+        end case;
+    end;
+
+    -- Whether text is count hexadecimal digits.
+    generic [T: Region]
+    function isHex(text: Span[Nat8, T], count: Index): Bool is
+        if spanLength(text) /= count then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < count do
+            case hexDigitValue(text[i]) of
+                when Some(value as digit: Nat8) do
+                    skip;
+                when None do
+                    return false;
+            end case;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether mac is the signature of time and nonce under key.
+    generic [K: Region, T: Region, N: Region, M: Region]
+    function signatureFits(key: Span[Nat8, K], time: Span[Nat8, T], nonce: Span[Nat8, N], mac: Span[Nat8, M]): Bool is
+        if spanLength(key) < formKeyBytes() then
+            return false;
+        end if;
+        case signature(key, time, nonce) of
+            when Some(value as expected: String) do
+                let fits: Bool := constantTimeEqual(asSpan(&expected), mac);
+                destroyString(expected);
+                return fits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- A refusal, as plainChecks gives it.
+    function refusal(check: FormCheck): Option[FormCheck] is
+        return Some(value => check);
+    end;
+
+    -- The checks that need no database: the honeypot, the form of the
+    -- stamp, its signature and its age.  None when they all passed.
+    generic [K: Region, H: Region, T: Region, N: Region, M: Region]
+    function plainChecks(key: Span[Nat8, K], honeypot: Span[Nat8, H], time: Span[Nat8, T], nonce: Span[Nat8, N],
+                         mac: Span[Nat8, M], now: Int64): Option[FormCheck] is
+        if spanLength(honeypot) > 0 then
+            return refusal(Honeypot());
+        end if;
+        if not (isHex(nonce, nonceBytes * 2) and isHex(mac, 64)) then
+            return refusal(BadStamp());
+        end if;
+        -- The signature covers the text of the time byte for byte, so a
+        -- time that makeStamp did not write fails it however it reads.
+        case parseInt(time) of
+            when Some(value as made: Int64) do
+                if not signatureFits(key, time, nonce, mac) then
+                    return refusal(BadStamp());
+                end if;
+                if made > now then
+                    return refusal(Expired());
+                end if;
+                let age: Int64 := now - made;
+                if age < fastestSeconds() then
+                    return refusal(TooFast());
+                end if;
+                if age > slowestSeconds() then
+                    return refusal(Expired());
+                end if;
+                return None();
+            when None do
+                return refusal(BadStamp());
+        end case;
+    end;
+
+    generic [R: Region, K: Region, H: Region, T: Region, N: Region, M: Region, C: Region]
+    function checkSubmission(db: &![Database[Writing], R], key: Span[Nat8, K], honeypot: Span[Nat8, H],
+                             time: Span[Nat8, T], nonce: Span[Nat8, N], mac: Span[Nat8, M], client: Span[Nat8, C],
+                             now: Int64, limit: Int64, window: Int64): Either[DbError, FormCheck] is
+        case plainChecks(key, honeypot, time, nonce, mac, now) of
+            when Some(value as refused: FormCheck) do
+                return Right(right => refused);
+            when None do
+                skip;
+        end case;
+        case hit(&~db, "form", client, now, limit, window) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as verdict: Verdict) do
+                case verdict of
+                    when Limited(retryAfter: Int64) do
+                        let many: FormCheck := TooMany(retryAfter => retryAfter);
+                        return Right(right => many);
+                    when Allowed do
+                        skip;
+                end case;
+        end case;
+        case execute(&~db, dropExpired, withInt64(noValues(), now)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        -- The stamp is kept until it would have expired anyway; the time
+        -- parsed above, so parseInt gives a value here.
+        var until: Int64 := now + slowestSeconds();
+        case parseInt(time) of
+            when Some(value as made: Int64) do
+                until := made + slowestSeconds();
+            when None do
+                skip;
+        end case;
+        let useStampSql: Span[Nat8, Static] := pick(&db, useStamp, useStampPg);
+        case execute(&~db, useStampSql, withInt64(withText(noValues(), mac), until)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as added: Nat64) do
+                if added = 0 then
+                    let again: FormCheck := Replayed();
+                    return Right(right => again);
+                else
+                    let passed: FormCheck := Passed();
+                    return Right(right => passed);
+                end if;
+        end case;
+    end;
+end module body.

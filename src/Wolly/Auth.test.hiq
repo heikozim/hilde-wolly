@@ -1,0 +1,809 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database in memory; the audit log is a file of its own
+-- in the temporary directory, removed again.  The list of known passwords
+-- is written there by addWithList and stays for the run; the container of
+-- the run takes it along.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    contains
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    environmentValue,
+    openRead,
+    readAll,
+    closeFile,
+    removeFileIfThere
+);
+import Standard.File (
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readExactly
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Session (
+    isSessionToken
+);
+import Standard.Base32 (
+    decodeBase32
+);
+import Standard.Otp (
+    OtpSha256,
+    hotp
+);
+import Wolly.Totp (
+    startEnrolment,
+    confirmEnrolment
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Auth (
+    AuthError,
+    LoginResult,
+    LoggedIn,
+    CodeNeeded,
+    Refused,
+    Throttled,
+    LoginFailed,
+    prepareAuth,
+    isUserName,
+    addUser,
+    externalLogin,
+    startSession,
+    login,
+    visitorSession,
+    sessionUser,
+    logout,
+    loginCode,
+    pendingSeconds,
+    changePassword,
+    audit as writeAuditLine
+);
+
+module body Wolly.Auth.Test is
+    constant goodPassword: Span[Nat8, Static] := "correct horse battery";
+    constant totpKey: Span[Nat8, Static] := "0123456789abcdef0123456789abcdef";
+    constant otherKey: Span[Nat8, Static] := "0123456789abcdef0123456789abcdeX";
+
+    function pathOf(name: Span[Nat8, Static]): String is
+        var path: StringBuilder := makeStringBuilder();
+        case environmentValue("TMPDIR") of
+            when Some(value as dir: String) do
+                writeString(&!path, asSpan(&dir));
+                writeString(&!path, "/");
+                destroyString(dir);
+            when None do
+                skip;
+        end case;
+        writeString(&!path, name);
+        return finalize(path);
+    end;
+
+    generic [P: Region]
+    function fileText(path: Span[Nat8, P]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readAll(&!file) of
+                    when Some(value as text: String) do
+                        let closed: Bool := closeFile(file);
+                        return text;
+                    when None do
+                        let closed: Bool := closeFile(file);
+                        var empty: StringBuilder := makeStringBuilder();
+                        return finalize(empty);
+                end case;
+            when None do
+                var empty: StringBuilder := makeStringBuilder();
+                return finalize(empty);
+        end case;
+    end;
+
+    -- The tables and the user ann, in a database just opened.
+    generic [R: Region]
+    function setUp(db: &![Database[Writing], R]): Unit is
+        case prepareAuth(&~db) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as error: AuthError) do
+                assertTrue(false, "the tables are made");
+        end case;
+        added(addWithList(&~db, "ann", goodPassword), true, "the user of the tests");
+        return nil;
+    end;
+
+    function noDatabase(error: DbError): Unit is
+        assertTrue(false, "a database in memory opens");
+        return nil;
+    end;
+
+    -- addUser with the list of the tests, written first.
+    generic [R: Region, N: Region, P: Region]
+    function addWithList(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[AuthError, Bool] is
+        let path: String := listWritten();
+        let outcome: Either[AuthError, Bool] := addUser(&~db, name, password, asSpan(&path));
+        destroyString(path);
+        return outcome;
+    end;
+
+    generic [R: Region, N: Region, C: Region, P: Region]
+    function changeWithList(db: &![Database[Writing], R], name: Span[Nat8, N], current: Span[Nat8, C], next: Span[Nat8, P]): Either[AuthError, Bool] is
+        let path: String := listWritten();
+        let changed: Either[AuthError, Bool] := changePassword(&~db, name, current, next, asSpan(&path));
+        destroyString(path);
+        return changed;
+    end;
+
+    -- The path of the list of known passwords, written.
+    function listWritten(): String is
+        let path: String := pathOf("wolly-auth-known-passwords.txt");
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let done: Bool := writeAll(&!file, "passwordpassword\nqwertyuiopasdfgh\n");
+                let closed: Bool := closeFile(file);
+                assertTrue(done and closed, "the list is written");
+            when None do
+                assertTrue(false, "the list is written");
+        end case;
+        return path;
+    end;
+
+    function nothing(): String is
+        var empty: StringBuilder := makeStringBuilder();
+        return finalize(empty);
+    end;
+
+    function added(result: Either[AuthError, Bool], wanted: Bool, message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as done: Bool) do
+                assertTrue(done = wanted, message);
+            when Left(left as error: AuthError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- The token of a login that must succeed, or the test fails.
+    function loggedIn(result: LoginResult, message: Span[Nat8, Static]): String is
+        case result of
+            when LoggedIn(token: String) do
+                assertTrue(isSessionToken(asSpan(&token)), message);
+                return token;
+            when CodeNeeded(token: String) do
+                destroyString(token);
+                assertTrue(false, message);
+                return nothing();
+            when Refused do
+                assertTrue(false, message);
+                return nothing();
+            when Throttled do
+                assertTrue(false, message);
+                return nothing();
+            when LoginFailed(error: AuthError) do
+                assertTrue(false, message);
+                return nothing();
+        end case;
+    end;
+
+    -- Whether the result is Refused (wanted false) or Throttled (wanted true).
+    function notIn(result: LoginResult, throttled: Bool, message: Span[Nat8, Static]): Unit is
+        case result of
+            when LoggedIn(token: String) do
+                destroyString(token);
+                assertTrue(false, message);
+            when CodeNeeded(token: String) do
+                destroyString(token);
+                assertTrue(false, message);
+            when Refused do
+                assertFalse(throttled, message);
+            when Throttled do
+                assertTrue(throttled, message);
+            when LoginFailed(error: AuthError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function userIs(result: Either[AuthError, Option[String]], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as user: String) do
+                        let same: Bool := contains(asSpan(&user), wanted) and (spanLength(asSpan(&user)) = spanLength(wanted));
+                        destroyString(user);
+                        assertTrue(same, message);
+                    when None do
+                        assertTrue(spanLength(wanted) = 0, message);
+                end case;
+            when Left(left as error: AuthError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [A: Region, B: Region]
+    function sameText(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        return contains(a, b) and (spanLength(a) = spanLength(b));
+    end;
+
+    function testNames(): Unit is
+        assertTrue(isUserName("ann"), "a word");
+        assertTrue(isUserName("a.b-c_9"), "dot, hyphen, underscore, digit");
+        assertFalse(isUserName(""), "empty");
+        assertFalse(isUserName("Ann"), "a capital");
+        assertFalse(isUserName("a b"), "a space");
+        assertFalse(isUserName("a'b"), "a quote");
+        assertTrue(isUserName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "64 bytes");
+        assertFalse(isUserName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "65 bytes");
+        return nil;
+    end;
+
+    function testAddUser(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                runAddUser(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                noDatabase(error);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runAddUser(db: &![Database[Writing], R]): Unit is
+        added(addWithList(&~db, "ann", "another long password"), false, "a name that is taken");
+        added(addWithList(&~db, "bob", "fourteen chars"), false, "14 characters, a user has no second factor at first");
+        added(addWithList(&~db, "bob", "passwordpassword"), false, "a password on the list");
+        added(addWithList(&~db, "bob", "bob's own password"), false, "a password that holds the name");
+        added(addWithList(&~db, "bob", "fifteen chars!!"), true, "15 characters");
+        added(addWithList(&~db, "Bad Name", goodPassword), false, "a name that is no name");
+        -- Seven ligatures fi and more: in NFKC five fingers on a hand.
+        added(addWithList(&~db, "fay", "ﬁve ﬁngers on a hand"), true, "a password with ligatures");
+        let fay: String := loggedIn(login(&~db, "", "fay", "five fingers on a hand", "10.0.0.20", 500, "/dev/null"), "the same password in NFKC logs in");
+        destroyString(fay);
+        -- The password as it is typed, with the ligatures: only a login that
+        -- brings it to NFKC finds the hash of the NFKC form.
+        let typed: String := loggedIn(login(&~db, "", "fay", "ﬁve ﬁngers on a hand", "10.0.0.20", 501, "/dev/null"), "the password with the ligatures logs in");
+        destroyString(typed);
+        return nil;
+    end;
+
+    function testChangePassword(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                runChangePassword(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                noDatabase(error);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runChangePassword(db: &![Database[Writing], R]): Unit is
+        added(changeWithList(&~db, "ann", goodPassword, "eight ch"), false, "without a second factor 8 characters are too few");
+        added(changeWithList(&~db, "ann", "wrong password here", "a new long password"), false, "a wrong current password");
+        added(changeWithList(&~db, "ann", goodPassword, "passwordpassword"), false, "a listed password");
+        added(changeWithList(&~db, "ann", goodPassword, "a new long password"), true, "the change");
+        let fresh: String := loggedIn(login(&~db, "", "ann", "a new long password", "10.0.0.21", 600, "/dev/null"), "the new password logs in");
+        destroyString(fresh);
+        notIn(login(&~db, "", "ann", goodPassword, "10.0.0.21", 601, "/dev/null"), false, "the old one does not");
+        return nil;
+    end;
+
+    generic [R: Region, T: Region, N: Region, A: Region]
+    function externalToken(db: &![Database[Writing], R], token: Span[Nat8, T], name: Span[Nat8, N], auditPath: Span[Nat8, A], now: Int64): Option[String] is
+        case externalLogin(&~db, token, name, auditPath, "10.0.0.9", now) of
+            when Right(right as given: Option[String]) do
+                return given;
+            when Left(left as error: AuthError) do
+                assertTrue(false, "externalLogin answers");
+                return None();
+        end case;
+    end;
+
+    function testExternalLogin(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                runExternalLogin(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                noDatabase(error);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runExternalLogin(db: &![Database[Writing], R]): Unit is
+        let auditPath: String := pathOf("wolly-auth-external.log");
+        let cleared: Bool := removeFileIfThere(asSpan(&auditPath));
+        case startSession(&~db, 1000) of
+            when Right(right as before: String) do
+                case externalToken(&~db, asSpan(&before), "ann", asSpan(&auditPath), 1010) of
+                    when Some(value as after: String) do
+                        assertFalse(sameText(asSpan(&after), asSpan(&before)), "the session goes on under a new token");
+                        userIs(sessionUser(&~db, asSpan(&after), 1020), "ann", "the new token names ann");
+                        userIs(sessionUser(&~db, asSpan(&before), 1020), "", "the token from before opens nothing");
+                        destroyString(after);
+                    when None do
+                        assertTrue(false, "ann, a user here, is logged in");
+                end case;
+                case externalToken(&~db, asSpan(&before), "nobody", asSpan(&auditPath), 1030) of
+                    when Some(value as stray: String) do
+                        destroyString(stray);
+                        assertTrue(false, "a name that is no user here is not logged in");
+                    when None do
+                        assertTrue(true, "a name that is no user here is not logged in");
+                end case;
+                case externalToken(&~db, "no token", "../ann", asSpan(&auditPath), 1040) of
+                    when Some(value as stray: String) do
+                        destroyString(stray);
+                        assertTrue(false, "a name that is no user name");
+                    when None do
+                        assertTrue(true, "a name that is no user name");
+                end case;
+                destroyString(before);
+            when Left(left as error: AuthError) do
+                assertTrue(false, "a visitor gets a session");
+        end case;
+        case externalToken(&~db, "no token at all", "ann", asSpan(&auditPath), 1050) of
+            when Some(value as fresh: String) do
+                userIs(sessionUser(&~db, asSpan(&fresh), 1060), "ann", "without a session a new one holds ann");
+                destroyString(fresh);
+            when None do
+                assertTrue(false, "a new session for ann");
+        end case;
+        let audit: String := fileText(asSpan(&auditPath));
+        assertTrue(contains(asSpan(&audit), "login-external"), "the audit names the event");
+        assertTrue(contains(asSpan(&audit), "\"outcome\":\"no-user\""), "and the refusal");
+        assertTrue(contains(asSpan(&audit), "\"outcome\":\"ok\""), "and the login");
+        destroyString(audit);
+        let removed: Bool := removeFileIfThere(asSpan(&auditPath));
+        destroyString(auditPath);
+        return nil;
+    end;
+
+    function testLoginRotatesTheSession(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                runLoginRotatesTheSession(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                noDatabase(error);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runLoginRotatesTheSession(db: &![Database[Writing], R]): Unit is
+        let auditPath: String := pathOf("wolly-auth-rotate.log");
+        let cleared: Bool := removeFileIfThere(asSpan(&auditPath));
+        case startSession(&~db, 1000) of
+            when Right(right as before: String) do
+                userIs(sessionUser(&~db, asSpan(&before), 1000), "", "a visitor's session holds no user");
+                case visitorSession(&~db, asSpan(&before), 1001) of
+                    when Right(right as kept: String) do
+                        assertTrue(sameText(asSpan(&kept), asSpan(&before)), "a live session keeps its token");
+                        destroyString(kept);
+                    when Left(left as error: AuthError) do
+                        assertTrue(false, "a live session keeps its token");
+                end case;
+                case visitorSession(&~db, "no token at all", 1001) of
+                    when Right(right as fresh: String) do
+                        assertTrue(isSessionToken(asSpan(&fresh)), "no session gives a new one");
+                        assertFalse(sameText(asSpan(&fresh), asSpan(&before)), "and a new token");
+                        destroyString(fresh);
+                    when Left(left as error: AuthError) do
+                        assertTrue(false, "no session gives a new one");
+                end case;
+                let after: String := loggedIn(login(&~db, asSpan(&before), "ann", goodPassword, "10.0.0.1", 1010, asSpan(&auditPath)), "ann logs in");
+                userIs(sessionUser(&~db, asSpan(&after), 1020), "ann", "the new token names ann");
+                userIs(sessionUser(&~db, asSpan(&before), 1020), "", "the token from before the login opens nothing");
+                case logout(&~db, asSpan(&after), "10.0.0.1", 1030, asSpan(&auditPath)) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as error: AuthError) do
+                        assertTrue(false, "the logout");
+                end case;
+                userIs(sessionUser(&~db, asSpan(&after), 1040), "", "after the logout the token opens nothing");
+                destroyString(after);
+                destroyString(before);
+            when Left(left as error: AuthError) do
+                assertTrue(false, "a visitor gets a session");
+        end case;
+        let audit: String := fileText(asSpan(&auditPath));
+        assertTrue(contains(asSpan(&audit), "\"user\":\"ann\""), "the audit names the user");
+        assertTrue(contains(asSpan(&audit), "\"outcome\":\"ok\""), "the audit has the outcome");
+        assertTrue(contains(asSpan(&audit), "logout"), "the audit has the logout");
+        assertFalse(contains(asSpan(&audit), goodPassword), "the audit never holds the password");
+        destroyString(audit);
+        let removed: Bool := removeFileIfThere(asSpan(&auditPath));
+        destroyString(auditPath);
+        return nil;
+    end;
+
+    -- The token of a login that must stop at the code.
+    function waiting(result: LoginResult, message: Span[Nat8, Static]): String is
+        case result of
+            when CodeNeeded(token: String) do
+                assertTrue(isSessionToken(asSpan(&token)), message);
+                return token;
+            when LoggedIn(token: String) do
+                destroyString(token);
+                assertTrue(false, message);
+                return nothing();
+            when Refused do
+                assertTrue(false, message);
+                return nothing();
+            when Throttled do
+                assertTrue(false, message);
+                return nothing();
+            when LoginFailed(error: AuthError) do
+                assertTrue(false, message);
+                return nothing();
+        end case;
+    end;
+
+    -- The code of the base32 secret at the step of seconds.
+    generic [S: Region]
+    function codeAt(secret: Span[Nat8, S], seconds: Int64): String is
+        case toNat64(seconds / 30) of
+            when Some(value as counter: Nat64) do
+                case decodeBase32(secret) of
+                    when Some(value as seed: String) do
+                        let made: Option[String] := hotp(asSpan(&seed), counter, 6, OtpSha256());
+                        destroyString(seed);
+                        case made of
+                            when Some(value as code: String) do
+                                return code;
+                            when None do
+                                return nothing();
+                        end case;
+                    when None do
+                        return nothing();
+                end case;
+            when None do
+                return nothing();
+        end case;
+    end;
+
+    function testSecondFactor(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                runSecondFactor(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                noDatabase(error);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runSecondFactor(db: &![Database[Writing], R]): Unit is
+        let auditPath: String := pathOf("wolly-auth-totp.log");
+        let cleared: Bool := removeFileIfThere(asSpan(&auditPath));
+        let plain: String := loggedIn(login(&~db, "", "ann", goodPassword, "10.0.0.5", 3000, asSpan(&auditPath)), "the control: without the factor the password logs in");
+        destroyString(plain);
+        var secret: String := nothing();
+        case startEnrolment(&~db, totpKey, "ann") of
+            when Right(right as given: Option[String]) do
+                case given of
+                    when Some(value as seed: String) do
+                        destroyString(secret);
+                        secret := seed;
+                    when None do
+                        assertTrue(false, "ann starts the factor");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "ann starts the factor");
+        end case;
+        let first: String := codeAt(asSpan(&secret), 3090);
+        case confirmEnrolment(&~db, totpKey, "ann", asSpan(&first), 3090) of
+            when Right(right as on: Bool) do
+                assertTrue(on, "and confirms it");
+            when Left(left as error: DbError) do
+                assertTrue(false, "and confirms it");
+        end case;
+        added(changeWithList(&~db, "ann", goodPassword, "eight ch"), true, "with the factor on 8 characters are enough");
+        added(changeWithList(&~db, "ann", "eight ch", goodPassword), true, "and the long one again");
+        let pending: String := waiting(login(&~db, "", "ann", goodPassword, "10.0.0.5", 3100, asSpan(&auditPath)), "now the password stops at the code");
+        userIs(sessionUser(&~db, asSpan(&pending), 3101), "", "a session that waits for the code is no login");
+        notIn(loginCode(&~db, totpKey, asSpan(&pending), asSpan(&first), "10.0.0.5", 3101, asSpan(&auditPath)), false, "the code of the confirmation is taken");
+        notIn(loginCode(&~db, totpKey, asSpan(&pending), "000000", "10.0.0.5", 3102, asSpan(&auditPath)), false, "a wrong code");
+        notIn(loginCode(&~db, totpKey, "no token", asSpan(&first), "10.0.0.5", 3103, asSpan(&auditPath)), false, "no session");
+        let fresh: String := codeAt(asSpan(&secret), 3120);
+        notIn(loginCode(&~db, otherKey, asSpan(&pending), asSpan(&fresh), "10.0.0.6", 3110, asSpan(&auditPath)), false, "under another key the seed does not open");
+        let start: Int64 := 3100;
+        let second: Int64 := 1;
+        let expiredAt: Int64 := (start + pendingSeconds()) + second;
+        let expired: String := codeAt(asSpan(&secret), expiredAt);
+        notIn(loginCode(&~db, totpKey, asSpan(&pending), asSpan(&expired), "10.0.0.7", expiredAt, asSpan(&auditPath)), false, "the code of that time, after the waiting time");
+        destroyString(expired);
+        let done: String := loggedIn(loginCode(&~db, totpKey, asSpan(&pending), asSpan(&fresh), "10.0.0.5", 3110, asSpan(&auditPath)), "the right code logs in");
+        userIs(sessionUser(&~db, asSpan(&done), 3111), "ann", "under a new token that names ann");
+        userIs(sessionUser(&~db, asSpan(&pending), 3111), "", "and the waiting token opens nothing");
+        notIn(loginCode(&~db, totpKey, asSpan(&done), asSpan(&fresh), "10.0.0.5", 3112, asSpan(&auditPath)), false, "a logged-in session waits for no code");
+        destroyString(done);
+        destroyString(pending);
+        destroyString(fresh);
+        destroyString(first);
+        -- Four wrong codes, then the right password: the failures stay,
+        -- and the fifth wrong code throttles.
+        let again: String := waiting(login(&~db, "", "ann", goodPassword, "10.0.0.8", 3200, asSpan(&auditPath)), "a second login stops at the code");
+        notIn(loginCode(&~db, totpKey, asSpan(&again), "111111", "10.0.0.8", 3201, asSpan(&auditPath)), false, "wrong 1");
+        notIn(loginCode(&~db, totpKey, asSpan(&again), "222222", "10.0.0.8", 3202, asSpan(&auditPath)), false, "wrong 2");
+        notIn(loginCode(&~db, totpKey, asSpan(&again), "333333", "10.0.0.8", 3203, asSpan(&auditPath)), false, "wrong 3");
+        notIn(loginCode(&~db, totpKey, asSpan(&again), "444444", "10.0.0.8", 3204, asSpan(&auditPath)), false, "wrong 4");
+        let third: String := waiting(login(&~db, "", "ann", goodPassword, "10.0.0.9", 3205, asSpan(&auditPath)), "the password again, from another client");
+        notIn(loginCode(&~db, totpKey, asSpan(&third), "555555", "10.0.0.9", 3206, asSpan(&auditPath)), false, "wrong 5, the failures of the name were not cleared");
+        let late: String := codeAt(asSpan(&secret), 3207);
+        notIn(loginCode(&~db, totpKey, asSpan(&third), asSpan(&late), "10.0.0.9", 3207, asSpan(&auditPath)), true, "so even the right code is throttled by the name");
+        destroyString(late);
+        destroyString(third);
+        destroyString(again);
+        destroyString(secret);
+        let text: String := fileText(asSpan(&auditPath));
+        assertTrue(contains(asSpan(&text), "\"outcome\":\"code-needed\""), "the audit has the stop at the code");
+        assertTrue(contains(asSpan(&text), "\"msg\":\"login-code\""), "and the codes");
+        assertTrue(contains(asSpan(&text), "\"outcome\":\"throttled-name\""), "and the throttling by name");
+        assertFalse(contains(asSpan(&text), "555555"), "the audit never holds a code");
+        destroyString(text);
+        let removed: Bool := removeFileIfThere(asSpan(&auditPath));
+        destroyString(auditPath);
+        return nil;
+    end;
+
+    function testRefusedAndThrottled(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                runRefusedAndThrottled(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                noDatabase(error);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runRefusedAndThrottled(db: &![Database[Writing], R]): Unit is
+        let auditPath: String := pathOf("wolly-auth-throttle.log");
+        let cleared: Bool := removeFileIfThere(asSpan(&auditPath));
+        notIn(login(&~db, "", "ann", "wrong password here", "10.0.0.2", 2000, asSpan(&auditPath)), false, "a wrong password");
+        notIn(login(&~db, "", "nobody", goodPassword, "10.0.0.2", 2001, asSpan(&auditPath)), false, "a user who does not exist");
+        notIn(login(&~db, "", "ann", "short", "10.0.0.2", 2002, asSpan(&auditPath)), false, "a password too short to be one");
+        notIn(login(&~db, "", "Bad Name", goodPassword, "10.0.0.2", 2003, asSpan(&auditPath)), false, "a name that is no name");
+        notIn(login(&~db, "", "ann", "wrong password again", "10.0.0.2", 2004, asSpan(&auditPath)), false, "the fifth failure");
+        notIn(login(&~db, "", "ann", goodPassword, "10.0.0.2", 2005, asSpan(&auditPath)), true, "after five failures even the right password is throttled");
+        let other: String := loggedIn(login(&~db, "", "ann", goodPassword, "10.0.0.3", 2006, asSpan(&auditPath)), "another client is not throttled");
+        destroyString(other);
+        let later: String := loggedIn(login(&~db, "", "ann", goodPassword, "10.0.0.2", 2905, asSpan(&auditPath)), "after the window the client may log in again");
+        destroyString(later);
+        let text: String := fileText(asSpan(&auditPath));
+        assertTrue(contains(asSpan(&text), "\"outcome\":\"refused\""), "the audit has the refusals");
+        assertTrue(contains(asSpan(&text), "\"outcome\":\"throttled\""), "the audit has the throttling");
+        assertFalse(contains(asSpan(&text), "wrong password"), "the audit never holds a password that was tried");
+        destroyString(text);
+        let removed: Bool := removeFileIfThere(asSpan(&auditPath));
+        destroyString(auditPath);
+        return nil;
+    end;
+
+    -- The audit line of a refusal names the user and never the password
+    -- that was tried.  The password has the shape of a user name, so a line
+    -- that took it for the name would write it: a password with a space is
+    -- written as - whatever line it is in, and tells nothing.
+    function testAuditOfARefusal(): Unit is
+        let auditPath: String := pathOf("wolly-auth-refusal.log");
+        let cleared: Bool := removeFileIfThere(asSpan(&auditPath));
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                notIn(login(&!db, "", "ann", "thisisawrongpasswordx", "10.0.0.8", 3000, asSpan(&auditPath)), false, "a wrong password that looks like a name");
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                noDatabase(error);
+        end case;
+        let text: String := fileText(asSpan(&auditPath));
+        assertTrue(contains(asSpan(&text), "\"msg\":\"login\",\"user\":\"ann\",\"client\":\"10.0.0.8\",\"outcome\":\"refused\""), "the audit names the user of the refusal");
+        assertFalse(contains(asSpan(&text), "thisisawrongpasswordx"), "and never the password that was tried");
+        destroyString(text);
+        let removed: Bool := removeFileIfThere(asSpan(&auditPath));
+        destroyString(auditPath);
+        return nil;
+    end;
+
+    function testThrottledByName(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                runThrottledByName(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                noDatabase(error);
+        end case;
+        return nil;
+    end;
+
+    -- Many addresses, one name: each address fails once, the name five times.
+    generic [R: Region]
+    function runThrottledByName(db: &![Database[Writing], R]): Unit is
+        let auditPath: String := pathOf("wolly-auth-name.log");
+        let cleared: Bool := removeFileIfThere(asSpan(&auditPath));
+        added(addWithList(&~db, "bea", goodPassword), true, "a second user");
+        notIn(login(&~db, "", "ann", "wrong password one", "10.0.1.1", 3000, asSpan(&auditPath)), false, "a failure from the first address");
+        notIn(login(&~db, "", "ann", "wrong password two", "10.0.1.2", 3001, asSpan(&auditPath)), false, "a failure from the second address");
+        notIn(login(&~db, "", "ann", "wrong password three", "10.0.1.3", 3002, asSpan(&auditPath)), false, "a failure from the third address");
+        notIn(login(&~db, "", "ann", "wrong password four", "10.0.1.4", 3003, asSpan(&auditPath)), false, "a failure from the fourth address");
+        notIn(login(&~db, "", "ann", "wrong password five", "10.0.1.5", 3004, asSpan(&auditPath)), false, "a failure from the fifth address");
+        notIn(login(&~db, "", "ann", goodPassword, "10.0.1.6", 3005, asSpan(&auditPath)), true, "after five failures from five addresses the name is throttled, the right password too");
+        let second: String := loggedIn(login(&~db, "", "bea", goodPassword, "10.0.1.6", 3006, asSpan(&auditPath)), "another name from the same address is not throttled");
+        destroyString(second);
+        let later: String := loggedIn(login(&~db, "", "ann", goodPassword, "10.0.1.7", 3905, asSpan(&auditPath)), "after the window the name may log in again");
+        destroyString(later);
+        -- A login clears the failures of the name: four before it and one
+        -- after it are five, which would throttle if it did not.
+        notIn(login(&~db, "", "ann", "wrong password six", "10.0.2.1", 3906, asSpan(&auditPath)), false, "a failure after the window");
+        notIn(login(&~db, "", "ann", "wrong password seven", "10.0.2.2", 3907, asSpan(&auditPath)), false, "a second failure after the window");
+        notIn(login(&~db, "", "ann", "wrong password eight", "10.0.2.3", 3908, asSpan(&auditPath)), false, "a third failure after the window");
+        notIn(login(&~db, "", "ann", "wrong password nine", "10.0.2.4", 3909, asSpan(&auditPath)), false, "a fourth failure after the window");
+        let fourth: String := loggedIn(login(&~db, "", "ann", goodPassword, "10.0.2.5", 3910, asSpan(&auditPath)), "four failures do not throttle the name");
+        destroyString(fourth);
+        notIn(login(&~db, "", "ann", "wrong password ten", "10.0.2.6", 3911, asSpan(&auditPath)), false, "a failure after the login");
+        let again: String := loggedIn(login(&~db, "", "ann", goodPassword, "10.0.2.7", 3912, asSpan(&auditPath)), "the login cleared the failures of the name");
+        destroyString(again);
+        let text: String := fileText(asSpan(&auditPath));
+        assertTrue(contains(asSpan(&text), "\"outcome\":\"throttled-name\""), "the audit tells the throttling of a name");
+        assertFalse(contains(asSpan(&text), "\"outcome\":\"throttled\""), "no address was throttled");
+        assertFalse(contains(asSpan(&text), "wrong password"), "the audit never holds a password that was tried");
+        destroyString(text);
+        let removed: Bool := removeFileIfThere(asSpan(&auditPath));
+        destroyString(auditPath);
+        return nil;
+    end;
+
+    -- The text of the log at path, None when it cannot be read.
+    generic [P: Region]
+    function logText(path: Span[Nat8, P]): Option[String] is
+        let text: String := fileText(path);
+        return Some(value => text);
+    end;
+
+    -- The holder of the lock, a second process: it begins a writing
+    -- transaction on the database, says held, waits 7 seconds, writes the
+    -- log anew beside it with a line of its own and renames it over the
+    -- old one, as Wolly.AuditLog does, and commits.
+    constant holder: Span[Nat8, Static] := "import os, sqlite3, sys, time\ndb = sqlite3.connect(sys.argv[1], timeout=30, isolation_level=None)\ndb.execute('BEGIN IMMEDIATE')\nsys.stdout.write('held\\n')\nsys.stdout.flush()\ntime.sleep(7)\nlog = sys.argv[2]\ndata = open(log, 'rb').read()\nwith open(log + '.held', 'wb') as f:\n    f.write(data + b'written by the holder\\n')\nos.chmod(log + '.held', 0o640)\nos.rename(log + '.held', log)\ndb.execute('COMMIT')\n";
+
+    function nanosNow(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as t: Nat64) do
+                return t;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A second process holds a writing transaction for 7 seconds, longer
+    -- than the busy time of 5, and rewrites the log under it.  An audit
+    -- line asked for meanwhile waits, tries again once, and stands in the
+    -- new log with lock_retries 1.
+    function testAuditWaitsForTheLock(): Unit is
+        let dbPath: String := pathOf("audit-test-lock.db");
+        let logPath: String := pathOf("audit-test-lock.log");
+        let walPath: String := pathOf("audit-test-lock.db-wal");
+        let shmPath: String := pathOf("audit-test-lock.db-shm");
+        let c1: Bool := removeFileIfThere(asSpan(&dbPath));
+        let c2: Bool := removeFileIfThere(asSpan(&walPath));
+        let c3: Bool := removeFileIfThere(asSpan(&shmPath));
+        let c4: Bool := removeFileIfThere(asSpan(&logPath));
+        case openSqlite(asSpan(&dbPath)) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                assertTrue(writeAuditLine(&!db, asSpan(&logPath), "login", "bea", "c3c3", "ok"), "a line without a lock held elsewhere");
+                let command: Command := addArgument(addArgument(addArgument(addArgument(addArgument(makeCommand("/usr/bin/env"), "python3"), "-c"), holder), asSpan(&dbPath)), asSpan(&logPath));
+                case spawnProcess(command) of
+                    when Some(value as running: Running) do
+                        let { process as child: Process, input as toChild: FileDescriptor, output as fromChild: FileDescriptor, errors as childErrors: FileDescriptor } := running;
+                        var output: FileDescriptor := fromChild;
+                        let closedIn: Bool := closeFile(toChild);
+                        case readExactly(&!output, 5) of
+                            when Some(value as said: String) do
+                                assertTrue(contains(asSpan(&said), "held"), "the second process holds the transaction");
+                                destroyString(said);
+                            when None do
+                                assertTrue(false, "the second process holds the transaction");
+                        end case;
+                        let before: Nat64 := nanosNow();
+                        let waited: Bool := writeAuditLine(&!db, asSpan(&logPath), "login", "ann", "c1c1", "ok");
+                        let after: Nat64 := nanosNow();
+                        assertTrue(waited, "the line is written");
+                        assertTrue((after - before) >= 6000000000, "after it waited for the lock");
+                        let status: ProcessStatus := waitProcess(child);
+                        assertTrue(exitedNormally(status) and (exitCode(status) = 0), "the second process committed and ended");
+                        let closedOut: Bool := closeFile(output);
+                        let closedErr: Bool := closeFile(childErrors);
+                    when None do
+                        assertTrue(false, "the second process starts");
+                end case;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "the database opens");
+        end case;
+        case logText(asSpan(&logPath)) of
+            when Some(value as text: String) do
+                assertTrue(contains(asSpan(&text), "written by the holder\n"), "the log is the one the holder wrote");
+                assertTrue(contains(asSpan(&text), "\"user\":\"bea\",\"client\":\"c3c3\",\"outcome\":\"ok\"}\n"), "with the line from before, without lock_retries");
+                assertTrue(contains(asSpan(&text), "written by the holder\n{\"time\":"), "the line that waited comes after the rename");
+                assertTrue(contains(asSpan(&text), "\"user\":\"ann\",\"client\":\"c1c1\",\"outcome\":\"ok\",\"lock_retries\":1}\n"), "and the line that waited, with one retry");
+                destroyString(text);
+            when None do
+                assertTrue(false, "the log is read back");
+        end case;
+        let r1: Bool := removeFileIfThere(asSpan(&dbPath));
+        let r2: Bool := removeFileIfThere(asSpan(&walPath));
+        let r3: Bool := removeFileIfThere(asSpan(&shmPath));
+        let r4: Bool := removeFileIfThere(asSpan(&logPath));
+        destroyString(dbPath);
+        destroyString(walPath);
+        destroyString(shmPath);
+        destroyString(logPath);
+        return nil;
+    end;
+end module body.

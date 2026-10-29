@@ -1,0 +1,261 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A template of Hilde's Jinja dialect, read from a list of directories when
+the programme runs and turned into a Program of plain steps that
+Wolly.View renders.
+
+What it does is what Hilde's compiler does for @template, taken over part
+by part: the text is split into text, values and tags (comments dropped,
+raw kept, the - whitespace control and the options trim_blocks and
+lstrip_blocks applied); each tag is parsed; extends, blocks, include, the
+imports and macros are resolved into one tree; and that tree is walked with
+the place in the HTML (Wolly.ViewContext), which chooses the writer of
+each value.  Every construct @template refuses for a reason of the text is
+refused here with the same code and the same words, and the template's
+name and line.
+
+A name is looked for in each directory in turn, and the first that holds
+it wins.  A name is relative: 1 to 1024 bytes of a to z, A to Z, 0 to 9,
+dot, hyphen, underscore and slash, no empty segment, no segment that
+begins with a dot, and no part of the path a symbolic link.
+
+What @template checks against the data's type, the Program leaves to the
+render: there is no type when a template is loaded.  A call of a name
+that is not a macro is a call of a function when the name is among those
+given; any other name is refused, as an unknown macro is.
+
+The limits: mostTemplateBytes a file, mostFiles files a template,
+mostNesting tags, brackets and operators of a chain inside one another,
+mostDepth templates or macros inside one another, mostSteps steps,
+mostBindings names bound at one place (each name is looked for among
+them), mostTextBytes bytes of text, macros and includes expanded.
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Wolly.ViewContext (
+    Writer
+);
+
+module Wolly.ViewCompile is
+    """
+    The limits of a template: 1 MiB a file, 64 files, 64 levels of
+    nesting, 16 templates or macros deep, 200000 steps, 256 names bound at
+    one place, 16 MiB of text expanded.
+    """
+    function mostTemplateBytes(): Index
+        ensures result = 1048576;
+    function mostFiles(): Index
+        ensures result = 64;
+    function mostNesting(): Index
+        ensures result = 64;
+    function mostDepth(): Index
+        ensures result = 16;
+    function mostSteps(): Index
+        ensures result = 200000;
+    function mostBindings(): Index
+        ensures result = 256;
+    function mostTextBytes(): Index
+        ensures result = 16777216;
+
+    """
+    One step of a Program.  op says what it does; a to d are its operands
+    (an expression, a slot, a loop, a target, a text); writer, raw and
+    inText belong to a step that writes a value: the function it is
+    written with, whether it goes out as it is (|safe, or a block's text),
+    and whether it stands in HTML text, the one place a value of HTML may
+    go.  file and line are the template's, for a message.
+    """
+    record Step: Free is
+        op: Nat8;
+        a: Index;
+        b: Index;
+        c: Index;
+        d: Index;
+        writer: Writer;
+        raw: Bool;
+        inText: Bool;
+        file: Index;
+        line: Index;
+    end;
+
+    """
+    One expression of a Program: op, its operands a to c (expressions,
+    texts, lists, slots), a number, and where it stands.
+    """
+    record Expr: Free is
+        op: Nat8;
+        a: Index;
+        b: Index;
+        c: Index;
+        number: Int64;
+        file: Index;
+        line: Index;
+    end;
+
+    """
+    The operations of a step.
+    """
+    constant stepText: Nat8;
+    constant stepOut: Nat8;
+    constant stepJump: Nat8;
+    constant stepUnless: Nat8;
+    constant stepBind: Nat8;
+    constant stepRelease: Nat8;
+    constant stepForEnter: Nat8;
+    constant stepForItem: Nat8;
+    constant stepForCount: Nat8;
+    constant stepForStep: Nat8;
+    constant stepForRestart: Nat8;
+    constant stepIfEmpty: Nat8;
+    constant stepCaptureBegin: Nat8;
+    constant stepCaptureEnd: Nat8;
+
+    """
+    What a bind keeps: a reference to a value of the data, a number, a
+    text, or a text of HTML (a block's, escaped already).
+    """
+    constant bindReference: Index;
+    constant bindNumber: Index;
+    constant bindText: Index;
+    constant bindMarkup: Index;
+
+    """
+    The operations of an expression.
+    """
+    constant exprText: Nat8;
+    constant exprInteger: Nat8;
+    constant exprBool: Nat8;
+    constant exprData: Nat8;
+    constant exprSlot: Nat8;
+    constant exprLoop: Nat8;
+    constant exprCycle: Nat8;
+    constant exprNot: Nat8;
+    constant exprAnd: Nat8;
+    constant exprOr: Nat8;
+    constant exprTextEquals: Nat8;
+    constant exprCompare: Nat8;
+    constant exprIsNone: Nat8;
+    constant exprIn: Nat8;
+    constant exprConcat: Nat8;
+    constant exprArith: Nat8;
+    constant exprFloorDivide: Nat8;
+    constant exprModulo: Nat8;
+    constant exprCond: Nat8;
+    constant exprFilter: Nat8;
+    constant exprJoin: Nat8;
+    constant exprLength: Nat8;
+    constant exprCall: Nat8;
+    constant exprScriptValue: Nat8;
+    constant exprTranslate: Nat8;
+    constant exprTruth: Nat8;
+
+    """
+    A compiled template.  Linear: destroyProgram gives it back.
+    """
+    type Program: Linear;
+
+    """
+    The template name, read from the directories in their order, turned
+    into a Program; layout, when it is not empty, is the template the
+    page extends, as if {% extends layout %} stood at its head.
+    functions and catalogs are the names a call or a catalog may name; a
+    call of a function gives its position there.  Left with the message:
+    the name and line, the code, and what is wrong.
+    No contract: it reads files.
+    """
+    generic [D: Region, F: Region, C: Region, N: Region, L: Region]
+    function compileView(directories: &[Buffer[String], D], functions: &[Buffer[String], F],
+        catalogs: &[Buffer[String], C], name: Span[Nat8, N], layout: Span[Nat8, L], trimBlocks: Bool,
+        lstripBlocks: Bool): Either[String, Program];
+
+    """
+    Gives the program back.
+    No contract: nothing is left to ask.
+    """
+    function destroyProgram(program: Program): Unit;
+
+    """
+    How many steps the program holds, and the step at a place.
+    """
+    generic [R: Region]
+    function stepCount(program: &[Program, R]): Index
+        ensures result <= mostSteps();
+    generic [R: Region]
+    function stepAt(program: &[Program, R], at: Index): Step
+        requires at < stepCount(program);
+    """
+    How many expressions the program holds.
+    No contract: any number.
+    """
+    generic [R: Region]
+    function exprCount(program: &[Program, R]): Index;
+    generic [R: Region]
+    function exprAt(program: &[Program, R], at: Index): Expr
+        requires at < exprCount(program);
+    """
+    How many list entries the program holds.
+    No contract: any number.
+    """
+    generic [R: Region]
+    function listCount(program: &[Program, R]): Index;
+    generic [R: Region]
+    function listAt(program: &[Program, R], at: Index): Index
+        requires at < listCount(program);
+    """
+    How many texts the program holds.
+    No contract: any number.
+    """
+    generic [R: Region]
+    function textCount(program: &[Program, R]): Index;
+    generic [R: Region]
+    function textAt(program: &[Program, R], at: Index): Span[Nat8, R]
+        requires at < textCount(program);
+
+    """
+    How many slots a render of the program needs.
+    No contract: any number.
+    """
+    generic [R: Region]
+    function slotCount(program: &[Program, R]): Index;
+
+    """
+    How many loops a render of the program needs.
+    No contract: any number.
+    """
+    generic [R: Region]
+    function loopCount(program: &[Program, R]): Index;
+
+    """
+    The names of the templates the program was made of, by the number a
+    step or an expression gives as its file, and the paths of the files
+    read, for a watch.
+    """
+    generic [R: Region]
+    function fileCount(program: &[Program, R]): Index
+        ensures result <= mostFiles();
+    generic [R: Region]
+    function fileName(program: &[Program, R], at: Index): Span[Nat8, R]
+        requires at < fileCount(program);
+    generic [R: Region]
+    function pathCount(program: &[Program, R]): Index
+        ensures result <= mostFiles();
+    generic [R: Region]
+    function pathAt(program: &[Program, R], at: Index): Span[Nat8, R]
+        requires at < pathCount(program);
+
+    """
+    Whether name may name a template: see the description of the module.
+    No contract: a walk over name.
+    """
+    generic [N: Region]
+    function isTemplateName(name: Span[Nat8, N]): Bool;
+end module.

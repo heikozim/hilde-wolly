@@ -1,0 +1,227 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test writes a log of its own beside the tests and removes it.  The
+-- lines are the ones Wolly.Auth writes; ann and anna differ in one byte at
+-- the end, so a name taken as a prefix shows.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    startsWith,
+    substring,
+    equal
+);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    openWrite,
+    openRead,
+    readAll,
+    writeAll,
+    closeFile,
+    statusOf,
+    removeFileIfThere
+);
+import Wolly.AuditLog (
+    retentionSeconds,
+    newPseudonym,
+    pseudonymize,
+    prune,
+    note
+);
+
+module body Wolly.AuditLog.Test is
+    constant pseudonym: Span[Nat8, Static] := "deleted-0123456789abcdef";
+
+    constant lineAnn: Span[Nat8, Static] := "{\"time\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"login\",\"user\":\"ann\",\"client\":\"c1c1\",\"outcome\":\"ok\"}\n";
+    constant lineAnna: Span[Nat8, Static] := "{\"time\":\"2026-10-14T10:00:01.000Z\",\"level\":\"info\",\"msg\":\"login\",\"user\":\"anna\",\"client\":\"c2c2\",\"outcome\":\"refused\"}\n";
+    constant lineGarbage: Span[Nat8, Static] := "garbage that names ann\n";
+    constant lineLogout: Span[Nat8, Static] := "{\"time\":\"2026-10-14T10:05:00.000Z\",\"level\":\"info\",\"msg\":\"logout\",\"user\":\"ann\",\"client\":\"c1c1\",\"outcome\":\"ok\"}\n";
+
+    -- now of the test of prune, and the lines around its cutoff
+    -- 1728864000, which is 2024-10-14T00:00:00Z.
+    constant pruneNow: Int64 := 1760400000;
+    constant lineOld: Span[Nat8, Static] := "{\"time\":\"2024-10-13T23:59:59.000Z\",\"level\":\"info\",\"msg\":\"login\",\"user\":\"old\",\"client\":\"-\",\"outcome\":\"ok\"}\n";
+    constant lineEdge: Span[Nat8, Static] := "{\"time\":\"2024-10-14T00:00:00.000Z\",\"level\":\"info\",\"msg\":\"login\",\"user\":\"edge\",\"client\":\"-\",\"outcome\":\"ok\"}\n";
+    constant lineNew: Span[Nat8, Static] := "{\"time\":\"2025-10-13T23:59:00.000Z\",\"level\":\"info\",\"msg\":\"login\",\"user\":\"new\",\"client\":\"-\",\"outcome\":\"ok\"}\n";
+    constant lineTimeless: Span[Nat8, Static] := "{\"level\":\"info\",\"msg\":\"login\",\"user\":\"timeless\"}\n";
+
+    function written(path: Span[Nat8, Static], a: Span[Nat8, Static], b: Span[Nat8, Static], c: Span[Nat8, Static],
+                     d: Span[Nat8, Static]): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wroteA: Bool := writeAll(&!file, a);
+                let wroteB: Bool := writeAll(&!file, b);
+                let wroteC: Bool := writeAll(&!file, c);
+                let wroteD: Bool := writeAll(&!file, d);
+                let ok: Bool := ((wroteA and wroteB) and wroteC) and wroteD;
+                let closed: Bool := closeFile(file);
+                return ok and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function readBack(path: Span[Nat8, Static]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- How often part occurs in text.
+    generic [T: Region]
+    function occurrences(text: Span[Nat8, T], part: Span[Nat8, Static]): Index is
+        var count: Index := 0;
+        var at: Index := 0;
+        while (at + spanLength(part)) <= spanLength(text) do
+            if equal(substring(text, at, at + spanLength(part)), part) then
+                count := count + 1;
+            end if;
+            at := at + 1;
+        end while;
+        return count;
+    end;
+
+    function counted(result: Option[Int64], expected: Int64, message: Span[Nat8, Static]): Unit is
+        case result of
+            when Some(value as count: Int64) do
+                assertTrue(count = expected, message);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- Whether every byte of text from start on is 0 to 9 or a to f.
+    generic [T: Region]
+    function hexFrom(text: Span[Nat8, T], start: Index): Bool is
+        var i: Index := start;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if not (((byte >= '0') and (byte <= '9')) or ((byte >= 'a') and (byte <= 'f'))) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function testPseudonym(): Unit is
+        case newPseudonym() of
+            when Some(value as first: String) do
+                assertTrue(length(&first) = 24, "deleted- and 16 digits");
+                assertTrue(startsWith(asSpan(&first), "deleted-"), "it starts with deleted-");
+                assertTrue(hexFrom(asSpan(&first), 8), "the digits are lowercase hexadecimal");
+                case newPseudonym() of
+                    when Some(value as second: String) do
+                        assertFalse(equal(asSpan(&first), asSpan(&second)), "two pseudonyms differ");
+                        destroyString(second);
+                    when None do
+                        assertTrue(false, "a second pseudonym");
+                end case;
+                destroyString(first);
+            when None do
+                assertTrue(false, "a pseudonym");
+        end case;
+        return nil;
+    end;
+
+    function testPseudonymize(): Unit is
+        let path: Span[Nat8, Static] := "audit-test-pseudonymize.log";
+        let cleared: Bool := removeFileIfThere(path);
+        assertTrue(written(path, lineAnn, lineAnna, lineGarbage, lineLogout), "the log is written");
+        counted(pseudonymize(path, "ann", pseudonym), 2, "the two lines of ann are changed");
+        case readBack(path) of
+            when Some(value as text: String) do
+                assertTrue(occurrences(asSpan(&text), "\"user\":\"ann\"") = 0, "ann is no user of any line");
+                assertTrue(occurrences(asSpan(&text), "c1c1") = 0, "nor is ann's client in any line");
+                assertTrue(occurrences(asSpan(&text), pseudonym) = 4, "the pseudonym is user and client of both lines");
+                assertTrue(occurrences(asSpan(&text), "\"user\":\"anna\"") = 1, "anna, whose name starts with ann, stays");
+                assertTrue(occurrences(asSpan(&text), "c2c2") = 1, "and so does its client");
+                assertTrue(occurrences(asSpan(&text), "garbage that names ann\n") = 1, "a line that is no JSON stays as it was");
+                assertTrue(occurrences(asSpan(&text), "2026-10-14T10:00:00.000Z") = 1, "the time of the login stays");
+                assertTrue(occurrences(asSpan(&text), "2026-10-14T10:05:00.000Z") = 1, "and of the logout");
+                assertTrue(occurrences(asSpan(&text), "\"msg\":\"logout\"") = 1, "the event stays");
+                assertTrue(occurrences(asSpan(&text), "\"outcome\":\"refused\"") = 1, "and the outcome");
+                assertTrue(occurrences(asSpan(&text), "\n") = 4, "four lines, as before");
+                destroyString(text);
+            when None do
+                assertTrue(false, "the log is read back");
+        end case;
+        counted(pseudonymize(path, "ann", pseudonym), 0, "a second call finds no line of ann");
+        counted(pseudonymize(path, "nobody", pseudonym), 0, "nor does a name without lines");
+        let removed: Bool := removeFileIfThere(path);
+        counted(pseudonymize(path, "ann", pseudonym), 0, "without a log there is nothing to do");
+        case statusOf(path) of
+            when FileMissing do
+                assertTrue(true, "and no log is made");
+            when FileUnreadable do
+                assertTrue(false, "and no log is made");
+            when FileFound(status: FileStatus) do
+                assertTrue(false, "and no log is made");
+        end case;
+        return nil;
+    end;
+
+    function testPrune(): Unit is
+        let path: Span[Nat8, Static] := "audit-test-prune.log";
+        let cleared: Bool := removeFileIfThere(path);
+        assertTrue(retentionSeconds() = 31536000, "12 months are 365 days");
+        assertTrue(written(path, lineOld, lineEdge, lineNew, lineTimeless), "the log is written");
+        counted(prune(path, pruneNow), 1, "one line is older than the cutoff");
+        case readBack(path) of
+            when Some(value as text: String) do
+                assertTrue(occurrences(asSpan(&text), "\"user\":\"old\"") = 0, "the line one second before the cutoff is gone");
+                assertTrue(occurrences(asSpan(&text), lineEdge) = 1, "the line at the cutoff stays, as it was");
+                assertTrue(occurrences(asSpan(&text), lineNew) = 1, "a new line stays");
+                assertTrue(occurrences(asSpan(&text), lineTimeless) = 1, "a line without a time stays");
+                assertTrue(occurrences(asSpan(&text), "\n") = 3, "three lines are left");
+                destroyString(text);
+            when None do
+                assertTrue(false, "the log is read back");
+        end case;
+        counted(prune(path, pruneNow), 0, "a second run removes nothing");
+        counted(prune(path, pruneNow + 1), 1, "a second later the line at the cutoff goes too");
+        let removed: Bool := removeFileIfThere(path);
+        counted(prune(path, pruneNow), 0, "without a log there is nothing to do");
+        return nil;
+    end;
+
+    function testNote(): Unit is
+        let path: Span[Nat8, Static] := "audit-test-note.log";
+        let cleared: Bool := removeFileIfThere(path);
+        assertTrue(note(path, "audit-pseudonymize", pseudonym, 2), "the line is written");
+        case readBack(path) of
+            when Some(value as text: String) do
+                assertTrue(occurrences(asSpan(&text), "\"msg\":\"audit-pseudonymize\",\"user\":\"deleted-0123456789abcdef\",\"client\":\"-\",\"outcome\":\"ok\",\"lines\":2}") = 1,
+                           "the event, the pseudonym, no client, the outcome and the count");
+                destroyString(text);
+            when None do
+                assertTrue(false, "the log is read back");
+        end case;
+        let removed: Bool := removeFileIfThere(path);
+        return nil;
+    end;
+end module body.

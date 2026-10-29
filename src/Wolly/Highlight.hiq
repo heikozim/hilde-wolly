@@ -1,0 +1,598 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The tables below are synlight's lexers.go, Copyright (c) 2018,2019 Ted
+-- Unangst, under the ISC notice in Highlight.hih; each pattern with \A
+-- before it, where synlight puts ^.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    nthRef,
+    lengthMut,
+    destroyFree,
+    remove,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    equal
+);
+import Standard.Regex (
+    Regex,
+    Found,
+    compile,
+    find,
+    foundEnd,
+    destroyFound,
+    destroyRegex
+);
+
+module body Wolly.Highlight is
+    -- What a token is, and so the class of its span.
+    union Kind: Free is
+        case Plain;
+        case Number;
+        case Keyword;
+        case Builtin;
+        case TypeName;
+        case Str;
+        case Comment;
+        case Operator;
+        case Pair;
+        case Unpair;
+        case AddLine;
+        case DelLine;
+    end;
+
+    -- close is the text a pattern of the form opener, (?s:.*?), close
+    -- must find after its start; empty for any other pattern.
+    record Token: Linear is
+        regex: Regex;
+        close: Span[Nat8, Static];
+        kind: Kind;
+        state: Nat8;
+        next: Nat8;
+    end;
+
+    function mostHighlightBytes(): Index is
+        return 65536;
+    end;
+
+    generic [B: Region]
+    function add(tokens: &![Buffer[Token], B], pattern: Span[Nat8, Static], kind: Kind, state: Nat8, next: Nat8): Unit is
+        addClosed(&~tokens, pattern, "", kind, state, next);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function addClosed(tokens: &![Buffer[Token], B], pattern: Span[Nat8, Static], close: Span[Nat8, Static], kind: Kind,
+                       state: Nat8, next: Nat8): Unit is
+        case compile(pattern) of
+            when Right(right as regex: Regex) do
+                insertBack(&~tokens, Token(regex => regex, close => close, kind => kind, state => state, next => next));
+            when Left(left as message: String) do
+                -- A literal pattern the engine refuses does not compile in
+                -- the first place; this is the branch the type asks for.
+                destroyString(message);
+        end case;
+        return nil;
+    end;
+
+    function destroyTokens(tokens: Buffer[Token]): Unit is
+        var rest: Buffer[Token] := tokens;
+        while lengthMut(&!rest) > 0 do
+            let last: Index := lengthMut(&!rest) - 1;
+            let token: Token := remove(&!rest, last);
+            let { regex as regex: Regex, close as ends: Span[Nat8, Static], kind as k: Kind, state as was: Nat8, next as goes: Nat8 } := token;
+            destroyRegex(regex);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [N: Region]
+    function languageOf(fileName: Span[Nat8, N]): Option[Language] is
+        var dot: Index := spanLength(fileName);
+        var i: Index := 0;
+        while i < spanLength(fileName) do
+            if fileName[i] = '.' then
+                dot := i;
+            end if;
+            i := i + 1;
+        end while;
+        -- No dot: the whole name is the extension, as in synlight.
+        var start: Index := 0;
+        if dot < spanLength(fileName) then
+            start := dot + 1;
+        end if;
+        let ext: Span[Nat8, N] := substring(fileName, start, spanLength(fileName));
+        if equal(ext, "c") or equal(ext, "h") then
+            return Some(value => CLanguage());
+        end if;
+        if equal(ext, "diff") or equal(ext, "patch") then
+            return Some(value => Diff());
+        end if;
+        if equal(ext, "go") then
+            return Some(value => GoLanguage());
+        end if;
+        if equal(ext, "html") or equal(ext, "xml") then
+            return Some(value => HtmlLanguage());
+        end if;
+        if equal(ext, "js") then
+            return Some(value => JavaScript());
+        end if;
+        if equal(ext, "lua") then
+            return Some(value => Lua());
+        end if;
+        if equal(ext, "py") or equal(ext, "python") then
+            return Some(value => Python());
+        end if;
+        if equal(ext, "rs") or equal(ext, "rust") then
+            return Some(value => Rust());
+        end if;
+        if equal(ext, "sql") then
+            return Some(value => SqlLanguage());
+        end if;
+        return None();
+    end;
+
+    -- Writes text escaped for HTML, as Go's template.HTMLEscape does.
+    generic [T: Region, B: Region]
+    function writeEscaped(out: &![StringBuilder, B], text: Span[Nat8, T]): Unit is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if byte = '<' then
+                writeString(&~out, "&lt;");
+            else
+                if byte = '>' then
+                    writeString(&~out, "&gt;");
+                else
+                    if byte = '&' then
+                        writeString(&~out, "&amp;");
+                    else
+                        if byte = '"' then
+                            writeString(&~out, "&#34;");
+                        else
+                            if byte = 39 then
+                                writeString(&~out, "&#39;");
+                            else
+                                if byte = 0 then
+                                    -- U+FFFD, as Go's HTMLEscape writes for NUL.
+                                    writeByte(&~out, 239);
+                                    writeByte(&~out, 191);
+                                    writeByte(&~out, 189);
+                                else
+                                    writeByte(&~out, byte);
+                                end if;
+                            end if;
+                        end if;
+                    end if;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [C: Region]
+    function escapeCode(code: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeEscaped(&!out, code);
+        return finalize(out);
+    end;
+
+    -- The class of kind, the empty span for one without; pairs take theirs
+    -- from turn.
+    function classOf(kind: Kind, turn: Nat8): Span[Nat8, Static] is
+        case kind of
+            when Plain do
+                return "";
+            when Number do
+                return "nm";
+            when Keyword do
+                return "kw";
+            when Builtin do
+                return "bi";
+            when TypeName do
+                return "tp";
+            when Str do
+                return "st";
+            when Comment do
+                return "cm";
+            when Operator do
+                return "op";
+            when Pair do
+                return pairClass(turn);
+            when Unpair do
+                return pairClass(turn);
+            when AddLine do
+                return "al";
+            when DelLine do
+                return "dl";
+        end case;
+    end;
+
+    -- synlight's pairnames: string, keyword, comment, builtin.
+    function pairClass(turn: Nat8): Span[Nat8, Static] is
+        if turn = 0 then
+            return "st";
+        end if;
+        if turn = 1 then
+            return "kw";
+        end if;
+        if turn = 2 then
+            return "cm";
+        end if;
+        return "bi";
+    end;
+
+    function isPair(kind: Kind): Bool is
+        case kind of
+            when Pair do
+                return true;
+            when Plain do
+                return false;
+            when Number do
+                return false;
+            when Keyword do
+                return false;
+            when Builtin do
+                return false;
+            when TypeName do
+                return false;
+            when Str do
+                return false;
+            when Comment do
+                return false;
+            when Operator do
+                return false;
+            when Unpair do
+                return false;
+            when AddLine do
+                return false;
+            when DelLine do
+                return false;
+        end case;
+    end;
+
+    function isUnpair(kind: Kind): Bool is
+        case kind of
+            when Unpair do
+                return true;
+            when Plain do
+                return false;
+            when Number do
+                return false;
+            when Keyword do
+                return false;
+            when Builtin do
+                return false;
+            when TypeName do
+                return false;
+            when Str do
+                return false;
+            when Comment do
+                return false;
+            when Operator do
+                return false;
+            when Pair do
+                return false;
+            when AddLine do
+                return false;
+            when DelLine do
+                return false;
+        end case;
+    end;
+
+    function tokensOf(language: Language): Buffer[Token] is
+        var tokens: Buffer[Token] := allocateEmpty();
+        case language of
+            when CLanguage do
+                lexer_c(&!tokens);
+            when Diff do
+                lexer_diff(&!tokens);
+            when GoLanguage do
+                lexer_go(&!tokens);
+            when HtmlLanguage do
+                lexer_html(&!tokens);
+            when JavaScript do
+                lexer_js(&!tokens);
+            when Lua do
+                lexer_lua(&!tokens);
+            when Python do
+                lexer_py(&!tokens);
+            when Rust do
+                lexer_rs(&!tokens);
+            when SqlLanguage do
+                lexer_sql(&!tokens);
+        end case;
+        return tokens;
+    end;
+
+    -- What token i of tokens takes at the start of rest in state: width 0
+    -- when it is of another state or does not match.
+    record Step: Free is
+        width: Index;
+        kind: Kind;
+        next: Nat8;
+    end;
+
+    -- The place in code after which no close of token i starts, or the
+    -- size of code for a token without a close: a lazy pattern that cannot
+    -- find its close would read the rest of the code at every place, which
+    -- makes code of opened comments cost the square of its size.
+    generic [R: Region, C: Region]
+    function reachOf(tokens: &[Buffer[Token], R], i: Index, code: Span[Nat8, C]): Index is
+        let token: &[Token, R] := nthRef(tokens, i);
+        let close: Span[Nat8, Static] := token->close;
+        if spanLength(close) = 0 then
+            return spanLength(code);
+        end if;
+        var reach: Index := 0;
+        var at: Index := 0;
+        while (at + spanLength(close)) <= spanLength(code) do
+            var same: Bool := true;
+            var k: Index := 0;
+            while same and (k < spanLength(close)) do
+                same := code[at + k] = close[k];
+                k := k + 1;
+            end while;
+            if same then
+                reach := at;
+            end if;
+            at := at + 1;
+        end while;
+        return reach;
+    end;
+
+    generic [R: Region, T: Region]
+    function stepOf(tokens: &[Buffer[Token], R], i: Index, state: Nat8, rest: Span[Nat8, T], at: Index, reach: Index): Step is
+        let token: &[Token, R] := nthRef(tokens, i);
+        var width: Index := 0;
+        if (token->state = state) and (at < reach) then
+            case find(&(token->regex), rest) of
+                when Some(value as found: Found) do
+                    width := foundEnd(&found);
+                    destroyFound(found);
+                when None do
+                    skip;
+            end case;
+        end if;
+        return Step(width => width, kind => token->kind, next => token->next);
+    end;
+
+    generic [C: Region]
+    function highlight(code: Span[Nat8, C], language: Language): String is
+        if spanLength(code) > mostHighlightBytes() then
+            return escapeCode(code);
+        end if;
+        let tokens: Buffer[Token] := tokensOf(language);
+        var reaches: Buffer[Index] := allocateEmpty();
+        var r: Index := 0;
+        while r < length(&tokens) do
+            insertBack(&!reaches, reachOf(&tokens, r, code));
+            r := r + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(code);
+        var at: Index := 0;
+        var state: Nat8 := 0;
+        var turn: Nat8 := 0;
+        while at < size do
+            -- The first token of this state that matches; when none does,
+            -- synlight goes back to state 0, whose last token takes one
+            -- character.
+            let rest: Span[Nat8, C] := substring(code, at, size);
+            var taken: Bool := false;
+            var i: Index := 0;
+            while (i < length(&tokens)) and (not taken) do
+                let step: Step := stepOf(&tokens, i, state, rest, at, nth(&reaches, i));
+                if step.width > 0 then
+                    taken := true;
+                    state := step.next;
+                    var name: Span[Nat8, Static] := classOf(step.kind, turn);
+                    if isPair(step.kind) then
+                        name := pairClass(turn);
+                        turn := (turn + 1) - (((turn + 1) / 4) * 4);
+                    end if;
+                    if isUnpair(step.kind) then
+                        turn := (turn + 3) - (((turn + 3) / 4) * 4);
+                        name := pairClass(turn);
+                    end if;
+                    if spanLength(name) > 0 then
+                        writeString(&!out, "<span class=");
+                        writeString(&!out, name);
+                        writeString(&!out, ">");
+                    end if;
+                    writeEscaped(&!out, substring(rest, 0, step.width));
+                    if spanLength(name) > 0 then
+                        writeString(&!out, "</span>");
+                    end if;
+                    at := at + step.width;
+                end if;
+                i := i + 1;
+            end while;
+            if not taken then
+                state := (0 : Nat8);
+            end if;
+        end while;
+        destroyTokens(tokens);
+        destroyFree(reaches);
+        return finalize(out);
+    end;
+
+    generic [B: Region]
+    function lexer_c(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\A[ \\t\\r\\n]+", Plain(), 0, 0);
+        add(&~tokens, "\\A(0[xX][0-9a-fA-F]+|[0-9]+)", Number(), 0, 0);
+        add(&~tokens, "\\A'(\\\\.|[^'])'", Number(), 0, 0);
+        add(&~tokens, "\\A(if|else|for|while|continue|break|switch|case|default|return|typedef|extern)\\b", Keyword(), 0, 0);
+        add(&~tokens, "\\A(NULL|va_list|true|false)\\b", Builtin(), 0, 0);
+        add(&~tokens, "\\A#(\\\\\\n|[^\\n])*", Builtin(), 0, 0);
+        add(&~tokens, "\\A(static|struct|const|unsigned|char|int|long|byte|bool|void|int8_t|uint8_t|int32_t|uint32_t)\\b", TypeName(), 0, 0);
+        add(&~tokens, "\\A\"(\\\\\"|[^\"])*\"", Str(), 0, 0);
+        add(&~tokens, "\\A[a-zA-Z_][a-zA-Z0-9_]*", Plain(), 0, 0);
+        add(&~tokens, "\\A//[^\\n]*", Comment(), 0, 0);
+        addClosed(&~tokens, "\\A/\\*(?s:.*?)\\*/", "*/", Comment(), 0, 0);
+        add(&~tokens, "\\A[-+/*=:<>,\\.!]+", Operator(), 0, 0);
+        add(&~tokens, "\\A[([{]", Pair(), 0, 0);
+        add(&~tokens, "\\A[)\\]}]", Unpair(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function lexer_diff(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\Adiff[^\\n]*", Keyword(), 0, 0);
+        add(&~tokens, "\\A@@[^\\n]*", Builtin(), 0, 0);
+        add(&~tokens, "\\A-[^\\n]*", DelLine(), 0, 0);
+        add(&~tokens, "\\A\\+[^\\n]*", AddLine(), 0, 0);
+        add(&~tokens, "\\A[^\\n]+", Plain(), 0, 0);
+        add(&~tokens, "\\A\\n", Plain(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function lexer_go(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\A[ \\t\\r\\n]+", Plain(), 0, 0);
+        add(&~tokens, "\\A(0[xX][0-9a-fA-F]+|[0-9]+)", Number(), 0, 0);
+        add(&~tokens, "\\A'(\\\\.|[^'])'", Number(), 0, 0);
+        add(&~tokens, "\\A(package|if|else|nil|func|var|for|continue|break|switch|case|default|return|type)\\b", Keyword(), 0, 0);
+        add(&~tokens, "\\A(import|defer|len|append|range|make|true|false)\\b", Builtin(), 0, 0);
+        add(&~tokens, "\\A(struct|interface|string|map|int|byte|bool|chan|int32)\\b", TypeName(), 0, 0);
+        add(&~tokens, "\\A`[^`]*`", Str(), 0, 0);
+        add(&~tokens, "\\A\"(\\\\\"|[^\"])*\"", Str(), 0, 0);
+        add(&~tokens, "\\A[a-zA-Z_][a-zA-Z0-9_]*", Plain(), 0, 0);
+        add(&~tokens, "\\A//[^\\n]*", Comment(), 0, 0);
+        addClosed(&~tokens, "\\A/\\*(?s:.*?)\\*/", "*/", Comment(), 0, 0);
+        add(&~tokens, "\\A[-+/*=:<>,\\.!]+", Operator(), 0, 0);
+        add(&~tokens, "\\A(\\[]|{})", Plain(), 0, 0);
+        add(&~tokens, "\\A[([{]", Pair(), 0, 0);
+        add(&~tokens, "\\A[)\\]}]", Unpair(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function lexer_html(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\A<[/a-zA-Z]*", Builtin(), 0, 1);
+        add(&~tokens, "\\A[^=/>\"]+", Keyword(), 1, 1);
+        add(&~tokens, "\\A\"[^\"]*\"", Str(), 1, 1);
+        add(&~tokens, "\\A[\\s=]+", Plain(), 1, 1);
+        add(&~tokens, "\\A/?>", Builtin(), 1, 0);
+        addClosed(&~tokens, "\\A{{(?s:.*?)}}", "}}", Comment(), 0, 0);
+        add(&~tokens, "\\A[^<{]+", Plain(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function lexer_js(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\A[ \\t\\r\\n]+", Plain(), 0, 0);
+        add(&~tokens, "\\A(0[xX][0-9a-fA-F]+|[0-9]+)", Number(), 0, 0);
+        add(&~tokens, "\\A(function|return|var|break|and|or|not|do|else|if|then|elseif|for|in|while|end)\\b", Keyword(), 0, 0);
+        add(&~tokens, "\\A(new|escape|true|false)\\b", Builtin(), 0, 0);
+        add(&~tokens, "\\A((console|Math|window|document|history)\\.[[:alpha:]]+)\\b", Builtin(), 0, 0);
+        addClosed(&~tokens, "\\A\\[=*\\[(?s:.*?)\\]=*\\]", "]", Str(), 0, 0);
+        add(&~tokens, "\\A'(\\\\'|[^'])*'", Str(), 0, 0);
+        add(&~tokens, "\\A\"(\\\\\"|[^\"])*\"", Str(), 0, 0);
+        add(&~tokens, "\\A[a-zA-Z_][a-zA-Z0-9_]*", Plain(), 0, 0);
+        add(&~tokens, "\\A//[^\\n]*", Comment(), 0, 0);
+        add(&~tokens, "\\A[-+/*=:<>,\\.!]+", Operator(), 0, 0);
+        add(&~tokens, "\\A[([{]", Pair(), 0, 0);
+        add(&~tokens, "\\A[)\\]}]", Unpair(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function lexer_lua(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\A[ \\t\\r\\n]+", Plain(), 0, 0);
+        add(&~tokens, "\\A(0[xX][0-9a-fA-F]+|[0-9]+)", Number(), 0, 0);
+        add(&~tokens, "\\A(function|return|local|break|and|or|not|do|else|if|then|elseif|for|in|while|end)\\b", Keyword(), 0, 0);
+        add(&~tokens, "\\A(require|print|pairs|ipairs|next|true|false)\\b", Builtin(), 0, 0);
+        add(&~tokens, "\\A(string\\.format)\\b", Builtin(), 0, 0);
+        addClosed(&~tokens, "\\A\\[=*\\[(?s:.*?)\\]=*\\]", "]", Str(), 0, 0);
+        add(&~tokens, "\\A'(\\\\'|[^'])*'", Str(), 0, 0);
+        add(&~tokens, "\\A\"(\\\\\"|[^\"])*\"", Str(), 0, 0);
+        add(&~tokens, "\\A[a-zA-Z_][a-zA-Z0-9_]*", Plain(), 0, 0);
+        add(&~tokens, "\\A--[^\\n]*", Comment(), 0, 0);
+        add(&~tokens, "\\A[-+/*=:<>,\\.!]+", Operator(), 0, 0);
+        add(&~tokens, "\\A[([{]", Pair(), 0, 0);
+        add(&~tokens, "\\A[)\\]}]", Unpair(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function lexer_py(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\A[ \\t\\r\\n]+", Plain(), 0, 0);
+        add(&~tokens, "\\A(0[xX][0-9a-fA-F]+|[0-9]+)", Number(), 0, 0);
+        add(&~tokens, "\\A(def|return|break|or|and|not|do|else|is|if|then|elif|try|raise|except|for|in|while|as)\\b", Keyword(), 0, 0);
+        add(&~tokens, "\\A(from|import|print|isinstance|None|True|False|Exception)\\b", Builtin(), 0, 0);
+        add(&~tokens, "\\A'(\\\\'|[^'])*'", Str(), 0, 0);
+        add(&~tokens, "\\A\"(\\\\\"|[^\"])*\"", Str(), 0, 0);
+        add(&~tokens, "\\A[a-zA-Z_][a-zA-Z0-9_]*", Plain(), 0, 0);
+        add(&~tokens, "\\A#[^\\n]*", Comment(), 0, 0);
+        add(&~tokens, "\\A[-+/*=:[\\](){}<>,\\.!]+", Operator(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function lexer_rs(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\A[ \\t\\r\\n]+", Plain(), 0, 0);
+        add(&~tokens, "\\A(0[xX][0-9a-fA-F]+|[0-9]+)", Number(), 0, 0);
+        add(&~tokens, "\\A'(\\\\.|[^'])'", Number(), 0, 0);
+        add(&~tokens, "\\A(extern|if|else|fn|pub|let|for|loop|continue|break|match|return|type|struct|impl)\\b", Keyword(), 0, 0);
+        add(&~tokens, "\\A(Err|Ok|Result|Some|None|dyn|unsafe|len|new|true|false|unwrap|as_bytes|to_string|as_str)\\b", Builtin(), 0, 0);
+        add(&~tokens, "\\A(println!|format!)", Builtin(), 0, 0);
+        add(&~tokens, "\\A(&?mut|const|&?String|i32|u32|i8|u8|i64|byte|bool|chan|usize)\\b", TypeName(), 0, 0);
+        add(&~tokens, "\\A(\\w+::)", TypeName(), 0, 0);
+        add(&~tokens, "\\A^#[^\\n]*", Str(), 0, 0);
+        add(&~tokens, "\\A^use [^\\n]*", Builtin(), 0, 0);
+        add(&~tokens, "\\A`[^`]*`", Str(), 0, 0);
+        add(&~tokens, "\\A\"(\\\\\"|[^\"])*\"", Str(), 0, 0);
+        add(&~tokens, "\\A[a-zA-Z_][a-zA-Z0-9_]*", Plain(), 0, 0);
+        add(&~tokens, "\\A//[^\\n]*", Comment(), 0, 0);
+        addClosed(&~tokens, "\\A/\\*(?s:.*?)\\*/", "*/", Comment(), 0, 0);
+        add(&~tokens, "\\A[-+/*=:<>,\\.!]+", Operator(), 0, 0);
+        add(&~tokens, "\\A[([{]", Pair(), 0, 0);
+        add(&~tokens, "\\A[)\\]}]", Unpair(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function lexer_sql(tokens: &![Buffer[Token], B]): Unit is
+        add(&~tokens, "\\A[ \\t\\r\\n]+", Plain(), 0, 0);
+        add(&~tokens, "\\A(0[xX][0-9a-fA-F]+|[0-9]+)", Number(), 0, 0);
+        add(&~tokens, "\\A((?i)create|using|insert|into|select|from|on|where|join|like)\\b", Keyword(), 0, 0);
+        add(&~tokens, "\\A((?i)table|index|values|integer|primary|key|blob|text)\\b", Builtin(), 0, 0);
+        addClosed(&~tokens, "\\A\\[=*\\[(?s:.*?)\\]=*\\]", "]", Str(), 0, 0);
+        add(&~tokens, "\\A'(''|[^'])*'", Str(), 0, 0);
+        add(&~tokens, "\\A[a-zA-Z_][a-zA-Z0-9_]*", Plain(), 0, 0);
+        add(&~tokens, "\\A(?s:.)", Plain(), 0, 0);
+        return nil;
+    end;
+end module body.

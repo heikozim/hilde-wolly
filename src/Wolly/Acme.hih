@@ -1,0 +1,91 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A certificate from an ACME server such as Let's Encrypt, with the
+challenge http-01: Standard.Acme takes the steps, and
+this module runs them in order for a list of DNS names, puts the answer of
+each challenge as a file under the webroot that the web server serves, and
+waits for the verdict.
+
+The account key and the key of the certificate are PEM texts the caller
+keeps (Wolly.Secret); the module keeps nothing.  The certificate comes
+back as the chain in PEM.  No wildcard name: http-01 cannot prove one.
+dns-01, which needs the API of a DNS provider, is not here; the value for
+the TXT record is Standard.Acme.dnsChallengeValue.
+
+The server is spoken to over HTTPS, verified against the certificates in
+caFile.  A CA that lives on a private address, such as Pebble in a test, is
+reached only when privateCa is true.
+"""
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.Acme is
+    """
+    The most names in one certificate: 20.
+    """
+    function mostNames(): Index
+        ensures result = 20;
+
+    """
+    Thirty days in seconds: how long before its end a certificate is
+    renewed.
+    """
+    function renewalSeconds(): Int64
+        ensures result = 2592000;
+
+    """
+    Whether the certificate in certPem should be renewed: true when it does
+    not parse, or ends less than before seconds after the time at, seconds
+    since 1970.
+    """
+    generic [C: Region]
+    function needsRenewal(certPem: Span[Nat8, C], at: Int64, before: Int64): Bool
+        requires (at > 0) and (before > 0);
+
+    """
+    Whether token may be the token of a challenge and a name of a file: 1 to
+    128 letters, digits, hyphens and underscores, the alphabet of base64url.
+    Anything else would put a slash or a dot into a path.
+    No contract: the answer is the check, over outside input.
+    """
+    generic [T: Region]
+    function isToken(token: Span[Nat8, T]): Bool;
+
+    """
+    Whether names is a list for http-01: DNS names separated by commas, at
+    most mostNames, none with a star.
+    No contract: the answer is the check, over outside input.
+    """
+    generic [N: Region]
+    function usableNames(names: Span[Nat8, N]): Bool;
+
+    """
+    The file that serves the answer to the challenge with token under the
+    webroot: webroot, /.well-known/acme-challenge/ (28 bytes) and the token.
+    """
+    generic [W: Region, T: Region]
+    function challengePath(webroot: Span[Nat8, W], token: Span[Nat8, T]): String
+        ensures length(&result) = ((spanLength(webroot) + spanLength(token)) + 28);
+
+    """
+    The certificate chain, PEM, for the DNS names, separated by commas, from
+    the ACME server at directoryUrl (an https URL), through http-01 with the
+    webroot as the root of the directory the web server serves under /.  The
+    account is made, or found, with the key accountKeyPem and the e-mail
+    address contact (may be empty); domainKeyPem is the key of the
+    certificate.  Left holds the step that failed and the words of the
+    server.  Waits up to 60 seconds for each verdict.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [D: Region, F: Region, A: Region, C: Region, N: Region, W: Region, K: Region]
+    function obtainHttp01(directoryUrl: Span[Nat8, D], caFile: Span[Nat8, F], accountKeyPem: Span[Nat8, A],
+                          contact: Span[Nat8, C], names: Span[Nat8, N], webroot: Span[Nat8, W],
+                          domainKeyPem: Span[Nat8, K], privateCa: Bool): Either[String, String];
+end module.

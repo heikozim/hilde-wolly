@@ -1,0 +1,220 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Codes drawn by Wolly.Bunti, written as PNG and read from it again (every
+-- picture here goes that way), turned by 0, 90, 180 and 270
+-- degrees, seen in perspective, with a colour cast and noise, read back to
+-- the very payload; pictures without a code refused; and the limits
+-- measured: the strongest perspective, cast and noise still read.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Wolly.Bunti (
+    BuntiCode,
+    BuntiMode,
+    Plain,
+    Dna,
+    BuntiLevel,
+    LevelL,
+    LevelM,
+    LevelQ,
+    LevelH,
+    BuntiError,
+    NotFound,
+    encodeBunti,
+    pixelSide,
+    buntiPixels,
+    buntiPng,
+    destroyBunti
+);
+import Wolly.BuntiScan (
+    decodeBuntiPixels,
+    decodeBuntiPng
+);
+import Wolly.Image (
+    pngOfRgb
+);
+
+module body Wolly.BuntiScanPart3.Test is
+    -- A picture: its side and its pixels.
+    record Picture: Linear is
+        side: Index;
+        pixels: String;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        if number > 255 then
+            return 255;
+        end if;
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function whole(f: Float64): Index is
+        if f < 0.0 then
+            return 0;
+        end if;
+        case toInt64(f) of
+            when Some(value as n: Int64) do
+                case toIndex(n) of
+                    when Some(value as i: Index) do
+                        return i;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function payloadOf(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            let value: Index := (i * 13) + 5;
+            writeByte(&!out, narrow(value - ((value / 256) * 256)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The picture of the code of payload at scale; a white square of 30
+    -- pixels when there is no code.
+    generic [P: Region]
+    function drawn(payload: Span[Nat8, P], mode: BuntiMode, level: BuntiLevel, scale: Index): Picture is
+        case encodeBunti(payload, mode, level) of
+            when Right(right as code: BuntiCode) do
+                let side: Index := pixelSide(&code, scale);
+                let pixels: String := buntiPixels(&code, scale);
+                destroyBunti(code);
+                return Picture(side => side, pixels => pixels);
+            when Left(left as error: BuntiError) do
+                return blank(30);
+        end case;
+    end;
+
+    function blank(side: Index): Picture is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < ((side * side) * 3) do
+            writeByte(&!out, (255 : Nat8));
+            i := i + 1;
+        end while;
+        return Picture(side => side, pixels => finalize(out));
+    end;
+
+    generic [S: Region]
+    function pixelByte(pixels: &[String, S], at: Index): Nat8 is
+        let all: Span[Nat8, S] := asSpan(pixels);
+        return all[at];
+    end;
+
+    -- Whether the picture, written as PNG and read again, reads to payload.
+    generic [P: Region]
+    function reads(picture: Picture, payload: Span[Nat8, P]): Bool is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        var good: Bool := false;
+        case pngOfRgb(side, side, pixels) of
+            when Some(value as png: String) do
+                case decodeBuntiPng(asSpan(&png), 16000000) of
+                    when Right(right as back: String) do
+                        good := equal(asSpan(&back), payload);
+                        destroyString(back);
+                    when Left(left as error: BuntiError) do
+                        skip;
+                end case;
+                destroyString(png);
+            when None do
+                skip;
+        end case;
+        return good;
+    end;
+
+    -- The picture scaled by over / under, each pixel the nearest.
+    function scaled(picture: Picture, over: Index, under: Index): Picture is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        let size: Index := (side * over) / under;
+        var out: StringBuilder := makeStringBuilder();
+        var y: Index := 0;
+        while y < size do
+            var x: Index := 0;
+            while x < size do
+                let sx: Index := (x * under) / over;
+                let sy: Index := (y * under) / over;
+                let at: Index := ((sy * side) + sx) * 3;
+                writeByte(&!out, pixelByte(&pixels, at));
+                writeByte(&!out, pixelByte(&pixels, at + 1));
+                writeByte(&!out, pixelByte(&pixels, at + 2));
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        destroyString(pixels);
+        return Picture(side => size, pixels => finalize(out));
+    end;
+
+    -- Whether the code of payload at mode M, 6 pixels a cell, scaled by over
+    -- / under, reads.
+    generic [P: Region]
+    function readsScaled(payload: Span[Nat8, P], over: Index, under: Index): Bool is
+        return reads(scaled(drawn(payload, Plain(), LevelM(), 6), over, under), payload);
+    end;
+
+    -- Scales: cells of 2 to 12 whole pixels, and of 2.25, 2.5, 3.5, 7.5, 10.5
+    -- and 14 pixels, where cells and pixels do not line up.
+    function testScales(): Unit is
+        let payload: String := payloadOf(120);
+        var o: Index := 2;
+        var wholeCells: Index := 0;
+        while o <= 12 do
+            if readsScaled(asSpan(&payload), o, 6) then
+                wholeCells := wholeCells + 1;
+            end if;
+            o := o + 1;
+        end while;
+        assertTrue(wholeCells = 11, "cells of 2 to 12 pixels: all 11 read");
+        assertTrue(readsScaled(asSpan(&payload), 3, 8), "cells of 2.25 pixels");
+        assertTrue(readsScaled(asSpan(&payload), 5, 12), "cells of 2.5 pixels");
+        assertTrue(readsScaled(asSpan(&payload), 7, 12), "cells of 3.5 pixels");
+        assertTrue(readsScaled(asSpan(&payload), 5, 4), "cells of 7.5 pixels");
+        assertTrue(readsScaled(asSpan(&payload), 7, 4), "cells of 10.5 pixels");
+        assertTrue(readsScaled(asSpan(&payload), 7, 3), "cells of 14 pixels");
+        destroyString(payload);
+        return nil;
+    end;
+end module body.

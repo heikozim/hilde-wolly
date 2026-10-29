@@ -1,0 +1,1092 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Wolly.Limit: every statement is a
+-- constant, every value is bound, the tables are strict.  No cryptography
+-- of its own: SHA-256 is Standard.Libcrypto's, the check of a signature
+-- Standard.X509's, CBOR is read by Standard.Cbor and a COSE key turned into
+-- the SubjectPublicKeyInfo X509 takes by Standard.Cose; what is here is the
+-- allowlist of keys and the checks of WebAuthn.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    equal
+);
+import Standard.Base64 (
+    encodeUnpadded,
+    decodeUnpadded
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    readJson,
+    destroyJson,
+    stringAt,
+    boolAt
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha256
+);
+import Standard.X509 (
+    verifyMessage
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Values,
+    noValues,
+    withInt64,
+    withText,
+    withBytes,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    columnBytes,
+    finish
+);
+import Wolly.Role (
+    isName
+);
+import Standard.Cbor (
+    Cbor,
+    CborError,
+    CborItem,
+    CborKind,
+    CborUnsigned,
+    CborNegative,
+    CborBytes,
+    CborText,
+    CborArray,
+    CborMap,
+    CborFalse,
+    CborTrue,
+    CborNull,
+    CborUndefined,
+    CborFloat,
+    readCbor,
+    destroyCbor,
+    rootOf,
+    kindOf,
+    integerOf,
+    bytesOf,
+    textOf,
+    countOf,
+    textKey,
+    integerKey
+);
+import Standard.Cose (
+    publicKeyFromCose
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.Passkey is
+    constant makeChallenges: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_passkey_challenges (challenge TEXT PRIMARY KEY, name TEXT NOT NULL, purpose TEXT NOT NULL CHECK (purpose IN ('create', 'get')), expires_at INTEGER NOT NULL) STRICT";
+    constant makeChallengesPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_passkey_challenges (challenge TEXT PRIMARY KEY, name TEXT NOT NULL, purpose TEXT NOT NULL CHECK (purpose IN ('create', 'get')), expires_at BIGINT NOT NULL)";
+    constant makeKeys: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_passkeys (credential TEXT PRIMARY KEY, name TEXT NOT NULL, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL CHECK (sign_count >= 0), created_at INTEGER NOT NULL) STRICT";
+    constant makeKeysPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_passkeys (credential TEXT PRIMARY KEY, name TEXT NOT NULL, public_key BYTEA NOT NULL, sign_count BIGINT NOT NULL CHECK (sign_count >= 0), created_at BIGINT NOT NULL)";
+    constant makeKeysIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_passkeys_name ON wolly_passkeys (name)";
+    constant makeChallengesIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_passkey_challenges_expiry ON wolly_passkey_challenges (expires_at)";
+    constant dropEarlier: Span[Nat8, Static] := "DELETE FROM wolly_passkey_challenges WHERE name = ? AND purpose = ?";
+    constant dropKeysOf: Span[Nat8, Static] := "DELETE FROM wolly_passkeys WHERE name = ?";
+    constant dropChallengesOf: Span[Nat8, Static] := "DELETE FROM wolly_passkey_challenges WHERE name = ?";
+    constant dropStale: Span[Nat8, Static] := "DELETE FROM wolly_passkey_challenges WHERE expires_at < ?";
+    constant putChallenge: Span[Nat8, Static] := "INSERT INTO wolly_passkey_challenges (challenge, name, purpose, expires_at) VALUES (?, ?, ?, ?)";
+    -- Read and taken out in one statement: a challenge is used once.
+    constant takeChallenge: Span[Nat8, Static] := "DELETE FROM wolly_passkey_challenges WHERE challenge = ? AND purpose = ? RETURNING name, expires_at";
+    constant putKey: Span[Nat8, Static] := "INSERT INTO wolly_passkeys (credential, name, public_key, sign_count, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (credential) DO NOTHING";
+    constant keyOf: Span[Nat8, Static] := "SELECT name, public_key FROM wolly_passkeys WHERE credential = ?";
+    -- The counter goes up, or stays at 0 for a passkey that does not count;
+    -- one statement, so two logins with the same counter cannot both pass.
+    constant moveCounter: Span[Nat8, Static] := "UPDATE wolly_passkeys SET sign_count = ? WHERE credential = ? AND (sign_count < ? OR (sign_count = 0 AND ? = 0))";
+    constant moveCounterPg: Span[Nat8, Static] := "UPDATE wolly_passkeys SET sign_count = ? WHERE credential = ? AND (sign_count < ? OR (sign_count = 0 AND CAST(? AS BIGINT) = 0))";
+    constant countKeys: Span[Nat8, Static] := "SELECT count(*) FROM wolly_passkeys WHERE name = ?";
+    constant listKeys: Span[Nat8, Static] := "SELECT credential, created_at FROM wolly_passkeys WHERE name = ? ORDER BY created_at, credential";
+    constant ownerOfKey: Span[Nat8, Static] := "SELECT name FROM wolly_passkeys WHERE credential = ?";
+    constant dropOneKey: Span[Nat8, Static] := "DELETE FROM wolly_passkeys WHERE name = ? AND credential = ?";
+
+    -- The bounds of what a browser sends: WebAuthn's 1023 bytes of a
+    -- credential id, and far more than a client data or an attestation of
+    -- the format none takes.
+    constant mostCredential: Index := 1023;
+    constant mostClientData: Index := 4096;
+    constant mostAttestation: Index := 16384;
+
+    function challengeSeconds(): Int64 is
+        return 300;
+    end;
+
+    function mostPasskeys(): Int64 is
+        return 20;
+    end;
+
+    generic [B: Region]
+    function toBase64Url(bytes: Span[Nat8, B]): String is
+        let plain: String := encodeUnpadded(bytes);
+        let url: String := urlAlphabet(asSpan(&plain));
+        destroyString(plain);
+        return url;
+    end;
+
+    -- text of the standard alphabet in the one of URLs: - for +, _ for /.
+    generic [T: Region]
+    function urlAlphabet(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if byte = '+' then
+                writeByte(&!out, '-');
+            else
+                if byte = '/' then
+                    writeByte(&!out, '_');
+                else
+                    writeByte(&!out, byte);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [T: Region]
+    function fromBase64Url(text: Span[Nat8, T]): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        var clean: Bool := true;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if (byte = '+') or (byte = '/') then
+                clean := false;
+            end if;
+            if byte = '-' then
+                writeByte(&!out, '+');
+            else
+                if byte = '_' then
+                    writeByte(&!out, '/');
+                else
+                    writeByte(&!out, byte);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        let standard: String := finalize(out);
+        if clean then
+            let bytes: Option[String] := decodeUnpadded(asSpan(&standard));
+            destroyString(standard);
+            return bytes;
+        else
+            destroyString(standard);
+            return None();
+        end if;
+    end;
+
+    -- The flags of the authenticator data, without bit operators.
+    function userPresent(flags: Nat8): Bool is
+        return (flags - ((flags / 2) * 2)) = 1;
+    end;
+
+    function userVerified(flags: Nat8): Bool is
+        return ((flags / 4) - ((flags / 8) * 2)) = 1;
+    end;
+
+    function hasCredential(flags: Nat8): Bool is
+        return ((flags / 64) - ((flags / 128) * 2)) = 1;
+    end;
+
+    function hasExtensions(flags: Nat8): Bool is
+        return flags >= 128;
+    end;
+
+    function widen(byte: Nat8): Int64 is
+        case toInt64(byte) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The counter of authenticator data, four bytes big-endian at 33.
+    generic [U: Region]
+    function counterOf(data: Span[Nat8, U]): Int64 is
+        return (((widen(data[33]) * 16777216) + (widen(data[34]) * 65536)) + (widen(data[35]) * 256)) + widen(data[36]);
+    end;
+
+    -- Whether the authenticator data starts with the hash of rpId and says
+    -- the user was present and verified.
+    generic [U: Region, I: Region]
+    function partyAndUser(data: Span[Nat8, U], rpId: Span[Nat8, I]): Option[Refusal] is
+        if spanLength(data) < 37 then
+            return Some(value => PasskeyMalformed());
+        end if;
+        case sha256(rpId) of
+            when Some(value as hash: String) do
+                let same: Bool := equal(substring(data, 0, 32), asSpan(&hash));
+                destroyString(hash);
+                if not same then
+                    return Some(value => WrongParty());
+                end if;
+            when None do
+                return Some(value => PasskeyMalformed());
+        end case;
+        let flags: Nat8 := data[32];
+        if not (userPresent(flags) and userVerified(flags)) then
+            return Some(value => NotVerified());
+        end if;
+        return None();
+    end;
+
+    -- The DER SubjectPublicKeyInfo of a COSE key of ES256 on P-256 or of
+    -- EdDSA on Ed25519; None for another key or a malformed one.  The
+    -- allowlist is Wolly's: the key names its alg, and only these two
+    -- pass, though Standard.Cose would take more.
+    generic [K: Region]
+    function spkiOf(cose: Span[Nat8, K]): Option[String] is
+        case readCbor(cose) of
+            when Left(left as error: CborError) do
+                return None();
+            when Right(right as read: Cbor) do
+                let top: CborItem := rootOf(&read);
+                let kty: Int64 := integerUnder(&read, top, 1);
+                let alg: Int64 := integerUnder(&read, top, 3);
+                let crv: Int64 := integerUnder(&read, top, -1);
+                destroyCbor(read);
+                if ((kty = 2) and (alg = -7)) and (crv = 1) then
+                    return publicKeyFromCose(cose);
+                end if;
+                if ((kty = 1) and (alg = -8)) and (crv = 6) then
+                    return publicKeyFromCose(cose);
+                end if;
+                return None();
+        end case;
+    end;
+
+    -- The integer under key of map, 0 when there is none; COSE uses no 0
+    -- for these labels.
+    generic [D: Region]
+    function integerUnder(document: &[Cbor, D], map: CborItem, key: Int64): Int64 is
+        case integerKey(document, map, key) of
+            when Some(value as item: CborItem) do
+                case integerOf(document, item) of
+                    when Some(value as number: Int64) do
+                        return number;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Whether item is a map.
+    generic [D: Region]
+    function isMap(document: &[Cbor, D], item: CborItem): Bool is
+        case kindOf(document, item) of
+            when Some(value as kind: CborKind) do
+                case kind of
+                    when CborMap do
+                        return true;
+                    when CborUnsigned do
+                        return false;
+                    when CborNegative do
+                        return false;
+                    when CborBytes do
+                        return false;
+                    when CborText do
+                        return false;
+                    when CborArray do
+                        return false;
+                    when CborFalse do
+                        return false;
+                    when CborTrue do
+                        return false;
+                    when CborNull do
+                        return false;
+                    when CborUndefined do
+                        return false;
+                    when CborFloat do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether item is the text wanted.
+    generic [D: Region]
+    function isText(document: &[Cbor, D], item: CborItem, wanted: Span[Nat8, Static]): Bool is
+        case textOf(document, item) of
+            when Some(value as text: String) do
+                let same: Bool := equal(asSpan(&text), wanted);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether item is a map without pairs.
+    generic [D: Region]
+    function isEmptyMap(document: &[Cbor, D], item: CborItem): Bool is
+        if not isMap(document, item) then
+            return false;
+        end if;
+        case countOf(document, item) of
+            when Some(value as pairs: Index) do
+                return pairs = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The challenge of client data of type kind from origin, or why not.
+    generic [C: Region, O: Region]
+    function clientChallenge(clientData: Span[Nat8, C], kind: Span[Nat8, Static], origin: Span[Nat8, O]): Either[Refusal, String] is
+        if spanLength(clientData) > mostClientData then
+            return Left(left => PasskeyMalformed());
+        end if;
+        case readJson(clientData) of
+            when Left(left as error: JsonError) do
+                return Left(left => PasskeyMalformed());
+            when Right(right as document: Json) do
+                let verdict: Either[Refusal, String] := clientOf(&document, kind, origin);
+                destroyJson(document);
+                return verdict;
+        end case;
+    end;
+
+    generic [R: Region, O: Region]
+    function clientOf(document: &[Json, R], kind: Span[Nat8, Static], origin: Span[Nat8, O]): Either[Refusal, String] is
+        var fits: Bool := false;
+        case stringAt(document, "/type") of
+            when Some(value as found: String) do
+                fits := equal(asSpan(&found), kind);
+                destroyString(found);
+            when None do
+                skip;
+        end case;
+        case boolAt(document, "/crossOrigin") of
+            when Some(value as cross: Bool) do
+                if cross then
+                    fits := false;
+                end if;
+            when None do
+                skip;
+        end case;
+        if not fits then
+            return Left(left => PasskeyWrongType());
+        end if;
+        var sameOrigin: Bool := false;
+        case stringAt(document, "/origin") of
+            when Some(value as found: String) do
+                sameOrigin := equal(asSpan(&found), origin);
+                destroyString(found);
+            when None do
+                skip;
+        end case;
+        if not sameOrigin then
+            return Left(left => WrongOrigin());
+        end if;
+        case stringAt(document, "/challenge") of
+            when Some(value as challenge: String) do
+                return Right(right => challenge);
+            when None do
+                return Left(left => WrongChallenge());
+        end case;
+    end;
+
+    function purposeName(purpose: Purpose): Span[Nat8, Static] is
+        case purpose of
+            when Create do
+                return "create";
+            when Get do
+                return "get";
+        end case;
+    end;
+
+    -- Takes the challenge of purpose out of the table: Right Some with its
+    -- name when it was there and has not run out.
+    generic [R: Region, C: Region]
+    function taken(db: &![Database[Writing], R], challenge: Span[Nat8, C], purpose: Purpose,
+        now: Int64): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, takeChallenge, withText(withText(noValues(), challenge), purposeName(purpose)));
+        var found: Option[String] := None();
+        if advance(&!cursor) then
+            if columnInt64(&cursor, 1) >= now then
+                let owner: String := fromSpan(columnText(&cursor, 0));
+                dropText(found);
+                found := Some(value => owner);
+            end if;
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropText(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    function dropText(text: Option[String]): Unit is
+        case text of
+            when Some(value as there: String) do
+                destroyString(there);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Whether the challenge was of purpose for name: Right None when so.
+    generic [R: Region, C: Region, N: Region]
+    function challengeOf(db: &![Database[Writing], R], challenge: Span[Nat8, C], purpose: Purpose, name: Span[Nat8, N],
+        now: Int64): Either[DbError, Option[Refusal]] is
+        case taken(&~db, challenge, purpose, now) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as owner: Option[String]) do
+                case owner of
+                    when Some(value as who: String) do
+                        let same: Bool := equal(asSpan(&who), name);
+                        destroyString(who);
+                        if same then
+                            return Right(right => None());
+                        end if;
+                        return Right(right => Some(value => WrongChallenge()));
+                    when None do
+                        return Right(right => Some(value => WrongChallenge()));
+                end case;
+        end case;
+    end;
+
+    function refuse(refusal: Refusal): Either[DbError, Option[Refusal]] is
+        return Right(right => Some(value => refusal));
+    end;
+
+    generic [R: Region]
+    function preparePasskeys(db: &![Database[Writing], R]): Option[DbError] is
+        let makeChallengesSql: Span[Nat8, Static] := pick(&db, makeChallenges, makeChallengesPg);
+        case execute(&~db, makeChallengesSql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                skip;
+        end case;
+        let makeKeysSql: Span[Nat8, Static] := pick(&db, makeKeys, makeKeysPg);
+        case execute(&~db, makeKeysSql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, makeKeysIndex, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, makeChallengesIndex, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, N: Region]
+    function newChallenge(db: &![Database[Writing], R], name: Span[Nat8, N], purpose: Purpose,
+        now: Int64): Either[DbError, Option[String]] is
+        if not isName(name) then
+            return Right(right => None());
+        end if;
+        return challengeFor(&~db, name, purpose, now);
+    end;
+
+    -- A new challenge kept under name, which the caller has checked.
+    generic [R: Region, N: Region]
+    function challengeFor(db: &![Database[Writing], R], name: Span[Nat8, N], purpose: Purpose,
+        now: Int64): Either[DbError, Option[String]] is
+        case execute(&~db, dropStale, withInt64(noValues(), now)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, dropEarlier, withText(withText(noValues(), name), purposeName(purpose))) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        case randomBytes(32) of
+            when Some(value as raw: String) do
+                let challenge: String := toBase64Url(asSpan(&raw));
+                destroyString(raw);
+                let values: Values := withInt64(withText(withText(withText(noValues(), asSpan(&challenge)), name), purposeName(purpose)), now + challengeSeconds());
+                case execute(&~db, putChallenge, values) of
+                    when Left(left as error: DbError) do
+                        destroyString(challenge);
+                        return Left(left => error);
+                    when Right(right as put: Nat64) do
+                        return Right(right => Some(value => challenge));
+                end case;
+            when None do
+                return Right(right => None());
+        end case;
+    end;
+
+    generic [R: Region, N: Region, C: Region, A: Region, I: Region, O: Region]
+    function register(db: &![Database[Writing], R], name: Span[Nat8, N], clientData: Span[Nat8, C],
+        attestation: Span[Nat8, A], rpId: Span[Nat8, I], origin: Span[Nat8, O],
+        now: Int64): Either[DbError, Option[Refusal]] is
+        case registerCredential(&~db, name, clientData, attestation, rpId, origin, now) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as verdict: Either[Refusal, String]) do
+                case verdict of
+                    when Left(left as refusal: Refusal) do
+                        return refuse(refusal);
+                    when Right(right as credential: String) do
+                        destroyString(credential);
+                        let none: Option[Refusal] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, N: Region, C: Region, A: Region, I: Region, O: Region]
+    function registerCredential(db: &![Database[Writing], R], name: Span[Nat8, N], clientData: Span[Nat8, C],
+        attestation: Span[Nat8, A], rpId: Span[Nat8, I], origin: Span[Nat8, O],
+        now: Int64): Either[DbError, Either[Refusal, String]] is
+        if not isName(name) then
+            return denied(BadName());
+        end if;
+        if spanLength(attestation) > mostAttestation then
+            return denied(PasskeyMalformed());
+        end if;
+        case clientChallenge(clientData, "webauthn.create", origin) of
+            when Left(left as refusal: Refusal) do
+                return denied(refusal);
+            when Right(right as challenge: String) do
+                let checked: Either[DbError, Option[Refusal]] := challengeOf(&~db, asSpan(&challenge), Create(), name, now);
+                destroyString(challenge);
+                case checked of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as refused: Option[Refusal]) do
+                        case refused of
+                            when Some(value as refusal: Refusal) do
+                                return denied(refusal);
+                            when None do
+                                return attested(&~db, name, attestation, rpId, now);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The attestation object of a registration whose client data passed.
+    generic [R: Region, N: Region, A: Region, I: Region]
+    function attested(db: &![Database[Writing], R], name: Span[Nat8, N], attestation: Span[Nat8, A], rpId: Span[Nat8, I],
+        now: Int64): Either[DbError, Either[Refusal, String]] is
+        case readCbor(attestation) of
+            when Left(left as error: CborError) do
+                return denied(PasskeyMalformed());
+            when Right(right as read: Cbor) do
+                let verdict: Either[DbError, Either[Refusal, String]] := attestedIn(&~db, name, &read, rpId, now);
+                destroyCbor(read);
+                return verdict;
+        end case;
+    end;
+
+    -- The attestation object read: of the format none, without a
+    -- statement, and the authenticator data kept.
+    generic [R: Region, N: Region, D: Region, I: Region]
+    function attestedIn(db: &![Database[Writing], R], name: Span[Nat8, N], document: &[Cbor, D], rpId: Span[Nat8, I],
+        now: Int64): Either[DbError, Either[Refusal, String]] is
+        let top: CborItem := rootOf(document);
+        case textKey(document, top, "fmt") of
+            when Some(value as format: CborItem) do
+                if not isText(document, format, "none") then
+                    return denied(Attested());
+                end if;
+            when None do
+                return denied(PasskeyMalformed());
+        end case;
+        case textKey(document, top, "attStmt") of
+            when Some(value as statement: CborItem) do
+                if not isEmptyMap(document, statement) then
+                    return denied(Attested());
+                end if;
+            when None do
+                return denied(PasskeyMalformed());
+        end case;
+        case textKey(document, top, "authData") of
+            when Some(value as data: CborItem) do
+                case bytesOf(document, data) of
+                    when Some(value as bytes: String) do
+                        let kept: Either[DbError, Either[Refusal, String]] := keep(&~db, name, asSpan(&bytes), rpId, now);
+                        destroyString(bytes);
+                        return kept;
+                    when None do
+                        return denied(PasskeyMalformed());
+                end case;
+            when None do
+                return denied(PasskeyMalformed());
+        end case;
+    end;
+
+    -- Keeps the credential of the authenticator data of a registration and
+    -- gives its id in base64url.
+    generic [R: Region, N: Region, U: Region, I: Region]
+    function keep(db: &![Database[Writing], R], name: Span[Nat8, N], data: Span[Nat8, U], rpId: Span[Nat8, I],
+        now: Int64): Either[DbError, Either[Refusal, String]] is
+        case partyAndUser(data, rpId) of
+            when Some(value as refusal: Refusal) do
+                return denied(refusal);
+            when None do
+                skip;
+        end case;
+        let flags: Nat8 := data[32];
+        -- Extensions would follow the key, and none is asked for.
+        if (not hasCredential(flags)) or hasExtensions(flags) then
+            return denied(PasskeyMalformed());
+        end if;
+        -- 37 bytes, the model ID of the authenticator in 16, the length of the
+        -- id in two.
+        if spanLength(data) < 55 then
+            return denied(PasskeyMalformed());
+        end if;
+        case toIndex((widen(data[53]) * 256) + widen(data[54])) of
+            when Some(value as idLength: Index) do
+                if (idLength = 0) or (idLength > mostCredential) then
+                    return denied(PasskeyMalformed());
+                end if;
+                if (spanLength(data) - 55) <= idLength then
+                    return denied(PasskeyMalformed());
+                end if;
+                let idStart: Index := 55;
+                let id: Span[Nat8, U] := substring(data, idStart, idStart + idLength);
+                let cose: Span[Nat8, U] := substring(data, idStart + idLength, spanLength(data));
+                -- The key must be all that follows the id: one whole item.
+                case readCbor(cose) of
+                    when Left(left as error: CborError) do
+                        return denied(PasskeyMalformed());
+                    when Right(right as whole: Cbor) do
+                        destroyCbor(whole);
+                end case;
+                case passkeyCount(&~db, name) of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as held: Int64) do
+                        if held >= mostPasskeys() then
+                            return denied(PasskeyTooMany());
+                        end if;
+                end case;
+                case spkiOf(cose) of
+                    when Some(value as spki: String) do
+                        let credential: String := toBase64Url(id);
+                        let values: Values := withInt64(withInt64(withBytes(withText(withText(noValues(), asSpan(&credential)), name), asSpan(&spki)), counterOf(data)), now);
+                        destroyString(spki);
+                        case execute(&~db, putKey, values) of
+                            when Left(left as error: DbError) do
+                                destroyString(credential);
+                                return Left(left => error);
+                            when Right(right as changed: Nat64) do
+                                if changed = 0 then
+                                    destroyString(credential);
+                                    return denied(Known());
+                                end if;
+                                let verdict: Either[Refusal, String] := Right(right => credential);
+                                return Right(right => verdict);
+                        end case;
+                    when None do
+                        return denied(BadKey());
+                end case;
+            when None do
+                return denied(PasskeyMalformed());
+        end case;
+    end;
+
+    function denied(refusal: Refusal): Either[DbError, Either[Refusal, String]] is
+        let verdict: Either[Refusal, String] := Left(left => refusal);
+        return Right(right => verdict);
+    end;
+
+    generic [R: Region, D: Region, C: Region, U: Region, S: Region, I: Region, O: Region]
+    function authenticate(db: &![Database[Writing], R], credential: Span[Nat8, D], clientData: Span[Nat8, C],
+        authenticatorData: Span[Nat8, U], signature: Span[Nat8, S], rpId: Span[Nat8, I],
+        origin: Span[Nat8, O], now: Int64): Either[DbError, Either[Refusal, String]] is
+        return loginAs(&~db, "", credential, clientData, authenticatorData, signature, rpId, origin, now);
+    end;
+
+    -- A login with credential as the browser sent it; marker as loginOf
+    -- takes it.
+    generic [R: Region, M: Region, D: Region, C: Region, U: Region, S: Region, I: Region, O: Region]
+    function loginAs(db: &![Database[Writing], R], marker: Span[Nat8, M], credential: Span[Nat8, D], clientData: Span[Nat8, C],
+        authenticatorData: Span[Nat8, U], signature: Span[Nat8, S], rpId: Span[Nat8, I],
+        origin: Span[Nat8, O], now: Int64): Either[DbError, Either[Refusal, String]] is
+        case fromBase64Url(credential) of
+            when Some(value as id: String) do
+                let size: Index := length(&id);
+                -- The id as registration wrote it, whatever the text was.
+                let canonical: String := toBase64Url(asSpan(&id));
+                destroyString(id);
+                if (size = 0) or (size > mostCredential) then
+                    destroyString(canonical);
+                    return denied(PasskeyMalformed());
+                else
+                    let verdict: Either[DbError, Either[Refusal, String]] := loginOf(&~db, marker, asSpan(&canonical), clientData, authenticatorData, signature, rpId, origin, now);
+                    destroyString(canonical);
+                    return verdict;
+                end if;
+            when None do
+                return denied(PasskeyMalformed());
+        end case;
+    end;
+
+    -- The name a challenge for a login bound to bound is kept under: a star
+    -- and bound, which no name of isName can be.
+    generic [B: Region]
+    function markerOf(bound: Span[Nat8, B]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeByte(&!b, '*');
+        writeString(&!b, bound);
+        return finalize(b);
+    end;
+
+    generic [R: Region, B: Region]
+    function newDiscoverableChallenge(db: &![Database[Writing], R], bound: Span[Nat8, B],
+        now: Int64): Either[DbError, Option[String]] is
+        if not isName(bound) then
+            let none: Option[String] := None();
+            return Right(right => none);
+        end if;
+        let marker: String := markerOf(bound);
+        let made: Either[DbError, Option[String]] := challengeFor(&~db, asSpan(&marker), Get(), now);
+        destroyString(marker);
+        return made;
+    end;
+
+    generic [R: Region, B: Region, D: Region, C: Region, U: Region, S: Region, I: Region, O: Region]
+    function authenticateDiscoverable(db: &![Database[Writing], R], bound: Span[Nat8, B], credential: Span[Nat8, D],
+        clientData: Span[Nat8, C], authenticatorData: Span[Nat8, U],
+        signature: Span[Nat8, S], rpId: Span[Nat8, I], origin: Span[Nat8, O],
+        now: Int64): Either[DbError, Either[Refusal, String]] is
+        if not isName(bound) then
+            return denied(BadName());
+        end if;
+        let marker: String := markerOf(bound);
+        let verdict: Either[DbError, Either[Refusal, String]] := loginAs(&~db, asSpan(&marker), credential, clientData, authenticatorData, signature, rpId, origin, now);
+        destroyString(marker);
+        return verdict;
+    end;
+
+    -- A login of credential; marker is empty when the challenge was for the
+    -- user of the credential, else the name the challenge is kept under,
+    -- and the user is then the one whose credential it is.
+    generic [R: Region, M: Region, D: Region, C: Region, U: Region, S: Region, I: Region, O: Region]
+    function loginOf(db: &![Database[Writing], R], marker: Span[Nat8, M], credential: Span[Nat8, D], clientData: Span[Nat8, C],
+        authenticatorData: Span[Nat8, U], signature: Span[Nat8, S], rpId: Span[Nat8, I],
+        origin: Span[Nat8, O], now: Int64): Either[DbError, Either[Refusal, String]] is
+        case clientChallenge(clientData, "webauthn.get", origin) of
+            when Left(left as refusal: Refusal) do
+                return denied(refusal);
+            when Right(right as challenge: String) do
+                -- The challenge goes first, so that it is spent even when
+                -- the credential is unknown.
+                let owner: Either[DbError, Option[String]] := taken(&~db, asSpan(&challenge), Get(), now);
+                destroyString(challenge);
+                case owner of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as found: Option[String]) do
+                        case found of
+                            when Some(value as who: String) do
+                                if spanLength(marker) = 0 then
+                                    let verdict: Either[DbError, Either[Refusal, String]] := signedBy(&~db, asSpan(&who), credential, clientData, authenticatorData, signature, rpId);
+                                    destroyString(who);
+                                    return verdict;
+                                end if;
+                                let same: Bool := equal(asSpan(&who), marker);
+                                destroyString(who);
+                                if not same then
+                                    return denied(WrongChallenge());
+                                end if;
+                                return discovered(&~db, credential, clientData, authenticatorData, signature, rpId);
+                            when None do
+                                return denied(WrongChallenge());
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The login of the user whose credential it is, after a challenge that
+    -- named nobody.
+    generic [R: Region, D: Region, C: Region, U: Region, S: Region, I: Region]
+    function discovered(db: &![Database[Writing], R], credential: Span[Nat8, D], clientData: Span[Nat8, C],
+        authenticatorData: Span[Nat8, U], signature: Span[Nat8, S], rpId: Span[Nat8, I]): Either[DbError, Either[Refusal, String]] is
+        case passkeyOwner(&~db, credential) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as owner: String) do
+                        let verdict: Either[DbError, Either[Refusal, String]] := signedBy(&~db, asSpan(&owner), credential, clientData, authenticatorData, signature, rpId);
+                        destroyString(owner);
+                        return verdict;
+                    when None do
+                        return denied(Unknown());
+                end case;
+        end case;
+    end;
+
+    -- The login of who, whose challenge it was, with credential.
+    generic [R: Region, W: Region, D: Region, C: Region, U: Region, S: Region, I: Region]
+    function signedBy(db: &![Database[Writing], R], who: Span[Nat8, W], credential: Span[Nat8, D], clientData: Span[Nat8, C],
+        authenticatorData: Span[Nat8, U], signature: Span[Nat8, S], rpId: Span[Nat8, I]): Either[DbError, Either[Refusal, String]] is
+        var cursor: Cursor := start(&~db, keyOf, withText(noValues(), credential));
+        var owner: Option[String] := None();
+        var spki: Option[String] := None();
+        if advance(&!cursor) then
+            let name: String := fromSpan(columnText(&cursor, 0));
+            let key: String := fromSpan(columnBytes(&cursor, 1));
+            dropText(owner);
+            owner := Some(value => name);
+            dropText(spki);
+            spki := Some(value => key);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropText(owner);
+                dropText(spki);
+                return Left(left => error);
+            when None do
+                case owner of
+                    when Some(value as name: String) do
+                        case spki of
+                            when Some(value as key: String) do
+                                let verdict: Either[DbError, Either[Refusal, String]] := finalChecks(&~db, who, name, asSpan(&key), credential, clientData, authenticatorData, signature, rpId);
+                                destroyString(key);
+                                return verdict;
+                            when None do
+                                destroyString(name);
+                                return denied(Unknown());
+                        end case;
+                    when None do
+                        dropText(spki);
+                        return denied(Unknown());
+                end case;
+        end case;
+    end;
+
+    -- Why a login of the credential of owner, whose key is spki, fails
+    -- before its counter is asked; None when it passes so far.
+    generic [W: Region, N: Region, K: Region, C: Region, U: Region, S: Region, I: Region]
+    function loginRefusal(who: Span[Nat8, W], owner: Span[Nat8, N], spki: Span[Nat8, K], clientData: Span[Nat8, C],
+        authenticatorData: Span[Nat8, U], signature: Span[Nat8, S], rpId: Span[Nat8, I]): Option[Refusal] is
+        if not equal(owner, who) then
+            return Some(value => WrongChallenge());
+        end if;
+        case partyAndUser(authenticatorData, rpId) of
+            when Some(value as refusal: Refusal) do
+                return Some(value => refusal);
+            when None do
+                skip;
+        end case;
+        case sha256(clientData) of
+            when Some(value as hash: String) do
+                var message: StringBuilder := makeStringBuilder();
+                writeString(&!message, authenticatorData);
+                writeString(&!message, asSpan(&hash));
+                destroyString(hash);
+                let signed: String := finalize(message);
+                let fits: Bool := verifyMessage(spki, asSpan(&signed), signature);
+                destroyString(signed);
+                if fits then
+                    return None();
+                end if;
+                return Some(value => BadSignature());
+            when None do
+                return Some(value => PasskeyMalformed());
+        end case;
+    end;
+
+    -- The last checks of a login of the credential of name, whose key is
+    -- spki; name is given back when they pass.
+    generic [R: Region, W: Region, K: Region, D: Region, C: Region, U: Region, S: Region, I: Region]
+    function finalChecks(db: &![Database[Writing], R], who: Span[Nat8, W], name: String, spki: Span[Nat8, K], credential: Span[Nat8, D],
+        clientData: Span[Nat8, C], authenticatorData: Span[Nat8, U], signature: Span[Nat8, S],
+        rpId: Span[Nat8, I]): Either[DbError, Either[Refusal, String]] is
+        case loginRefusal(who, asSpan(&name), spki, clientData, authenticatorData, signature, rpId) of
+            when Some(value as refusal: Refusal) do
+                destroyString(name);
+                return denied(refusal);
+            when None do
+                let counter: Int64 := counterOf(authenticatorData);
+                let values: Values := withInt64(withInt64(withText(withInt64(noValues(), counter), credential), counter), counter);
+                let moveCounterSql: Span[Nat8, Static] := pick(&db, moveCounter, moveCounterPg);
+                case execute(&~db, moveCounterSql, values) of
+                    when Left(left as error: DbError) do
+                        destroyString(name);
+                        return Left(left => error);
+                    when Right(right as changed: Nat64) do
+                        if changed = 0 then
+                            destroyString(name);
+                            return denied(PasskeyReplayed());
+                        else
+                            let verdict: Either[Refusal, String] := Right(right => name);
+                            return Right(right => verdict);
+                        end if;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, N: Region]
+    function removePasskeys(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[DbError, Bool] is
+        case execute(&~db, dropChallengesOf, withText(noValues(), name)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, dropKeysOf, withText(noValues(), name)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as removed: Nat64) do
+                let there: Bool := removed > 0;
+                return Right(right => there);
+        end case;
+    end;
+
+    generic [M: Free, R: Region, N: Region]
+    function passkeyCount(db: &![Database[M], R], name: Span[Nat8, N]): Either[DbError, Int64] is
+        var cursor: Cursor := start(&~db, countKeys, withText(noValues(), name));
+        var total: Int64 := 0;
+        if advance(&!cursor) then
+            total := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => total);
+        end case;
+    end;
+
+    function destroyPasskeyEntries(entries: Buffer[PasskeyEntry]): Unit is
+        var all: Buffer[PasskeyEntry] := entries;
+        while bufferLength(&all) > 0 do
+            let { credential: String, createdAt: Int64 } := removeLast(&!all);
+            destroyString(credential);
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    generic [R: Region, N: Region]
+    function listPasskeys(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[DbError, Buffer[PasskeyEntry]] is
+        var cursor: Cursor := start(&~db, listKeys, withText(noValues(), name));
+        var all: Buffer[PasskeyEntry] := allocateEmpty();
+        while advance(&!cursor) do
+            let entry: PasskeyEntry := PasskeyEntry(credential => fromSpan(columnText(&cursor, 0)),
+                createdAt => columnInt64(&cursor, 1));
+            insertBack(&!all, entry);
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyPasskeyEntries(all);
+                return Left(left => error);
+            when None do
+                return Right(right => all);
+        end case;
+    end;
+
+    generic [R: Region, D: Region]
+    function passkeyOwner(db: &![Database[Writing], R], credential: Span[Nat8, D]): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, ownerOfKey, withText(noValues(), credential));
+        var found: Option[String] := None();
+        if advance(&!cursor) then
+            let owner: String := fromSpan(columnText(&cursor, 0));
+            dropText(found);
+            found := Some(value => owner);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropText(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    generic [R: Region, N: Region, D: Region]
+    function removePasskey(db: &![Database[Writing], R], name: Span[Nat8, N],
+        credential: Span[Nat8, D]): Either[DbError, Bool] is
+        case execute(&~db, dropOneKey, withText(withText(noValues(), name), credential)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as removed: Nat64) do
+                let there: Bool := removed > 0;
+                return Right(right => there);
+        end case;
+    end;
+
+    generic [O: Region]
+    function relyingPartyId(origin: Span[Nat8, O]): String is
+        var first: Index := 0;
+        var i: Index := 0;
+        while (i + 2) < spanLength(origin) do
+            if ((origin[i] = ':') and (origin[i + 1] = '/')) and (origin[i + 2] = '/') then
+                first := i + 3;
+            end if;
+            i := i + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        var j: Index := first;
+        if (j < spanLength(origin)) and (origin[j] = '[') then
+            -- [::1]:8443: the address between the brackets.
+            j := j + 1;
+            while (j < spanLength(origin)) and (origin[j] /= ']') do
+                writeByte(&!out, origin[j]);
+                j := j + 1;
+            end while;
+        else
+            while (j < spanLength(origin)) and (origin[j] /= ':') do
+                writeByte(&!out, origin[j]);
+                j := j + 1;
+            end while;
+        end if;
+        return finalize(out);
+    end;
+end module body.

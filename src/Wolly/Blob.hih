@@ -1,0 +1,106 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Files an application keeps, such as uploads, as blobs in its SQLite
+database: the same content is kept
+once however often it is saved, and each save keeps its own name and media
+type beside it.
+
+A blob is named by an xid: 32 hexadecimal digits of 16 random bytes,
+not the hash of its content, so that whoever knows a content cannot ask
+whether it is stored.  The SHA-256 of the content finds a copy kept
+already.  The content lives in the table, not in files: one database to
+back up, no path made from a name.  A blob holds at most mostBlobBytes.
+
+Built on Standard.Database with SQLite as the backend.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Blob is
+    """
+    The most bytes of a blob: 16 MiB.
+    """
+    function mostBlobBytes(): Index
+        ensures result = 16777216;
+
+    """
+    Whether text is an xid: 32 hexadecimal digits in lower case.
+    No contract: a test of outside input; false is its answer for a bad
+    one.
+    """
+    generic [T: Region]
+    function isXid(text: Span[Nat8, T]): Bool;
+
+    """
+    Whether text is a media type: a type and a subtype of letters, digits
+    and the marks RFC 6838 allows (! # $ & - ^ _ . +), separated by one
+    slash, at most 127 bytes; no parameters.
+    No contract: a test of outside input; false is its answer for a bad
+    one.
+    """
+    generic [T: Region]
+    function isMediaType(text: Span[Nat8, T]): Bool;
+
+    """
+    Whether text may be the name of a blob: 1 to 255 bytes, none below 32
+    and not 127, no slash and no backslash.  It is shown, never a path.
+    No contract: a test of outside input; false is its answer for a bad
+    one.
+    """
+    generic [T: Region]
+    function isBlobName(text: Span[Nat8, T]): Bool;
+
+    """
+    Makes the tables of blobs, if they are not there.  None when they exist
+    afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareBlobs(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Keeps content under name with the media type media and gives its xid:
+    the xid of the same content kept before, or a new one.  Right None when
+    content is empty or longer than mostBlobBytes, name is no blob name or
+    media no media type, and when no random bytes came; then nothing is
+    kept.  Both rows are written in one transaction.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, C: Region, N: Region, M: Region]
+    function saveBlob(db: &![Database[Writing], R], content: Span[Nat8, C], name: Span[Nat8, N],
+                      media: Span[Nat8, M]): Either[DbError, Option[String]];
+
+    """
+    The content of the blob xid; Right None when there is none.
+    No contract: the answer is the work of the database.
+    """
+    generic [Q: Free, R: Region, X: Region]
+    function loadBlob(db: &![Database[Q], R], xid: Span[Nat8, X]): Either[DbError, Option[String]];
+
+    """
+    The names it was saved under, with their media types, "name<TAB>media"
+    one a line in the order of the saves; empty when there is no such blob.
+    No contract: the answer is the work of the database.
+    """
+    generic [Q: Free, R: Region, X: Region]
+    function blobNames(db: &![Database[Q], R], xid: Span[Nat8, X]): Either[DbError, String];
+
+    """
+    Removes the blob xid with all its names.  Right true when there was
+    one.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, X: Region]
+    function deleteBlob(db: &![Database[Writing], R], xid: Span[Nat8, X]): Either[DbError, Bool];
+end module.

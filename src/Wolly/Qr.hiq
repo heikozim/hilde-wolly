@@ -1,0 +1,67 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Qr (
+    QrCode,
+    QrMedium,
+    encodeQr,
+    qrToImage,
+    destroyQr
+);
+import Standard.Png (
+    Image,
+    encodePng,
+    destroyImage
+);
+import Standard.Base64 (
+    encode
+);
+
+module body Wolly.Qr is
+    -- The light modules around the code, as the standard asks.
+    constant quietModules: Index := 4;
+
+    function moduleScale(): Index is
+        return 4;
+    end;
+
+    generic [R: Region]
+    function qrDataUri(text: Span[Nat8, R]): Option[String] is
+        case encodeQr(text, QrMedium()) of
+            when Some(value as made: QrCode) do
+                let drawn: Option[Image] := qrToImage(&made, moduleScale(), quietModules);
+                destroyQr(made);
+                case drawn of
+                    when Some(value as image: Image) do
+                        let png: String := encodePng(&image);
+                        destroyImage(image);
+                        let base64: String := encode(asSpan(&png));
+                        destroyString(png);
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, "data:image/png;base64,");
+                        writeString(&!out, asSpan(&base64));
+                        destroyString(base64);
+                        let uri: String := finalize(out);
+                        return Some(value => uri);
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+end module body.

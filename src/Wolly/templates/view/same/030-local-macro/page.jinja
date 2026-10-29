@@ -1,0 +1,4 @@
+{% macro who(x, sep=" for ") %}<b>{{ x }}</b>{{ sep }}{{ owner }}{% endmacro -%}
+<p>{{ who(title) }}</p>
+{% for item in items %}<p>{{ who(item.name, " by ") }}</p>
+{% endfor %}

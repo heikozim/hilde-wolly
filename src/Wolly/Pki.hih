@@ -1,0 +1,88 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A private certificate authority for mutual TLS between the machines of
+one operator: a key, the certificate of the
+authority, the certificate of a machine issued by it, and the check of
+a certificate against the authority.  Everything is PEM text in and out,
+so a key or certificate is kept by the caller (Wolly.Secret for a key) and
+nothing of it stays here.
+
+Keys are NIST P-256.  The certificate of an authority is valid for at
+most 3650 days, that of a machine for at most 825 days, the longest the
+browsers of Apple and Chrome accept; a longer time is refused here, not
+cut.  Names and the common name are checked by Standard.X509.
+
+Not here: revocation lists (the X.509 module makes none) and client
+certificates in Standard.Tls.  A machine that must lose its right is
+issued a short certificate and not renewed.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Pki is
+    """
+    The most days an authority is valid.
+    """
+    function authorityDays(): Nat32
+        ensures result = 3650;
+
+    """
+    The most days a machine certificate is valid.
+    """
+    function machineDays(): Nat32
+        ensures result = 825;
+
+    """
+    A new key as PEM.  None when libcrypto refused.
+    No contract: the key is the work of libcrypto.
+    """
+    function newKey(): Option[String];
+
+    """
+    The certificate of an authority for the key keyPem, as PEM, with
+    commonName, valid from now for days, 1 to authorityDays.  None for
+    other days, a key that does not parse or a common name X509 refuses.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [K: Region, C: Region]
+    function authorityCertificate(keyPem: Span[Nat8, K], commonName: Span[Nat8, C], days: Nat32): Option[String];
+
+    """
+    The certificate, as PEM, of the machine whose key is machineKeyPem,
+    issued by the authority caPem with caKeyPem: commonName, the DNS names
+    separated by commas (may be empty), valid for days, 1 to machineDays.
+    None for other days, a certificate that is no authority, a key that is
+    not the authority's, and every refusal of X509.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [A: Region, K: Region, M: Region, C: Region, N: Region]
+    function issueMachine(caPem: Span[Nat8, A], caKeyPem: Span[Nat8, K], machineKeyPem: Span[Nat8, M],
+                          commonName: Span[Nat8, C], names: Span[Nat8, N], days: Nat32): Option[String];
+
+    """
+    True when certPem verifies against the authority caPem at the time at,
+    seconds since 1970, and for the DNS name host unless host is empty.
+    A certificate that is not issued by caPem, is expired, or is not yet
+    valid gives false.
+    No contract: the answer is the work of libcrypto.
+    """
+    generic [C: Region, A: Region, H: Region]
+    function verifies(certPem: Span[Nat8, C], caPem: Span[Nat8, A], host: Span[Nat8, H], at: Int64): Bool;
+
+    """
+    The SHA-256 of the certificate as hex, for pinning a peer.  None when
+    certPem does not parse.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [C: Region]
+    function fingerprint(certPem: Span[Nat8, C]): Option[String];
+end module.

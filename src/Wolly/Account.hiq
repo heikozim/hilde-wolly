@@ -1,0 +1,1018 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database: every statement is a constant and
+-- every value is bound.  The table is not strict and its columns are those
+-- of an existing implementation in Go, so that one database serves both.  No cryptography of
+-- its own: the peppered hash is Standard.Password's, the random bytes and
+-- the codes are Standard.Libcrypto's and Standard.Otp's, the seal
+-- Wolly.Fernet's.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    trim,
+    startsWith,
+    indexOfByte,
+    toLower,
+    equal,
+    constantTimeEqual,
+    urlEncode
+);
+import Standard.Base64 (
+    encodeUnpadded,
+    decodeUnpadded
+);
+import Standard.Base32 (
+    encodeBase32,
+    decodeBase32
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.Otp (
+    OtpHash,
+    OtpSha1,
+    totp
+);
+import Standard.Password (
+    PasswordCheck,
+    Matches,
+    MatchesStoreAgain,
+    DoesNotMatch,
+    Unreadable,
+    Failed,
+    hashPepperedPassword,
+    checkPepperedPassword
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Values,
+    noValues,
+    withInt64,
+    withText,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    isUniqueViolation
+);
+import Wolly.Fernet (
+    sealFernet,
+    openFernet
+);
+
+module body Wolly.Account is
+    constant makeAccounts: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL DEFAULT '', must_change_password INTEGER NOT NULL DEFAULT 1, totp_secret TEXT NOT NULL DEFAULT '', totp_last_code TEXT NOT NULL DEFAULT '', totp_last_at INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0, locked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)";
+    -- The two flags as a case expression: PostgreSQL gives <> as a boolean, which columnInt64 refuses.
+    constant selectById: Span[Nat8, Static] := "SELECT id, email, name, locked, locked_at, must_change_password, CASE WHEN password_hash <> '' THEN 1 ELSE 0 END, CASE WHEN totp_secret <> '' THEN 1 ELSE 0 END, created_at, updated_at FROM accounts WHERE id = ?";
+    constant selectByEmail: Span[Nat8, Static] := "SELECT id, email, name, locked, locked_at, must_change_password, CASE WHEN password_hash <> '' THEN 1 ELSE 0 END, CASE WHEN totp_secret <> '' THEN 1 ELSE 0 END, created_at, updated_at FROM accounts WHERE email = ?";
+    constant selectAll: Span[Nat8, Static] := "SELECT id, email, name, locked, locked_at, must_change_password, CASE WHEN password_hash <> '' THEN 1 ELSE 0 END, CASE WHEN totp_secret <> '' THEN 1 ELSE 0 END, created_at, updated_at FROM accounts ORDER BY email";
+    constant insertAccount: Span[Nat8, Static] := "INSERT INTO accounts (id, email, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)";
+    constant updateLocked: Span[Nat8, Static] := "UPDATE accounts SET locked = ?, locked_at = ?, updated_at = ? WHERE id = ?";
+    constant updateEmail: Span[Nat8, Static] := "UPDATE accounts SET email = ?, updated_at = ? WHERE id = ?";
+    constant updateName: Span[Nat8, Static] := "UPDATE accounts SET name = ?, updated_at = ? WHERE id = ?";
+    constant deleteRow: Span[Nat8, Static] := "DELETE FROM accounts WHERE id = ?";
+    constant updatePassword: Span[Nat8, Static] := "UPDATE accounts SET password_hash = ?, must_change_password = ?, updated_at = ? WHERE id = ?";
+    constant selectCredentials: Span[Nat8, Static] := "SELECT password_hash, totp_secret FROM accounts WHERE id = ?";
+    constant updateTotp: Span[Nat8, Static] := "UPDATE accounts SET totp_secret = ?, totp_last_code = ?, totp_last_at = ?, updated_at = ? WHERE id = ?";
+    constant takeCode: Span[Nat8, Static] := "UPDATE accounts SET totp_last_code = ?, totp_last_at = ? WHERE id = ? AND NOT (totp_last_code = ? AND totp_last_at > ?)";
+    constant clearTotp: Span[Nat8, Static] := "UPDATE accounts SET totp_secret = '', totp_last_code = '', totp_last_at = 0, updated_at = ? WHERE id = ?";
+
+    constant hashPrefix: Span[Nat8, Static] := "$argon2id-hmac$v=19$m=65536,t=3,p=4$";
+    -- A stored form of the right shape that no password was made from: an
+    -- unknown address costs the same work as a known one.
+    constant dummyHash: Span[Nat8, Static] := "$argon2id-hmac$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    constant saltBytes: Index := 16;
+    constant macBytes: Index := 32;
+    constant mostEmailBytes: Index := 254;
+    constant mostNameBytes: Index := 200;
+    constant minimumPepper: Index := 32;
+    constant replaySeconds: Int64 := 90;
+    constant stepSeconds: Int64 := 30;
+    constant alphabet: Span[Nat8, Static] := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    function destroyAccount(account: Account): Unit is
+        let { id: String, email: String, name: String, locked: Bool, lockedAt: Int64, mustChangePassword: Bool,
+            hasPassword: Bool, hasTotp: Bool, createdAt: Int64, updatedAt: Int64 } := account;
+        destroyString(id);
+        destroyString(email);
+        destroyString(name);
+        return nil;
+    end;
+
+    function destroyAccounts(accounts: Buffer[Account]): Unit is
+        var all: Buffer[Account] := accounts;
+        while bufferLength(&all) > 0 do
+            destroyAccount(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    function idLength(): Index is
+        return 26;
+    end;
+
+    generic [T: Region]
+    function isAccountId(text: Span[Nat8, T]): Bool is
+        if spanLength(text) /= idLength() then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            let letter: Bool := (c >= 'a') and (c <= 'z');
+            let digit: Bool := (c >= '2') and (c <= '7');
+            if not (letter or digit) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        -- 26 characters carry 130 bits; the last two must be zero, as they
+        -- are for 16 bytes.  The last character then is one of a, e, i, m,
+        -- q, u, y and 4.
+        let last: Nat8 := text[25];
+        return (last = 'a') or (last = 'e') or (last = 'i') or (last = 'm') or (last = 'q') or (last = 'u') or
+            (last = 'y') or (last = '4');
+    end;
+
+    function newAccountId(): Option[String] is
+        case randomBytes(16) of
+            when Some(value as raw: String) do
+                let padded: String := encodeBase32(asSpan(&raw));
+                destroyString(raw);
+                let lower: String := toLower(substring(asSpan(&padded), 0, 26));
+                destroyString(padded);
+                return Some(value => lower);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- Whether c may stand in an atom of RFC 5322, a byte of UTF-8 included.
+    function atomByte(c: Nat8): Bool is
+        if ((c >= 'a') and (c <= 'z')) or ((c >= '0') and (c <= '9')) then
+            return true;
+        end if;
+        if c >= 128 then
+            return true;
+        end if;
+        case c of
+            when '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '/' | '=' | '?' | '^' | '_' | '`' | '{' | '|' | '}' | '~' do
+                return true;
+            when _ do
+                return false;
+        end case;
+    end;
+
+    -- Whether part is atoms joined by single dots, at least one byte.
+    generic [P: Region]
+    function dotAtom(part: Span[Nat8, P]): Bool is
+        if spanLength(part) = 0 then
+            return false;
+        end if;
+        if (part[0] = '.') or (part[spanLength(part) - 1] = '.') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(part) do
+            let c: Nat8 := part[i];
+            if c = '.' then
+                if part[i - 1] = '.' then
+                    return false;
+                end if;
+            else if not atomByte(c) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Region]
+    function normalizeEmail(text: Span[Nat8, T]): Option[String] is
+        let lower: String := toLower(trim(text));
+        if (length(&lower) = 0) or (length(&lower) > mostEmailBytes) then
+            destroyString(lower);
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let fits: Bool := plainAddress(asSpan(&lower));
+        if fits then
+            return Some(value => lower);
+        end if;
+        destroyString(lower);
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    generic [A: Region]
+    function plainAddress(address: Span[Nat8, A]): Bool is
+        case indexOfByte(address, '@') of
+            when Some(value as at: Index) do
+                let local: Span[Nat8, A] := substring(address, 0, at);
+                let domain: Span[Nat8, A] := substring(address, at + 1, spanLength(address));
+                case indexOfByte(domain, '@') of
+                    when Some(value as second: Index) do
+                        return false;
+                    when None do
+                        skip;
+                end case;
+                case indexOfByte(domain, '.') of
+                    when Some(value as dot: Index) do
+                        skip;
+                    when None do
+                        return false;
+                end case;
+                return dotAtom(local) and dotAtom(domain);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [T: Region]
+    function cleanName(text: Span[Nat8, T]): Option[String] is
+        let trimmed: Span[Nat8, T] := trim(text);
+        if spanLength(trimmed) > mostNameBytes then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(trimmed) do
+            let c: Nat8 := trimmed[i];
+            if (c < 32) or (c = 127) then
+                let none: Option[String] := None();
+                return none;
+            end if;
+            -- C1 controls, U+0080 to U+009F, are C2 80 to C2 9F in UTF-8.
+            if ((c = 194) and ((i + 1) < spanLength(trimmed))) and ((trimmed[i + 1] >= 128) and (trimmed[i + 1] <= 159)) then
+                let none: Option[String] := None();
+                return none;
+            end if;
+            i := i + 1;
+        end while;
+        return Some(value => fromSpan(trimmed));
+    end;
+
+    generic [R: Region]
+    function prepareAccounts(db: &![Database[Writing], R]): Option[DbError] is
+        case execute(&~db, makeAccounts, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as done: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+        end case;
+    end;
+
+    -- The account of the row the cursor stands on.
+    generic [C: Region]
+    function accountAt(cursor: &[Cursor, C]): Account is
+        return Account(id => fromSpan(columnText(cursor, 0)), email => fromSpan(columnText(cursor, 1)),
+            name => fromSpan(columnText(cursor, 2)), locked => columnInt64(cursor, 3) /= 0,
+            lockedAt => columnInt64(cursor, 4), mustChangePassword => columnInt64(cursor, 5) /= 0,
+            hasPassword => columnInt64(cursor, 6) /= 0, hasTotp => columnInt64(cursor, 7) /= 0,
+            createdAt => columnInt64(cursor, 8), updatedAt => columnInt64(cursor, 9));
+    end;
+
+    -- The one account sql with value finds.
+    generic [M: Free, R: Region, V: Region]
+    function oneAccount(db: &![Database[M], R], sql: Span[Nat8, Static], value: Span[Nat8, V]): Either[DbError, Option[Account]] is
+        var cursor: Cursor := start(&~db, sql, withText(noValues(), value));
+        var found: Option[Account] := None();
+        if advance(&!cursor) then
+            let made: Account := accountAt(&cursor);
+            ignoreNone(found);
+            found := Some(value => made);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                case found of
+                    when Some(value as account: Account) do
+                        destroyAccount(account);
+                    when None do
+                        skip;
+                end case;
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    -- Consumes an Option that is None at this point.
+    function ignoreNone(value: Option[Account]): Unit is
+        case value of
+            when Some(value as account: Account) do
+                destroyAccount(account);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, E: Region, N: Region]
+    function createAccount(db: &![Database[Writing], R], email: Span[Nat8, E], name: Span[Nat8, N],
+        now: Int64): Either[DbError, Either[AccountProblem, Account]] is
+        case normalizeEmail(email) of
+            when Some(value as address: String) do
+                case cleanName(name) of
+                    when Some(value as display: String) do
+                        case newAccountId() of
+                            when Some(value as id: String) do
+                                let values: Values := withInt64(withInt64(withText(withText(withText(noValues(), asSpan(&id)),
+                                    asSpan(&address)), asSpan(&display)), now), now);
+                                let stored: Either[DbError, Nat64] := execute(&~db, insertAccount, values);
+                                destroyString(address);
+                                destroyString(display);
+                                case stored of
+                                    when Left(left as error: DbError) do
+                                        destroyString(id);
+                                        if isUniqueViolation(error) then
+                                            return Right(right => Left(left => EmailTaken()));
+                                        end if;
+                                        return Left(left => error);
+                                    when Right(right as rows: Nat64) do
+                                        let found: Either[DbError, Option[Account]] := oneAccount(&~db, selectById, asSpan(&id));
+                                        destroyString(id);
+                                        case found of
+                                            when Left(left as error: DbError) do
+                                                return Left(left => error);
+                                            when Right(right as account: Option[Account]) do
+                                                case account of
+                                                    when Some(value as made: Account) do
+                                                        return Right(right => Right(right => made));
+                                                    when None do
+                                                        return Right(right => Left(left => EmailTaken()));
+                                                end case;
+                                        end case;
+                                end case;
+                            when None do
+                                destroyString(address);
+                                destroyString(display);
+                                return Right(right => Left(left => BadName()));
+                        end case;
+                    when None do
+                        destroyString(address);
+                        return Right(right => Left(left => BadName()));
+                end case;
+            when None do
+                return Right(right => Left(left => BadEmail()));
+        end case;
+    end;
+
+    generic [M: Free, R: Region, I: Region]
+    function accountById(db: &![Database[M], R], id: Span[Nat8, I]): Either[DbError, Option[Account]] is
+        if not isAccountId(id) then
+            let none: Option[Account] := None();
+            return Right(right => none);
+        end if;
+        return oneAccount(&~db, selectById, id);
+    end;
+
+    generic [M: Free, R: Region, E: Region]
+    function accountByEmail(db: &![Database[M], R], email: Span[Nat8, E]): Either[DbError, Option[Account]] is
+        case normalizeEmail(email) of
+            when Some(value as address: String) do
+                let found: Either[DbError, Option[Account]] := oneAccount(&~db, selectByEmail, asSpan(&address));
+                destroyString(address);
+                return found;
+            when None do
+                let none: Option[Account] := None();
+                return Right(right => none);
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function listAccounts(db: &![Database[M], R]): Either[DbError, Buffer[Account]] is
+        var cursor: Cursor := start(&~db, selectAll, noValues());
+        var all: Buffer[Account] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!all, accountAt(&cursor));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyAccounts(all);
+                return Left(left => error);
+            when None do
+                return Right(right => all);
+        end case;
+    end;
+
+    -- Whether one row was changed.
+    function oneRow(result: Either[DbError, Nat64]): Either[DbError, Bool] is
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Nat64) do
+                return Right(right => rows = 1);
+        end case;
+    end;
+
+    function flag(value: Bool): Int64 is
+        return if value then (1 : Int64) else (0 : Int64);
+    end;
+
+    generic [R: Region, I: Region]
+    function setLocked(db: &![Database[Writing], R], id: Span[Nat8, I], locked: Bool, now: Int64): Either[DbError, Bool] is
+        let at: Int64 := if locked then now else (0 : Int64);
+        return oneRow(execute(&~db, updateLocked, withText(withInt64(withInt64(withInt64(noValues(), flag(locked)), at), now), id)));
+    end;
+
+    generic [R: Region, I: Region, E: Region]
+    function setEmail(db: &![Database[Writing], R], id: Span[Nat8, I], email: Span[Nat8, E],
+        now: Int64): Either[DbError, Either[AccountProblem, Bool]] is
+        case normalizeEmail(email) of
+            when Some(value as address: String) do
+                let changed: Either[DbError, Nat64] := execute(&~db, updateEmail, withText(withInt64(withText(noValues(),
+                    asSpan(&address)), now), id));
+                destroyString(address);
+                case changed of
+                    when Left(left as error: DbError) do
+                        if isUniqueViolation(error) then
+                            return Right(right => Left(left => EmailTaken()));
+                        end if;
+                        return Left(left => error);
+                    when Right(right as rows: Nat64) do
+                        return Right(right => Right(right => rows = 1));
+                end case;
+            when None do
+                return Right(right => Left(left => BadEmail()));
+        end case;
+    end;
+
+    generic [R: Region, I: Region, N: Region]
+    function setName(db: &![Database[Writing], R], id: Span[Nat8, I], name: Span[Nat8, N],
+        now: Int64): Either[DbError, Either[AccountProblem, Bool]] is
+        case cleanName(name) of
+            when Some(value as display: String) do
+                let changed: Either[DbError, Bool] := oneRow(execute(&~db, updateName, withText(withInt64(withText(noValues(),
+                    asSpan(&display)), now), id)));
+                destroyString(display);
+                case changed of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as done: Bool) do
+                        return Right(right => Right(right => done));
+                end case;
+            when None do
+                return Right(right => Left(left => BadName()));
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function deleteAccountRow(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Bool] is
+        return oneRow(execute(&~db, deleteRow, withText(noValues(), id)));
+    end;
+
+    function fewestPasswordCharacters(): Index is
+        return 12;
+    end;
+
+    function mostPasswordBytes(): Index is
+        return 128;
+    end;
+
+    -- The characters of text as UTF-8 counts them: bytes that do not
+    -- continue a character.
+    generic [T: Region]
+    function characters(text: Span[Nat8, T]): Index is
+        var n: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            if (c < 128) or (c >= 192) then
+                n := n + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return n;
+    end;
+
+    -- Whether two texts are equal when ASCII letters are folded.
+    generic [A: Region, B: Region]
+    function sameFolded(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        let x: String := toLower(a);
+        let y: String := toLower(b);
+        let same: Bool := equal(asSpan(&x), asSpan(&y));
+        destroyString(x);
+        destroyString(y);
+        return same;
+    end;
+
+    generic [P: Region, E: Region]
+    function passwordProblem(password: Span[Nat8, P], email: Span[Nat8, E]): Option[PasswordProblem] is
+        if characters(password) < fewestPasswordCharacters() then
+            return Some(value => TooShort());
+        end if;
+        if spanLength(password) > mostPasswordBytes() then
+            return Some(value => TooLong());
+        end if;
+        if spanLength(trim(password)) = 0 then
+            return Some(value => OnlyBlanks());
+        end if;
+        if sameFolded(trim(password), email) then
+            return Some(value => IsTheEmail());
+        end if;
+        let none: Option[PasswordProblem] := None();
+        return none;
+    end;
+
+    generic [P: Region, Q: Region]
+    function hashPassword(password: Span[Nat8, P], pepper: Span[Nat8, Q]): Option[String] is
+        return hashPepperedPassword(password, pepper);
+    end;
+
+    generic [P: Region, E: Region, Q: Region]
+    function checkPassword(password: Span[Nat8, P], encoded: Span[Nat8, E], pepper: Span[Nat8, Q]): Bool is
+        case checkPepperedPassword(password, encoded, pepper) of
+            when Matches do
+                return true;
+            when MatchesStoreAgain do
+                return false;
+            when DoesNotMatch do
+                return false;
+            when Unreadable do
+                return false;
+            when Failed do
+                return false;
+        end case;
+    end;
+
+    function oneTimePassword(): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        var made: Index := 0;
+        let letters: Span[Nat8, Static] := alphabet;
+        while made < 20 do
+            case randomBytes(32) of
+                when Some(value as raw: String) do
+                    borrow r: &[String, B] := &raw do
+                        let bytes: Span[Nat8, B] := asSpan(r);
+                        var i: Index := 0;
+                        while (i < spanLength(bytes)) and (made < 20) do
+                            let b: Nat8 := bytes[i];
+                            -- 248 is 4 times 62: bytes below it fall evenly on
+                            -- the alphabet.
+                            if b < 248 then
+                                case toIndex(rem(b, 62)) of
+                                    when Some(value as k: Index) do
+                                        writeByte(&!out, letters[k]);
+                                        made := made + 1;
+                                    when None do
+                                        skip;
+                                end case;
+                            end if;
+                            i := i + 1;
+                        end while;
+                    end borrow;
+                    destroyString(raw);
+                when None do
+                    let text: String := finalize(out);
+                    destroyString(text);
+                    let none: Option[String] := None();
+                    return none;
+            end case;
+        end while;
+        return Some(value => finalize(out));
+    end;
+
+    generic [R: Region, I: Region, E: Region]
+    function storePassword(db: &![Database[Writing], R], id: Span[Nat8, I], encoded: Span[Nat8, E],
+        mustChange: Bool, now: Int64): Either[DbError, Bool] is
+        return oneRow(execute(&~db, updatePassword, withText(withInt64(withInt64(withText(noValues(), encoded),
+            flag(mustChange)), now), id)));
+    end;
+
+    function newTotpSecret(): Option[String] is
+        case randomBytes(20) of
+            when Some(value as raw: String) do
+                let text: String := encodeBase32(asSpan(&raw));
+                destroyString(raw);
+                return Some(value => text);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The bytes of text percent-encoded as Go's url.PathEscape does for a
+    -- segment: what is unreserved and the sub-delimiters, colon and at sign
+    -- stay, every other byte becomes percent and two uppercase hex digits.
+    generic [T: Region]
+    function pathEscaped(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let hex: Span[Nat8, Static] := "0123456789ABCDEF";
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            let plain: Bool := (((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'))) or ((c >= '0') and (c <= '9'));
+            var keep: Bool := plain;
+            case c of
+                when '-' | '.' | '_' | '~' | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | '=' | ':' | '@' do
+                    keep := true;
+                when _ do
+                    skip;
+            end case;
+            if keep then
+                writeByte(&!out, c);
+            else
+                writeByte(&!out, '%');
+                case toIndex(c / 16) of
+                    when Some(value as high: Index) do
+                        writeByte(&!out, hex[high]);
+                    when None do
+                        skip;
+                end case;
+                case toIndex(rem(c, 16)) of
+                    when Some(value as low: Index) do
+                        writeByte(&!out, hex[low]);
+                    when None do
+                        skip;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The value as Go's url.Values.Encode writes it: letters, digits and
+    -- - . _ ~ stay, a blank becomes a plus, every other byte a percent
+    -- escape with uppercase hex digits.
+    generic [T: Region]
+    function queryEscaped(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let hex: Span[Nat8, Static] := "0123456789ABCDEF";
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            let plain: Bool := (((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'))) or ((c >= '0') and (c <= '9'));
+            if plain or ((c = '-') or (c = '.') or (c = '_') or (c = '~')) then
+                writeByte(&!out, c);
+            else if c = ' ' then
+                writeByte(&!out, '+');
+            else
+                writeByte(&!out, '%');
+                case toIndex(c / 16) of
+                    when Some(value as high: Index) do
+                        writeByte(&!out, hex[high]);
+                    when None do
+                        skip;
+                end case;
+                case toIndex(rem(c, 16)) of
+                    when Some(value as low: Index) do
+                        writeByte(&!out, hex[low]);
+                    when None do
+                        skip;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [I: Region, E: Region, S: Region]
+    function totpUri(issuer: Span[Nat8, I], email: Span[Nat8, E], secret: Span[Nat8, S]): String is
+        var label: StringBuilder := makeStringBuilder();
+        writeString(&!label, issuer);
+        writeByte(&!label, ':');
+        writeString(&!label, email);
+        let plain: String := finalize(label);
+        let escaped: String := pathEscaped(asSpan(&plain));
+        destroyString(plain);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "otpauth://totp/");
+        writeString(&!out, asSpan(&escaped));
+        destroyString(escaped);
+        writeString(&!out, "?algorithm=SHA1&digits=6&issuer=");
+        let i: String := queryEscaped(issuer);
+        writeString(&!out, asSpan(&i));
+        destroyString(i);
+        writeString(&!out, "&period=30&secret=");
+        let s: String := queryEscaped(secret);
+        writeString(&!out, asSpan(&s));
+        destroyString(s);
+        return finalize(out);
+    end;
+
+    -- Whether code is six decimal digits.
+    generic [C: Region]
+    function sixDigits(code: Span[Nat8, C]): Bool is
+        if spanLength(code) /= 6 then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < 6 do
+            if (code[i] < '0') or (code[i] > '9') then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether code is the code of key at seconds.
+    generic [K: Region, C: Region]
+    function codeAt(key: Span[Nat8, K], code: Span[Nat8, C], seconds: Int64): Bool is
+        if seconds < 0 then
+            return false;
+        end if;
+        case totp(key, seconds, 30, 6, OtpSha1()) of
+            when Some(value as expected: String) do
+                let fits: Bool := constantTimeEqual(asSpan(&expected), code);
+                destroyString(expected);
+                return fits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [S: Region, C: Region]
+    function codeFits(secret: Span[Nat8, S], code: Span[Nat8, C], now: Int64): Bool is
+        if not sixDigits(code) then
+            return false;
+        end if;
+        case decodeBase32(secret) of
+            when Some(value as key: String) do
+                var fits: Bool := false;
+                if length(&key) >= 10 then
+                    let current: Bool := codeAt(asSpan(&key), code, now);
+                    let before: Bool := codeAt(asSpan(&key), code, now - stepSeconds);
+                    fits := current or before;
+                end if;
+                destroyString(key);
+                return fits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, I: Region, S: Region, C: Region, K: Region]
+    function confirmTotp(db: &![Database[Writing], R], id: Span[Nat8, I], secret: Span[Nat8, S], code: Span[Nat8, C],
+        totpKey: Span[Nat8, K], now: Int64): Either[DbError, Bool] is
+        case decodeBase32(secret) of
+            when Some(value as raw: String) do
+                let longEnough: Bool := length(&raw) >= 16;
+                destroyString(raw);
+                if not longEnough then
+                    return Right(right => false);
+                end if;
+            when None do
+                return Right(right => false);
+        end case;
+        if not codeFits(secret, code, now) then
+            return Right(right => false);
+        end if;
+        case sealFernet(totpKey, secret, now) of
+            when Some(value as token: String) do
+                let stored: String := encodeUnpadded(asSpan(&token));
+                destroyString(token);
+                let changed: Either[DbError, Bool] := oneRow(execute(&~db, updateTotp, withText(withInt64(withInt64(withText(withText(noValues(),
+                    asSpan(&stored)), code), now), now), id)));
+                destroyString(stored);
+                return changed;
+            when None do
+                return Right(right => false);
+        end case;
+    end;
+
+    -- The stored hash and sealed secret of the account id, empty when there
+    -- is no such account.
+    record Credentials: Linear is
+        hash: String;
+        sealed: String;
+    end;
+
+    function destroyCredentials(credentials: Credentials): Unit is
+        let { hash: String, sealed: String } := credentials;
+        destroyString(hash);
+        destroyString(sealed);
+        return nil;
+    end;
+
+    generic [M: Free, R: Region, I: Region]
+    function credentialsOf(db: &![Database[M], R], id: Span[Nat8, I]): Either[DbError, Credentials] is
+        var cursor: Cursor := start(&~db, selectCredentials, withText(noValues(), id));
+        var hash: String := fromSpan("");
+        var sealed: String := fromSpan("");
+        if advance(&!cursor) then
+            destroyString(hash);
+            destroyString(sealed);
+            hash := fromSpan(columnText(&cursor, 0));
+            sealed := fromSpan(columnText(&cursor, 1));
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyString(hash);
+                destroyString(sealed);
+                return Left(left => error);
+            when None do
+                return Right(right => Credentials(hash => hash, sealed => sealed));
+        end case;
+    end;
+
+    -- Whether code fits the sealed secret and was not taken; takes it.
+    generic [R: Region, I: Region, S: Region, C: Region, K: Region]
+    function codeOfSealed(db: &![Database[Writing], R], id: Span[Nat8, I], sealed: Span[Nat8, S], code: Span[Nat8, C],
+        totpKey: Span[Nat8, K], now: Int64): Either[DbError, Bool]
+        requires now > 0 is
+        if (not sixDigits(code)) or (spanLength(sealed) = 0) then
+            return Right(right => false);
+        end if;
+        case decodeUnpadded(sealed) of
+            when Some(value as token: String) do
+                let opened: Option[String] := openFernet(totpKey, asSpan(&token));
+                destroyString(token);
+                case opened of
+                    when Some(value as secret: String) do
+                        let fits: Bool := codeFits(asSpan(&secret), code, now);
+                        destroyString(secret);
+                        if not fits then
+                            return Right(right => false);
+                        end if;
+                        return oneRow(execute(&~db, takeCode, withInt64(withText(withText(withInt64(withText(noValues(), code),
+                            now), id), code), now - replaySeconds)));
+                    when None do
+                        return Right(right => false);
+                end case;
+            when None do
+                return Right(right => false);
+        end case;
+    end;
+
+    generic [R: Region, I: Region, C: Region, K: Region]
+    function checkTotp(db: &![Database[Writing], R], id: Span[Nat8, I], code: Span[Nat8, C], totpKey: Span[Nat8, K],
+        now: Int64): Either[DbError, Bool] is
+        case credentialsOf(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Credentials) do
+                let { hash: String, sealed: String } := found;
+                destroyString(hash);
+                let checked: Either[DbError, Bool] := codeOfSealed(&~db, id, asSpan(&sealed), code, totpKey, now);
+                destroyString(sealed);
+                return checked;
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function resetTotp(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Either[DbError, Bool] is
+        return oneRow(execute(&~db, clearTotp, withText(withInt64(noValues(), now), id)));
+    end;
+
+    function destroySignIn(outcome: SignIn): Unit is
+        case outcome of
+            when WrongProof do
+                skip;
+            when LockedOut do
+                skip;
+            when Passed(account: String, amr: String, mustChangePassword: Bool, needsTotp: Bool) do
+                destroyString(account);
+                destroyString(amr);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, E: Region, P: Region, C: Region, Q: Region, K: Region]
+    function signIn(db: &![Database[Writing], R], email: Span[Nat8, E], password: Span[Nat8, P], code: Span[Nat8, C],
+        pepper: Span[Nat8, Q], totpKey: Span[Nat8, K], now: Int64): Either[DbError, SignIn] is
+        let found: Either[DbError, Option[Account]] := accountByEmail(&~db, email);
+        case found of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as maybe: Option[Account]) do
+                case maybe of
+                    when None do
+                        let spent: Bool := checkPassword(password, dummyHash, pepper);
+                        return Right(right => WrongProof());
+                    when Some(value as account: Account) do
+                        let { id: String, email as address: String, name: String, locked: Bool, lockedAt: Int64,
+                            mustChangePassword: Bool, hasPassword: Bool, hasTotp: Bool, createdAt: Int64,
+                            updatedAt: Int64 } := account;
+                        destroyString(address);
+                        destroyString(name);
+                        let result: Either[DbError, SignIn] := proven(&~db, id, password, code, pepper, totpKey, now, locked,
+                            mustChangePassword, hasTotp);
+                        return result;
+                end case;
+        end case;
+    end;
+
+    -- The sign-in of the account id once it is found.
+    generic [R: Region, P: Region, C: Region, Q: Region, K: Region]
+    function proven(db: &![Database[Writing], R], id: String, password: Span[Nat8, P], code: Span[Nat8, C],
+        pepper: Span[Nat8, Q], totpKey: Span[Nat8, K], now: Int64, locked: Bool, mustChangePassword: Bool,
+        hasTotp: Bool): Either[DbError, SignIn]
+        requires now > 0 is
+        case credentialsOf(&~db, asSpan(&id)) of
+            when Left(left as error: DbError) do
+                destroyString(id);
+                return Left(left => error);
+            when Right(right as found: Credentials) do
+                let { hash: String, sealed: String } := found;
+                let holds: Bool := (length(&hash) > 0) and checkPassword(password, asSpan(&hash), pepper);
+                destroyString(hash);
+                if not holds then
+                    destroyString(sealed);
+                    destroyString(id);
+                    return Right(right => WrongProof());
+                end if;
+                var amr: String := fromSpan("pwd");
+                if hasTotp then
+                    let checked: Either[DbError, Bool] := codeOfSealed(&~db, asSpan(&id), asSpan(&sealed), code, totpKey, now);
+                    case checked of
+                        when Left(left as error: DbError) do
+                            destroyString(sealed);
+                            destroyString(id);
+                            destroyString(amr);
+                            return Left(left => error);
+                        when Right(right as fits: Bool) do
+                            if not fits then
+                                destroyString(sealed);
+                                destroyString(id);
+                                destroyString(amr);
+                                return Right(right => WrongProof());
+                            end if;
+                    end case;
+                    destroyString(amr);
+                    amr := fromSpan("pwd otp mfa");
+                end if;
+                destroyString(sealed);
+                if locked then
+                    destroyString(id);
+                    destroyString(amr);
+                    return Right(right => LockedOut());
+                end if;
+                return Right(right => Passed(account => id, amr => amr, mustChangePassword => mustChangePassword,
+                    needsTotp => not hasTotp));
+        end case;
+    end;
+
+    generic [R: Region, I: Region, P: Region, C: Region, Q: Region, K: Region]
+    function reauthenticate(db: &![Database[Writing], R], id: Span[Nat8, I], password: Span[Nat8, P], code: Span[Nat8, C],
+        pepper: Span[Nat8, Q], totpKey: Span[Nat8, K], now: Int64): Either[DbError, Bool] is
+        case credentialsOf(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Credentials) do
+                let { hash: String, sealed: String } := found;
+                if length(&sealed) = 0 then
+                    destroyString(hash);
+                    destroyString(sealed);
+                    return Right(right => false);
+                end if;
+                let holds: Bool := (length(&hash) > 0) and checkPassword(password, asSpan(&hash), pepper);
+                destroyString(hash);
+                if not holds then
+                    destroyString(sealed);
+                    return Right(right => false);
+                end if;
+                let checked: Either[DbError, Bool] := codeOfSealed(&~db, id, asSpan(&sealed), code, totpKey, now);
+                destroyString(sealed);
+                return checked;
+        end case;
+    end;
+
+    generic [R: Region, I: Region, P: Region, Q: Region]
+    function passwordOf(db: &![Database[Writing], R], id: Span[Nat8, I], password: Span[Nat8, P],
+        pepper: Span[Nat8, Q]): Either[DbError, Bool] is
+        case credentialsOf(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Credentials) do
+                let { hash: String, sealed: String } := found;
+                destroyString(sealed);
+                let holds: Bool := (length(&hash) > 0) and checkPassword(password, asSpan(&hash), pepper);
+                destroyString(hash);
+                return Right(right => holds);
+        end case;
+    end;
+end module body.

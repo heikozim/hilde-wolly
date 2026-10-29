@@ -1,0 +1,48 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Names by their sound: the
+Kölner Phonetik (Postel, 1969) for German names, so that Meier, Maier,
+Mayer, Mair and Meyer get one code, and American Soundex for English ones.
+
+Both read a word as letters only: ASCII letters in either case, and the
+letters of Latin-1 with a diacritic as their base letter (ä a, ö o, ü u, ß
+s, é e, ç c, ñ n and the like, in either case).  Every other byte, a
+hyphen, a digit, a letter of another script, is left out, so
+Müller-Lüdenscheidt is read as one word.  A full-text search
+waits for FTS5 in the binding of SQLite.
+"""
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.Phonetic is
+    """
+    The word as the two codes read it: lowercase a to z only.
+    """
+    generic [W: Region]
+    function lettersOf(word: Span[Nat8, W]): String
+        ensures length(&result) <= spanLength(word);
+
+    """
+    The Kölner Phonetik of word: digits, the same digit never twice in a
+    row, a 0 only at the start; empty for a word without a coded letter.
+    No contract: an x gives two digits, so the length follows from every
+    letter, more than O(1).
+    """
+    generic [W: Region]
+    function cologne(word: Span[Nat8, W]): String;
+
+    """
+    The American Soundex of word: its first letter in capitals and three
+    digits, 0 filling up; empty for a word without a letter.
+    """
+    generic [W: Region]
+    function soundex(word: Span[Nat8, W]): String
+        ensures (length(&result) = 0) or (length(&result) = 4);
+end module.

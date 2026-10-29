@@ -1,0 +1,86 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The questions a handler asks of a Standard.FcgiServer.Request: its method,
+its path, a parameter of its query string and the value of one of its
+cookies.  Every answer is a copy the caller destroys; the request stays the
+caller's.
+
+The path is REQUEST_URI up to the first question mark, as the client sent
+it: percent-encoded, not decoded, so that %2F stays inside a segment and
+does not become a separator.  Query parameters are decoded.
+
+Every function here returns an Option of a value read from the request, so
+none states an ensures: the rule leaves out results of parsers that return
+an Option, and the answer depends on what the client sent.
+"""
+import Standard.String (
+    String
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Request is
+    """
+    REQUEST_METHOD, None when the web server sent none.
+    No contract: an Option read from the request.
+    """
+    generic [R: Region]
+    function requestMethod(request: &[Request, R]): Option[String];
+
+    """
+    The path of REQUEST_URI, without the query.  None when there is no
+    REQUEST_URI or it does not begin with a slash.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [R: Region]
+    function requestPath(request: &[Request, R]): Option[String];
+
+    """
+    The decoded value of the first parameter name of QUERY_STRING, pairs
+    name=value separated by ampersands; a plus is a space.  None when
+    there is no such parameter.  A parameter without an equals sign has
+    the empty value.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [R: Region, N: Region]
+    function query(request: &[Request, R], name: Span[Nat8, N]): Option[String];
+
+    """
+    The value of the first cookie name of the Cookie header (HTTP_COOKIE),
+    read by Standard.Cookie.cookieValue.  None as there, and when there is
+    no Cookie header.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [R: Region, N: Region]
+    function cookie(request: &[Request, R], name: Span[Nat8, N]): Option[String];
+
+    """
+    The decoded value of the first field name of a form the request
+    carries in its body, read as query reads a query string.  None when
+    there is no such field, and when the body is not a form: its
+    Content-Type (CONTENT_TYPE) must be application/x-www-form-urlencoded,
+    in any case, with or without parameters after it.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [R: Region, N: Region]
+    function formValue(request: &[Request, R], name: Span[Nat8, N]): Option[String];
+
+    """
+    The query parameter name of a query string, as query does.  For a
+    query string that is not in a request.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [Q: Region, N: Region]
+    function queryValue(queryString: Span[Nat8, Q], name: Span[Nat8, N]): Option[String];
+end module.

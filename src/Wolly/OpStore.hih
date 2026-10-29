@@ -1,0 +1,530 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What an OpenID provider keeps between requests, in the tables op_sessions,
+op_requests, op_codes, op_refresh and op_roles of an earlier provider
+written in Go, column for column: browser sessions, login requests waiting for the
+login page, authorization codes, refresh tokens in families, and the roles
+an account holds in a client.
+
+Secrets are stored only as the hex of their SHA-256 (Wolly.OpRandom): the
+session cookie, the flow cookie of a login request, a code, a refresh
+token.  Times are seconds since 1970.  A session is alive while it is not
+ended, was used within idle seconds and authenticated within max seconds.
+Ending a session revokes every refresh token that hangs off it.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.OpStore is
+    """
+    Makes the five tables and their indexes, when they are not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareStore(db: &![Database[Writing], R]): Option[DbError];
+
+    --- Sessions
+
+    """
+    A browser's sign-in at the provider.  amr is the methods of the last
+    full authentication, separated by blanks; ended is 0 while it lasts.
+    """
+    record OpSession: Linear is
+        id: String;
+        subject: String;
+        authTime: Int64;
+        amr: String;
+        created: Int64;
+        lastSeen: Int64;
+        ended: Int64;
+        userAgent: String;
+        firstIp: String;
+        lastIp: String;
+    end;
+
+    """
+    Frees session.
+    No contract: it only frees.
+    """
+    function destroySession(session: OpSession): Unit;
+
+    """
+    Frees sessions.
+    No contract: it only frees.
+    """
+    function destroySessions(sessions: Buffer[OpSession]): Unit;
+
+    """
+    Whether session is alive at now within idle and max seconds.
+    """
+    generic [S: Region]
+    function isAlive(session: &[OpSession, S], now: Int64, idle: Int64, max: Int64): Bool
+        requires now > 0;
+
+    """
+    The session whose cookie value is token, ended or not.  Right None when
+    the token has another length than 40 to 200 bytes or no session has it.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, T: Region]
+    function sessionByToken(db: &![Database[Writing], R], token: Span[Nat8, T]): Either[DbError, Option[OpSession]];
+
+    """
+    The session id, ended or not.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, I: Region]
+    function sessionById(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Option[OpSession]];
+
+    """
+    Records activity of session at now: last_seen moves at most once a
+    minute, a new address ip is written at once, an empty ip leaves the
+    address.  The lastSeen of the record session follows.
+    """
+    generic [R: Region, S: Region, I: Region]
+    function touchSession(db: &![Database[Writing], R], session: &![OpSession, S], ip: Span[Nat8, I], now: Int64): Option[DbError]
+        requires now > 0;
+
+    """
+    What startSession made: the session and the cookie value to set.
+    """
+    record Started: Linear is
+        session: OpSession;
+        token: String;
+    end;
+
+    """
+    Signs subject in at now with the methods amr.  When current, the
+    session of the browser's cookie, is alive and of subject, it is
+    renewed: same ID, new cookie value, new auth_time.  Otherwise current,
+    if any, is ended and a new session begins.  Right None when the random
+    source fails.
+    """
+    generic [R: Region, U: Region, A: Region, I: Region, G: Region]
+    function startSession(db: &![Database[Writing], R], current: Option[String], subject: Span[Nat8, U],
+        amr: Span[Nat8, A], ip: Span[Nat8, I], userAgent: Span[Nat8, G], now: Int64, idle: Int64,
+        max: Int64): Either[DbError, Option[Started]]
+        requires now > 0;
+
+    """
+    Ends the session id at now for reason, and every refresh token of it.
+    """
+    generic [R: Region, I: Region, E: Region]
+    function endSession(db: &![Database[Writing], R], id: Span[Nat8, I], reason: Span[Nat8, E], now: Int64): Option[DbError]
+        requires now > 0;
+
+    """
+    Ends every session and revokes every refresh token of subject at now.
+    The number of rows that changed.
+    """
+    generic [R: Region, U: Region, E: Region]
+    function revokeSubject(db: &![Database[Writing], R], subject: Span[Nat8, U], reason: Span[Nat8, E],
+        now: Int64): Either[DbError, Int64]
+        requires now > 0;
+
+    """
+    The live sessions of subject, or of everybody when subject is empty,
+    the most recently used first.
+    """
+    generic [R: Region, U: Region]
+    function liveSessions(db: &![Database[Writing], R], subject: Span[Nat8, U], now: Int64, idle: Int64,
+        max: Int64): Either[DbError, Buffer[OpSession]]
+        requires now > 0;
+
+    --- Login requests
+
+    """
+    A validated authorization request waiting for the login page.
+    clientId is empty for a login at the provider itself, which goes to
+    returnTo; maxAge is -1 when the request named none.
+    """
+    record AuthRequest: Linear is
+        clientId: String;
+        redirectUri: String;
+        scope: String;
+        state: String;
+        nonce: String;
+        challenge: String;
+        maxAge: Int64;
+        prompt: String;
+        returnTo: String;
+        returnName: String;
+        restarted: Bool;
+    end;
+
+    """
+    Frees request.
+    No contract: it only frees.
+    """
+    function destroyRequest(request: AuthRequest): Unit;
+
+    """
+    A request for a login at the provider itself that returns to returnTo.
+    No contract: its length follows the input.
+    """
+    generic [T: Region]
+    function directRequest(returnTo: Span[Nat8, T]): AuthRequest;
+
+    """
+    The params JSON of request as the table keeps it.
+    """
+    generic [Q: Region]
+    function requestParams(request: &[AuthRequest, Q]): String
+        ensures length(&result) > 0;
+
+    """
+    The request of params JSON.  None for text that is no JSON object.
+    No contract: an Option read from text.
+    """
+    generic [P: Region]
+    function readRequestParams(params: Span[Nat8, P]): Option[AuthRequest];
+
+    """
+    What saveRequest made: the ID of the request and the value of the flow
+    cookie that binds it to the browser.
+    """
+    record Saved: Linear is
+        id: String;
+        flow: String;
+    end;
+
+    """
+    Frees saved.
+    No contract: it only frees.
+    """
+    function destroySaved(saved: Saved): Unit;
+
+    """
+    Keeps request for ttl seconds from now.  Right None when the random
+    source fails.
+    """
+    generic [R: Region, Q: Region]
+    function saveRequest(db: &![Database[Writing], R], request: &[AuthRequest, Q], now: Int64,
+        ttl: Int64): Either[DbError, Option[Saved]]
+        requires (now > 0) and (ttl > 0);
+
+    """
+    Why a request could not be had.
+    """
+    union RequestProblem: Free is
+        """
+        No request of this ID, or it ran out.
+        """
+        case UnknownRequest;
+        """
+        The request belongs to another browser: the flow cookie is missing
+        or does not fit.
+        """
+        case FlowMismatch;
+    end;
+
+    """
+    The live request id when flow, the value of the flow cookie, fits it.
+    """
+    generic [R: Region, I: Region, F: Region]
+    function loadRequest(db: &![Database[Writing], R], id: Span[Nat8, I], flow: Span[Nat8, F],
+        now: Int64): Either[DbError, Either[RequestProblem, AuthRequest]]
+        requires now > 0;
+
+    """
+    A request as it is kept, live or not, and the time it ends.
+    """
+    record KeptRequest: Linear is
+        request: AuthRequest;
+        expires: Int64;
+    end;
+
+    """
+    The request id as it is kept, live or not, and the time it ends: for a
+    login page that outlived its request.  Right None when there is none.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, I: Region]
+    function keptRequest(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Option[KeptRequest]];
+
+    """
+    Ends the request id at now; its record stays until cleanup.
+    """
+    generic [R: Region, I: Region]
+    function dropRequest(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Option[DbError]
+        requires now > 0;
+
+    --- Codes
+
+    """
+    A stored authorization code.
+    """
+    record CodeRow: Linear is
+        clientId: String;
+        subject: String;
+        sessionId: String;
+        redirectUri: String;
+        challenge: String;
+        scope: String;
+        nonce: String;
+        amr: String;
+        family: String;
+        authTime: Int64;
+        expires: Int64;
+        used: Int64;
+    end;
+
+    """
+    Frees code.
+    No contract: it only frees.
+    """
+    function destroyCode(code: CodeRow): Unit;
+
+    """
+    A new code for the request of clientId, of session, valid ttl seconds
+    from now.  Right None when the random source fails.
+    """
+    generic [R: Region, C: Region, S: Region, Q: Region]
+    function issueCode(db: &![Database[Writing], R], clientId: Span[Nat8, C], session: &[OpSession, S],
+        request: &[AuthRequest, Q], now: Int64, ttl: Int64): Either[DbError, Option[String]]
+        requires (now > 0) and (ttl > 0);
+
+    """
+    The code token, used or not.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, T: Region]
+    function loadCode(db: &![Database[Writing], R], token: Span[Nat8, T]): Either[DbError, Option[CodeRow]];
+
+    """
+    Marks the code token used at now and records the family its tokens
+    carry.  Right false when it was used already.
+    """
+    generic [R: Region, T: Region, F: Region]
+    function spendCode(db: &![Database[Writing], R], token: Span[Nat8, T], family: Span[Nat8, F],
+        now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    --- Refresh tokens
+
+    """
+    A stored refresh token.
+    """
+    record RefreshRow: Linear is
+        family: String;
+        clientId: String;
+        subject: String;
+        sessionId: String;
+        device: String;
+        scope: String;
+        amr: String;
+        firstIp: String;
+        authTime: Int64;
+        familyCreated: Int64;
+        created: Int64;
+        expires: Int64;
+        used: Int64;
+        revoked: Int64;
+    end;
+
+    """
+    Frees row.
+    No contract: it only frees.
+    """
+    function destroyRefresh(row: RefreshRow): Unit;
+
+    """
+    The fields of a new refresh token.
+    """
+    record NewRefresh: Linear is
+        family: String;
+        clientId: String;
+        subject: String;
+        sessionId: String;
+        device: String;
+        scope: String;
+        amr: String;
+        firstIp: String;
+        lastIp: String;
+        authTime: Int64;
+        familyCreated: Int64;
+    end;
+
+    """
+    Frees fresh.
+    No contract: it only frees.
+    """
+    function destroyNewRefresh(fresh: NewRefresh): Unit;
+
+    """
+    Stores a new refresh token of fresh at now, valid ttl seconds, and gives
+    it.  Right None when the random source fails.
+    """
+    generic [R: Region, F: Region]
+    function storeRefresh(db: &![Database[Writing], R], fresh: &[NewRefresh, F], now: Int64,
+        ttl: Int64): Either[DbError, Option[String]]
+        requires (now > 0) and (ttl > 0);
+
+    """
+    The refresh token token, used, revoked or not.  Right None for a token
+    that is empty, longer than 200 bytes or unknown.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, T: Region]
+    function loadRefresh(db: &![Database[Writing], R], token: Span[Nat8, T]): Either[DbError, Option[RefreshRow]];
+
+    """
+    Marks the refresh token used at now.  Right false when it was used or
+    revoked already.
+    """
+    generic [R: Region, T: Region]
+    function spendRefresh(db: &![Database[Writing], R], token: Span[Nat8, T], now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    """
+    Revokes every token of family at now; nothing for an empty family.
+    """
+    generic [R: Region, F: Region]
+    function revokeFamily(db: &![Database[Writing], R], family: Span[Nat8, F], now: Int64): Option[DbError]
+        requires now > 0;
+
+    """
+    A sign-in handed to an app: the live refresh family of a client.
+    """
+    record Device: Linear is
+        family: String;
+        clientId: String;
+        clientName: String;
+        label: String;
+        created: Int64;
+        lastUsed: Int64;
+        firstIp: String;
+        lastIp: String;
+    end;
+
+    """
+    Frees devices.
+    No contract: it only frees.
+    """
+    function destroyDevices(devices: Buffer[Device]): Unit;
+
+    """
+    The live families of subject at now: of native clients only when
+    nativeOnly, else of every client that is no service, the newest first.
+    """
+    generic [R: Region, U: Region]
+    function devicesOf(db: &![Database[Writing], R], subject: Span[Nat8, U], nativeOnly: Bool,
+        now: Int64): Either[DbError, Buffer[Device]]
+        requires now > 0;
+
+    """
+    Revokes the family of subject at now, of anybody when subject is
+    empty.  Right false when there was none to revoke.
+    """
+    generic [R: Region, U: Region, F: Region]
+    function revokeDevice(db: &![Database[Writing], R], subject: Span[Nat8, U], family: Span[Nat8, F],
+        now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    --- Roles
+
+    """
+    Whether text is a role name: a lowercase letter, then up to 31 lowercase
+    letters, digits, - and _.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Region]
+    function isRole(text: Span[Nat8, T]): Bool;
+
+    """
+    The most roles an account holds in one client: 16.
+    """
+    function mostRoles(): Int64
+        ensures result = 16;
+
+    """
+    What grantRole did.
+    """
+    union Granted: Free is
+        case RoleAdded;
+        case RoleHeldAlready;
+        case TooManyRoles;
+    end;
+
+    """
+    Gives subject the role in clientId at now; the caller has checked the
+    client, the account and the name.
+    """
+    generic [R: Region, C: Region, U: Region, O: Region]
+    function grantRole(db: &![Database[Writing], R], clientId: Span[Nat8, C], subject: Span[Nat8, U],
+        role: Span[Nat8, O], now: Int64): Either[DbError, Granted]
+        requires now > 0;
+
+    """
+    Takes the role away.  Right false when subject did not hold it.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, C: Region, U: Region, O: Region]
+    function revokeRole(db: &![Database[Writing], R], clientId: Span[Nat8, C], subject: Span[Nat8, U],
+        role: Span[Nat8, O]): Either[DbError, Bool];
+
+    """
+    The roles subject holds in clientId, sorted.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, C: Region, U: Region]
+    function rolesFor(db: &![Database[Writing], R], clientId: Span[Nat8, C], subject: Span[Nat8, U]): Either[DbError, Buffer[String]];
+
+    """
+    A role held.
+    """
+    record RoleGrant: Linear is
+        clientId: String;
+        subject: String;
+        role: String;
+        created: Int64;
+    end;
+
+    """
+    Frees grants.
+    No contract: it only frees.
+    """
+    function destroyGrants(grants: Buffer[RoleGrant]): Unit;
+
+    """
+    Every role held, of one client and one subject when they are not
+    empty, ordered by client, subject and role.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, C: Region, U: Region]
+    function listRoles(db: &![Database[Writing], R], clientId: Span[Nat8, C], subject: Span[Nat8, U]): Either[DbError, Buffer[RoleGrant]];
+
+    """
+    Removes every row of subject from the five tables: for an account that
+    is deleted.  The number of rows removed.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, U: Region]
+    function forgetSubject(db: &![Database[Writing], R], subject: Span[Nat8, U]): Either[DbError, Int64];
+
+    --- Cleanup
+
+    """
+    Deletes requests a day after they ended, codes an hour after, refresh
+    tokens and ended sessions 30 days after they were spent, and sessions
+    nobody used for 30 days that are older than max.  The rows deleted.
+    """
+    generic [R: Region]
+    function cleanup(db: &![Database[Writing], R], now: Int64, max: Int64): Either[DbError, Int64]
+        requires (now > 0) and (max > 0);
+end module.

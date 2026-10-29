@@ -1,0 +1,169 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    startsWith,
+    toLower,
+    indexOfByte,
+    substring,
+    replace,
+    urlDecode,
+    equal
+);
+import Standard.Cookie (
+    cookieValue
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam,
+    requestBody
+);
+
+module body Wolly.Request is
+    generic [R: Region]
+    function requestMethod(request: &[Request, R]): Option[String] is
+        return requestParam(request, "REQUEST_METHOD");
+    end;
+
+    -- Whether text begins with a slash, as the path of a request must.
+    generic [T: Region]
+    function startsWithSlash(text: Span[Nat8, T]): Bool is
+        if spanLength(text) = 0 then
+            return false;
+        end if;
+        return text[0] = '/';
+    end;
+
+    -- The bytes of uri before its first question mark, as a string of
+    -- their own.
+    generic [U: Region]
+    function withoutQuery(uri: Span[Nat8, U]): String is
+        case indexOfByte(uri, '?') of
+            when Some(value as at: Index) do
+                return fromSpan(substring(uri, 0, at));
+            when None do
+                return fromSpan(uri);
+        end case;
+    end;
+
+    generic [R: Region]
+    function requestPath(request: &[Request, R]): Option[String] is
+        case requestParam(request, "REQUEST_URI") of
+            when Some(value as uri: String) do
+                let fits: Bool := startsWithSlash(asSpan(&uri));
+                let cut: String := withoutQuery(asSpan(&uri));
+                destroyString(uri);
+                if fits then
+                    return Some(value => cut);
+                else
+                    destroyString(cut);
+                    return None();
+                end if;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- A plus is a space in a query (HTML forms); it is replaced before the
+    -- percent escapes are undone, so that %2B stays a plus.
+    generic [V: Region]
+    function decodeQueryPart(raw: Span[Nat8, V]): String is
+        let spaced: String := replace(raw, "+", " ");
+        let decoded: String := urlDecode(asSpan(&spaced));
+        destroyString(spaced);
+        return decoded;
+    end;
+
+    generic [Q: Region, N: Region]
+    function queryValue(queryString: Span[Nat8, Q], name: Span[Nat8, N]): Option[String] is
+        let size: Index := spanLength(queryString);
+        var start: Index := 0;
+        while start <= size do
+            var stop: Index := size;
+            case indexOfByte(substring(queryString, start, size), '&') of
+                when Some(value as at: Index) do
+                    stop := start + at;
+                when None do
+                    skip;
+            end case;
+            let piece: Span[Nat8, Q] := substring(queryString, start, stop);
+            var nameStop: Index := spanLength(piece);
+            var valueStart: Index := spanLength(piece);
+            case indexOfByte(piece, '=') of
+                when Some(value as at: Index) do
+                    nameStop := at;
+                    valueStart := at + 1;
+                when None do
+                    skip;
+            end case;
+            let pieceName: String := decodeQueryPart(substring(piece, 0, nameStop));
+            let matches: Bool := equal(asSpan(&pieceName), name);
+            destroyString(pieceName);
+            if matches and (spanLength(piece) > 0) then
+                return Some(value => decodeQueryPart(substring(piece, valueStart, spanLength(piece))));
+            end if;
+            start := stop + 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region, N: Region]
+    function query(request: &[Request, R], name: Span[Nat8, N]): Option[String] is
+        case requestParam(request, "QUERY_STRING") of
+            when Some(value as raw: String) do
+                let found: Option[String] := queryValue(asSpan(&raw), name);
+                destroyString(raw);
+                return found;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Whether contentType names a form: application/x-www-form-urlencoded,
+    -- alone or followed by a semicolon and parameters.
+    generic [C: Region]
+    function isForm(contentType: Span[Nat8, C]): Bool is
+        let lower: String := toLower(contentType);
+        let exact: Bool := equal(asSpan(&lower), "application/x-www-form-urlencoded");
+        let withParameters: Bool := startsWith(asSpan(&lower), "application/x-www-form-urlencoded;");
+        destroyString(lower);
+        return exact or withParameters;
+    end;
+
+    generic [R: Region, N: Region]
+    function formValue(request: &[Request, R], name: Span[Nat8, N]): Option[String] is
+        case requestParam(request, "CONTENT_TYPE") of
+            when Some(value as contentType: String) do
+                let form: Bool := isForm(asSpan(&contentType));
+                destroyString(contentType);
+                if form then
+                    return queryValue(requestBody(request), name);
+                else
+                    return None();
+                end if;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, N: Region]
+    function cookie(request: &[Request, R], name: Span[Nat8, N]): Option[String] is
+        case requestParam(request, "HTTP_COOKIE") of
+            when Some(value as header: String) do
+                let found: Option[String] := cookieValue(asSpan(&header), name);
+                destroyString(header);
+                return found;
+            when None do
+                return None();
+        end case;
+    end;
+end module body.

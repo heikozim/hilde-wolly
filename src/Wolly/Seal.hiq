@@ -1,0 +1,97 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Libcrypto (
+    sealChaCha20Poly1305,
+    openChaCha20Poly1305,
+    randomBytes,
+    hmacSha256
+);
+
+module body Wolly.Seal is
+    constant nonceBytes: Index := 12;
+    constant tagBytes: Index := 16;
+
+    function sealKeyBytes(): Index is
+        return 32;
+    end;
+
+    function overheadBytes(): Index is
+        return nonceBytes + tagBytes;
+    end;
+
+    -- The key that seals for purpose: the HMAC-SHA256 of purpose under
+    -- key, 32 bytes.  None for a short key or a failure of libcrypto.
+    generic [K: Region]
+    function purposeKey(key: Span[Nat8, K], purpose: Span[Nat8, Static]): Option[String] is
+        if spanLength(key) < sealKeyBytes() then
+            return None();
+        end if;
+        return hmacSha256(key, purpose);
+    end;
+
+    generic [K: Region, V: Region, C: Region]
+    function sealValue(key: Span[Nat8, K], purpose: Span[Nat8, Static], value: Span[Nat8, V],
+                       context: Span[Nat8, C]): Option[String] is
+        case purposeKey(key, purpose) of
+            when Some(value as sub: String) do
+                case randomBytes(nonceBytes) of
+                    when Some(value as nonce: String) do
+                        let sealed: Option[String] := sealChaCha20Poly1305(asSpan(&sub), asSpan(&nonce), value, context);
+                        destroyString(sub);
+                        case sealed of
+                            when Some(value as cipher: String) do
+                                var out: StringBuilder := makeStringBuilder();
+                                writeString(&!out, asSpan(&nonce));
+                                writeString(&!out, asSpan(&cipher));
+                                destroyString(nonce);
+                                destroyString(cipher);
+                                let whole: String := finalize(out);
+                                return Some(value => whole);
+                            when None do
+                                destroyString(nonce);
+                                return None();
+                        end case;
+                    when None do
+                        destroyString(sub);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [K: Region, S: Region, C: Region]
+    function openValue(key: Span[Nat8, K], purpose: Span[Nat8, Static], sealed: Span[Nat8, S],
+                       context: Span[Nat8, C]): Option[String] is
+        if spanLength(sealed) < overheadBytes() then
+            return None();
+        end if;
+        case purposeKey(key, purpose) of
+            when Some(value as sub: String) do
+                let opened: Option[String] := openChaCha20Poly1305(asSpan(&sub), substring(sealed, 0, nonceBytes),
+                                                                   substring(sealed, nonceBytes, spanLength(sealed)), context);
+                destroyString(sub);
+                return opened;
+            when None do
+                return None();
+        end case;
+    end;
+end module body.

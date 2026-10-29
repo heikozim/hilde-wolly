@@ -1,0 +1,983 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Checks: View ViewCompile ViewContext ViewData ViewFunctions
+--
+-- The same template, once through @template with a record and once through
+-- Wolly.View with the same data as a ViewData, must give the same bytes.
+-- The templates: every test of Hilde's suite 045-template that renders a
+-- page (from the Hilde this release builds with, copied unchanged into
+-- templates/view/same with its data.json), the two templates of
+-- Wolly.Dashboard where they stand, and the five pages of examples/login
+-- (copied into templates/view/same/login).  The records and their values
+-- are those of the Hilde tests; data.json holds the same values, which
+-- Hilde's oracle checked against Jinja2.  @template reads the file when
+-- this test is compiled; the engine reads the same bytes, embedded with
+-- @bytes and written into a directory of the test under the same path.
+-- @template takes every name a template gives against the directory of the
+-- module, so the names that extends, include and import give in the copies
+-- of 020, 040 and login carry the copy's path in front; nothing else of a
+-- copy is changed.  testControl shows that one byte changed is seen.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    length
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    asSpan,
+    destroyString,
+    storeNth,
+    length as textLength
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Template (
+    Render
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory
+);
+import Standard.Text (
+    equal
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    setWhitespace,
+    renderView
+);
+
+module body Wolly.ViewSame.Test is
+    ---
+    --- The engine's side
+    ---
+
+    generic [C: Region]
+    function directoryOf(id: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "view-same-");
+        writeString(&!out, id);
+        return finalize(out);
+    end;
+
+    -- The file name of the case id written with text; a name with a
+    -- directory has it made.
+    function written(id: Span[Nat8, Static], name: Span[Nat8, Static], text: Span[Nat8, Static]): Bool is
+        let directory: String := directoryOf(id);
+        let made: Bool := createDirectory(asSpan(&directory));
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if name[i] = '/' then
+                var sub: StringBuilder := makeStringBuilder();
+                writeString(&!sub, asSpan(&directory));
+                writeString(&!sub, "/");
+                writeString(&!sub, spanPart(name, 0, i));
+                let parent: String := finalize(sub);
+                let madeParent: Bool := createDirectory(asSpan(&parent));
+                destroyString(parent);
+            end if;
+            i := i + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&directory));
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        destroyString(directory);
+        let path: String := finalize(out);
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                destroyString(path);
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                destroyString(path);
+                return false;
+        end case;
+    end;
+
+    -- The engine of the case renders entry with the JSON data and must give
+    -- the bytes @template gave.
+    function sameAsTemplate(id: Span[Nat8, Static], entry: Span[Nat8, Static], json: Span[Nat8, Static],
+        compiled: String, trim: Bool, message: Span[Nat8, Static]): Unit is
+        var engine: ViewEngine := makeViewEngine();
+        let directory: String := directoryOf(id);
+        addDirectory(&!engine, asSpan(&directory));
+        destroyString(directory);
+        setWhitespace(&!engine, trim, trim);
+        case readViewJson(json) of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, message);
+            when Right(right as data: ViewData) do
+                var out: StringBuilder := makeStringBuilder();
+                let result: Either[String, Unit] := renderView(&!engine, entry, &data, &!out);
+                destroyViewData(data);
+                let rendered: String := finalize(out);
+                case result of
+                    when Left(left as failure: String) do
+                        printLn(asSpan(&failure));
+                        destroyString(failure);
+                        assertTrue(false, message);
+                    when Right(right as done: Unit) do
+                        let same: Bool := equal(asSpan(&rendered), asSpan(&compiled));
+                        if not same then
+                            printLn("@template:");
+                            printLn(asSpan(&compiled));
+                            printLn("Wolly.View:");
+                            printLn(asSpan(&rendered));
+                        end if;
+                        assertTrue(same, message);
+                end case;
+                destroyString(rendered);
+        end case;
+        destroyString(compiled);
+        destroyViewEngine(engine);
+        return nil;
+    end;
+
+    function destroyStrings(texts: Buffer[String]): Unit is
+        var rest: Buffer[String] := texts;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function noText(): Option[String] is
+        let nothing: Option[String] := None();
+        return nothing;
+    end;
+
+    function destroyOption(value: Option[String]): Unit is
+        case value of
+            when Some(value as text: String) do
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- 001-basics
+    ---
+
+    record BasicsItem: Linear is
+        name: String;
+        price: Index;
+        note: Option[String];
+    end;
+
+    record BasicsPage: Linear is
+        title: String;
+        user: String;
+        admin: Bool;
+        count: Int32;
+        items: Buffer[BasicsItem];
+        empty: Buffer[BasicsItem];
+        motto: Option[String];
+        missing: Option[String];
+    end;
+
+    generic [R: Region]
+    function renderBasics(page: &[BasicsPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/001-basics/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function destroyBasicsItems(items: Buffer[BasicsItem]): Unit is
+        var rest: Buffer[BasicsItem] := items;
+        while length(&rest) > 0 do
+            let item: BasicsItem := removeLast(&!rest);
+            let { name: String, price: Index, note: Option[String] } := item;
+            destroyString(name);
+            destroyOption(note);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function testBasics(): Unit is
+        var goods: Buffer[BasicsItem] := allocateEmpty();
+        insertBack(&!goods, BasicsItem(name => fromLiteral("apple"), price => 3, note => noText()));
+        insertBack(&!goods, BasicsItem(name => fromLiteral("pear <x>"), price => 12,
+            note => Some(value => fromLiteral("ripe & sweet"))));
+        let none: Buffer[BasicsItem] := allocateEmpty();
+        let page: BasicsPage := BasicsPage(title => fromLiteral("Tom & Jerry's <Page>"),
+            user => fromLiteral("Ann \"A\" O'Neil"), admin => true, count => 3, items => goods, empty => none,
+            motto => Some(value => fromLiteral("  keep going  ")), missing => noText());
+        let compiled: String := renderBasics(&page);
+        let { title: String, user: String, admin: Bool, count: Int32, items: Buffer[BasicsItem],
+            empty: Buffer[BasicsItem], motto: Option[String], missing: Option[String] } := page;
+        destroyString(title);
+        destroyString(user);
+        destroyBasicsItems(items);
+        destroyBasicsItems(empty);
+        destroyOption(motto);
+        destroyOption(missing);
+        assertTrue(written("001", "templates/view/same/001-basics/page.jinja", @bytes("templates/view/same/001-basics/page.jinja")), "001 is written");
+        sameAsTemplate("001", "templates/view/same/001-basics/page.jinja", @bytes("templates/view/same/001-basics/data.json"), compiled, false,
+            "001-basics: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- 015-deviations: not ASCII, built byte by byte as Hilde's test does
+    ---
+
+    record DeviationsPage: Linear is
+        word: String;
+        spaced: String;
+    end;
+
+    generic [R: Region]
+    function renderDeviations(page: &[DeviationsPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/015-deviations/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function testDeviations(): Unit is
+        var w: StringBuilder := makeStringBuilder();
+        writeByte(&!w, 195);
+        writeByte(&!w, 169);
+        writeByte(&!w, 't');
+        writeByte(&!w, 195);
+        writeByte(&!w, 137);
+        var s: StringBuilder := makeStringBuilder();
+        writeByte(&!s, 227);
+        writeByte(&!s, 128);
+        writeByte(&!s, 128);
+        writeByte(&!s, 'x');
+        writeByte(&!s, 227);
+        writeByte(&!s, 128);
+        writeByte(&!s, 128);
+        let page: DeviationsPage := DeviationsPage(word => finalize(w), spaced => finalize(s));
+        let compiled: String := renderDeviations(&page);
+        let { word: String, spaced: String } := page;
+        destroyString(word);
+        destroyString(spaced);
+        assertTrue(written("015", "templates/view/same/015-deviations/page.jinja", @bytes("templates/view/same/015-deviations/page.jinja")), "015 is written");
+        sameAsTemplate("015", "templates/view/same/015-deviations/page.jinja", @bytes("templates/view/same/015-deviations/data.json"), compiled, false,
+            "015-deviations: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- 020-inheritance and 030-local-macro: the same data
+    ---
+
+    record ShopItem: Linear is
+        name: String;
+        price: Index;
+    end;
+
+    record ShopPage: Linear is
+        title: String;
+        owner: String;
+        items: Buffer[ShopItem];
+    end;
+
+    function makeShop(): ShopPage is
+        var goods: Buffer[ShopItem] := allocateEmpty();
+        insertBack(&!goods, ShopItem(name => fromLiteral("pen"), price => 2));
+        insertBack(&!goods, ShopItem(name => fromLiteral("ink <blue>"), price => 11));
+        return ShopPage(title => fromLiteral("Shop & <More>"), owner => fromLiteral("O'Brien"), items => goods);
+    end;
+
+    function destroyShop(page: ShopPage): Unit is
+        let { title: String, owner: String, items: Buffer[ShopItem] } := page;
+        destroyString(title);
+        destroyString(owner);
+        var rest: Buffer[ShopItem] := items;
+        while length(&rest) > 0 do
+            let item: ShopItem := removeLast(&!rest);
+            let { name: String, price: Index } := item;
+            destroyString(name);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function renderInheritance(page: &[ShopPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/020-inheritance/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderLocalMacro(page: &[ShopPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/030-local-macro/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function testInheritance(): Unit is
+        let page: ShopPage := makeShop();
+        let compiled: String := renderInheritance(&page);
+        destroyShop(page);
+        assertTrue(written("020", "templates/view/same/020-inheritance/page.jinja", @bytes("templates/view/same/020-inheritance/page.jinja")), "020 page");
+        assertTrue(written("020", "templates/view/same/020-inheritance/layout.jinja", @bytes("templates/view/same/020-inheritance/layout.jinja")), "020 layout");
+        assertTrue(written("020", "templates/view/same/020-inheritance/base.jinja", @bytes("templates/view/same/020-inheritance/base.jinja")), "020 base");
+        assertTrue(written("020", "templates/view/same/020-inheritance/macros.jinja", @bytes("templates/view/same/020-inheritance/macros.jinja")), "020 macros");
+        assertTrue(written("020", "templates/view/same/020-inheritance/price.jinja", @bytes("templates/view/same/020-inheritance/price.jinja")), "020 price");
+        assertTrue(written("020", "templates/view/same/020-inheritance/row.jinja", @bytes("templates/view/same/020-inheritance/row.jinja")), "020 row");
+        sameAsTemplate("020", "templates/view/same/020-inheritance/page.jinja", @bytes("templates/view/same/020-inheritance/data.json"), compiled, false,
+            "020-inheritance: the engine writes what @template writes");
+        return nil;
+    end;
+
+    function testLocalMacro(): Unit is
+        let page: ShopPage := makeShop();
+        let compiled: String := renderLocalMacro(&page);
+        destroyShop(page);
+        assertTrue(written("030", "templates/view/same/030-local-macro/page.jinja", @bytes("templates/view/same/030-local-macro/page.jinja")), "030 page");
+        sameAsTemplate("030", "templates/view/same/030-local-macro/page.jinja", @bytes("templates/view/same/030-local-macro/data.json"), compiled, false,
+            "030-local-macro: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- 031-migration-go
+    ---
+
+    record Link: Linear is
+        name: String;
+        href: String;
+    end;
+
+    record LinksPage: Linear is
+        title: String;
+        kind: String;
+        links: Buffer[Link];
+        note: String;
+        mail: String;
+    end;
+
+    generic [R: Region]
+    function renderMigration(page: &[LinksPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/031-migration-go/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function testMigration(): Unit is
+        var links: Buffer[Link] := allocateEmpty();
+        insertBack(&!links, Link(name => fromLiteral("a b"), href => fromLiteral("http://example.org/x y?q=1&r=<2>#top")));
+        insertBack(&!links, Link(name => fromLiteral("evil"), href => fromLiteral("javascript:alert(1)")));
+        insertBack(&!links, Link(name => fromLiteral("O'Neil (x)"), href => fromLiteral("/local/p'q")));
+        insertBack(&!links, Link(name => fromLiteral("up"), href => fromLiteral("HTTPS://example.org/")));
+        let page: LinksPage := LinksPage(title => fromLiteral("Links & <Things>"), kind => fromLiteral("list"),
+            links => links, note => fromLiteral(""), mail => fromLiteral("a@b.example"));
+        let compiled: String := renderMigration(&page);
+        let { title: String, kind: String, links as held: Buffer[Link], note: String, mail: String } := page;
+        destroyString(title);
+        destroyString(kind);
+        destroyString(note);
+        destroyString(mail);
+        var rest: Buffer[Link] := held;
+        while length(&rest) > 0 do
+            let link: Link := removeLast(&!rest);
+            let { name: String, href: String } := link;
+            destroyString(name);
+            destroyString(href);
+        end while;
+        destroyEmpty(rest);
+        assertTrue(written("031", "templates/view/same/031-migration-go/page.jinja", @bytes("templates/view/same/031-migration-go/page.jinja")), "031 page");
+        sameAsTemplate("031", "templates/view/same/031-migration-go/page.jinja", @bytes("templates/view/same/031-migration-go/data.json"), compiled, false,
+            "031-migration-go: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- 032-plus-sign and 038-go-differences: one text each
+    ---
+
+    record WordPage: Linear is
+        word: String;
+    end;
+
+    record CssPage: Linear is
+        c: String;
+    end;
+
+    generic [R: Region]
+    function renderPlus(page: &[WordPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/032-plus-sign/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderGoDifferences(page: &[CssPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/038-go-differences/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function testPlus(): Unit is
+        let page: WordPage := WordPage(word => fromLiteral("a+b"));
+        let compiled: String := renderPlus(&page);
+        let { word: String } := page;
+        destroyString(word);
+        assertTrue(written("032", "templates/view/same/032-plus-sign/page.jinja", @bytes("templates/view/same/032-plus-sign/page.jinja")), "032 page");
+        sameAsTemplate("032", "templates/view/same/032-plus-sign/page.jinja", @bytes("templates/view/same/032-plus-sign/data.json"), compiled, false,
+            "032-plus-sign: the engine writes what @template writes");
+        return nil;
+    end;
+
+    function testGoDifferences(): Unit is
+        let page: CssPage := CssPage(c => fromLiteral("\\72 ed"));
+        let compiled: String := renderGoDifferences(&page);
+        let { c: String } := page;
+        destroyString(c);
+        assertTrue(written("038", "templates/view/same/038-go-differences/page.jinja", @bytes("templates/view/same/038-go-differences/page.jinja")), "038 page");
+        sameAsTemplate("038", "templates/view/same/038-go-differences/page.jinja", @bytes("templates/view/same/038-go-differences/data.json"), compiled, false,
+            "038-go-differences: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- 033-js-css
+    ---
+
+    record ScriptPage: Linear is
+        s: String;
+        n: Index;
+        neg: Int32;
+        flag: Bool;
+        color: String;
+        bad: String;
+        font: String;
+    end;
+
+    generic [R: Region]
+    function renderScript(page: &[ScriptPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/033-js-css/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function testScript(): Unit is
+        let page: ScriptPage := ScriptPage(s => fromLiteral("a\"b'c<d>&e/f\\g"), n => 42, neg => -7, flag => true,
+            color => fromLiteral("#fff"), bad => fromLiteral("red;x"), font => fromLiteral("Open Sans"));
+        let compiled: String := renderScript(&page);
+        let { s: String, n: Index, neg: Int32, flag: Bool, color: String, bad: String, font: String } := page;
+        destroyString(s);
+        destroyString(color);
+        destroyString(bad);
+        destroyString(font);
+        assertTrue(written("033", "templates/view/same/033-js-css/page.jinja", @bytes("templates/view/same/033-js-css/page.jinja")), "033 page");
+        sameAsTemplate("033", "templates/view/same/033-js-css/page.jinja", @bytes("templates/view/same/033-js-css/data.json"), compiled, false,
+            "033-js-css: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- 037-tasks (and 050, the same template): two pages
+    ---
+
+    record NumbersPage: Linear is
+        name: String;
+        numbers: Buffer[Index];
+    end;
+
+    generic [R: Region]
+    function renderNumbers(page: &[NumbersPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/037-tasks/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function numbersPage(name: Span[Nat8, Static], start: Index): String is
+        var numbers: Buffer[Index] := allocateEmpty();
+        insertBack(&!numbers, start);
+        insertBack(&!numbers, start + 1);
+        insertBack(&!numbers, start + 2);
+        let page: NumbersPage := NumbersPage(name => fromLiteral(name), numbers => numbers);
+        let compiled: String := renderNumbers(&page);
+        let { name as held: String, numbers as numbersHeld: Buffer[Index] } := page;
+        destroyString(held);
+        var rest: Buffer[Index] := numbersHeld;
+        while length(&rest) > 0 do
+            let dropped: Index := removeLast(&!rest);
+        end while;
+        destroyEmpty(rest);
+        return compiled;
+    end;
+
+    function testTasks(): Unit is
+        assertTrue(written("037", "templates/view/same/037-tasks/page.jinja", @bytes("templates/view/same/037-tasks/page.jinja")), "037 page");
+        sameAsTemplate("037", "templates/view/same/037-tasks/page.jinja", "{\"name\": \"a<b\", \"numbers\": [1, 2, 3]}", numbersPage("a<b", 1),
+            false, "037-tasks, the first page: the engine writes what @template writes");
+        sameAsTemplate("037", "templates/view/same/037-tasks/page.jinja", "{\"name\": \"c&d\", \"numbers\": [10, 11, 12]}", numbersPage("c&d", 10),
+            false, "037-tasks, the second page: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- 040-more-syntax and 041-whitespace-options: the same data
+    ---
+
+    record User: Linear is
+        name: String;
+        active: Bool;
+    end;
+
+    record Person: Linear is
+        name: String;
+    end;
+
+    record SyntaxPage: Linear is
+        title: String;
+        name: String;
+        word: String;
+        sentence: String;
+        n: Int32;
+        m: Int32;
+        items: Buffer[String];
+        pairs: Buffer[Pair[String, Index]];
+        users: Buffer[User];
+        author: Person;
+    end;
+
+    function makeSyntaxPage(): SyntaxPage is
+        var items: Buffer[String] := allocateEmpty();
+        insertBack(&!items, fromLiteral("a"));
+        insertBack(&!items, fromLiteral("b<"));
+        insertBack(&!items, fromLiteral("c"));
+        var pairs: Buffer[Pair[String, Index]] := allocateEmpty();
+        let xValue: Index := 1;
+        let yValue: Index := 2;
+        insertBack(&!pairs, Pair(first => fromLiteral("x"), second => xValue));
+        insertBack(&!pairs, Pair(first => fromLiteral("y"), second => yValue));
+        var users: Buffer[User] := allocateEmpty();
+        insertBack(&!users, User(name => fromLiteral("Ann"), active => true));
+        insertBack(&!users, User(name => fromLiteral("Ben"), active => false));
+        insertBack(&!users, User(name => fromLiteral("Cy"), active => true));
+        return SyntaxPage(title => fromLiteral("a tale-of two (cities)"), name => fromLiteral("Ada & <Bob>"),
+            word => fromLiteral("hello world"), sentence => fromLiteral("The quick brown fox jumps over the lazy dog"),
+            n => 7, m => -7, items => items, pairs => pairs, users => users,
+            author => Person(name => fromLiteral("Eve")));
+    end;
+
+    function destroySyntaxPage(page: SyntaxPage): Unit is
+        let { title: String, name: String, word: String, sentence: String, n: Int32, m: Int32,
+            items as texts: Buffer[String], pairs as two: Buffer[Pair[String, Index]],
+            users as people: Buffer[User], author: Person } := page;
+        destroyString(title);
+        destroyString(name);
+        destroyString(word);
+        destroyString(sentence);
+        destroyStrings(texts);
+        var restPairs: Buffer[Pair[String, Index]] := two;
+        while length(&restPairs) > 0 do
+            let pair: Pair[String, Index] := removeLast(&!restPairs);
+            let { first: String, second: Index } := pair;
+            destroyString(first);
+        end while;
+        destroyEmpty(restPairs);
+        var restUsers: Buffer[User] := people;
+        while length(&restUsers) > 0 do
+            let user: User := removeLast(&!restUsers);
+            let { name as userName: String, active: Bool } := user;
+            destroyString(userName);
+        end while;
+        destroyEmpty(restUsers);
+        let { name as authorName: String } := author;
+        destroyString(authorName);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function renderMoreSyntax(page: &[SyntaxPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/040-more-syntax/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderWhitespace(page: &[SyntaxPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/041-whitespace-options/page.jinja", page, out, "trim_blocks lstrip_blocks");
+        return finalize(out);
+    end;
+
+    function testMoreSyntax(): Unit is
+        let page: SyntaxPage := makeSyntaxPage();
+        let compiled: String := renderMoreSyntax(&page);
+        destroySyntaxPage(page);
+        assertTrue(written("040", "templates/view/same/040-more-syntax/page.jinja", @bytes("templates/view/same/040-more-syntax/page.jinja")), "040 page");
+        assertTrue(written("040", "templates/view/same/040-more-syntax/macros.jinja", @bytes("templates/view/same/040-more-syntax/macros.jinja")), "040 macros");
+        sameAsTemplate("040", "templates/view/same/040-more-syntax/page.jinja", @bytes("templates/view/same/040-more-syntax/data.json"), compiled, false,
+            "040-more-syntax: the engine writes what @template writes");
+        return nil;
+    end;
+
+    function testWhitespace(): Unit is
+        let page: SyntaxPage := makeSyntaxPage();
+        let compiled: String := renderWhitespace(&page);
+        destroySyntaxPage(page);
+        assertTrue(written("041", "templates/view/same/041-whitespace-options/page.jinja", @bytes("templates/view/same/041-whitespace-options/page.jinja")), "041 page");
+        sameAsTemplate("041", "templates/view/same/041-whitespace-options/page.jinja", @bytes("templates/view/same/041-whitespace-options/data.json"), compiled, true,
+            "041-whitespace-options: the engine writes what @template writes, both options on");
+        return nil;
+    end;
+
+    ---
+    --- 049-in-displayed
+    ---
+
+    record InPage: Linear is
+        numbers: Buffer[Index];
+    end;
+
+    generic [R: Region]
+    function renderIn(page: &[InPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/049-in-displayed/page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function testIn(): Unit is
+        var numbers: Buffer[Index] := allocateEmpty();
+        let three: Index := 3;
+        insertBack(&!numbers, three);
+        let page: InPage := InPage(numbers => numbers);
+        let compiled: String := renderIn(&page);
+        let { numbers as held: Buffer[Index] } := page;
+        var rest: Buffer[Index] := held;
+        while length(&rest) > 0 do
+            let dropped: Index := removeLast(&!rest);
+        end while;
+        destroyEmpty(rest);
+        assertTrue(written("049", "templates/view/same/049-in-displayed/page.jinja", @bytes("templates/view/same/049-in-displayed/page.jinja")), "049 page");
+        sameAsTemplate("049", "templates/view/same/049-in-displayed/page.jinja", "{\"numbers\": [3]}", compiled, false,
+            "049-in-displayed: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- Wolly.Dashboard: the panel and the page, the records of Dashboard
+    ---
+
+    record PanelView: Linear is
+        name: String;
+        title: String;
+        kind: String;
+        figure: String;
+        url: String;
+        every: Int64;
+    end;
+
+    record PageView: Linear is
+        title: String;
+        style: String;
+        top: String;
+        refresh: Int64;
+        script: String;
+        quiet: Int64;
+        generated: String;
+        panels: Buffer[String];
+    end;
+
+    generic [R: Region]
+    function renderPanel(view: &[PanelView, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/dashboard-panel.jinja", view, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderDashboard(view: &[PageView, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/dashboard-page.jinja", view, out);
+        return finalize(out);
+    end;
+
+    function panelOf(name: Span[Nat8, Static], figure: Span[Nat8, Static], url: Span[Nat8, Static]): String is
+        let view: PanelView := PanelView(name => fromLiteral(name), title => fromLiteral("Load & <ratio>"),
+            kind => fromLiteral("line"), figure => fromLiteral(figure), url => fromLiteral(url), every => 15);
+        let compiled: String := renderPanel(&view);
+        let { name as n: String, title: String, kind: String, figure as f: String, url as u: String, every: Int64 } := view;
+        destroyString(n);
+        destroyString(title);
+        destroyString(kind);
+        destroyString(f);
+        destroyString(u);
+        return compiled;
+    end;
+
+    function testDashboardPanel(): Unit is
+        assertTrue(written("panel", "templates/dashboard-panel.jinja", @bytes("templates/dashboard-panel.jinja")), "the panel is written");
+        sameAsTemplate("panel", "templates/dashboard-panel.jinja",
+            "{\"name\": \"cpu\", \"title\": \"Load & <ratio>\", \"kind\": \"line\", \"figure\": \"<svg viewBox=\\\"0 0 1 1\\\"></svg>\", \"url\": \"/live/cpu?x=1&y=2\", \"every\": 15}",
+            panelOf("cpu", "<svg viewBox=\"0 0 1 1\"></svg>", "/live/cpu?x=1&y=2"), false,
+            "the dashboard panel with a figure and a url: the engine writes what @template writes");
+        sameAsTemplate("panel", "templates/dashboard-panel.jinja",
+            "{\"name\": \"disk\", \"title\": \"Load & <ratio>\", \"kind\": \"line\", \"figure\": \"\", \"url\": \"\", \"every\": 15}",
+            panelOf("disk", "", ""), false,
+            "the dashboard panel without either: the engine writes what @template writes");
+        return nil;
+    end;
+
+    function testDashboardPage(): Unit is
+        var panels: Buffer[String] := allocateEmpty();
+        insertBack(&!panels, fromLiteral("<section>a</section>"));
+        insertBack(&!panels, fromLiteral("<section>b&amp;c</section>"));
+        let view: PageView := PageView(title => fromLiteral("Hosts \"one\" & two"), style => fromLiteral("/static/d.css?v=1"),
+            top => fromLiteral("<p>top</p>"), refresh => 30, script => fromLiteral("/static/htmx.js"), quiet => 60,
+            generated => fromLiteral("2026-10-23T12:00:00Z"), panels => panels);
+        let compiled: String := renderDashboard(&view);
+        let { title: String, style: String, top: String, refresh: Int64, script: String, quiet: Int64,
+            generated: String, panels as held: Buffer[String] } := view;
+        destroyString(title);
+        destroyString(style);
+        destroyString(top);
+        destroyString(script);
+        destroyString(generated);
+        destroyStrings(held);
+        assertTrue(written("dashboard", "templates/dashboard-page.jinja", @bytes("templates/dashboard-page.jinja")), "the page is written");
+        sameAsTemplate("dashboard", "templates/dashboard-page.jinja",
+            "{\"title\": \"Hosts \\\"one\\\" & two\", \"style\": \"/static/d.css?v=1\", \"top\": \"<p>top</p>\", \"refresh\": 30, \"script\": \"/static/htmx.js\", \"quiet\": 60, \"generated\": \"2026-10-23T12:00:00Z\", \"panels\": [\"<section>a</section>\", \"<section>b&amp;c</section>\"]}",
+            compiled, false, "the dashboard page: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- examples/login: five pages over one layout
+    ---
+
+    record LoginPage: Linear is
+        csrf: String;
+        message: String;
+        name: String;
+    end;
+
+    record CodePage: Linear is
+        csrf: String;
+        message: String;
+    end;
+
+    record TotpPage: Linear is
+        csrf: String;
+        qr: String;
+        secret: String;
+    end;
+
+    record UserPage: Linear is
+        name: String;
+        csrf: String;
+    end;
+
+    record NotesPage: Linear is
+        csrf: String;
+        notes: String;
+    end;
+
+    generic [R: Region]
+    function renderLogin(page: &[LoginPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/login/templates/login.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderCode(page: &[CodePage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/login/templates/code.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderTotp(page: &[TotpPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/login/templates/totp.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderUser(page: &[UserPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/login/templates/user.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderNotes(page: &[NotesPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/view/same/login/templates/notes.jinja", page, out);
+        return finalize(out);
+    end;
+
+    function writeLogin(): Unit is
+        assertTrue(written("login", "templates/view/same/login/templates/base.jinja", @bytes("templates/view/same/login/templates/base.jinja")),
+            "the layout is written");
+        assertTrue(written("login", "templates/view/same/login/templates/login.jinja", @bytes("templates/view/same/login/templates/login.jinja")),
+            "login is written");
+        assertTrue(written("login", "templates/view/same/login/templates/code.jinja", @bytes("templates/view/same/login/templates/code.jinja")),
+            "code is written");
+        assertTrue(written("login", "templates/view/same/login/templates/totp.jinja", @bytes("templates/view/same/login/templates/totp.jinja")),
+            "totp is written");
+        assertTrue(written("login", "templates/view/same/login/templates/user.jinja", @bytes("templates/view/same/login/templates/user.jinja")),
+            "user is written");
+        assertTrue(written("login", "templates/view/same/login/templates/notes.jinja", @bytes("templates/view/same/login/templates/notes.jinja")),
+            "notes is written");
+        return nil;
+    end;
+
+    function testLoginPages(): Unit is
+        writeLogin();
+        let login: LoginPage := LoginPage(csrf => fromLiteral("t0k\"en"), message => fromLiteral("refused <x>"),
+            name => fromLiteral("Ann & co"));
+        let loginText: String := renderLogin(&login);
+        let { csrf: String, message: String, name: String } := login;
+        destroyString(csrf);
+        destroyString(message);
+        destroyString(name);
+        sameAsTemplate("login", "templates/view/same/login/templates/login.jinja",
+            "{\"csrf\": \"t0k\\\"en\", \"message\": \"refused <x>\", \"name\": \"Ann & co\"}", loginText, false,
+            "the login page: the engine writes what @template writes");
+        let empty: LoginPage := LoginPage(csrf => fromLiteral("t"), message => fromLiteral(""), name => fromLiteral(""));
+        let emptyText: String := renderLogin(&empty);
+        let { csrf as c2: String, message as m2: String, name as n2: String } := empty;
+        destroyString(c2);
+        destroyString(m2);
+        destroyString(n2);
+        sameAsTemplate("login", "templates/view/same/login/templates/login.jinja", "{\"csrf\": \"t\", \"message\": \"\", \"name\": \"\"}",
+            emptyText, false, "the login page without a message: the engine writes what @template writes");
+        return nil;
+    end;
+
+    function testOtherPages(): Unit is
+        writeLogin();
+        let code: CodePage := CodePage(csrf => fromLiteral("c"), message => fromLiteral("wrong 'code'"));
+        let codeText: String := renderCode(&code);
+        let { csrf: String, message: String } := code;
+        destroyString(csrf);
+        destroyString(message);
+        sameAsTemplate("login", "templates/view/same/login/templates/code.jinja", "{\"csrf\": \"c\", \"message\": \"wrong 'code'\"}", codeText,
+            false, "the code page: the engine writes what @template writes");
+        let totp: TotpPage := TotpPage(csrf => fromLiteral("c"), qr => fromLiteral("data:image/png;base64,AAAA"),
+            secret => fromLiteral("JBSWY3DP"));
+        let totpText: String := renderTotp(&totp);
+        let { csrf as c2: String, qr: String, secret: String } := totp;
+        destroyString(c2);
+        destroyString(qr);
+        destroyString(secret);
+        sameAsTemplate("login", "templates/view/same/login/templates/totp.jinja",
+            "{\"csrf\": \"c\", \"qr\": \"data:image/png;base64,AAAA\", \"secret\": \"JBSWY3DP\"}", totpText, false,
+            "the totp page: the engine writes what @template writes");
+        let user: UserPage := UserPage(name => fromLiteral("<Ann>"), csrf => fromLiteral("c"));
+        let userText: String := renderUser(&user);
+        let { name: String, csrf as c3: String } := user;
+        destroyString(name);
+        destroyString(c3);
+        sameAsTemplate("login", "templates/view/same/login/templates/user.jinja", "{\"name\": \"<Ann>\", \"csrf\": \"c\"}", userText, false,
+            "the user page: the engine writes what @template writes");
+        let notes: NotesPage := NotesPage(csrf => fromLiteral("c"), notes => fromLiteral("one & two\n<three>"));
+        let notesText: String := renderNotes(&notes);
+        let { csrf as c4: String, notes as n: String } := notes;
+        destroyString(c4);
+        destroyString(n);
+        sameAsTemplate("login", "templates/view/same/login/templates/notes.jinja", "{\"csrf\": \"c\", \"notes\": \"one & two\\n<three>\"}",
+            notesText, false, "the notes page: the engine writes what @template writes");
+        return nil;
+    end;
+
+    ---
+    --- The control: one byte changed is seen
+    ---
+
+    -- The engine's render of 001 against @template's, then the same with
+    -- one byte in the middle changed: the comparison sameAsTemplate makes
+    -- sees it.
+    function testControl(): Unit is
+        var goods: Buffer[BasicsItem] := allocateEmpty();
+        insertBack(&!goods, BasicsItem(name => fromLiteral("apple"), price => 3, note => noText()));
+        insertBack(&!goods, BasicsItem(name => fromLiteral("pear <x>"), price => 12,
+            note => Some(value => fromLiteral("ripe & sweet"))));
+        let none: Buffer[BasicsItem] := allocateEmpty();
+        let page: BasicsPage := BasicsPage(title => fromLiteral("Tom & Jerry's <Page>"),
+            user => fromLiteral("Ann \"A\" O'Neil"), admin => true, count => 3, items => goods, empty => none,
+            motto => Some(value => fromLiteral("  keep going  ")), missing => noText());
+        let compiled: String := renderBasics(&page);
+        let { title: String, user: String, admin: Bool, count: Int32, items: Buffer[BasicsItem],
+            empty: Buffer[BasicsItem], motto: Option[String], missing: Option[String] } := page;
+        destroyString(title);
+        destroyString(user);
+        destroyBasicsItems(items);
+        destroyBasicsItems(empty);
+        destroyOption(motto);
+        destroyOption(missing);
+        assertTrue(written("control", "templates/view/same/001-basics/page.jinja",
+            @bytes("templates/view/same/001-basics/page.jinja")), "the control's template is written");
+        var engine: ViewEngine := makeViewEngine();
+        let directory: String := directoryOf("control");
+        addDirectory(&!engine, asSpan(&directory));
+        destroyString(directory);
+        case readViewJson(@bytes("templates/view/same/001-basics/data.json")) of
+            when Left(left as failure: String) do
+                destroyString(failure);
+                assertTrue(false, "the control's data is read");
+            when Right(right as data: ViewData) do
+                var out: StringBuilder := makeStringBuilder();
+                let result: Either[String, Unit] := renderView(&!engine, "templates/view/same/001-basics/page.jinja", &data,
+                    &!out);
+                destroyViewData(data);
+                var rendered: String := finalize(out);
+                case result of
+                    when Left(left as failure: String) do
+                        destroyString(failure);
+                        assertTrue(false, "the control renders");
+                    when Right(right as done: Unit) do
+                        assertTrue(textLength(&rendered) > 100, "the control's render holds more than 100 bytes");
+                        assertTrue(equal(asSpan(&rendered), asSpan(&compiled)), "the control's render is the same");
+                        let middle: Index := textLength(&rendered) / 2;
+                        storeNth(&!rendered, middle, '#');
+                        assertFalse(equal(asSpan(&rendered), asSpan(&compiled)), "one byte changed in the middle is seen");
+                end case;
+                destroyString(rendered);
+        end case;
+        destroyString(compiled);
+        destroyViewEngine(engine);
+        return nil;
+    end;
+end module body.

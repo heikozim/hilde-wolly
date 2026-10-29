@@ -1,0 +1,364 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The rules of a panel, the buckets, and fragments and pages drawn from
+-- samples in a database in memory: what each panel shows, that a title
+-- is escaped, that the page holds every fragment and what the caller gave.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    contains,
+    indexOf,
+    substring
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.Metrics (
+    Fold,
+    Total,
+    Highest,
+    prepareMetrics,
+    recordMetric
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Dashboard (
+    PanelKind,
+    TilePanel,
+    ChangePanel,
+    LinePanel,
+    BarPanel,
+    Panel,
+    Live,
+    DashboardFailure,
+    DashboardStorage,
+    UnfitPanels,
+    mostPanels,
+    isPanelName,
+    isPanel,
+    isLivePath,
+    isLive,
+    firstBucket,
+    validPanels,
+    findPanel,
+    panelFragment,
+    livePanelFragment,
+    dashboardPage,
+    liveDashboardPage,
+    dashboardStyle
+);
+
+module body Wolly.Dashboard.Test is
+    function panel(name: Span[Nat8, Static], title: Span[Nat8, Static], metric: Span[Nat8, Static], kind: PanelKind,
+                   step: Int64, buckets: Index): Panel is
+        return Panel(name => name, title => title, metric => metric, kind => kind, fold => Total(), step => step, buckets => buckets);
+    end;
+
+    function testRules(): Unit is
+        assertTrue(mostPanels() = 32, "32 panels");
+        assertTrue(isPanelName("requests-1"), "a name");
+        assertFalse(isPanelName(""), "empty");
+        assertFalse(isPanelName("Requests"), "a capital");
+        assertFalse(isPanelName("a/b"), "a slash");
+        assertFalse(isPanelName("../x"), "dots");
+        assertFalse(isPanelName("a\"b"), "a quote");
+        assertTrue(isPanelName("abcdefghijklmnopqrstuvwxyz012345"), "32 bytes");
+        assertFalse(isPanelName("abcdefghijklmnopqrstuvwxyz0123456"), "33 bytes");
+        assertTrue(isPanel(panel("req", "Requests", "http.requests", LinePanel(), 60, 2)), "the least step and buckets");
+        assertTrue(isPanel(panel("req", "Requests", "http.requests", LinePanel(), 31622400, 1000)), "the most");
+        assertFalse(isPanel(panel("req", "Requests", "http.requests", LinePanel(), 59, 2)), "a step of 59 s");
+        assertFalse(isPanel(panel("req", "Requests", "http.requests", LinePanel(), 31622401, 2)), "a step over 366 days");
+        assertFalse(isPanel(panel("req", "Requests", "http.requests", LinePanel(), 60, 1)), "one bucket");
+        assertFalse(isPanel(panel("req", "Requests", "http.requests", LinePanel(), 60, 1001)), "1001 buckets");
+        assertFalse(isPanel(panel("Req", "Requests", "http.requests", LinePanel(), 60, 2)), "no panel name");
+        assertFalse(isPanel(panel("req", "", "http.requests", LinePanel(), 60, 2)), "no title");
+        assertFalse(isPanel(panel("req", "a\nb", "http.requests", LinePanel(), 60, 2)), "a line end in the title");
+        assertFalse(isPanel(panel("req", "Requests", "HTTP", LinePanel(), 60, 2)), "no metric name");
+        assertTrue(spanLength(dashboardStyle()) > 0, "a style sheet");
+        return nil;
+    end;
+
+    function testBuckets(): Unit is
+        assertTrue(firstBucket(3600, 60, 2) = 3540, "two buckets up to the one of 3600");
+        assertTrue(firstBucket(3599, 60, 1) = 3540, "the bucket that holds 3599");
+        assertTrue(firstBucket(3600, 60, 1) = 3600, "a time at the start of its bucket");
+        assertTrue(firstBucket(119, 60, 2) = 0, "two buckets from 0");
+        assertTrue(firstBucket(119, 60, 3) = 0, "no bucket before 1970");
+        assertTrue(firstBucket(0, 60, 1) = 0, "the first bucket");
+        return nil;
+    end;
+
+    function testPanels(): Unit is
+        var panels: Buffer[Panel] := allocateEmpty();
+        insertBack(&!panels, panel("req", "Requests", "http.requests", LinePanel(), 60, 10));
+        insertBack(&!panels, panel("err", "Errors", "http.errors", BarPanel(), 3600, 24));
+        assertTrue(validPanels(&panels), "two panels");
+        case findPanel(&panels, "err") of
+            when Some(value as found: Panel) do
+                assertTrue(found.step = 3600, "found by name");
+            when None do
+                assertTrue(false, "found by name");
+        end case;
+        case findPanel(&panels, "nope") of
+            when Some(value as found: Panel) do
+                assertTrue(false, "a name no panel has");
+            when None do
+                assertTrue(true, "a name no panel has");
+        end case;
+        case findPanel(&panels, "../req") of
+            when Some(value as found: Panel) do
+                assertTrue(false, "a name that is none");
+            when None do
+                assertTrue(true, "a name that is none");
+        end case;
+        insertBack(&!panels, panel("req", "Again", "http.requests", TilePanel(), 60, 2));
+        assertFalse(validPanels(&panels), "a name twice");
+        destroyFree(panels);
+        var bad: Buffer[Panel] := allocateEmpty();
+        insertBack(&!bad, panel("req", "Requests", "http.requests", LinePanel(), 60, 1));
+        assertFalse(validPanels(&bad), "a panel that cannot be drawn");
+        destroyFree(bad);
+        var many: Buffer[Panel] := allocateEmpty();
+        let names: Span[Nat8, Static] := "abcdefghijklmnopqrstuvwxyz0123456789";
+        var i: Index := 0;
+        while i < 33 do
+            insertBack(&!many, panel(substring(names, i, i + 1), "T", "m", TilePanel(), 60, 2));
+            i := i + 1;
+        end while;
+        assertFalse(validPanels(&many), "33 panels");
+        destroyFree(many);
+        var most: Buffer[Panel] := allocateEmpty();
+        i := (0 : Index);
+        while i < 32 do
+            insertBack(&!most, panel(substring(names, i, i + 1), "T", "m", TilePanel(), 60, 2));
+            i := i + 1;
+        end while;
+        assertTrue(validPanels(&most), "32 panels");
+        destroyFree(most);
+        return nil;
+    end;
+
+    function testLive(): Unit is
+        assertTrue(isLivePath("/panel/"), "a base");
+        assertTrue(isLivePath("/htmx.min.js"), "a script");
+        assertTrue(isLivePath("/a/b-c_d.e"), "letters, digits and - _ . /");
+        assertFalse(isLivePath("/"), "one byte is too short");
+        assertFalse(isLivePath("panel/"), "a slash first");
+        assertFalse(isLivePath("/a b"), "no space");
+        assertFalse(isLivePath("/a\"b"), "no quote");
+        assertFalse(isLivePath("/a//b"), "no two slashes");
+        assertFalse(isLivePath("/a/../b"), "no two dots");
+        assertFalse(isLivePath("/a?b=1"), "no query");
+        assertFalse(isLivePath("//evil.example/x.js"), "no other host");
+        assertTrue(isLive(Live(base => "/panel/", script => "/htmx.min.js", every => 60)), "a live of a minute");
+        assertTrue(isLive(Live(base => "/p/", script => "/h.js", every => 5)), "5 seconds");
+        assertTrue(isLive(Live(base => "/p/", script => "/h.js", every => 3600)), "an hour");
+        assertFalse(isLive(Live(base => "/p/", script => "/h.js", every => 4)), "4 seconds is too often");
+        assertFalse(isLive(Live(base => "/p/", script => "/h.js", every => 3601)), "3601 seconds");
+        assertFalse(isLive(Live(base => "/p", script => "/h.js", every => 60)), "the base ends in a slash");
+        assertFalse(isLive(Live(base => "/p/", script => "/js/", every => 60)), "the script is a file");
+        assertFalse(isLive(Live(base => "/p/", script => "//x/h.js", every => 60)), "a script of another host");
+        return nil;
+    end;
+
+    -- The fragment of p holds every part wanted and none of unwanted.
+    generic [R: Region]
+    function fragmentHas(db: &![Database[Writing], R], p: Panel, now: Int64, wanted: Span[Nat8, Static],
+                         also: Span[Nat8, Static], unwanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case panelFragment(&~db, p, now) of
+            when Right(right as text: String) do
+                let fit: Bool := (contains(asSpan(&text), wanted) and contains(asSpan(&text), also)) and (not contains(asSpan(&text), unwanted));
+                if not fit then
+                    printLn(asSpan(&text));
+                end if;
+                assertTrue(fit, message);
+                destroyString(text);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function keepSample(db: &![Database[Writing], R], name: Span[Nat8, Static], at: Int64, value: Int64): Unit is
+        case recordMetric(&~db, name, at, value) of
+            when Right(right as kept: Bool) do
+                assertTrue(kept, "a sample kept");
+            when Left(left as error: DbError) do
+                assertTrue(false, "a sample kept");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        case prepareMetrics(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table");
+            when None do
+                assertTrue(true, "the table");
+        end case;
+        -- now is 7200, 1970-01-01T02:00:00Z; buckets of an hour start at
+        -- 0, 3600 and 7200.
+        keepSample(&~db, "http.requests", 100, 5);
+        keepSample(&~db, "http.requests", 3700, 10);
+        keepSample(&~db, "http.requests", 3800, 10);
+        keepSample(&~db, "http.requests", 7300, 40);
+        keepSample(&~db, "queue.length", 7000, 1234567);
+        keepSample(&~db, "http.errors", 3700, 9);
+        keepSample(&~db, "http.errors", 7300, 3);
+        fragmentHas(&~db, panel("queue", "Queue", "queue.length", TilePanel(), 60, 2), 7200,
+                    "id=\"panel-queue\"", "1.2 M", "no sample yet", "a tile of the latest sample, read as people read it");
+        fragmentHas(&~db, panel("none", "Nothing", "no.samples", TilePanel(), 60, 2), 7200,
+                    "id=\"panel-none\"", "no sample yet", "<svg", "a tile without a sample");
+        fragmentHas(&~db, panel("rise", "Rise", "http.requests", ChangePanel(), 3600, 2), 7300,
+                    "wolly-up", "40", "wolly-down", "the last hour against the one before: 40 against 20");
+        fragmentHas(&~db, panel("fall", "Fall", "http.errors", ChangePanel(), 3600, 2), 7300,
+                    "wolly-down", ">-0.7</text>", "wolly-up", "the last hour against the one before: 3 against 9");
+        fragmentHas(&~db, panel("line", "Requests", "http.requests", LinePanel(), 3600, 3), 7300,
+                    "wolly-line", "class=\"wolly-panel wolly-line\"", "no sample yet", "a line");
+        fragmentHas(&~db, panel("bars", "Requests", "http.requests", BarPanel(), 3600, 3), 7300,
+                    "00:00", "02:00", "no sample yet", "bars with the hours they start at");
+        fragmentHas(&~db, panel("days", "Requests", "http.requests", BarPanel(), 86400, 2), 7300,
+                    "01-01", "01-02", "no sample yet", "bars of days with their dates");
+        fragmentHas(&~db, panel("esc", "a<b & \"c\"", "http.requests", LinePanel(), 3600, 3), 7300,
+                    "<h2>a&lt;b &amp; &#34;c&#34;</h2>", "a&lt;b", "a<b", "a title is escaped in the heading and the chart");
+        var panels: Buffer[Panel] := allocateEmpty();
+        insertBack(&!panels, panel("first", "First", "http.requests", LinePanel(), 3600, 3));
+        insertBack(&!panels, panel("second", "Second", "queue.length", TilePanel(), 60, 2));
+        case dashboardPage(&~db, &panels, "Ops <1>", "/style.css?v=1&x=2", "<form id=\"search\"></form>", 3600, 30) of
+            when Right(right as text: String) do
+                assertTrue(contains(asSpan(&text), "<!DOCTYPE html>"), "a page");
+                assertTrue(contains(asSpan(&text), "<meta http-equiv=\"refresh\" content=\"30\">"), "the refresh");
+                assertTrue(contains(asSpan(&text), "<title>Ops &lt;1&gt;</title>"), "the title escaped");
+                assertTrue(contains(asSpan(&text), "href=\"/style.css?v=1&amp;x=2\""), "the style sheet");
+                assertTrue(contains(asSpan(&text), "<form id=\"search\"></form>"), "top as the caller gave it");
+                assertTrue(contains(asSpan(&text), "datetime=\"1970-01-01T01:00:00Z\""), "the time of the page");
+                assertTrue(inOrder(asSpan(&text), "id=\"panel-first\"", "id=\"panel-second\""), "the panels in their order");
+                destroyString(text);
+            when Left(left as failure: DashboardFailure) do
+                assertTrue(false, "a page");
+        end case;
+        case dashboardPage(&~db, &panels, "Ops", "/s.css", "", 3600, 0) of
+            when Right(right as text: String) do
+                assertFalse(contains(asSpan(&text), "http-equiv"), "no refresh");
+                destroyString(text);
+            when Left(left as failure: DashboardFailure) do
+                assertTrue(false, "a page without refresh");
+        end case;
+        insertBack(&!panels, panel("first", "Again", "http.requests", TilePanel(), 60, 2));
+        case dashboardPage(&~db, &panels, "Ops", "/s.css", "", 3600, 0) of
+            when Right(right as text: String) do
+                destroyString(text);
+                assertTrue(false, "a name twice is no page");
+            when Left(left as failure: DashboardFailure) do
+                case failure of
+                    when UnfitPanels do
+                        assertTrue(true, "a name twice is no page");
+                    when DashboardStorage(error as error: DbError) do
+                        assertTrue(false, "a name twice is no page");
+                end case;
+        end case;
+        destroyFree(panels);
+        exerciseLive(&~db);
+        return nil;
+    end;
+
+    -- The pages and fragments with htmx, against the same samples.
+    generic [R: Region]
+    function exerciseLive(db: &![Database[Writing], R]): Unit is
+        let live: Live := Live(base => "/panel/", script => "/htmx.min.js", every => 60);
+        case livePanelFragment(&~db, panel("line", "Requests", "http.requests", LinePanel(), 3600, 3), 7300, live) of
+            when Right(right as text: String) do
+                assertTrue(contains(asSpan(&text), "id=\"panel-line\" hx-get=\"/panel/line\" hx-trigger=\"every 60s\" hx-swap=\"outerHTML\">"),
+                           "a live fragment asks for itself every minute and takes its own place");
+                assertTrue(contains(asSpan(&text), "wolly-line"), "and holds its chart");
+                destroyString(text);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a live fragment");
+        end case;
+        case panelFragment(&~db, panel("line", "Requests", "http.requests", LinePanel(), 3600, 3), 7300) of
+            when Right(right as text: String) do
+                assertFalse(contains(asSpan(&text), "hx-"), "a fragment of panelFragment asks for nothing");
+                destroyString(text);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a fragment");
+        end case;
+        var panels: Buffer[Panel] := allocateEmpty();
+        insertBack(&!panels, panel("first", "First", "http.requests", LinePanel(), 3600, 3));
+        insertBack(&!panels, panel("second", "Second", "queue.length", TilePanel(), 60, 2));
+        case liveDashboardPage(&~db, &panels, "Ops", "/s.css", "", 3600, live) of
+            when Right(right as text: String) do
+                assertTrue(contains(asSpan(&text), "<script src=\"/htmx.min.js\"></script>"), "the page loads htmx");
+                assertTrue(contains(asSpan(&text), "<meta name=\"htmx-config\" content='{\"includeIndicatorStyles\":false,\"allowEval\":false,\"allowScriptTags\":false}'>"),
+                           "htmx adds no style and evaluates nothing");
+                assertTrue(contains(asSpan(&text), "<noscript><meta http-equiv=\"refresh\" content=\"60\"></noscript>"),
+                           "without script the page loads itself again");
+                assertFalse(contains(asSpan(&text), "<meta http-equiv=\"refresh\" content=\"0\">"), "no refresh of 0");
+                assertTrue(inOrder(asSpan(&text), "hx-get=\"/panel/first\"", "hx-get=\"/panel/second\""), "every panel asks for itself");
+                assertTrue(inOrder(asSpan(&text), "<noscript>", "</head>"), "the refresh without script in the head");
+                destroyString(text);
+            when Left(left as failure: DashboardFailure) do
+                assertTrue(false, "a live page");
+        end case;
+        case dashboardPage(&~db, &panels, "Ops", "/s.css", "", 3600, 30) of
+            when Right(right as text: String) do
+                assertFalse(contains(asSpan(&text), "<script"), "dashboardPage has no script");
+                assertFalse(contains(asSpan(&text), "hx-"), "and no panel of it asks for itself");
+                destroyString(text);
+            when Left(left as failure: DashboardFailure) do
+                assertTrue(false, "a page");
+        end case;
+        destroyFree(panels);
+        return nil;
+    end;
+
+    -- Whether a stands in text before b.
+    generic [T: Region]
+    function inOrder(text: Span[Nat8, T], a: Span[Nat8, Static], b: Span[Nat8, Static]): Bool is
+        case indexOf(text, a) of
+            when Some(value as first: Index) do
+                case indexOf(text, b) of
+                    when Some(value as second: Index) do
+                        return first < second;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function testDraw(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

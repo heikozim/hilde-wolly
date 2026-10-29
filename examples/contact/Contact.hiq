@@ -1,0 +1,506 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The page holds no value from a request: only constants, the digits of
+-- the count and the hexadecimal and decimal parts of the stamp, so it
+-- needs no escaping.  What a visitor sends is stored and never shown.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    withInt64,
+    withText,
+    closeDatabase,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    finish as finishCursor
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Csrf (
+    sameOriginRequest
+);
+import Standard.FcgiServer (
+    Request,
+    defaultLimits,
+    requestParam,
+    destroyRequest
+);
+import Wolly.Request (
+    formValue
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish
+);
+import Wolly.Router (
+    Route
+);
+import Wolly.Middleware (
+    Step,
+    dispatchWith,
+    knownMethods,
+    securityHeaders
+);
+import Wolly.Server (
+    Outcome,
+    Stopped,
+    NoSocket,
+    NotStarted,
+    serve
+);
+import Wolly.Secret (
+    readKey,
+    makeKey
+);
+import Wolly.Guard (
+    expectedOrigin
+);
+import Wolly.Limit (
+    tooManyRequests
+);
+import Wolly.Ban (
+    withBan
+);
+import Wolly.FormGuard (
+    FormCheck,
+    Passed,
+    Honeypot,
+    BadStamp,
+    TooFast,
+    Expired,
+    TooMany,
+    Replayed,
+    Stamp,
+    honeypotField,
+    timeField,
+    nonceField,
+    macField,
+    makeStamp,
+    destroyStamp,
+    prepareFormGuard,
+    checkSubmission
+);
+
+import Standard.Text (
+    formatInt
+);
+
+import Wolly.Version (
+    answerAbout,
+    library,
+    destroyLibraries
+);
+import Standard.Libcrypto (
+    libraryVersion as cryptoVersion
+);
+import Standard.SqlCipher (
+    libraryVersion as sqlcipherVersion
+);
+
+import Wolly.Confine (
+    sandboxAsked,
+    printSandbox,
+    confineServer
+);
+
+module body Wolly.Example.Contact is
+    constant databasePath: Span[Nat8, Static] := "contact.db";
+    constant keyPath: Span[Nat8, Static] := "form.key";
+    constant socketPath: Span[Nat8, Static] := "contact.sock";
+    -- At most postLimit messages of a client in postWindow seconds.
+    constant postLimit: Int64 := 3;
+    constant postWindow: Int64 := 600;
+    -- A filled honeypot asks Hiawatha to ban the client for an hour; the
+    -- Hiawatha of the end-to-end run cuts it to 2 seconds (BanByCGI).
+    constant honeypotBan: Int64 := 3600;
+    constant mostNameBytes: Index := 100;
+    constant mostMessageBytes: Index := 2000;
+    constant makeMessages: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS contact_messages (name TEXT NOT NULL, message TEXT NOT NULL, at INTEGER NOT NULL) STRICT";
+    constant countMessages: Span[Nat8, Static] := "SELECT count(*) FROM contact_messages";
+    constant addMessage: Span[Nat8, Static] := "INSERT INTO contact_messages (name, message, at) VALUES (?, ?, ?)";
+
+    -- The seconds of the wall clock; 0 when it cannot be read.
+    function now(): Int64 is
+        let ten9: Nat64 := 1000000000;
+        case toInt64(wallNanos() / ten9) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A parameter the web server hands on, empty when there is none.
+    generic [R: Region]
+    function param(request: &[Request, R], name: Span[Nat8, Static]): String is
+        case requestParam(request, name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- A form field, empty when there is none.
+    generic [R: Region]
+    function field(request: &[Request, R], name: Span[Nat8, Static]): String is
+        case formValue(request, name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- A response that is no page to cache or to run scripts in.
+    function guarded(status: Nat16, contentType: Span[Nat8, Static]): Response is
+        let cached: Response := addHeader(makeResponse(status, contentType), "Cache-Control", "no-store");
+        return addHeader(cached, "Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'");
+    end;
+
+    function plain(status: Nat16, text: Span[Nat8, Static]): String is
+        return finish(guarded(status, "text/plain; charset=utf-8"), text);
+    end;
+
+    -- The answer of a message that is taken, and of one that is dropped
+    -- without a word, so that a robot cannot tell the two apart.
+    function sent(): String is
+        return finish(addHeader(guarded(303, "text/plain; charset=utf-8"), "Location", "/contact?sent=1"), "sent\n");
+    end;
+
+    -- The answer of sent for a robot that filled the honeypot, with the
+    -- ban that Hiawatha takes out of it before it leaves.
+    function trapped(): String is
+        return finish(withBan(addHeader(guarded(303, "text/plain; charset=utf-8"), "Location", "/contact?sent=1"), honeypotBan),
+                      "sent\n");
+    end;
+
+    generic [B: Region, V: Region]
+    function hidden(out: &![StringBuilder, B], name: Span[Nat8, Static], value: Span[Nat8, V]): Unit is
+        writeString(&~out, "<input type=\"hidden\" name=\"");
+        writeString(&~out, name);
+        writeString(&~out, "\" value=\"");
+        writeString(&~out, value);
+        writeString(&~out, "\">\n");
+        return nil;
+    end;
+
+    -- The form with stamp, and how many messages are kept.
+    generic [S: Region]
+    function formPage(stamp: &[Stamp, S], count: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>Contact</title></head>\n<body>\n<h1>Contact</h1>\n<p class=\"count\">messages: ");
+        let digits1: String := formatInt(count);
+        writeString(&!out, asSpan(&digits1));
+        destroyString(digits1);
+        writeString(&!out, "</p>\n<form method=\"post\" action=\"/contact\">\n");
+        writeString(&!out, "<label>Name <input name=\"name\" maxlength=\"100\"></label>\n");
+        writeString(&!out, "<label>Message <textarea name=\"message\" maxlength=\"2000\" required></textarea></label>\n");
+        writeString(&!out, "<div hidden><label>Website <input name=\"");
+        writeString(&!out, honeypotField());
+        writeString(&!out, "\" tabindex=\"-1\" autocomplete=\"off\"></label></div>\n");
+        hidden(&!out, timeField(), asSpan(&(stamp->time)));
+        hidden(&!out, nonceField(), asSpan(&(stamp->nonce)));
+        hidden(&!out, macField(), asSpan(&(stamp->mac)));
+        writeString(&!out, "<button>Send</button>\n</form>\n</body>\n</html>\n");
+        let page: String := finalize(out);
+        let output: String := finish(guarded(200, "text/html; charset=utf-8"), asSpan(&page));
+        destroyString(page);
+        return output;
+    end;
+
+    -- The messages kept, None when the database failed.
+    generic [R: Region]
+    function messageCount(db: &![Database[Writing], R]): Option[Int64] is
+        var cursor: Cursor := start(&~db, countMessages, noValues());
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finishCursor(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return None();
+            when None do
+                return Some(value => count);
+        end case;
+    end;
+
+    function showForm(request: Request): String is
+        destroyRequest(request);
+        case readKey(keyPath) of
+            when Some(value as key: String) do
+                let made: Option[Stamp] := makeStamp(asSpan(&key), now());
+                destroyString(key);
+                case made of
+                    when Some(value as stamp: Stamp) do
+                        case openSqlite(databasePath) of
+                            when Right(right as opened: Database[Writing]) do
+                                var db: Database[Writing] := opened;
+                                let count: Option[Int64] := messageCount(&!db);
+                                closeDatabase(db);
+                                case count of
+                                    when Some(value as kept: Int64) do
+                                        let output: String := formPage(&stamp, kept);
+                                        destroyStamp(stamp);
+                                        return output;
+                                    when None do
+                                        destroyStamp(stamp);
+                                        return plain(500, "the messages could not be counted\n");
+                                end case;
+                            when Left(left as error: DbError) do
+                                destroyStamp(stamp);
+                                return plain(500, "contact.db could not be opened\n");
+                        end case;
+                    when None do
+                        return plain(500, "no stamp could be made\n");
+                end case;
+            when None do
+                return plain(500, "form.key could not be read\n");
+        end case;
+    end;
+
+    -- Whether the browser says the request came from this site.
+    generic [R: Region]
+    function sameOrigin(request: &[Request, R]): Bool is
+        case expectedOrigin(request) of
+            when Some(value as own: String) do
+                let site: String := param(request, "HTTP_SEC_FETCH_SITE");
+                let origin: String := param(request, "HTTP_ORIGIN");
+                let taken: Bool := sameOriginRequest(asSpan(&site), asSpan(&origin), asSpan(&own));
+                destroyString(site);
+                destroyString(origin);
+                destroyString(own);
+                return taken;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Stores one message; false when the database failed.
+    generic [R: Region, N: Region, M: Region]
+    function store(db: &![Database[Writing], R], name: Span[Nat8, N], message: Span[Nat8, M], at: Int64): Bool is
+        case execute(&~db, addMessage, withInt64(withText(withText(noValues(), name), message), at)) of
+            when Right(right as added: Nat64) do
+                return true;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    -- The answer to a message the checks have judged.
+    generic [R: Region, N: Region, M: Region]
+    function answer(db: &![Database[Writing], R], result: Either[DbError, FormCheck], name: Span[Nat8, N],
+                    message: Span[Nat8, M], at: Int64): String is
+        case result of
+            when Left(left as error: DbError) do
+                return plain(500, "the message could not be checked\n");
+            when Right(right as check: FormCheck) do
+                case check of
+                    when Passed do
+                        if store(&~db, name, message, at) then
+                            return sent();
+                        else
+                            return plain(500, "the message could not be kept\n");
+                        end if;
+                    when Honeypot do
+                        return trapped();
+                    when TooFast do
+                        return sent();
+                    when Replayed do
+                        return sent();
+                    when BadStamp do
+                        return plain(400, "the form is not valid, load it again\n");
+                    when Expired do
+                        return plain(400, "the form has expired, load it again\n");
+                    when TooMany(retryAfter: Int64) do
+                        return tooManyRequests(retryAfter);
+                end case;
+        end case;
+    end;
+
+    -- The checks of FormGuard on the fields of request, at now.
+    generic [R: Region, K: Region, Q: Region, N: Region, M: Region]
+    function judged(db: &![Database[Writing], R], key: Span[Nat8, K], request: &[Request, Q], name: Span[Nat8, N],
+                    message: Span[Nat8, M], at: Int64): String is
+        let honeypot: String := field(request, honeypotField());
+        let time: String := field(request, timeField());
+        let nonce: String := field(request, nonceField());
+        let mac: String := field(request, macField());
+        let client: String := param(request, "REMOTE_ADDR");
+        let result: Either[DbError, FormCheck] := checkSubmission(&~db, key, asSpan(&honeypot), asSpan(&time), asSpan(&nonce),
+                                                                    asSpan(&mac), asSpan(&client), at, postLimit, postWindow);
+        destroyString(honeypot);
+        destroyString(time);
+        destroyString(nonce);
+        destroyString(mac);
+        destroyString(client);
+        return answer(&~db, result, name, message, at);
+    end;
+
+    -- The answer of judged in a database of its own.
+    generic [K: Region, Q: Region, N: Region, M: Region]
+    function withDatabase(key: Span[Nat8, K], request: &[Request, Q], name: Span[Nat8, N], message: Span[Nat8, M]): String is
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let output: String := judged(&!db, key, request, name, message, now());
+                closeDatabase(db);
+                return output;
+            when Left(left as error: DbError) do
+                return plain(500, "contact.db could not be opened\n");
+        end case;
+    end;
+
+    -- The answer to name and message of request, which came from this site.
+    generic [Q: Region, N: Region, M: Region]
+    function checkedForm(request: &[Request, Q], name: Span[Nat8, N], message: Span[Nat8, M]): String is
+        if (spanLength(name) > mostNameBytes) or ((spanLength(message) = 0) or (spanLength(message) > mostMessageBytes)) then
+            return plain(400, "a name of at most 100 bytes and a message of 1 to 2000 bytes\n");
+        else
+            case readKey(keyPath) of
+                when Some(value as key: String) do
+                    let output: String := withDatabase(asSpan(&key), request, name, message);
+                    destroyString(key);
+                    return output;
+                when None do
+                    return plain(500, "form.key could not be read\n");
+            end case;
+        end if;
+    end;
+
+    generic [Q: Region]
+    function fromForm(request: &[Request, Q]): String is
+        let name: String := field(request, "name");
+        let message: String := field(request, "message");
+        let output: String := checkedForm(request, asSpan(&name), asSpan(&message));
+        destroyString(name);
+        destroyString(message);
+        return output;
+    end;
+
+    function takeMessage(request: Request): String is
+        if sameOrigin(&request) then
+            let output: String := fromForm(&request);
+            destroyRequest(request);
+            return output;
+        else
+            destroyRequest(request);
+            return plain(403, "forbidden\n");
+        end if;
+    end;
+
+    function handle(request: Request): String is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/contact", handler => showForm));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/contact", handler => takeMessage));
+        var befores: Buffer[Fn[Request, Step]] := allocateEmpty();
+        insertBack(&!befores, knownMethods);
+        var afters: Buffer[Fn[String, String]] := allocateEmpty();
+        insertBack(&!afters, securityHeaders);
+        let output: String := dispatchWith(request, &routes, &befores, &afters);
+        destroyFree(routes);
+        destroyFree(befores);
+        destroyFree(afters);
+        return output;
+    end;
+
+    -- The tables, and the key when there is none yet.
+    function prepare(): Bool is
+        case readKey(keyPath) of
+            when Some(value as key: String) do
+                destroyString(key);
+            when None do
+                if not makeKey(keyPath) then
+                    printLn("contact: form.key is unfit and could not be made: mode 0600, 32 to 4096 bytes");
+                    return false;
+                end if;
+        end case;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let guard: Option[DbError] := prepareFormGuard(&!db);
+                let table: Either[DbError, Nat64] := execute(&!db, makeMessages, noValues());
+                closeDatabase(db);
+                case guard of
+                    when Some(value as error: DbError) do
+                        printLn("contact: the tables of the guard could not be made");
+                        return false;
+                    when None do
+                        case table of
+                            when Right(right as changed: Nat64) do
+                                return true;
+                            when Left(left as error: DbError) do
+                                printLn("contact: the table of messages could not be made");
+                                return false;
+                        end case;
+                end case;
+            when Left(left as error: DbError) do
+                printLn("contact: contact.db could not be opened");
+                return false;
+        end case;
+    end;
+
+    function main(): ExitCode is
+        var libraries: Buffer[String] := allocateEmpty();
+        insertBack(&!libraries, library("libcrypto", cryptoVersion()));
+        insertBack(&!libraries, library("sqlcipher", sqlcipherVersion()));
+        let answered: Bool := answerAbout("contact", &libraries);
+        destroyLibraries(libraries);
+        if answered then
+            return ExitSuccess();
+        end if;
+        if sandboxAsked() then
+            printSandbox("contact");
+            return ExitSuccess();
+        end if;
+        confineServer("contact");
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case serve(socketPath, handle, defaultLimits()) of
+            when Stopped(accepted: Index) do
+                print("contact: stopped, connections accepted: ");
+                printLn(accepted);
+                return ExitSuccess();
+            when NoSocket do
+                printLn("contact: the socket contact.sock could not be made");
+                return ExitFailure();
+            when NotStarted do
+                printLn("contact: the server did not start");
+                return ExitFailure();
+        end case;
+    end;
+end module body.

@@ -1,0 +1,331 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Codes drawn by Wolly.Bunti, written as PNG and read from it again (every
+-- picture here goes that way), turned by 0, 90, 180 and 270
+-- degrees, seen in perspective, with a colour cast and noise, read back to
+-- the very payload; pictures without a code refused; and the limits
+-- measured: the strongest perspective, cast and noise still read.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Wolly.Bunti (
+    BuntiCode,
+    BuntiMode,
+    Plain,
+    Dna,
+    BuntiLevel,
+    LevelL,
+    LevelM,
+    LevelQ,
+    LevelH,
+    BuntiError,
+    NotFound,
+    encodeBunti,
+    pixelSide,
+    buntiPixels,
+    buntiPng,
+    destroyBunti
+);
+import Wolly.BuntiScan (
+    decodeBuntiPixels,
+    decodeBuntiPng
+);
+import Wolly.Image (
+    pngOfRgb
+);
+
+module body Wolly.BuntiScanPart2.Test is
+    -- A picture: its side and its pixels.
+    record Picture: Linear is
+        side: Index;
+        pixels: String;
+    end;
+
+    function next(state: Nat32): Nat32 is
+        return modularAdd(modularMultiply(state, (1664525 : Nat32)), (1013904223 : Nat32));
+    end;
+
+    function below(state: Nat32, bound: Index): Index is
+        case toIndex(state / 65536) of
+            when Some(value as high: Index) do
+                return high - ((high / bound) * bound);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        if number > 255 then
+            return 255;
+        end if;
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as number: Index) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function fl(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as f: Float64) do
+                return f;
+            when None do
+                return 0.0;
+        end case;
+    end;
+
+    function whole(f: Float64): Index is
+        if f < 0.0 then
+            return 0;
+        end if;
+        case toInt64(f) of
+            when Some(value as n: Int64) do
+                case toIndex(n) of
+                    when Some(value as i: Index) do
+                        return i;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function payloadOf(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            let value: Index := (i * 13) + 5;
+            writeByte(&!out, narrow(value - ((value / 256) * 256)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The picture of the code of payload at scale; a white square of 30
+    -- pixels when there is no code.
+    generic [P: Region]
+    function drawn(payload: Span[Nat8, P], mode: BuntiMode, level: BuntiLevel, scale: Index): Picture is
+        case encodeBunti(payload, mode, level) of
+            when Right(right as code: BuntiCode) do
+                let side: Index := pixelSide(&code, scale);
+                let pixels: String := buntiPixels(&code, scale);
+                destroyBunti(code);
+                return Picture(side => side, pixels => pixels);
+            when Left(left as error: BuntiError) do
+                return blank(30);
+        end case;
+    end;
+
+    function blank(side: Index): Picture is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < ((side * side) * 3) do
+            writeByte(&!out, (255 : Nat8));
+            i := i + 1;
+        end while;
+        return Picture(side => side, pixels => finalize(out));
+    end;
+
+    generic [S: Region]
+    function pixelByte(pixels: &[String, S], at: Index): Nat8 is
+        let all: Span[Nat8, S] := asSpan(pixels);
+        return all[at];
+    end;
+
+    -- The picture seen in perspective: on a canvas a fifth larger on each
+    -- side, the pixel at (X, Y) taken from (u (1 + s) / w, v (1 + s) / w)
+    -- of the picture, u and v measured from the margin, w = 1 + s u / side
+    -- + s v / side: the right and the lower edge drawn nearer.
+    function inPerspective(picture: Picture, strength: Float64): Picture is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        let margin: Index := side / 5;
+        let canvas: Index := side + (margin * 2);
+        var out: StringBuilder := makeStringBuilder();
+        var y: Index := 0;
+        while y < canvas do
+            var x: Index := 0;
+            while x < canvas do
+                let u: Float64 := fl(x) - fl(margin);
+                let v: Float64 := fl(y) - fl(margin);
+                let w: Float64 := (1.0 + ((strength * u) / fl(side))) + ((strength * v) / fl(side));
+                let sx: Float64 := (u * (1.0 + strength)) / w;
+                let sy: Float64 := (v * (1.0 + strength)) / w;
+                if ((sx >= 0.0) and (sy >= 0.0)) and ((sx < fl(side)) and (sy < fl(side))) then
+                    let at: Index := ((whole(sy) * side) + whole(sx)) * 3;
+                    writeByte(&!out, pixelByte(&pixels, at));
+                    writeByte(&!out, pixelByte(&pixels, at + 1));
+                    writeByte(&!out, pixelByte(&pixels, at + 2));
+                else
+                    writeByte(&!out, (255 : Nat8));
+                    writeByte(&!out, (255 : Nat8));
+                    writeByte(&!out, (255 : Nat8));
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        destroyString(pixels);
+        return Picture(side => canvas, pixels => finalize(out));
+    end;
+
+    -- A colour cast of strength percent: red up, blue down, all a little
+    -- darker; then noise of amplitude up and down on every value.
+    function cast(picture: Picture, strength: Index, amplitude: Index, seed: Nat32): Picture is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        var state: Nat32 := seed;
+        var out: StringBuilder := makeStringBuilder();
+        let count: Index := (side * side) * 3;
+        var i: Index := 0;
+        while i < count do
+            var value: Index := wide(pixelByte(&pixels, i));
+            let channel: Index := i - ((i / 3) * 3);
+            if channel = 0 then
+                value := ((value * ((100 : Index) - (strength / 2))) / 100) + strength;
+            end if;
+            if channel = 1 then
+                value := (value * ((100 : Index) - (strength / 2))) / 100;
+            end if;
+            if channel = 2 then
+                value := (value * ((100 : Index) - strength)) / 100;
+            end if;
+            if amplitude > 0 then
+                state := next(state);
+                let noise: Index := below(state, (amplitude * 2) + 1);
+                value := value + noise;
+                if value >= amplitude then
+                    value := value - amplitude;
+                else
+                    value := (0 : Index);
+                end if;
+            end if;
+            writeByte(&!out, narrow(value));
+            i := i + 1;
+        end while;
+        destroyString(pixels);
+        return Picture(side => side, pixels => finalize(out));
+    end;
+
+    -- Whether the picture, written as PNG and read again, reads to payload.
+    generic [P: Region]
+    function reads(picture: Picture, payload: Span[Nat8, P]): Bool is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        var good: Bool := false;
+        case pngOfRgb(side, side, pixels) of
+            when Some(value as png: String) do
+                case decodeBuntiPng(asSpan(&png), 16000000) of
+                    when Right(right as back: String) do
+                        good := equal(asSpan(&back), payload);
+                        destroyString(back);
+                    when Left(left as error: BuntiError) do
+                        skip;
+                end case;
+                destroyString(png);
+            when None do
+                skip;
+        end case;
+        return good;
+    end;
+
+    function testLimits(): Unit is
+        let payload: String := payloadOf(120);
+        var perspective: Index := 0;
+        var s: Index := 0;
+        var going: Bool := true;
+        while going and (s <= 100) do
+            let strength: Float64 := fl(s) / 100.0;
+            if reads(inPerspective(drawn(asSpan(&payload), Plain(), LevelM(), 6), strength), asSpan(&payload)) then
+                perspective := s;
+                s := s + 5;
+            else
+                going := false;
+            end if;
+        end while;
+        var castMost: Index := 0;
+        var c: Index := 0;
+        var going2: Bool := true;
+        while going2 and (c <= 90) do
+            if reads(cast(drawn(asSpan(&payload), Plain(), LevelM(), 6), c, 0, 3), asSpan(&payload)) then
+                castMost := c;
+                c := c + 5;
+            else
+                going2 := false;
+            end if;
+        end while;
+        var noiseMost: Index := 0;
+        var a: Index := 0;
+        var going3: Bool := true;
+        while going3 and (a <= 200) do
+            if reads(cast(drawn(asSpan(&payload), Plain(), LevelM(), 6), 0, a, 11), asSpan(&payload)) then
+                noiseMost := a;
+                a := a + 10;
+            else
+                going3 := false;
+            end if;
+        end while;
+        var scaleLeast: Index := 6;
+        var sc: Index := 6;
+        var going4: Bool := true;
+        while going4 and (sc >= 1) do
+            if reads(drawn(asSpan(&payload), Plain(), LevelM(), sc), asSpan(&payload)) then
+                scaleLeast := sc;
+                sc := sc - 1;
+            else
+                going4 := false;
+            end if;
+        end while;
+        print("measured limits, 120 bytes at M, 6 pixels a cell: smallest cell ");
+        print(scaleLeast);
+        print(" pixels, perspective ");
+        print(perspective);
+        print("/100, cast ");
+        print(castMost);
+        print(" percent, noise +-");
+        printLn(noiseMost);
+        assertTrue(((perspective >= 10) and (castMost >= 20)) and (noiseMost >= 20), "at least what testDistorted asks");
+        destroyString(payload);
+        return nil;
+    end;
+end module body.

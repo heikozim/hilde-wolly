@@ -1,0 +1,101 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The sandbox of a Wolly server and its sandbox output,
+through Standard.Sandbox.
+
+- The server keeps its files in its working directory: the policy allows that directory to read,
+  write and create, the system libraries to read on Linux, and the promises stdio rpath wpath cpath
+  flock unix fattr: no network but its Unix socket, no exec, no fork.
+- On OpenBSD the promises are pledged and the paths unveiled; on Linux the paths are a Landlock
+  ruleset under no new privileges and a seccomp filter, and the promises are checked, not enforced.
+- confineServer applies it and prints the report: what took effect, and nothing else.
+- sandbox or -s as the one argument: the line of the printing process, a blank line, its profile, a
+  blank line and the profile of the server, its paths sorted, each once, with their number.
+
+    if sandboxAsked() then
+        printSandbox("hello");
+        return ExitSuccess();
+    end if;
+    confineServer("hello");
+"""
+import Standard.Sandbox (
+    Policy
+);
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.Confine is
+    """
+    The promises of a server, in the words of pledge.
+    """
+    function serverPromises(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The policy of a server: serverPromises, the working directory to read,
+    write and create, and on Linux /lib and /usr/lib to read, where glibc
+    loads libgcc_s when a thread first ends.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function serverPolicy(): Policy;
+
+    """
+    Applies serverPolicy to the process and prints program, a colon and the
+    report on one line.
+    No contract: the outcome is the work of the kernel.
+    """
+    function confineServer(program: Span[Nat8, Static]): Unit;
+
+    """
+    Whether the one argument of the process is sandbox or -s.
+    No contract: the answer is read from the arguments of the process.
+    """
+    function sandboxAsked(): Bool;
+
+    """
+    Prints the sandbox output: the mechanisms that confine this process
+    under the promise stdio, a blank line, its profile, a blank line and
+    the profile of the server under the name program.
+    No contract: the outcome is the work of the kernel.
+    """
+    function printSandbox(program: Span[Nat8, Static]): Unit;
+
+    """
+    The policy of a tool before its paths: promises, and on Linux /lib and
+    /usr/lib to read.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function toolPolicy(promises: Span[Nat8, Static]): Policy;
+
+    """
+    The directory of the file path: what comes before its last slash, / for
+    a file in the root, . for a name without a slash.
+    """
+    generic [P: Region]
+    function directoryOf(path: Span[Nat8, P]): String
+        requires spanLength(path) > 0
+        ensures length(&result) > 0;
+
+    """
+    Applies policy to the process without a word, so that the output of the
+    tool stays its own; false when the system refused it, and the tool then
+    stops.
+    No contract: the outcome is the work of the kernel.
+    """
+    function confineTool(policy: Policy): Bool;
+
+    """
+    printSandbox for a tool: its profile under the name program, with
+    promises and policy; a path the arguments give is named in policy by a
+    word in angle brackets, such as <directory-of-FILE>.
+    No contract: the outcome is the work of the kernel.
+    """
+    function printToolSandbox(program: Span[Nat8, Static], promises: Span[Nat8, Static], policy: Policy): Unit;
+end module.

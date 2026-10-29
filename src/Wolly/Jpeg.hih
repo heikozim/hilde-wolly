@@ -1,0 +1,89 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+JPEG read in Hilde alone: baseline, extended sequential and progressive
+pictures (SOF0, SOF1, SOF2) of 8-bit samples, one component (grey) or
+three (YCbCr as JFIF has it), sampling factors 1 and 2, Huffman tables,
+quantisation tables of 8 and 16 bits and restart markers.  The pixels come
+as red, green and blue, row by row from the top, three bytes a pixel, and
+turned as the EXIF orientation says (width and height swap for 5 to 8).
+
+Arithmetic-coded, lossless and hierarchical pictures and 12-bit samples
+answer Unsupported.  The inverse DCT is computed in Float64 and chroma of
+half the resolution is upsampled as libjpeg does, so pixels may differ
+from libjpeg's by a few levels (the test measures how much against
+ImageIO).
+
+Nothing of the file is trusted: every segment length is checked against
+what is left, the size against maxPixels and 16000 a side before anything
+is allocated, a Huffman code of more than 16 bits or a coefficient beyond
+the band answers Broken.  A file that ends after a whole scan without its
+EOI marker reads.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Jpeg is
+    """
+    Why a JPEG was not read.
+    """
+    union JpegError: Free is
+        """
+        The bytes do not begin with the SOI marker FF D8.
+        """
+        case NotJpeg;
+        """
+        Wider or higher than 16000, or more than maxPixels pixels.
+        """
+        case JpegTooLarge;
+        """
+        Arithmetic-coded, lossless or hierarchical, 12-bit, two or four
+        components, sampling factors above 2, or a height left to DNL.
+        """
+        case Unsupported;
+        """
+        The file ends early, a length does not fit, a table is missing, or
+        the entropy-coded data is not what the tables say.
+        """
+        case JpegBroken;
+    end;
+
+    """
+    A picture read: its width, its height and its pixels.
+    """
+    type JpegPicture: Linear;
+
+    """
+    The picture of the JPEG in data, with at most maxPixels pixels.
+    No contract: an Either read from bytes.
+    """
+    generic [D: Region]
+    function readJpeg(data: Span[Nat8, D], maxPixels: Index): Either[JpegError, JpegPicture]
+        requires maxPixels > 0;
+
+    generic [P: Region]
+    function jpegWidth(picture: &[JpegPicture, P]): Index
+        ensures (result >= 1) and (result <= 16000);
+
+    generic [P: Region]
+    function jpegHeight(picture: &[JpegPicture, P]): Index
+        ensures (result >= 1) and (result <= 16000);
+
+    """
+    The pixels: red, green and blue, width times height times 3 bytes.
+    """
+    generic [P: Region]
+    function jpegPixels(picture: &[JpegPicture, P]): Span[Nat8, P]
+        ensures spanLength(result) = ((jpegWidth(picture) * jpegHeight(picture)) * 3);
+
+    """
+    Frees picture and its pixels.
+    No contract: it only gives the value back.
+    """
+    function destroyJpeg(picture: JpegPicture): Unit;
+end module.

@@ -1,0 +1,91 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String
+);
+import Standard.File (
+    Listener,
+    listenUnix,
+    closeListener,
+    removeFileIfThere
+);
+import Standard.Signal (
+    Signals,
+    Wanted,
+    watchSignals,
+    stopWatching
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.FcgiServer (
+    Limits,
+    Request,
+    Turn,
+    Served,
+    serveUnix,
+    serveUnixWith
+);
+
+module body Wolly.Server is
+    generic [S: Region]
+    function serve(socketPath: Span[Nat8, S], handler: Fn[Request, String], limits: Limits): Outcome is
+        let cleared: Bool := removeFileIfThere(socketPath);
+        case listenUnix(socketPath, #o660) of
+            when Some(value as listener: Listener) do
+                var outcome: Outcome := NotStarted();
+                let wanted: Wanted := Wanted(hangup => false, interrupt => true, terminate => true, user1 => false, user2 => false);
+                case watchSignals(wanted) of
+                    when Some(value as watching: Signals) do
+                        var signals: Signals := watching;
+                        case serveUnix(&listener, handler, limits, &!signals) of
+                            when Some(value as accepted: Index) do
+                                outcome := Stopped(accepted => accepted);
+                            when None do
+                                skip;
+                        end case;
+                        let stopped: Bool := stopWatching(signals);
+                    when None do
+                        skip;
+                end case;
+                let closed: Bool := closeListener(listener);
+                let removed: Bool := removeFileIfThere(socketPath);
+                return outcome;
+            when None do
+                return NoSocket();
+        end case;
+    end;
+
+    generic [T: Type, S: Region, B: Region]
+    function serveWith(socketPath: Span[Nat8, S], states: &![Buffer[T], B], handler: Fn[Turn[T], Served[T]],
+        limits: Limits): Outcome is
+        let cleared: Bool := removeFileIfThere(socketPath);
+        case listenUnix(socketPath, #o660) of
+            when Some(value as listener: Listener) do
+                var outcome: Outcome := NotStarted();
+                let wanted: Wanted := Wanted(hangup => false, interrupt => true, terminate => true, user1 => false, user2 => false);
+                case watchSignals(wanted) of
+                    when Some(value as watching: Signals) do
+                        var signals: Signals := watching;
+                        case serveUnixWith(&listener, &~states, handler, limits, &!signals) of
+                            when Some(value as accepted: Index) do
+                                outcome := Stopped(accepted => accepted);
+                            when None do
+                                skip;
+                        end case;
+                        let stopped: Bool := stopWatching(signals);
+                    when None do
+                        skip;
+                end case;
+                let closed: Bool := closeListener(listener);
+                let removed: Bool := removeFileIfThere(socketPath);
+                return outcome;
+            when None do
+                return NoSocket();
+        end case;
+    end;
+end module body.

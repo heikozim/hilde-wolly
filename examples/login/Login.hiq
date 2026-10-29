@@ -1,0 +1,2500 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Utf8 (
+    isValid
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length as bufferLength,
+    nthRef,
+    destroyFree
+);
+import Standard.Template (
+    Render
+);
+import Standard.Text (
+    substring,
+    parseNat
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction,
+    closeDatabase,
+    begin,
+    commit,
+    rollback,
+    Cursor,
+    noValues,
+    withText,
+    withInt64,
+    start as startQuery,
+    advance,
+    columnText,
+    columnInt64,
+    finish as finishQuery,
+    execute
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardInput,
+    acquireInput,
+    releaseInput,
+    readHiddenLine
+);
+import Standard.Log (
+    Log,
+    Info,
+    JsonLines,
+    logToFile,
+    closeLog
+);
+import Standard.FcgiServer (
+    Request,
+    defaultLimits,
+    requestParam,
+    destroyRequest
+);
+import Wolly.Request (
+    formValue,
+    query,
+    requestMethod
+);
+import Wolly.SoundSearch (
+    Both,
+    prepareSounds,
+    indexSounds,
+    removeSounds,
+    findBySound,
+    destroyKeys
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish,
+    decimalText
+);
+import Wolly.Router (
+    Route
+);
+import Wolly.Middleware (
+    Step,
+    Next,
+    Answer,
+    dispatchWith,
+    dispatchLogged,
+    knownMethods,
+    securityHeaders
+);
+import Wolly.Server (
+    Outcome,
+    Stopped,
+    NoSocket,
+    NotStarted,
+    serve
+);
+import Wolly.Secret (
+    readKey,
+    makeKey
+);
+import Wolly.Guard (
+    csrfFieldName,
+    formToken,
+    changeAllowed,
+    expectedOrigin
+);
+import Wolly.Passkey (
+    Purpose,
+    Create,
+    Get,
+    Refusal,
+    preparePasskeys,
+    newChallenge,
+    register,
+    removePasskeys,
+    fromBase64Url,
+    relyingPartyId
+);
+import Wolly.Auth (
+    AuthError,
+    LoginResult,
+    LoggedIn,
+    CodeNeeded,
+    Refused,
+    Throttled,
+    LoginFailed,
+    prepareAuth,
+    addUser,
+    visitorSession,
+    login,
+    changePassword,
+    loginCode,
+    passkeyLogin,
+    confirmPassword,
+    sessionUser,
+    removeUser,
+    logout,
+    sessionToken,
+    withSessionCookie,
+    withoutSessionCookie
+);
+import Wolly.Limit (
+    Verdict,
+    Allowed,
+    Limited,
+    prepareLimits,
+    hit,
+    tooManyRequests
+);
+import Wolly.Totp (
+    startEnrolment,
+    confirmEnrolment,
+    removeTotp,
+    otpauthFor
+);
+import Wolly.Qr (
+    qrDataUri
+);
+import Wolly.Passphrase (
+    PassphraseCheck,
+    checkPassphrase,
+    describeCheck
+);
+import Wolly.Totp (
+    totpEnabled
+);
+import Wolly.Edges (
+    EdgeRoute,
+    NoRoute,
+    Found,
+    prepareEdges,
+    addEdge,
+    lightestRoute
+);
+import Wolly.Bearer (
+    prepareTokens,
+    issueToken,
+    tokenOwner,
+    revokeTokens,
+    bearerToken,
+    unauthorized
+);
+import Wolly.Pseudonym (
+    pseudonym
+);
+import Wolly.Role (
+    prepareRoles,
+    grant,
+    assign,
+    unassignAll,
+    may
+);
+import Wolly.AuditLog (
+    newPseudonym,
+    pseudonymize,
+    prune,
+    note
+);
+
+import Wolly.Version (
+    answerAbout,
+    library,
+    destroyLibraries
+);
+import Standard.Libcrypto (
+    libraryVersion as cryptoVersion
+);
+import Standard.SqlCipher (
+    libraryVersion as sqlcipherVersion
+);
+
+import Wolly.Confine (
+    sandboxAsked,
+    printSandbox,
+    confineServer
+);
+
+module body Wolly.Example.Login is
+    constant databasePath: Span[Nat8, Static] := "wolly.db";
+    constant keyPath: Span[Nat8, Static] := "csrf.key";
+    -- The key that seals the seeds of the second factor; another file than
+    -- the CSRF key, so that neither opens the other's purpose.
+    constant totpKeyPath: Span[Nat8, Static] := "totp.key";
+    -- Passwords known from breaches or as common, one a line: a short
+    -- sample beside the programme; a site takes a list of breaches.
+    constant knownPasswordsPath: Span[Nat8, Static] := "known-passwords.txt";
+    -- The key of the pseudonyms of client addresses.
+    constant pseudonymKeyPath: Span[Nat8, Static] := "pseudonym.key";
+    -- The weight of an edge before its digits were read.
+    constant noWeight: Int64 := -1;
+    constant auditPath: Span[Nat8, Static] := "audit.log";
+    constant accessPath: Span[Nat8, Static] := "access.log";
+    constant socketPath: Span[Nat8, Static] := "login.sock";
+    -- Every POST of a client counts: at most postLimit in postWindow
+    -- seconds.
+    constant postLimit: Int64 := 100;
+    constant postWindow: Int64 := 60;
+
+    -- The data of templates/login.jinja: the form token, a message when a
+    -- login was refused, and the name that was typed.
+    record LoginPage: Linear is
+        csrf: String;
+        message: String;
+        name: String;
+    end;
+
+    -- The data of templates/code.jinja.
+    record CodePage: Linear is
+        csrf: String;
+        message: String;
+    end;
+
+    -- The data of templates/totp.jinja: the token, the QR code as a data
+    -- URI and the secret.
+    record TotpPage: Linear is
+        csrf: String;
+        qr: String;
+        secret: String;
+    end;
+
+    -- The data of templates/user.jinja.
+    record UserPage: Linear is
+        name: String;
+        csrf: String;
+    end;
+
+    -- The notes of a user, one a line, and the token for the form.
+    record NotesPage: Linear is
+        csrf: String;
+        notes: String;
+    end;
+
+    -- The statements of the notes: a table of its own.  Hilde's @query, @execute and @migrations call
+    -- Standard.Sqlite, which a Database of Standard.Database is not, so the programme writes them out.
+    constant makeNotes: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL) STRICT";
+    constant makeNotesIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS notes_owner ON notes (owner, id)";
+    constant selectNotes: Span[Nat8, Static] := "SELECT content FROM notes WHERE owner = ? ORDER BY id DESC LIMIT 100";
+    constant countNotes: Span[Nat8, Static] := "SELECT count(*) FROM notes WHERE owner = ?";
+    constant insertNote: Span[Nat8, Static] := "INSERT INTO notes (owner, content, created_at) VALUES (?, ?, ?)";
+    constant deleteNotes: Span[Nat8, Static] := "DELETE FROM notes WHERE owner = ?";
+
+    -- The longest note in bytes.
+    constant noteLength: Index := 500;
+
+    -- How many notes a user may keep: as many as /notes shows, so that no
+    -- note is kept that its owner cannot see.
+    constant mostNotes: Int64 := 100;
+
+    -- The seconds of the wall clock; 0 when it cannot be read.
+    function now(): Int64 is
+        let ten9: Nat64 := 1000000000;
+        case toInt64(wallNanos() / ten9) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The pseudonym of the address the web server names for the client
+    -- (Wolly.Pseudonym): what the limits count, the failures are kept by
+    -- and the audit names, never the address itself.  Without the key all
+    -- clients are unknown and share one count: safe, and seen at once.
+    generic [R: Region]
+    function client(request: &[Request, R]): String is
+        case requestParam(request, "REMOTE_ADDR") of
+            when Some(value as address: String) do
+                case readKey(pseudonymKeyPath) of
+                    when Some(value as key: String) do
+                        let made: Option[String] := pseudonym(asSpan(&key), asSpan(&address));
+                        destroyString(key);
+                        destroyString(address);
+                        case made of
+                            when Some(value as named: String) do
+                                return named;
+                            when None do
+                                return fromSpan("unknown");
+                        end case;
+                    when None do
+                        destroyString(address);
+                        return fromSpan("unknown");
+                end case;
+            when None do
+                return fromSpan("unknown");
+        end case;
+    end;
+
+    -- A response that is no page to cache or to run scripts in; the step
+    -- securityHeaders adds nosniff, no framing and the referrer policy.
+    function guarded(status: Nat16, contentType: Span[Nat8, Static]): Response is
+        let cached: Response := addHeader(makeResponse(status, contentType), "Cache-Control", "no-store");
+        return addHeader(cached, "Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'");
+    end;
+
+    function plain(status: Nat16, text: Span[Nat8, Static]): String is
+        return finish(guarded(status, "text/plain; charset=utf-8"), text);
+    end;
+
+    function redirect(target: Span[Nat8, Static]): Response is
+        return addHeader(guarded(303, "text/plain; charset=utf-8"), "Location", target);
+    end;
+
+    -- The form to log in, with the token of the session for its csrf
+    -- field, a message and the name typed before; the template escapes
+    -- each value for where it lands.
+    function loginPage(csrf: String, message: Span[Nat8, Static], name: String): String is
+        let page: LoginPage := LoginPage(csrf => csrf, message => fromSpan(message), name => name);
+        let text: String := renderLogin(&page);
+        let { csrf as c: String, message as m: String, name as n: String } := page;
+        destroyString(c);
+        destroyString(m);
+        destroyString(n);
+        return text;
+    end;
+
+    -- The template names its data through a reference; the compiler reads
+    -- templates/login.jinja here and checks every name in it against the
+    -- record.
+    generic [R: Region]
+    function renderLogin(page: &[LoginPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/login.jinja", page, out);
+        return finalize(out);
+    end;
+
+    -- The page of a user, with the form to log out.
+    function userPage(name: String, csrf: String): String is
+        let page: UserPage := UserPage(name => name, csrf => csrf);
+        let text: String := renderUser(&page);
+        let { name as n: String, csrf as c: String } := page;
+        destroyString(n);
+        destroyString(c);
+        return text;
+    end;
+
+    generic [R: Region]
+    function renderUser(page: &[UserPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/user.jinja", page, out);
+        return finalize(out);
+    end;
+
+    -- The form token of the session of token, or the empty string when the
+    -- key cannot be read; a form without a token is refused on its way back.
+    generic [T: Region]
+    function tokenForForm(token: Span[Nat8, T]): String is
+        case readKey(keyPath) of
+            when Some(value as key: String) do
+                case formToken(asSpan(&key), token) of
+                    when Some(value as csrf: String) do
+                        destroyString(key);
+                        return csrf;
+                    when None do
+                        destroyString(key);
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function home(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                destroyRequest(request);
+                case openSqlite(databasePath) of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let found: Either[AuthError, Option[String]] := sessionUser(&!db, asSpan(&token), now());
+                        closeDatabase(db);
+                        case found of
+                            when Right(right as user: Option[String]) do
+                                case user of
+                                    when Some(value as name: String) do
+                                        let csrf: String := tokenForForm(asSpan(&token));
+                                        let page: String := userPage(name, csrf);
+                                        destroyString(token);
+                                        let output: String := finish(guarded(200, "text/html; charset=utf-8"), asSpan(&page));
+                                        destroyString(page);
+                                        return output;
+                                    when None do
+                                        destroyString(token);
+                                        return finish(redirect("/login"), "see /login\n");
+                                end case;
+                            when Left(left as error: AuthError) do
+                                destroyString(token);
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyString(token);
+                        return plain(500, "internal server error\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                return finish(redirect("/login"), "see /login\n");
+        end case;
+    end;
+
+    -- The page only a user may see who holds a role granted the action
+    -- admin; a visitor goes to the login, a user without it gets 403.
+    function admin(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                destroyRequest(request);
+                case openSqlite(databasePath) of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let found: Either[AuthError, Option[String]] := sessionUser(&!db, asSpan(&token), now());
+                        destroyString(token);
+                        case found of
+                            when Right(right as user: Option[String]) do
+                                case user of
+                                    when Some(value as name: String) do
+                                        let permitted: Either[DbError, Bool] := may(&!db, asSpan(&name), "admin");
+                                        destroyString(name);
+                                        closeDatabase(db);
+                                        case permitted of
+                                            when Right(right as granted: Bool) do
+                                                if granted then
+                                                    return plain(200, "admin area\n");
+                                                else
+                                                    return plain(403, "forbidden\n");
+                                                end if;
+                                            when Left(left as error: DbError) do
+                                                return plain(500, "internal server error\n");
+                                        end case;
+                                    when None do
+                                        closeDatabase(db);
+                                        return finish(redirect("/login"), "see /login\n");
+                                end case;
+                            when Left(left as error: AuthError) do
+                                closeDatabase(db);
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyString(token);
+                        return plain(500, "internal server error\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                return finish(redirect("/login"), "see /login\n");
+        end case;
+    end;
+
+    -- GET /admin/find?name=...: the users whose names sound like name, one
+    -- a line, for a holder of a role granted admin; a visitor goes to the
+    -- login, a user without it gets 403.
+    function adminFind(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                let asked: String := orNothing(query(&request, "name"));
+                destroyRequest(request);
+                case openSqlite(databasePath) of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let found: Either[AuthError, Option[String]] := sessionUser(&!db, asSpan(&token), now());
+                        destroyString(token);
+                        case found of
+                            when Right(right as user: Option[String]) do
+                                case user of
+                                    when Some(value as name: String) do
+                                        let permitted: Either[DbError, Bool] := may(&!db, asSpan(&name), "admin");
+                                        destroyString(name);
+                                        let answer: String := findAllowed(&!db, permitted, asSpan(&asked));
+                                        closeDatabase(db);
+                                        destroyString(asked);
+                                        return answer;
+                                    when None do
+                                        closeDatabase(db);
+                                        destroyString(asked);
+                                        return finish(redirect("/login"), "see /login\n");
+                                end case;
+                            when Left(left as error: AuthError) do
+                                closeDatabase(db);
+                                destroyString(asked);
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyString(token);
+                        destroyString(asked);
+                        return plain(500, "internal server error\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                return finish(redirect("/login"), "see /login\n");
+        end case;
+    end;
+
+    function orNothing(found: Option[String]): String is
+        case found of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The answer of /admin/find once the role is known.
+    generic [R: Region, A: Region]
+    function findAllowed(db: &![Database[Writing], R], permitted: Either[DbError, Bool], asked: Span[Nat8, A]): String is
+        case permitted of
+            when Right(right as granted: Bool) do
+                if not granted then
+                    return plain(403, "forbidden\n");
+                end if;
+                case findBySound(&~db, asked, Both(), 20) of
+                    when Right(right as keys: Buffer[String]) do
+                        var out: StringBuilder := makeStringBuilder();
+                        var i: Index := 0;
+                        while i < bufferLength(&keys) do
+                            writeString(&!out, asSpan(nthRef(&keys, i)));
+                            writeByte(&!out, '\n');
+                            i := i + 1;
+                        end while;
+                        destroyKeys(keys);
+                        let shown: String := finalize(out);
+                        let output: String := finish(guarded(200, "text/plain; charset=utf-8"), asSpan(&shown));
+                        destroyString(shown);
+                        return output;
+                    when Left(left as error: DbError) do
+                        return plain(500, "internal server error\n");
+                end case;
+            when Left(left as error: DbError) do
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    -- The page that asks for the code, with status.
+    function codePage(csrf: String, message: Span[Nat8, Static], status: Nat16): String is
+        let page: CodePage := CodePage(csrf => csrf, message => fromSpan(message));
+        let text: String := renderCode(&page);
+        let { csrf as c: String, message as m: String } := page;
+        destroyString(c);
+        destroyString(m);
+        let output: String := finish(guarded(status, "text/html; charset=utf-8"), asSpan(&text));
+        destroyString(text);
+        return output;
+    end;
+
+    generic [R: Region]
+    function renderCode(page: &[CodePage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/code.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderTotp(page: &[TotpPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/totp.jinja", page, out);
+        return finalize(out);
+    end;
+
+    -- As guarded, and the page may show an image given as a data URI.
+    function guardedWithImages(status: Nat16): Response is
+        let cached: Response := addHeader(makeResponse(status, "text/html; charset=utf-8"), "Cache-Control", "no-store");
+        return addHeader(cached, "Content-Security-Policy", "default-src 'none'; img-src data:; form-action 'self'; frame-ancestors 'none'");
+    end;
+
+    function showCode(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                destroyRequest(request);
+                let csrf: String := tokenForForm(asSpan(&token));
+                destroyString(token);
+                return codePage(csrf, "", 200);
+            when None do
+                destroyRequest(request);
+                return finish(redirect("/login"), "see /login\n");
+        end case;
+    end;
+
+    function doCode(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    return codeAllowed(request, token);
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- The code once the guard took the request.
+    function codeAllowed(request: Request, token: String): String is
+        let code: String := field(&request, "code");
+        let address: String := client(&request);
+        destroyRequest(request);
+        case readKey(totpKeyPath) of
+            when Some(value as key: String) do
+                case openSqlite(databasePath) of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let result: LoginResult := loginCode(&!db, asSpan(&key), asSpan(&token), asSpan(&code), asSpan(&address), now(), auditPath);
+                        closeDatabase(db);
+                        destroyString(key);
+                        destroyString(code);
+                        destroyString(address);
+                        return codeAnswer(result, token);
+                    when Left(left as error: DbError) do
+                        destroyString(key);
+                        destroyString(code);
+                        destroyString(address);
+                        destroyString(token);
+                        return plain(500, "internal server error\n");
+                end case;
+            when None do
+                destroyString(code);
+                destroyString(address);
+                destroyString(token);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    function codeAnswer(result: LoginResult, token: String): String is
+        case result of
+            when LoggedIn(token as renewed: String) do
+                destroyString(token);
+                let response: Response := withSessionCookie(redirect("/"), asSpan(&renewed));
+                destroyString(renewed);
+                return finish(response, "see /\n");
+            when CodeNeeded(token as waiting: String) do
+                destroyString(waiting);
+                destroyString(token);
+                return plain(500, "internal server error\n");
+            when Refused do
+                let csrf: String := tokenForForm(asSpan(&token));
+                destroyString(token);
+                return codePage(csrf, "code refused", 401);
+            when Throttled do
+                destroyString(token);
+                return finish(addHeader(guarded(429, "text/plain; charset=utf-8"), "Retry-After", "900"), "too many attempts\n");
+            when LoginFailed(error: AuthError) do
+                destroyString(token);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    -- The user of the session the request carries, None for a visitor or
+    -- a session that waits for a code.
+    generic [R: Region]
+    function userOf(request: &[Request, R]): Option[String] is
+        case sessionToken(request) of
+            when Some(value as token: String) do
+                case openSqlite(databasePath) of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let found: Either[AuthError, Option[String]] := sessionUser(&!db, asSpan(&token), now());
+                        closeDatabase(db);
+                        destroyString(token);
+                        case found of
+                            when Right(right as user: Option[String]) do
+                                return user;
+                            when Left(left as error: AuthError) do
+                                return None();
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyString(token);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- A new seed for the user, shown once as a QR code and as text, with
+    -- the form for the first code.  409 when the factor is on already.
+    function showTotp(request: Request): String is
+        let csrf: String := csrfOf(&request);
+        case userOf(&request) of
+            when Some(value as name: String) do
+                destroyRequest(request);
+                case readKey(totpKeyPath) of
+                    when Some(value as key: String) do
+                        case openSqlite(databasePath) of
+                            when Right(right as opened: Database[Writing]) do
+                                var db: Database[Writing] := opened;
+                                let started: Either[DbError, Option[String]] := startEnrolment(&!db, asSpan(&key), asSpan(&name));
+                                closeDatabase(db);
+                                destroyString(key);
+                                return enrolmentPage(started, name, csrf);
+                            when Left(left as error: DbError) do
+                                destroyString(key);
+                                destroyString(name);
+                                destroyString(csrf);
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when None do
+                        destroyString(name);
+                        destroyString(csrf);
+                        return plain(500, "internal server error\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                destroyString(csrf);
+                return finish(redirect("/login"), "see /login\n");
+        end case;
+    end;
+
+    -- The form token of the session the request carries, or empty.
+    generic [R: Region]
+    function csrfOf(request: &[Request, R]): String is
+        case sessionToken(request) of
+            when Some(value as token: String) do
+                let csrf: String := tokenForForm(asSpan(&token));
+                destroyString(token);
+                return csrf;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function enrolmentPage(started: Either[DbError, Option[String]], name: String, csrf: String): String is
+        case started of
+            when Right(right as given: Option[String]) do
+                case given of
+                    when Some(value as secret: String) do
+                        let uri: String := otpauthFor("Wolly", asSpan(&name), asSpan(&secret));
+                        destroyString(name);
+                        case qrDataUri(asSpan(&uri)) of
+                            when Some(value as qr: String) do
+                                destroyString(uri);
+                                let page: TotpPage := TotpPage(csrf => csrf, qr => qr, secret => secret);
+                                let text: String := renderTotp(&page);
+                                let { csrf as c: String, qr as q: String, secret as s: String } := page;
+                                destroyString(c);
+                                destroyString(q);
+                                destroyString(s);
+                                let output: String := finish(guardedWithImages(200), asSpan(&text));
+                                destroyString(text);
+                                return output;
+                            when None do
+                                destroyString(uri);
+                                destroyString(secret);
+                                destroyString(csrf);
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when None do
+                        destroyString(name);
+                        destroyString(csrf);
+                        return plain(409, "two-factor is on already\n");
+                end case;
+            when Left(left as error: DbError) do
+                destroyString(name);
+                destroyString(csrf);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    function doTotp(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    destroyString(token);
+                    return totpAllowed(request);
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- The first code of the app, which turns the factor on.
+    function totpAllowed(request: Request): String is
+        let code: String := field(&request, "code");
+        case userOf(&request) of
+            when Some(value as name: String) do
+                destroyRequest(request);
+                case readKey(totpKeyPath) of
+                    when Some(value as key: String) do
+                        case openSqlite(databasePath) of
+                            when Right(right as opened: Database[Writing]) do
+                                var db: Database[Writing] := opened;
+                                let confirmed: Either[DbError, Bool] := confirmEnrolment(&!db, asSpan(&key), asSpan(&name), asSpan(&code), now());
+                                closeDatabase(db);
+                                destroyString(key);
+                                destroyString(name);
+                                destroyString(code);
+                                case confirmed of
+                                    when Right(right as on: Bool) do
+                                        if on then
+                                            return plain(200, "two-factor is on\n");
+                                        else
+                                            return plain(400, "code refused\n");
+                                        end if;
+                                    when Left(left as error: DbError) do
+                                        return plain(500, "internal server error\n");
+                                end case;
+                            when Left(left as error: DbError) do
+                                destroyString(key);
+                                destroyString(name);
+                                destroyString(code);
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when None do
+                        destroyString(name);
+                        destroyString(code);
+                        return plain(500, "internal server error\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                destroyString(code);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- For a machine with a token: who the token was given to.  401 with
+    -- WWW-Authenticate: Bearer without one that opens anything.
+    function whoami(request: Request): String is
+        let token: Option[String] := bearerToken(&request);
+        destroyRequest(request);
+        case token of
+            when Some(value as presented: String) do
+                case openSqlite(databasePath) of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let owner: Either[DbError, Option[String]] := tokenOwner(&!db, asSpan(&presented));
+                        closeDatabase(db);
+                        destroyString(presented);
+                        case owner of
+                            when Right(right as found: Option[String]) do
+                                case found of
+                                    when Some(value as name: String) do
+                                        var out: StringBuilder := makeStringBuilder();
+                                        writeString(&!out, "token of ");
+                                        writeString(&!out, asSpan(&name));
+                                        writeString(&!out, "\n");
+                                        destroyString(name);
+                                        let text: String := finalize(out);
+                                        let output: String := finish(guarded(200, "text/plain; charset=utf-8"), asSpan(&text));
+                                        destroyString(text);
+                                        return output;
+                                    when None do
+                                        return unauthorized();
+                                end case;
+                            when Left(left as error: DbError) do
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyString(presented);
+                        return plain(500, "internal server error\n");
+                end case;
+            when None do
+                return unauthorized();
+        end case;
+    end;
+
+    function showLogin(request: Request): String is
+        var old: String := fromSpan("");
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                destroyString(old);
+                old := token;
+            when None do
+                skip;
+        end case;
+        destroyRequest(request);
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let session: Either[AuthError, String] := visitorSession(&!db, asSpan(&old), now());
+                closeDatabase(db);
+                destroyString(old);
+                case session of
+                    when Right(right as token: String) do
+                        let csrf: String := tokenForForm(asSpan(&token));
+                        let page: String := loginPage(csrf, "", fromSpan(""));
+                        let response: Response := withSessionCookie(guarded(200, "text/html; charset=utf-8"), asSpan(&token));
+                        destroyString(token);
+                        let output: String := finish(response, asSpan(&page));
+                        destroyString(page);
+                        return output;
+                    when Left(left as error: AuthError) do
+                        return plain(500, "internal server error\n");
+                end case;
+            when Left(left as error: DbError) do
+                destroyString(old);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    -- Whether request may change something in the session of token: the
+    -- key must be readable and the guard must take the request.
+    generic [R: Region, T: Region]
+    function allowed(request: &[Request, R], token: Span[Nat8, T]): Bool is
+        case readKey(keyPath) of
+            when Some(value as key: String) do
+                let taken: Bool := changeAllowed(request, asSpan(&key), token);
+                destroyString(key);
+                return taken;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function field(request: &[Request, R], name: Span[Nat8, Static]): String is
+        case formValue(request, name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function doLogin(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    return loginAllowed(request, token);
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- The login once the guard took the request.
+    function loginAllowed(request: Request, token: String): String is
+        let name: String := field(&request, "name");
+        let password: String := field(&request, "password");
+        let address: String := client(&request);
+        destroyRequest(request);
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let result: LoginResult := login(&!db, asSpan(&token), asSpan(&name), asSpan(&password), asSpan(&address), now(), auditPath);
+                closeDatabase(db);
+                destroyString(password);
+                destroyString(address);
+                case result of
+                    when LoggedIn(token as renewed: String) do
+                        destroyString(token);
+                        destroyString(name);
+                        let response: Response := withSessionCookie(redirect("/"), asSpan(&renewed));
+                        destroyString(renewed);
+                        return finish(response, "see /\n");
+                    when CodeNeeded(token as waiting: String) do
+                        destroyString(token);
+                        destroyString(name);
+                        let response: Response := withSessionCookie(redirect("/login/code"), asSpan(&waiting));
+                        destroyString(waiting);
+                        return finish(response, "see /login/code\n");
+                    when Refused do
+                        -- The form again, in the same session, with the
+                        -- name as it was typed.
+                        let csrf: String := tokenForForm(asSpan(&token));
+                        destroyString(token);
+                        let page: String := loginPage(csrf, "login refused", name);
+                        let output: String := finish(guarded(401, "text/html; charset=utf-8"), asSpan(&page));
+                        destroyString(page);
+                        return output;
+                    when Throttled do
+                        destroyString(token);
+                        destroyString(name);
+                        return finish(addHeader(guarded(429, "text/plain; charset=utf-8"), "Retry-After", "900"), "too many attempts\n");
+                    when LoginFailed(error: AuthError) do
+                        destroyString(token);
+                        destroyString(name);
+                        return plain(500, "internal server error\n");
+                end case;
+            when Left(left as error: DbError) do
+                destroyString(token);
+                destroyString(name);
+                destroyString(password);
+                destroyString(address);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    -- The bytes of the base64url field name, empty when it is none.
+    generic [R: Region]
+    function decodedField(request: &[Request, R], name: Span[Nat8, Static]): String is
+        let text: String := field(request, name);
+        case fromBase64Url(asSpan(&text)) of
+            when Some(value as bytes: String) do
+                destroyString(text);
+                return bytes;
+            when None do
+                destroyString(text);
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [R: Region]
+    function originOf(request: &[Request, R]): String is
+        case expectedOrigin(request) of
+            when Some(value as origin: String) do
+                return origin;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- POST /passkey/challenge: purpose=create for the user of the session,
+    -- purpose=get&name=... for a login; the challenge as text.
+    function passkeyChallenge(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    let purpose: String := field(&request, "purpose");
+                    let asked: String := field(&request, "name");
+                    destroyRequest(request);
+                    let answer: String := challengeAllowed(token, purpose, asked);
+                    return answer;
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- A challenge to create a passkey for the user of the session of
+    -- token, or to log in as asked; Right None for any other purpose or a
+    -- session without a user.
+    generic [R: Region, T: Region, P: Region, A: Region]
+    function challengeMade(db: &![Database[Writing], R], token: Span[Nat8, T], purpose: Span[Nat8, P],
+                           asked: Span[Nat8, A]): Either[DbError, Option[String]] is
+        if sameText(purpose, "get") then
+            return newChallenge(&~db, asked, Get(), now());
+        end if;
+        if not sameText(purpose, "create") then
+            return Right(right => None());
+        end if;
+        case sessionUser(&~db, token, now()) of
+            when Right(right as user: Option[String]) do
+                case user of
+                    when Some(value as name: String) do
+                        let made: Either[DbError, Option[String]] := newChallenge(&~db, asSpan(&name), Create(), now());
+                        destroyString(name);
+                        return made;
+                    when None do
+                        return Right(right => None());
+                end case;
+            when Left(left as error: AuthError) do
+                return Right(right => None());
+        end case;
+    end;
+
+    function challengeAllowed(token: String, purpose: String, asked: String): String is
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let made: Either[DbError, Option[String]] := challengeMade(&!db, asSpan(&token), asSpan(&purpose), asSpan(&asked));
+                destroyString(purpose);
+                closeDatabase(db);
+                destroyString(token);
+                destroyString(asked);
+                case made of
+                    when Right(right as challenge: Option[String]) do
+                        case challenge of
+                            when Some(value as text: String) do
+                                var out: StringBuilder := makeStringBuilder();
+                                writeString(&!out, asSpan(&text));
+                                writeByte(&!out, '\n');
+                                destroyString(text);
+                                let reply: String := finalize(out);
+                                let output: String := finish(guarded(200, "text/plain; charset=utf-8"), asSpan(&reply));
+                                destroyString(reply);
+                                return output;
+                            when None do
+                                return plain(400, "no challenge\n");
+                        end case;
+                    when Left(left as error: DbError) do
+                        return plain(500, "internal server error\n");
+                end case;
+            when Left(left as error: DbError) do
+                destroyString(token);
+                destroyString(purpose);
+                destroyString(asked);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    generic [A: Region]
+    function sameText(a: Span[Nat8, A], b: Span[Nat8, Static]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- POST /passkey/register: a passkey of the user of the session, the
+    -- client data and the attestation object in base64url.
+    function passkeyRegister(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    let clientData: String := decodedField(&request, "clientData");
+                    let attestation: String := decodedField(&request, "attestation");
+                    let password: String := field(&request, "password");
+                    let address: String := client(&request);
+                    let origin: String := originOf(&request);
+                    destroyRequest(request);
+                    let answer: String := registerAllowed(token, clientData, attestation, origin, password, address);
+                    return answer;
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- A passkey is kept only after the password of the user once more: a
+    -- session alone, perhaps taken for a moment, must not leave a key
+    -- behind that outlives it.
+    function registerAllowed(token: String, clientData: String, attestation: String, origin: String, password: String,
+                             address: String): String is
+        let rpId: String := relyingPartyId(asSpan(&origin));
+        var outcome: Nat16 := 500;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let found: Either[AuthError, Option[String]] := sessionUser(&!db, asSpan(&token), now());
+                case found of
+                    when Right(right as user: Option[String]) do
+                        case user of
+                            when Some(value as name: String) do
+                                case confirmPassword(&!db, asSpan(&name), asSpan(&password), asSpan(&address), now()) of
+                                    when Right(right as confirmed: Bool) do
+                                        if confirmed then
+                                            case register(&!db, asSpan(&name), asSpan(&clientData), asSpan(&attestation), asSpan(&rpId), asSpan(&origin), now()) of
+                                                when Right(right as refused: Option[Refusal]) do
+                                                    case refused of
+                                                        when Some(value as refusal: Refusal) do
+                                                            outcome := (400 : Nat16);
+                                                        when None do
+                                                            outcome := (201 : Nat16);
+                                                    end case;
+                                                when Left(left as error: DbError) do
+                                                    skip;
+                                            end case;
+                                        else
+                                            outcome := (401 : Nat16);
+                                        end if;
+                                    when Left(left as error: AuthError) do
+                                        skip;
+                                end case;
+                                destroyString(name);
+                            when None do
+                                outcome := (403 : Nat16);
+                        end case;
+                    when Left(left as error: AuthError) do
+                        skip;
+                end case;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                skip;
+        end case;
+        destroyString(token);
+        destroyString(clientData);
+        destroyString(attestation);
+        destroyString(origin);
+        destroyString(rpId);
+        destroyString(password);
+        destroyString(address);
+        if outcome = 201 then
+            return plain(201, "passkey kept\n");
+        end if;
+        if outcome = 401 then
+            return plain(401, "password refused\n");
+        end if;
+        if outcome = 400 then
+            return plain(400, "passkey refused\n");
+        end if;
+        if outcome = 403 then
+            return plain(403, "forbidden\n");
+        end if;
+        return plain(500, "internal server error\n");
+    end;
+
+    -- POST /passkey/login: the credential id as it was given, the client
+    -- data, the authenticator data and the signature in base64url.
+    function passkeySignIn(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    let credential: String := field(&request, "credential");
+                    let clientData: String := decodedField(&request, "clientData");
+                    let data: String := decodedField(&request, "authenticatorData");
+                    let signature: String := decodedField(&request, "signature");
+                    let origin: String := originOf(&request);
+                    let address: String := client(&request);
+                    destroyRequest(request);
+                    let rpId: String := relyingPartyId(asSpan(&origin));
+                    case openSqlite(databasePath) of
+                        when Right(right as opened: Database[Writing]) do
+                            var db: Database[Writing] := opened;
+                            let result: LoginResult := passkeyLogin(&!db, asSpan(&token), asSpan(&credential), asSpan(&clientData),
+                                                                    asSpan(&data), asSpan(&signature), asSpan(&rpId), asSpan(&origin),
+                                                                    asSpan(&address), now(), auditPath);
+                            closeDatabase(db);
+                            destroyString(token);
+                            destroyString(credential);
+                            destroyString(clientData);
+                            destroyString(data);
+                            destroyString(signature);
+                            destroyString(origin);
+                            destroyString(address);
+                            destroyString(rpId);
+                            case result of
+                                when LoggedIn(token as renewed: String) do
+                                    let response: Response := withSessionCookie(redirect("/"), asSpan(&renewed));
+                                    destroyString(renewed);
+                                    return finish(response, "see /\n");
+                                when CodeNeeded(token as waiting: String) do
+                                    destroyString(waiting);
+                                    return plain(500, "internal server error\n");
+                                when Refused do
+                                    return plain(401, "passkey refused\n");
+                                when Throttled do
+                                    return finish(addHeader(guarded(429, "text/plain; charset=utf-8"), "Retry-After", "900"), "too many attempts\n");
+                                when LoginFailed(error: AuthError) do
+                                    return plain(500, "internal server error\n");
+                            end case;
+                        when Left(left as error: DbError) do
+                            destroyString(token);
+                            destroyString(credential);
+                            destroyString(clientData);
+                            destroyString(data);
+                            destroyString(signature);
+                            destroyString(origin);
+                            destroyString(address);
+                            destroyString(rpId);
+                            return plain(500, "internal server error\n");
+                    end case;
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- A note is 1 to noteLength bytes of UTF-8 without a control byte, so
+    -- that the page can show it as one line.
+    generic [T: Region]
+    function isNote(text: Span[Nat8, T]): Bool is
+        if (spanLength(text) = 0) or (spanLength(text) > noteLength) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] < 32) or (text[i] = 127) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return isValid(text);
+    end;
+
+    -- The notes of owner, newest first, one a line, at most 100; None when
+    -- the database failed.  Only the notes of owner: the query filters by
+    -- the user of the session, never by a value of the request.
+    generic [R: Region, O: Region]
+    function notesOf(db: &![Database[Writing], R], owner: Span[Nat8, O]): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        var failed: Bool := false;
+        var cursor: Cursor := startQuery(&~db, selectNotes, withText(noValues(), owner));
+        while advance(&!cursor) do
+            writeString(&!out, columnText(&cursor, 0));
+            writeByte(&!out, '\n');
+        end while;
+        case finishQuery(&~db, cursor) of
+            when Some(value as error: DbError) do
+                failed := true;
+            when None do
+                skip;
+        end case;
+        let text: String := finalize(out);
+        if failed then
+            destroyString(text);
+            return None();
+        else
+            return Some(value => text);
+        end if;
+    end;
+
+    function notesPage(csrf: String, notes: String): String is
+        let page: NotesPage := NotesPage(csrf => csrf, notes => notes);
+        let text: String := renderNotes(&page);
+        let { csrf as c: String, notes as n: String } := page;
+        destroyString(c);
+        destroyString(n);
+        return text;
+    end;
+
+    generic [R: Region]
+    function renderNotes(page: &[NotesPage, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("templates/notes.jinja", page, out);
+        return finalize(out);
+    end;
+
+    -- GET /notes: the notes of the user of the session; a visitor goes to
+    -- the login.
+    function showNotes(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                destroyRequest(request);
+                case openSqlite(databasePath) of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let found: Either[AuthError, Option[String]] := sessionUser(&!db, asSpan(&token), now());
+                        case found of
+                            when Right(right as user: Option[String]) do
+                                case user of
+                                    when Some(value as name: String) do
+                                        let listed: Option[String] := notesOf(&!db, asSpan(&name));
+                                        destroyString(name);
+                                        closeDatabase(db);
+                                        case listed of
+                                            when Some(value as notes: String) do
+                                                let csrf: String := tokenForForm(asSpan(&token));
+                                                destroyString(token);
+                                                let page: String := notesPage(csrf, notes);
+                                                let output: String := finish(guarded(200, "text/html; charset=utf-8"), asSpan(&page));
+                                                destroyString(page);
+                                                return output;
+                                            when None do
+                                                destroyString(token);
+                                                return plain(500, "internal server error\n");
+                                        end case;
+                                    when None do
+                                        closeDatabase(db);
+                                        destroyString(token);
+                                        return finish(redirect("/login"), "see /login\n");
+                                end case;
+                            when Left(left as error: AuthError) do
+                                closeDatabase(db);
+                                destroyString(token);
+                                return plain(500, "internal server error\n");
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyString(token);
+                        return plain(500, "internal server error\n");
+                end case;
+            when None do
+                destroyRequest(request);
+                return finish(redirect("/login"), "see /login\n");
+        end case;
+    end;
+
+    -- POST /notes: a note of the user of the session, behind the guard.
+    function doNotes(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    let content: String := field(&request, "content");
+                    destroyRequest(request);
+                    if isNote(asSpan(&content)) then
+                        return storeNote(token, content);
+                    else
+                        destroyString(content);
+                        destroyString(token);
+                        return plain(400, "note refused\n");
+                    end if;
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- Stores content as a note of owner at at, unless owner keeps
+    -- mostNotes already: Some(false) then, None when the database failed.
+    -- The count and the insert are one transaction, begun immediate, so
+    -- two requests at once cannot both pass the count.
+    generic [R: Region, O: Region, C: Region]
+    function addNote(db: &![Database[Writing], R], owner: Span[Nat8, O], content: Span[Nat8, C], at: Int64): Option[Bool] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return None();
+            when Right(right as transaction: Transaction) do
+                var count: Int64 := mostNotes;
+                var counted: Bool := false;
+                var cursor: Cursor := startQuery(&~db, countNotes, withText(noValues(), owner));
+                if advance(&!cursor) then
+                    count := columnInt64(&cursor, 0);
+                    counted := true;
+                end if;
+                case finishQuery(&~db, cursor) of
+                    when Some(value as error: DbError) do
+                        counted := false;
+                    when None do
+                        skip;
+                end case;
+                if counted and (count < mostNotes) then
+                    let written: Either[DbError, Nat64] :=
+                        execute(&~db, insertNote, withInt64(withText(withText(noValues(), owner), content), at));
+                    case written of
+                        when Right(right as changed: Nat64) do
+                            case commit(&~db, transaction) of
+                                when Right(right as done: Unit) do
+                                    return Some(value => true);
+                                when Left(left as failure: DbError) do
+                                    return None();
+                            end case;
+                        when Left(left as failure: DbError) do
+                            rollback(&~db, transaction);
+                            return None();
+                    end case;
+                else
+                    rollback(&~db, transaction);
+                    if counted then
+                        return Some(value => false);
+                    end if;
+                    return None();
+                end if;
+        end case;
+    end;
+
+    function storeNote(token: String, content: String): String is
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let found: Either[AuthError, Option[String]] := sessionUser(&!db, asSpan(&token), now());
+                destroyString(token);
+                case found of
+                    when Right(right as user: Option[String]) do
+                        case user of
+                            when Some(value as name: String) do
+                                let written: Option[Bool] := addNote(&!db, asSpan(&name), asSpan(&content), now());
+                                destroyString(name);
+                                destroyString(content);
+                                closeDatabase(db);
+                                case written of
+                                    when Some(value as stored: Bool) do
+                                        if stored then
+                                            return finish(redirect("/notes"), "see /notes\n");
+                                        end if;
+                                        return plain(400, "too many notes\n");
+                                    when None do
+                                        return plain(500, "internal server error\n");
+                                end case;
+                            when None do
+                                closeDatabase(db);
+                                destroyString(content);
+                                return finish(redirect("/login"), "see /login\n");
+                        end case;
+                    when Left(left as error: AuthError) do
+                        closeDatabase(db);
+                        destroyString(content);
+                        return plain(500, "internal server error\n");
+                end case;
+            when Left(left as error: DbError) do
+                destroyString(token);
+                destroyString(content);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    function doLogout(request: Request): String is
+        case sessionToken(&request) of
+            when Some(value as token: String) do
+                if allowed(&request, asSpan(&token)) then
+                    return logoutAllowed(request, token);
+                else
+                    destroyString(token);
+                    destroyRequest(request);
+                    return plain(403, "forbidden\n");
+                end if;
+            when None do
+                destroyRequest(request);
+                return plain(403, "forbidden\n");
+        end case;
+    end;
+
+    -- The logout once the guard took the request.
+    function logoutAllowed(request: Request, token: String): String is
+        let address: String := client(&request);
+        destroyRequest(request);
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let ended: Either[AuthError, Unit] := logout(&!db, asSpan(&token), asSpan(&address), now(), auditPath);
+                closeDatabase(db);
+                destroyString(token);
+                destroyString(address);
+                case ended of
+                    when Right(right as done: Unit) do
+                        return finish(withoutSessionCookie(redirect("/login")), "see /login\n");
+                    when Left(left as error: AuthError) do
+                        return plain(500, "internal server error\n");
+                end case;
+            when Left(left as error: DbError) do
+                destroyString(token);
+                destroyString(address);
+                return plain(500, "internal server error\n");
+        end case;
+    end;
+
+    -- The verdict on one POST of who, None when the database failed.
+    generic [W: Region]
+    function postVerdict(who: Span[Nat8, W]): Option[Verdict] is
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let result: Either[DbError, Verdict] := hit(&!db, "post", who, now(), postLimit, postWindow);
+                closeDatabase(db);
+                case result of
+                    when Right(right as verdict: Verdict) do
+                        return Some(value => verdict);
+                    when Left(left as error: DbError) do
+                        return None();
+                end case;
+            when Left(left as error: DbError) do
+                return None();
+        end case;
+    end;
+
+    -- A step before: a POST past the limit of its client gets 429.  Without
+    -- the database the answer is 503: the request would need it anyway, and
+    -- an open door is no limit.
+    function limitPosts(request: Request): Step is
+        var post: Bool := false;
+        case requestMethod(&request) of
+            when Some(value as verb: String) do
+                post := sameWord(asSpan(&verb), "POST");
+                destroyString(verb);
+            when None do
+                skip;
+        end case;
+        if not post then
+            return Next(request => request);
+        else
+            let who: String := client(&request);
+            let verdict: Option[Verdict] := postVerdict(asSpan(&who));
+            destroyString(who);
+            case verdict of
+                when Some(value as decided: Verdict) do
+                    case decided of
+                        when Allowed do
+                            return Next(request => request);
+                        when Limited(retryAfter: Int64) do
+                            destroyRequest(request);
+                            return Answer(output => tooManyRequests(retryAfter));
+                    end case;
+                when None do
+                    destroyRequest(request);
+                    return Answer(output => plain(503, "unavailable\n"));
+            end case;
+        end if;
+    end;
+
+    -- The answer, with one line for it in the access log; a log that
+    -- cannot be opened loses the line, not the answer.
+    generic [R: Region, B: Region, A: Region]
+    function logged(request: Request, routes: &[Buffer[Route], R], befores: &[Buffer[Fn[Request, Step]], B],
+                    afters: &[Buffer[Fn[String, String]], A]): String is
+        case logToFile(accessPath, Info(), JsonLines()) of
+            when Some(value as opened: Log) do
+                var log: Log := opened;
+                let output: String := dispatchLogged(request, routes, befores, afters, &!log);
+                let closed: Bool := closeLog(log);
+                return output;
+            when None do
+                return dispatchWith(request, routes, befores, afters);
+        end case;
+    end;
+
+    function handle(request: Request): String is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/", handler => home));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/admin", handler => admin));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/admin/find", handler => adminFind));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/api/whoami", handler => whoami));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/login", handler => showLogin));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/login", handler => doLogin));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/logout", handler => doLogout));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/notes", handler => showNotes));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/notes", handler => doNotes));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/passkey/challenge", handler => passkeyChallenge));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/passkey/register", handler => passkeyRegister));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/passkey/login", handler => passkeySignIn));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/login/code", handler => showCode));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/login/code", handler => doCode));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/totp", handler => showTotp));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/totp", handler => doTotp));
+        var befores: Buffer[Fn[Request, Step]] := allocateEmpty();
+        insertBack(&!befores, knownMethods);
+        insertBack(&!befores, limitPosts);
+        var afters: Buffer[Fn[String, String]] := allocateEmpty();
+        insertBack(&!afters, securityHeaders);
+        let output: String := logged(request, &routes, &befores, &afters);
+        destroyFree(routes);
+        destroyFree(befores);
+        destroyFree(afters);
+        return output;
+    end;
+
+    -- The tables, and the key when there is none yet.
+    function prepare(): Bool is
+        case readKey(keyPath) of
+            when Some(value as key: String) do
+                destroyString(key);
+            when None do
+                if not makeKey(keyPath) then
+                    printLn("login: csrf.key is unfit and could not be made: mode 0600, 32 to 4096 bytes");
+                    return false;
+                end if;
+        end case;
+        case readKey(totpKeyPath) of
+            when Some(value as sealing: String) do
+                destroyString(sealing);
+            when None do
+                if not makeKey(totpKeyPath) then
+                    printLn("login: totp.key is unfit and could not be made: mode 0600, 32 to 4096 bytes");
+                    return false;
+                end if;
+        end case;
+        case readKey(pseudonymKeyPath) of
+            when Some(value as naming: String) do
+                destroyString(naming);
+            when None do
+                if not makeKey(pseudonymKeyPath) then
+                    printLn("login: pseudonym.key is unfit and could not be made: mode 0600, 32 to 4096 bytes");
+                    return false;
+                end if;
+        end case;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let prepared: Either[AuthError, Unit] := prepareAuth(&!db);
+                let limits: Option[DbError] := prepareLimits(&!db);
+                let roles: Option[DbError] := prepareRoles(&!db);
+                let edges: Option[DbError] := prepareEdges(&!db);
+                let tokens: Option[DbError] := prepareTokens(&!db);
+                let notes: Either[DbError, Index] := makeNotesTable(&!db);
+                let passkeys: Option[DbError] := preparePasskeys(&!db);
+                let sounds: Option[DbError] := prepareSounds(&!db);
+                closeDatabase(db);
+                case sounds of
+                    when Some(value as broken: DbError) do
+                        printLn("login: the table of sounds could not be made");
+                        return false;
+                    when None do
+                        skip;
+                end case;
+                case passkeys of
+                    when Some(value as broken: DbError) do
+                        printLn("login: the tables of passkeys could not be made");
+                        return false;
+                    when None do
+                        skip;
+                end case;
+                case notes of
+                    when Left(left as broken: DbError) do
+                        printLn("login: the table of notes could not be made");
+                        return false;
+                    when Right(right as applied: Index) do
+                        skip;
+                end case;
+                case tokens of
+                    when Some(value as missing: DbError) do
+                        printLn("login: the table of tokens could not be made");
+                        return false;
+                    when None do
+                        skip;
+                end case;
+                case edges of
+                    when Some(value as broken: DbError) do
+                        printLn("login: the table of edges could not be made");
+                        return false;
+                    when None do
+                        skip;
+                end case;
+                case prepared of
+                    when Right(right as done: Unit) do
+                        case limits of
+                            when Some(value as error: DbError) do
+                                printLn("login: the table of limits could not be made");
+                                return false;
+                            when None do
+                                case roles of
+                                    when Some(value as failure: DbError) do
+                                        printLn("login: the tables of roles could not be made");
+                                        return false;
+                                    when None do
+                                        return true;
+                                end case;
+                        end case;
+                    when Left(left as error: AuthError) do
+                        printLn("login: the tables could not be made");
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return false;
+        end case;
+    end;
+
+    function runServer(): ExitCode is
+        confineServer("login");
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        -- The retention run once at the start; a timer runs it daily.  The
+        -- server serves even when it fails, and says so.
+        case pruneAudit() of
+            when Some(value as removed: Int64) do
+                skip;
+            when None do
+                printLn("login: the audit log could not be pruned");
+        end case;
+        case serve(socketPath, handle, defaultLimits()) of
+            when Stopped(accepted: Index) do
+                print("login: stopped, connections accepted: ");
+                printLn(accepted);
+                return ExitSuccess();
+            when NoSocket do
+                printLn("login: the socket login.sock could not be made");
+                return ExitFailure();
+            when NotStarted do
+                printLn("login: the server did not start");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- Adds the user name with the password on the first line of the
+    -- standard input, read without echo on a terminal.
+    generic [R: Region]
+    function addFromInput(root: &![RootCapability, R], name: Span[Nat8, Static]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        var terminal: TerminalCapability := acquireTerminal(&~root);
+        var input: StandardInput := acquireInput(&!terminal);
+        let line: Option[String] := readHiddenLine(&!input);
+        releaseInput(input);
+        releaseTerminal(terminal);
+        case line of
+            when Some(value as password: String) do
+                case openSqlite(databasePath) of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        -- Only the line end goes: spaces are part of a password.
+                        let check: PassphraseCheck := checkPassphrase(lineOf(asSpan(&password)), name, false, knownPasswordsPath);
+                        let added: Either[AuthError, Bool] := addUser(&!db, name, lineOf(asSpan(&password)), knownPasswordsPath);
+                        -- The name is kept by its sound too, for /admin/find.
+                        var sounded: Bool := false;
+                        case added of
+                            when Right(right as stored: Bool) do
+                                if stored then
+                                    case indexSounds(&!db, name, name, Both()) of
+                                        when Right(right as kept: Bool) do
+                                            sounded := kept;
+                                        when Left(left as error: DbError) do
+                                            skip;
+                                    end case;
+                                end if;
+                            when Left(left as error: AuthError) do
+                                skip;
+                        end case;
+                        closeDatabase(db);
+                        destroyString(password);
+                        case added of
+                            when Right(right as done: Bool) do
+                                if done and (not sounded) then
+                                    printLn("login: user added, but the sound of the name could not be kept");
+                                    return ExitFailure();
+                                end if;
+                                if done then
+                                    printLn("login: user added");
+                                    return ExitSuccess();
+                                end if;
+                                print("login: refused: the name is taken or no name, or ");
+                                printLn(describeCheck(check));
+                                return ExitFailure();
+                            when Left(left as error: AuthError) do
+                                printLn("login: the user could not be stored");
+                                return ExitFailure();
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyString(password);
+                        printLn("login: wolly.db could not be opened");
+                        return ExitFailure();
+                end case;
+            when None do
+                printLn("login: no password was read");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- line without the CR and LF at its end.
+    generic [R: Region]
+    function lineOf(line: Span[Nat8, R]): Span[Nat8, R] is
+        var stop: Index := spanLength(line);
+        while (stop > 0) and ((line[stop - 1] = '\n') or (line[stop - 1] = '\r')) do
+            stop := stop - 1;
+        end while;
+        return substring(line, 0, stop);
+    end;
+
+    -- Changes the password of name: the current one on the first line of
+    -- the standard input, the new one on the second.
+    generic [R: Region]
+    function changeFromInput(root: &![RootCapability, R], name: Span[Nat8, Static]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        var terminal: TerminalCapability := acquireTerminal(&~root);
+        var input: StandardInput := acquireInput(&!terminal);
+        let first: Option[String] := readHiddenLine(&!input);
+        let second: Option[String] := readHiddenLine(&!input);
+        releaseInput(input);
+        releaseTerminal(terminal);
+        case first of
+            when Some(value as current: String) do
+                case second of
+                    when Some(value as next: String) do
+                        let code: ExitCode := storeChange(name, lineOf(asSpan(&current)), lineOf(asSpan(&next)));
+                        destroyString(current);
+                        destroyString(next);
+                        return code;
+                    when None do
+                        destroyString(current);
+                        printLn("login: no new password was read");
+                        return ExitFailure();
+                end case;
+            when None do
+                case second of
+                    when Some(value as stray: String) do
+                        destroyString(stray);
+                    when None do
+                        skip;
+                end case;
+                printLn("login: no password was read");
+                return ExitFailure();
+        end case;
+    end;
+
+    generic [C: Region, N: Region]
+    function storeChange(name: Span[Nat8, Static], current: Span[Nat8, C], next: Span[Nat8, N]): ExitCode is
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                var second: Bool := false;
+                case totpEnabled(&!db, name) of
+                    when Right(right as on: Bool) do
+                        second := on;
+                    when Left(left as error: DbError) do
+                        skip;
+                end case;
+                let check: PassphraseCheck := checkPassphrase(next, name, second, knownPasswordsPath);
+                let changed: Either[AuthError, Bool] := changePassword(&!db, name, current, next, knownPasswordsPath);
+                closeDatabase(db);
+                case changed of
+                    when Right(right as done: Bool) do
+                        if done then
+                            printLn("login: password changed");
+                            return ExitSuccess();
+                        end if;
+                        print("login: refused: the current password is wrong, or ");
+                        printLn(describeCheck(check));
+                        return ExitFailure();
+                    when Left(left as error: AuthError) do
+                        printLn("login: the password could not be stored");
+                        return ExitFailure();
+                end case;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- Grants the action second to the role first, or with holder gives the
+    -- role second to the user first.
+    generic [R: Region]
+    function storeRole(db: &![Database[Writing], R], holder: Bool, first: Span[Nat8, Static],
+                       second: Span[Nat8, Static]): Either[DbError, Bool] is
+        if holder then
+            return assign(&~db, first, second);
+        else
+            return grant(&~db, first, second);
+        end if;
+    end;
+
+    function changeRoles(holder: Bool, first: Span[Nat8, Static], second: Span[Nat8, Static]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let stored: Either[DbError, Bool] := storeRole(&!db, holder, first, second);
+                closeDatabase(db);
+                case stored of
+                    when Right(right as done: Bool) do
+                        if done then
+                            printLn("login: roles changed");
+                            return ExitSuccess();
+                        end if;
+                        printLn("login: refused: a name is no name (1 to 64 bytes of a to z, 0 to 9, dot, hyphen, underscore)");
+                        return ExitFailure();
+                    when Left(left as error: DbError) do
+                        printLn("login: the roles could not be stored");
+                        return ExitFailure();
+                end case;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- Prints a new token for name, once; or revokes the tokens of name.
+    function tokenCommand(name: Span[Nat8, Static], revoke: Bool): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                if revoke then
+                    let revoked: Either[DbError, Bool] := revokeTokens(&!db, name);
+                    closeDatabase(db);
+                    case revoked of
+                        when Right(right as done: Bool) do
+                            if done then
+                                printLn("login: tokens revoked");
+                                return ExitSuccess();
+                            end if;
+                            printLn("login: refused: the name has no token");
+                            return ExitFailure();
+                        when Left(left as error: DbError) do
+                            printLn("login: the tokens could not be revoked");
+                            return ExitFailure();
+                    end case;
+                else
+                    let issued: Either[DbError, Option[String]] := issueToken(&!db, name, now());
+                    closeDatabase(db);
+                    case issued of
+                        when Right(right as given: Option[String]) do
+                            case given of
+                                when Some(value as token: String) do
+                                    printLn(asSpan(&token));
+                                    destroyString(token);
+                                    return ExitSuccess();
+                                when None do
+                                    printLn("login: refused: the name is no name (1 to 64 bytes of a to z, 0 to 9, dot, hyphen, underscore)");
+                                    return ExitFailure();
+                            end case;
+                        when Left(left as error: DbError) do
+                            printLn("login: the token could not be stored");
+                            return ExitFailure();
+                    end case;
+                end if;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- Stores the edge from source to target of kind with the weight given
+    -- as decimal digits.
+    function link(source: Span[Nat8, Static], target: Span[Nat8, Static], kind: Span[Nat8, Static],
+                  digits: Span[Nat8, Static]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        var weight: Int64 := noWeight;
+        case parseNat(digits) of
+            when Some(value as number: Nat64) do
+                case toInt64(number) of
+                    when Some(value as signed: Int64) do
+                        weight := signed;
+                    when None do
+                        skip;
+                end case;
+            when None do
+                skip;
+        end case;
+        if weight < 0 then
+            printLn("login: refused: the weight is no number from 0");
+            return ExitFailure();
+        end if;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let added: Either[DbError, Bool] := addEdge(&!db, source, target, kind, weight);
+                closeDatabase(db);
+                case added of
+                    when Right(right as done: Bool) do
+                        if done then
+                            printLn("login: edge stored");
+                            return ExitSuccess();
+                        end if;
+                        printLn("login: refused: a name is no node name (1 to 128 bytes of letters, digits, dot, colon, hyphen, underscore)");
+                        return ExitFailure();
+                    when Left(left as error: DbError) do
+                        printLn("login: the edge could not be stored");
+                        return ExitFailure();
+                end case;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- Prints the lightest route from origin to goal along edges of kind:
+    -- its nodes one a line, then its weight.
+    function showRoute(kind: Span[Nat8, Static], origin: Span[Nat8, Static], goal: Span[Nat8, Static]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let found: Either[DbError, EdgeRoute] := lightestRoute(&!db, kind, origin, goal);
+                closeDatabase(db);
+                case found of
+                    when Right(right as route: EdgeRoute) do
+                        case route of
+                            when Found(weight: Nat64, nodes: String) do
+                                print(asSpan(&nodes));
+                                case toInt64(weight) of
+                                    when Some(value as total: Int64) do
+                                        let text: String := decimalText(total);
+                                        print("weight ");
+                                        printLn(asSpan(&text));
+                                        destroyString(text);
+                                    when None do
+                                        printLn("weight too large");
+                                end case;
+                                destroyString(nodes);
+                                return ExitSuccess();
+                            when NoRoute do
+                                printLn("login: no route");
+                                return ExitFailure();
+                        end case;
+                    when Left(left as error: DbError) do
+                        printLn("login: the edges could not be read");
+                        return ExitFailure();
+                end case;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- Turns the second factor of name off: for a user who lost the app,
+    -- by whoever may run the programme on the server.
+    function totpOff(name: Span[Nat8, Static]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let removed: Either[DbError, Bool] := removeTotp(&!db, name);
+                closeDatabase(db);
+                case removed of
+                    when Right(right as done: Bool) do
+                        if done then
+                            printLn("login: two-factor off");
+                            return ExitSuccess();
+                        end if;
+                        printLn("login: refused: the user has no second factor");
+                        return ExitFailure();
+                    when Left(left as error: DbError) do
+                        printLn("login: the seed could not be removed");
+                        return ExitFailure();
+                end case;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- login passkey-off NAME: every passkey of the user removed, for one
+    -- that is lost or was not the user's.
+    function passkeyOff(name: Span[Nat8, Static]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                let removed: Either[DbError, Bool] := removePasskeys(&!db, name);
+                closeDatabase(db);
+                case removed of
+                    when Right(right as done: Bool) do
+                        if done then
+                            printLn("login: passkeys removed");
+                            return ExitSuccess();
+                        end if;
+                        printLn("login: refused: the user has no passkey");
+                        return ExitFailure();
+                    when Left(left as error: DbError) do
+                        printLn("login: the passkeys could not be removed");
+                        return ExitFailure();
+                end case;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- Whether a removal left no error.
+    function cleanedUp(result: Either[DbError, Bool]): Bool is
+        case result of
+            when Right(right as any: Bool) do
+                return true;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    -- The table of the notes and its index; Right 2 when both exist afterwards.
+    generic [R: Region]
+    function makeNotesTable(db: &![Database[Writing], R]): Either[DbError, Index] is
+        case execute(&~db, makeNotes, noValues()) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as made: Nat64) do
+                case execute(&~db, makeNotesIndex, noValues()) of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as indexed: Nat64) do
+                        let two: Index := 2;
+                        return Right(right => two);
+                end case;
+        end case;
+    end;
+
+    -- Removes name from every table of the programme that keeps it: the
+    -- user with the failures of its name, the roles it holds, its second
+    -- factor, its tokens, its passkeys, the sound of its name and its
+    -- notes.  Some(true) when there was such a user, Some(false) when not,
+    -- None when a statement failed; the caller holds the transaction.
+    generic [R: Region]
+    function removeEverywhere(db: &![Database[Writing], R], name: Span[Nat8, Static]): Option[Bool] is
+        var there: Bool := false;
+        case removeUser(&~db, name) of
+            when Right(right as found: Bool) do
+                there := found;
+            when Left(left as error: AuthError) do
+                return None();
+        end case;
+        if not cleanedUp(unassignAll(&~db, name)) then
+            return None();
+        end if;
+        if not cleanedUp(removeTotp(&~db, name)) then
+            return None();
+        end if;
+        if not cleanedUp(revokeTokens(&~db, name)) then
+            return None();
+        end if;
+        if not cleanedUp(removePasskeys(&~db, name)) then
+            return None();
+        end if;
+        if not cleanedUp(removeSounds(&~db, name)) then
+            return None();
+        end if;
+        let notes: Either[DbError, Nat64] := execute(&~db, deleteNotes, withText(noValues(), name));
+        case notes of
+            when Right(right as changed: Nat64) do
+                return Some(value => there);
+            when Left(left as error: DbError) do
+                return None();
+        end case;
+    end;
+
+    -- Gives the lines of name in the audit log a new pseudonym and notes,
+    -- under the pseudonym, that it did.  The number of lines changed, or
+    -- None when the log could not be rewritten or the line not written.
+    -- The caller holds a writing transaction.
+    function pseudonymizeAudit(name: Span[Nat8, Static]): Option[Int64] is
+        case newPseudonym() of
+            when Some(value as alias: String) do
+                case pseudonymize(auditPath, name, asSpan(&alias)) of
+                    when Some(value as count: Int64) do
+                        let noted: Bool := note(auditPath, "audit-pseudonymize", asSpan(&alias), count);
+                        destroyString(alias);
+                        if noted then
+                            return Some(value => count);
+                        end if;
+                        return None();
+                    when None do
+                        destroyString(alias);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Removes the lines of the audit log older than 12 months under a
+    -- writing transaction and notes how many.  The number, or None.
+    function pruneAudit(): Option[Int64] is
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case begin(&!db) of
+                    when Right(right as transaction: Transaction) do
+                        var removed: Int64 := 0;
+                        var failed: Bool := false;
+                        case prune(auditPath, now()) of
+                            when Some(value as count: Int64) do
+                                removed := count;
+                                failed := not note(auditPath, "audit-prune", "-", count);
+                            when None do
+                                failed := true;
+                        end case;
+                        case commit(&!db, transaction) of
+                            when Right(right as done: Unit) do
+                                skip;
+                            when Left(left as error: DbError) do
+                                failed := true;
+                        end case;
+                        closeDatabase(db);
+                        if failed then
+                            return None();
+                        end if;
+                        return Some(value => removed);
+                    when Left(left as error: DbError) do
+                        closeDatabase(db);
+                        return None();
+                end case;
+            when Left(left as error: DbError) do
+                return None();
+        end case;
+    end;
+
+    -- login audit-prune: the retention run, for a daily timer.
+    function auditPrune(): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case pruneAudit() of
+            when Some(value as removed: Int64) do
+                print("login: lines of the audit log older than 12 months removed: ");
+                printLn(removed);
+                return ExitSuccess();
+            when None do
+                printLn("login: the audit log could not be pruned");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- login deluser NAME: the user and all the programme keeps of it, in
+    -- one transaction, so that a failure leaves the user whole.  A session
+    -- of the user opens nothing afterwards.  In the audit log the user and
+    -- the client of every line of the user become a random pseudonym, and
+    -- a line audit-pseudonymize under it says so.
+    function delUser(name: Span[Nat8, Static]): ExitCode is
+        if not prepare() then
+            return ExitFailure();
+        end if;
+        case openSqlite(databasePath) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case begin(&!db) of
+                    when Right(right as transaction: Transaction) do
+                        let outcome: Option[Bool] := removeEverywhere(&!db, name);
+                        var there: Bool := false;
+                        var failed: Bool := true;
+                        case outcome of
+                            when Some(value as found: Bool) do
+                                there := found;
+                                failed := false;
+                            when None do
+                                skip;
+                        end case;
+                        -- The audit log under the same transaction, so that
+                        -- no line of the server comes between its read and
+                        -- its rename.
+                        var lines: Int64 := 0;
+                        if there and (not failed) then
+                            case pseudonymizeAudit(name) of
+                                when Some(value as count: Int64) do
+                                    lines := count;
+                                when None do
+                                    failed := true;
+                            end case;
+                        end if;
+                        if there and (not failed) then
+                            case commit(&!db, transaction) of
+                                when Right(right as done: Unit) do
+                                    skip;
+                                when Left(left as error: DbError) do
+                                    failed := true;
+                            end case;
+                        else
+                            rollback(&!db, transaction);
+                        end if;
+                        closeDatabase(db);
+                        if failed then
+                            printLn("login: the user could not be removed");
+                            return ExitFailure();
+                        end if;
+                        if there then
+                            print("login: user removed, lines of the audit log pseudonymized: ");
+                            printLn(lines);
+                            return ExitSuccess();
+                        end if;
+                        printLn("login: refused: there is no such user");
+                        return ExitFailure();
+                    when Left(left as error: DbError) do
+                        closeDatabase(db);
+                        printLn("login: the user could not be removed");
+                        return ExitFailure();
+                end case;
+            when Left(left as error: DbError) do
+                printLn("login: wolly.db could not be opened");
+                return ExitFailure();
+        end case;
+    end;
+
+    -- The command of the arguments.  The capability is only lent, so
+    -- every command may return at once.
+    generic [R: Region]
+    function command(power: &![RootCapability, R]): ExitCode is
+        var libraries: Buffer[String] := allocateEmpty();
+        insertBack(&!libraries, library("libcrypto", cryptoVersion()));
+        insertBack(&!libraries, library("sqlcipher", sqlcipherVersion()));
+        let answered: Bool := answerAbout("login", &libraries);
+        destroyLibraries(libraries);
+        if answered then
+            return ExitSuccess();
+        end if;
+        if sandboxAsked() then
+            printSandbox("login");
+            return ExitSuccess();
+        end if;
+        if argumentCount() <= 1 then
+            return runServer();
+        end if;
+        let verb: Span[Nat8, Static] := nthArgument(1);
+        if (argumentCount() = 3) and sameWord(verb, "adduser") then
+            return addFromInput(&~power, nthArgument(2));
+        end if;
+        if (argumentCount() = 3) and sameWord(verb, "passwd") then
+            return changeFromInput(&~power, nthArgument(2));
+        end if;
+        if (argumentCount() = 4) and sameWord(verb, "grant") then
+            return changeRoles(false, nthArgument(2), nthArgument(3));
+        end if;
+        if (argumentCount() = 4) and sameWord(verb, "assign") then
+            return changeRoles(true, nthArgument(2), nthArgument(3));
+        end if;
+        if (argumentCount() = 2) and sameWord(verb, "audit-prune") then
+            return auditPrune();
+        end if;
+        if (argumentCount() = 3) and sameWord(verb, "deluser") then
+            return delUser(nthArgument(2));
+        end if;
+        if (argumentCount() = 3) and sameWord(verb, "passkey-off") then
+            return passkeyOff(nthArgument(2));
+        end if;
+        if (argumentCount() = 3) and sameWord(verb, "totp-off") then
+            return totpOff(nthArgument(2));
+        end if;
+        if (argumentCount() = 3) and sameWord(verb, "token") then
+            return tokenCommand(nthArgument(2), false);
+        end if;
+        if (argumentCount() = 3) and sameWord(verb, "revoke") then
+            return tokenCommand(nthArgument(2), true);
+        end if;
+        if (argumentCount() = 6) and sameWord(verb, "link") then
+            return link(nthArgument(2), nthArgument(3), nthArgument(4), nthArgument(5));
+        end if;
+        if (argumentCount() = 5) and sameWord(verb, "route") then
+            return showRoute(nthArgument(2), nthArgument(3), nthArgument(4));
+        end if;
+        printLn("usage: login | login adduser NAME   (the password on the standard input) | login deluser NAME | login audit-prune");
+        printLn("       login passwd NAME   (the current and the new password on two lines of the standard input)");
+        printLn("       login grant ROLE ACTION | login assign NAME ROLE | login totp-off NAME | login passkey-off NAME");
+        printLn("       login link SOURCE TARGET KIND WEIGHT | login route KIND FROM TO");
+        printLn("       login token NAME | login revoke NAME");
+        return ExitFailure();
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        let code: ExitCode := command(&!power);
+        surrenderRoot(power);
+        return code;
+    end;
+
+    generic [A: Region, B: Region]
+    function sameWord(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+end module body.

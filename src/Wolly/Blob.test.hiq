@@ -1,0 +1,222 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The store in a database in memory: a content kept once under two names,
+-- a second content, the refusals, deleting.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Blob (
+    mostBlobBytes,
+    isXid,
+    isMediaType,
+    isBlobName,
+    prepareBlobs,
+    saveBlob,
+    loadBlob,
+    blobNames,
+    deleteBlob
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Blob.Test is
+
+    function testRules(): Unit is
+        assertTrue(mostBlobBytes() = 16777216, "16 MiB");
+        assertTrue(isXid("0123456789abcdef0123456789abcdef"), "an xid");
+        assertFalse(isXid("0123456789ABCDEF0123456789ABCDEF"), "upper case");
+        assertFalse(isXid("0123456789abcdef0123456789abcde"), "31 digits");
+        assertFalse(isXid("0123456789abcdef0123456789abcdef0"), "33 digits");
+        assertFalse(isXid("0123456789abcdef0123456789abcdeg"), "a g");
+        assertFalse(isXid(""), "empty");
+        assertTrue(isMediaType("image/png"), "a media type");
+        assertTrue(isMediaType("application/vnd.oasis.opendocument.text"), "dots");
+        assertTrue(isMediaType("image/svg+xml"), "a plus");
+        assertFalse(isMediaType("image"), "no subtype");
+        assertFalse(isMediaType("image/"), "an empty subtype");
+        assertFalse(isMediaType("/png"), "an empty type");
+        assertFalse(isMediaType("a/b/c"), "two slashes");
+        assertFalse(isMediaType("text/html; charset=utf-8"), "no parameters");
+        assertFalse(isMediaType("text/ht ml"), "a space");
+        assertFalse(isMediaType(""), "empty");
+        assertTrue(isBlobName("Holiday 2026.jpg"), "a name");
+        assertFalse(isBlobName(""), "empty");
+        assertFalse(isBlobName("../etc/passwd"), "a slash");
+        assertFalse(isBlobName("a\\b"), "a backslash");
+        assertFalse(isBlobName("a\tb"), "a tab");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function kept(db: &![Database[Writing], R], content: Span[Nat8, Static], name: Span[Nat8, Static],
+                  media: Span[Nat8, Static]): Option[String] is
+        case saveBlob(&~db, content, name, media) of
+            when Left(left as error: DbError) do
+                assertTrue(false, "the save failed");
+                return None();
+            when Right(right as xid: Option[String]) do
+                return xid;
+        end case;
+    end;
+
+    generic [R: Region]
+    function refused(db: &![Database[Writing], R], content: Span[Nat8, Static], name: Span[Nat8, Static],
+                     media: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case kept(&~db, content, name, media) of
+            when Some(value as xid: String) do
+                destroyString(xid);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, X: Region]
+    function contentIs(db: &![Database[Writing], R], xid: Span[Nat8, X], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case loadBlob(&~db, xid) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as content: String) do
+                        assertTrue(equal(asSpan(&content), wanted), message);
+                        destroyString(content);
+                    when None do
+                        assertTrue(false, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, X: Region]
+    function namesAre(db: &![Database[Writing], R], xid: Span[Nat8, X], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case blobNames(&~db, xid) of
+            when Right(right as names: String) do
+                assertTrue(equal(asSpan(&names), wanted), message);
+                destroyString(names);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, X: Region]
+    function absent(db: &![Database[Writing], R], xid: Span[Nat8, X], message: Span[Nat8, Static]): Unit is
+        case loadBlob(&~db, xid) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as content: String) do
+                        destroyString(content);
+                        assertTrue(false, message);
+                    when None do
+                        assertTrue(true, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        case prepareBlobs(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the tables");
+            when None do
+                case prepareBlobs(&~db) of
+                    when Some(value as again: DbError) do
+                        assertTrue(false, "the tables a second time");
+                    when None do
+                        assertTrue(true, "the tables, twice");
+                end case;
+        end case;
+        refused(&~db, "", "empty.txt", "text/plain", "an empty content");
+        refused(&~db, "abc", "", "text/plain", "no name");
+        refused(&~db, "abc", "a/b", "text/plain", "a name with a slash");
+        refused(&~db, "abc", "a.txt", "text", "no media type");
+        case kept(&~db, "hello, world", "first.txt", "text/plain") of
+            when Some(value as first: String) do
+                assertTrue(isXid(asSpan(&first)), "an xid comes back");
+                case kept(&~db, "hello, world", "again.md", "text/markdown") of
+                    when Some(value as second: String) do
+                        assertTrue(equal(asSpan(&first), asSpan(&second)), "the same content, the same xid");
+                        destroyString(second);
+                    when None do
+                        assertTrue(false, "the second save");
+                end case;
+                case kept(&~db, "other", "other.txt", "text/plain") of
+                    when Some(value as other: String) do
+                        assertFalse(equal(asSpan(&first), asSpan(&other)), "another content, another xid");
+                        contentIs(&~db, asSpan(&other), "other", "the other content");
+                        destroyString(other);
+                    when None do
+                        assertTrue(false, "the other save");
+                end case;
+                contentIs(&~db, asSpan(&first), "hello, world", "the content comes back");
+                namesAre(&~db, asSpan(&first), "first.txt\ttext/plain\nagain.md\ttext/markdown\n", "both names, in order");
+                case deleteBlob(&~db, asSpan(&first)) of
+                    when Right(right as removed: Bool) do
+                        assertTrue(removed, "deleted");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the delete");
+                end case;
+                absent(&~db, asSpan(&first), "gone after the delete");
+                namesAre(&~db, asSpan(&first), "", "its names are gone");
+                case deleteBlob(&~db, asSpan(&first)) of
+                    when Right(right as removedAgain: Bool) do
+                        assertFalse(removedAgain, "a second delete finds nothing");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the second delete");
+                end case;
+                case kept(&~db, "hello, world", "third.txt", "text/plain") of
+                    when Some(value as third: String) do
+                        assertFalse(equal(asSpan(&first), asSpan(&third)), "kept again after the delete: a new xid");
+                        contentIs(&~db, asSpan(&third), "hello, world", "and the content");
+                        destroyString(third);
+                    when None do
+                        assertTrue(false, "the save after the delete");
+                end case;
+                destroyString(first);
+            when None do
+                assertTrue(false, "the first save");
+        end case;
+        absent(&~db, "0123456789abcdef0123456789abcdef", "an xid never given");
+        absent(&~db, "not an xid", "no xid at all");
+        return nil;
+    end;
+
+    function testStore(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

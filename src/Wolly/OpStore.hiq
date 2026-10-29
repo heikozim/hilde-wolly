@@ -1,0 +1,1316 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database: every statement is a constant and
+-- every value is bound.  The tables are not strict and their columns are
+-- those of an earlier provider written in Go, in the order its schema has
+-- them.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    equal
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonWriter,
+    readJson,
+    destroyJson,
+    stringAt,
+    integerAt,
+    boolAt,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    writeName,
+    writeString as writeJsonString,
+    writeInteger,
+    writeBool,
+    finishJson
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Values,
+    Transaction,
+    noValues,
+    withInt64,
+    withText,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    begin,
+    commit,
+    rollback,
+    isUniqueViolation
+);
+import Wolly.OpRandom (
+    randomToken,
+    randomId,
+    tokenHash,
+    tokenMatches
+);
+
+module body Wolly.OpStore is
+    constant makeSessions: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS op_sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, subject TEXT NOT NULL, auth_time INTEGER NOT NULL, amr TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL, ended_at INTEGER NOT NULL DEFAULT 0, ended_reason TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', first_ip TEXT NOT NULL DEFAULT '', last_ip TEXT NOT NULL DEFAULT '')";
+    constant makeSessionsIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS op_sessions_subject ON op_sessions (subject)";
+    constant makeRequests: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS op_requests (id TEXT PRIMARY KEY, flow_hash TEXT NOT NULL, params TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)";
+    constant makeCodes: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS op_codes (hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, subject TEXT NOT NULL, session_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, challenge TEXT NOT NULL, scope TEXT NOT NULL, nonce TEXT NOT NULL DEFAULT '', auth_time INTEGER NOT NULL, amr TEXT NOT NULL DEFAULT '', expires_at INTEGER NOT NULL, used_at INTEGER NOT NULL DEFAULT 0, family TEXT NOT NULL DEFAULT '')";
+    constant makeRefresh: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS op_refresh (hash TEXT PRIMARY KEY, id TEXT NOT NULL UNIQUE, family TEXT NOT NULL, client_id TEXT NOT NULL, subject TEXT NOT NULL, session_id TEXT NOT NULL, device TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '', auth_time INTEGER NOT NULL, amr TEXT NOT NULL DEFAULT '', family_created INTEGER NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER NOT NULL DEFAULT 0, revoked_at INTEGER NOT NULL DEFAULT 0, first_ip TEXT NOT NULL DEFAULT '', last_ip TEXT NOT NULL DEFAULT '')";
+    constant makeRefreshFamily: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS op_refresh_family ON op_refresh (family)";
+    constant makeRefreshSession: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS op_refresh_session ON op_refresh (session_id)";
+    constant makeRefreshSubject: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS op_refresh_subject ON op_refresh (subject)";
+    constant makeRoles: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS op_roles (client_id TEXT NOT NULL REFERENCES op_clients (id), subject TEXT NOT NULL, role TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (client_id, subject, role))";
+    constant makeRolesIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS op_roles_subject ON op_roles (subject)";
+
+    constant selectSessionByHash: Span[Nat8, Static] := "SELECT id, subject, auth_time, amr, created_at, last_seen, ended_at, user_agent, first_ip, last_ip FROM op_sessions WHERE token_hash = ?";
+    constant selectSessionById: Span[Nat8, Static] := "SELECT id, subject, auth_time, amr, created_at, last_seen, ended_at, user_agent, first_ip, last_ip FROM op_sessions WHERE id = ?";
+    constant selectLiveSessions: Span[Nat8, Static] := "SELECT id, subject, auth_time, amr, created_at, last_seen, ended_at, user_agent, first_ip, last_ip FROM op_sessions WHERE ended_at = 0 ORDER BY last_seen DESC";
+    constant selectLiveSessionsOf: Span[Nat8, Static] := "SELECT id, subject, auth_time, amr, created_at, last_seen, ended_at, user_agent, first_ip, last_ip FROM op_sessions WHERE ended_at = 0 AND subject = ? ORDER BY last_seen DESC";
+    constant touch: Span[Nat8, Static] := "UPDATE op_sessions SET last_seen = ?, last_ip = CASE WHEN ? = '' THEN last_ip ELSE ? END WHERE id = ? AND ended_at = 0";
+    constant reauth: Span[Nat8, Static] := "UPDATE op_sessions SET token_hash = ?, auth_time = ?, amr = ?, last_seen = ?, last_ip = CASE WHEN ? = '' THEN last_ip ELSE ? END WHERE id = ?";
+    constant insertSession: Span[Nat8, Static] := "INSERT INTO op_sessions (id, token_hash, subject, auth_time, amr, created_at, last_seen, user_agent, first_ip, last_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    constant endOne: Span[Nat8, Static] := "UPDATE op_sessions SET ended_at = ?, ended_reason = ? WHERE id = ? AND ended_at = 0";
+    constant revokeOfSession: Span[Nat8, Static] := "UPDATE op_refresh SET revoked_at = ? WHERE session_id = ? AND revoked_at = 0";
+    constant endOfSubject: Span[Nat8, Static] := "UPDATE op_sessions SET ended_at = ?, ended_reason = ? WHERE subject = ? AND ended_at = 0";
+    constant revokeOfSubject: Span[Nat8, Static] := "UPDATE op_refresh SET revoked_at = ? WHERE subject = ? AND revoked_at = 0";
+
+    constant insertRequest: Span[Nat8, Static] := "INSERT INTO op_requests (id, flow_hash, params, created_at, expires_at) VALUES (?, ?, ?, ?, ?)";
+    constant selectRequest: Span[Nat8, Static] := "SELECT flow_hash, params, expires_at FROM op_requests WHERE id = ?";
+    constant endRequest: Span[Nat8, Static] := "UPDATE op_requests SET expires_at = ? WHERE id = ? AND expires_at >= ?";
+
+    constant insertCode: Span[Nat8, Static] := "INSERT INTO op_codes (hash, client_id, subject, session_id, redirect_uri, challenge, scope, nonce, auth_time, amr, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    constant selectCode: Span[Nat8, Static] := "SELECT client_id, subject, session_id, redirect_uri, challenge, scope, nonce, amr, family, auth_time, expires_at, used_at FROM op_codes WHERE hash = ?";
+    constant useCode: Span[Nat8, Static] := "UPDATE op_codes SET used_at = ?, family = ? WHERE hash = ? AND used_at = 0";
+
+    constant insertRefresh: Span[Nat8, Static] := "INSERT INTO op_refresh (hash, id, family, client_id, subject, session_id, device, scope, auth_time, amr, family_created, created_at, expires_at, first_ip, last_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    constant selectRefresh: Span[Nat8, Static] := "SELECT family, client_id, subject, session_id, device, scope, amr, auth_time, family_created, created_at, expires_at, used_at, revoked_at, first_ip FROM op_refresh WHERE hash = ?";
+    constant useRefresh: Span[Nat8, Static] := "UPDATE op_refresh SET used_at = ? WHERE hash = ? AND used_at = 0 AND revoked_at = 0";
+    constant revokeOfFamily: Span[Nat8, Static] := "UPDATE op_refresh SET revoked_at = ? WHERE family = ? AND revoked_at = 0";
+    constant revokeFamilyOf: Span[Nat8, Static] := "UPDATE op_refresh SET revoked_at = ? WHERE family = ? AND subject = ? AND revoked_at = 0";
+    constant selectNative: Span[Nat8, Static] := "SELECT r.family, r.client_id, c.name, r.device, r.family_created, r.created_at, r.first_ip, r.last_ip FROM op_refresh r JOIN op_clients c ON c.id = r.client_id WHERE r.subject = ? AND c.kind = 'native' AND r.used_at = 0 AND r.revoked_at = 0 AND r.expires_at > ? ORDER BY r.created_at DESC";
+    constant selectBound: Span[Nat8, Static] := "SELECT r.family, r.client_id, c.name, r.device, r.family_created, r.created_at, r.first_ip, r.last_ip FROM op_refresh r JOIN op_clients c ON c.id = r.client_id WHERE r.subject = ? AND c.kind <> 'service' AND r.used_at = 0 AND r.revoked_at = 0 AND r.expires_at > ? ORDER BY r.created_at DESC";
+
+    constant insertRole: Span[Nat8, Static] := "INSERT INTO op_roles (client_id, subject, role, created_at) SELECT ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM op_roles WHERE client_id = ? AND subject = ?) < ?";
+    constant deleteRole: Span[Nat8, Static] := "DELETE FROM op_roles WHERE client_id = ? AND subject = ? AND role = ?";
+    constant selectRolesFor: Span[Nat8, Static] := "SELECT role FROM op_roles WHERE client_id = ? AND subject = ? ORDER BY role";
+    constant selectRoles: Span[Nat8, Static] := "SELECT client_id, subject, role, created_at FROM op_roles WHERE (? = '' OR client_id = ?) AND (? = '' OR subject = ?) ORDER BY client_id, subject, role";
+
+    constant forgetRoles: Span[Nat8, Static] := "DELETE FROM op_roles WHERE subject = ?";
+    constant forgetRefresh: Span[Nat8, Static] := "DELETE FROM op_refresh WHERE subject = ?";
+    constant forgetCodes: Span[Nat8, Static] := "DELETE FROM op_codes WHERE subject = ?";
+    constant forgetSessions: Span[Nat8, Static] := "DELETE FROM op_sessions WHERE subject = ?";
+
+    constant cleanRequests: Span[Nat8, Static] := "DELETE FROM op_requests WHERE expires_at < ?";
+    constant cleanCodes: Span[Nat8, Static] := "DELETE FROM op_codes WHERE expires_at < ?";
+    constant cleanRefresh: Span[Nat8, Static] := "DELETE FROM op_refresh WHERE (revoked_at > 0 AND revoked_at < ?) OR (used_at > 0 AND used_at < ?) OR expires_at < ?";
+    constant cleanSessions: Span[Nat8, Static] := "DELETE FROM op_sessions WHERE (ended_at > 0 AND ended_at < ?) OR (ended_at = 0 AND auth_time < ? AND last_seen < ?)";
+
+    constant touchEvery: Int64 := 60;
+    constant keepSpent: Int64 := 2592000;
+    constant restartWindow: Int64 := 86400;
+    constant mostUserAgent: Index := 200;
+
+    -- Runs sql with values; the rows it changed do not matter.
+    generic [R: Region]
+    function run(db: &![Database[Writing], R], sql: Span[Nat8, Static], values: Values): Option[DbError] is
+        case execute(&~db, sql, values) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as rows: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+        end case;
+    end;
+
+    -- The rows sql with values changed, as an Int64.
+    generic [R: Region]
+    function changedRows(db: &![Database[Writing], R], sql: Span[Nat8, Static], values: Values): Either[DbError, Int64] is
+        case execute(&~db, sql, values) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Nat64) do
+                case toInt64(rows) of
+                    when Some(value as n: Int64) do
+                        return Right(right => n);
+                    when None do
+                        return Right(right => 0);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepareStore(db: &![Database[Writing], R]): Option[DbError] is
+        case run(&~db, makeSessions, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeSessionsIndex, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeRequests, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeCodes, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeRefresh, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeRefreshFamily, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeRefreshSession, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeRefreshSubject, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeRoles, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        return run(&~db, makeRolesIndex, noValues());
+    end;
+
+    --- Sessions
+
+    function destroySession(session: OpSession): Unit is
+        let { id: String, subject: String, authTime: Int64, amr: String, created: Int64, lastSeen: Int64, ended: Int64,
+            userAgent: String, firstIp: String, lastIp: String } := session;
+        destroyString(id);
+        destroyString(subject);
+        destroyString(amr);
+        destroyString(userAgent);
+        destroyString(firstIp);
+        destroyString(lastIp);
+        return nil;
+    end;
+
+    function destroySessions(sessions: Buffer[OpSession]): Unit is
+        var all: Buffer[OpSession] := sessions;
+        while bufferLength(&all) > 0 do
+            destroySession(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    generic [S: Region]
+    function isAlive(session: &[OpSession, S], now: Int64, idle: Int64, max: Int64): Bool is
+        return (session->ended = 0) and ((now - session->lastSeen) <= idle) and ((now - session->authTime) <= max);
+    end;
+
+    generic [C: Region]
+    function sessionAt(cursor: &[Cursor, C]): OpSession is
+        return OpSession(id => fromSpan(columnText(cursor, 0)), subject => fromSpan(columnText(cursor, 1)),
+            authTime => columnInt64(cursor, 2), amr => fromSpan(columnText(cursor, 3)), created => columnInt64(cursor, 4),
+            lastSeen => columnInt64(cursor, 5), ended => columnInt64(cursor, 6), userAgent => fromSpan(columnText(cursor, 7)),
+            firstIp => fromSpan(columnText(cursor, 8)), lastIp => fromSpan(columnText(cursor, 9)));
+    end;
+
+    function dropSession(session: Option[OpSession]): Unit is
+        case session of
+            when Some(value as s: OpSession) do
+                destroySession(s);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, V: Region]
+    function oneSession(db: &![Database[Writing], R], sql: Span[Nat8, Static], value: Span[Nat8, V]): Either[DbError, Option[OpSession]] is
+        var cursor: Cursor := start(&~db, sql, withText(noValues(), value));
+        var found: Option[OpSession] := None();
+        if advance(&!cursor) then
+            let made: OpSession := sessionAt(&cursor);
+            dropSession(found);
+            found := Some(value => made);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropSession(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function sessionByToken(db: &![Database[Writing], R], token: Span[Nat8, T]): Either[DbError, Option[OpSession]] is
+        if (spanLength(token) < 40) or (spanLength(token) > 200) then
+            let none: Option[OpSession] := None();
+            return Right(right => none);
+        end if;
+        let hash: String := tokenHash(token);
+        let found: Either[DbError, Option[OpSession]] := oneSession(&~db, selectSessionByHash, asSpan(&hash));
+        destroyString(hash);
+        return found;
+    end;
+
+    generic [R: Region, I: Region]
+    function sessionById(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Option[OpSession]] is
+        return oneSession(&~db, selectSessionById, id);
+    end;
+
+    generic [S: Region, I: Region]
+    function lastIpIs(session: &[OpSession, S], ip: Span[Nat8, I]): Bool is
+        return equal(ip, asSpan(&(session->lastIp)));
+    end;
+
+    generic [R: Region, S: Region, I: Region]
+    function touchSession(db: &![Database[Writing], R], session: &![OpSession, S], ip: Span[Nat8, I], now: Int64): Option[DbError] is
+        let moved: Bool := (spanLength(ip) > 0) and (not lastIpIs(&session, ip));
+        if ((now - session->lastSeen) < touchEvery) and (not moved) then
+            let none: Option[DbError] := None();
+            return none;
+        end if;
+        let id: String := sessionIdCopy(&session);
+        let result: Option[DbError] := run(&~db, touch, withText(withText(withText(withInt64(noValues(), now), ip), ip), asSpan(&id)));
+        destroyString(id);
+        session->lastSeen := now;
+        return result;
+    end;
+
+    function destroyStarted(started: Started): Unit is
+        let { session: OpSession, token: String } := started;
+        destroySession(session);
+        destroyString(token);
+        return nil;
+    end;
+
+    -- The session the cookie current names when it is alive.
+    generic [R: Region]
+    function liveCurrent(db: &![Database[Writing], R], current: Option[String], now: Int64, idle: Int64,
+        max: Int64): Either[DbError, Option[OpSession]] is
+        case current of
+            when Some(value as token: String) do
+                let found: Either[DbError, Option[OpSession]] := sessionByToken(&~db, asSpan(&token));
+                destroyString(token);
+                case found of
+                    when Left(left as error: DbError) do
+                        return Left(left => error);
+                    when Right(right as maybe: Option[OpSession]) do
+                        case maybe of
+                            when Some(value as s: OpSession) do
+                                if isAlive(&s, now, idle, max) then
+                                    return Right(right => Some(value => s));
+                                end if;
+                                destroySession(s);
+                                let none: Option[OpSession] := None();
+                                return Right(right => none);
+                            when None do
+                                let none: Option[OpSession] := None();
+                                return Right(right => none);
+                        end case;
+                end case;
+            when None do
+                let none: Option[OpSession] := None();
+                return Right(right => none);
+        end case;
+    end;
+
+    generic [S: Region, U: Region]
+    function sessionOfSubject(session: &[OpSession, S], subject: Span[Nat8, U]): Bool is
+        return equal(asSpan(&(session->subject)), subject);
+    end;
+
+    generic [S: Region]
+    function sessionIdCopy(session: &[OpSession, S]): String is
+        return fromSpan(asSpan(&(session->id)));
+    end;
+
+    generic [R: Region, U: Region, A: Region, I: Region, G: Region]
+    function startSession(db: &![Database[Writing], R], current: Option[String], subject: Span[Nat8, U],
+        amr: Span[Nat8, A], ip: Span[Nat8, I], userAgent: Span[Nat8, G], now: Int64, idle: Int64,
+        max: Int64): Either[DbError, Option[Started]] is
+        let old: Either[DbError, Option[OpSession]] := liveCurrent(&~db, current, now, idle, max);
+        case old of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as maybe: Option[OpSession]) do
+                case maybe of
+                    when Some(value as s: OpSession) do
+                        let same: Bool := sessionOfSubject(&s, subject);
+                        let oldId: String := sessionIdCopy(&s);
+                        destroySession(s);
+                        if same then
+                            let renewed: Either[DbError, Option[Started]] := renew(&~db, asSpan(&oldId), amr, ip, now);
+                            destroyString(oldId);
+                            return renewed;
+                        end if;
+                        let ended: Option[DbError] := endSession(&~db, asSpan(&oldId), "replaced by another account", now);
+                        destroyString(oldId);
+                        case ended of
+                            when Some(value as error: DbError) do
+                                return Left(left => error);
+                            when None do
+                                skip;
+                        end case;
+                    when None do
+                        skip;
+                end case;
+        end case;
+        return newSession(&~db, subject, amr, ip, userAgent, now);
+    end;
+
+    -- A new cookie for the session id, a new auth_time and amr.
+    generic [R: Region, I: Region, A: Region, P: Region]
+    function renew(db: &![Database[Writing], R], id: Span[Nat8, I], amr: Span[Nat8, A], ip: Span[Nat8, P],
+        now: Int64): Either[DbError, Option[Started]] is
+        case randomToken() of
+            when Some(value as token: String) do
+                let hash: String := tokenHash(asSpan(&token));
+                let result: Option[DbError] := run(&~db, reauth, withText(withText(withText(withInt64(withText(withInt64(
+                    withText(noValues(), asSpan(&hash)), now), amr), now), ip), ip), id));
+                destroyString(hash);
+                case result of
+                    when Some(value as error: DbError) do
+                        destroyString(token);
+                        return Left(left => error);
+                    when None do
+                        return withSession(&~db, id, token);
+                end case;
+            when None do
+                let none: Option[Started] := None();
+                return Right(right => none);
+        end case;
+    end;
+
+    -- The session id read back, with the cookie value token.
+    generic [R: Region, I: Region]
+    function withSession(db: &![Database[Writing], R], id: Span[Nat8, I], token: String): Either[DbError, Option[Started]] is
+        case sessionById(&~db, id) of
+            when Left(left as error: DbError) do
+                destroyString(token);
+                return Left(left => error);
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as s: OpSession) do
+                        return Right(right => Some(value => Started(session => s, token => token)));
+                    when None do
+                        destroyString(token);
+                        let none: Option[Started] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    -- A new session of subject.
+    generic [R: Region, U: Region, A: Region, I: Region, G: Region]
+    function newSession(db: &![Database[Writing], R], subject: Span[Nat8, U], amr: Span[Nat8, A], ip: Span[Nat8, I],
+        userAgent: Span[Nat8, G], now: Int64): Either[DbError, Option[Started]] is
+        case randomId() of
+            when Some(value as id: String) do
+                case randomToken() of
+                    when Some(value as token: String) do
+                        let hash: String := tokenHash(asSpan(&token));
+                        var agent: Span[Nat8, G] := userAgent;
+                        if spanLength(agent) > mostUserAgent then
+                            agent := substring(userAgent, 0, mostUserAgent);
+                        end if;
+                        let values: Values := withText(withText(withText(withInt64(withInt64(withText(withInt64(withText(withText(
+                            withText(noValues(), asSpan(&id)), asSpan(&hash)), subject), now), amr), now), now), agent), ip), ip);
+                        let result: Option[DbError] := run(&~db, insertSession, values);
+                        destroyString(hash);
+                        case result of
+                            when Some(value as error: DbError) do
+                                destroyString(token);
+                                destroyString(id);
+                                return Left(left => error);
+                            when None do
+                                let started: Either[DbError, Option[Started]] := withSession(&~db, asSpan(&id), token);
+                                destroyString(id);
+                                return started;
+                        end case;
+                    when None do
+                        destroyString(id);
+                        let none: Option[Started] := None();
+                        return Right(right => none);
+                end case;
+            when None do
+                let none: Option[Started] := None();
+                return Right(right => none);
+        end case;
+    end;
+
+    -- Commits transaction, or rolls it back when failed holds an error.
+    generic [R: Region]
+    function settle(db: &![Database[Writing], R], transaction: Transaction, failed: Option[DbError]): Option[DbError] is
+        case failed of
+            when Some(value as error: DbError) do
+                rollback(&~db, transaction);
+                return Some(value => error);
+            when None do
+                case commit(&~db, transaction) of
+                    when Left(left as error: DbError) do
+                        return Some(value => error);
+                    when Right(right as done: Unit) do
+                        let none: Option[DbError] := None();
+                        return none;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, I: Region, E: Region]
+    function endSession(db: &![Database[Writing], R], id: Span[Nat8, I], reason: Span[Nat8, E], now: Int64): Option[DbError] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as transaction: Transaction) do
+                var failed: Option[DbError] := run(&~db, endOne, withText(withText(withInt64(noValues(), now), reason), id));
+                case failed of
+                    when Some(value as error: DbError) do
+                        failed := Some(value => error);
+                    when None do
+                        failed := run(&~db, revokeOfSession, withText(withInt64(noValues(), now), id));
+                end case;
+                return settle(&~db, transaction, failed);
+        end case;
+    end;
+
+    generic [R: Region, U: Region, E: Region]
+    function revokeSubject(db: &![Database[Writing], R], subject: Span[Nat8, U], reason: Span[Nat8, E],
+        now: Int64): Either[DbError, Int64] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                case changedRows(&~db, endOfSubject, withText(withText(withInt64(noValues(), now), reason), subject)) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Left(left => error);
+                    when Right(right as sessions: Int64) do
+                        case changedRows(&~db, revokeOfSubject, withText(withInt64(noValues(), now), subject)) of
+                            when Left(left as error: DbError) do
+                                rollback(&~db, transaction);
+                                return Left(left => error);
+                            when Right(right as tokens: Int64) do
+                                let none: Option[DbError] := None();
+                                case settle(&~db, transaction, none) of
+                                    when Some(value as error: DbError) do
+                                        return Left(left => error);
+                                    when None do
+                                        return Right(right => sessions + tokens);
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, U: Region]
+    function liveSessions(db: &![Database[Writing], R], subject: Span[Nat8, U], now: Int64, idle: Int64,
+        max: Int64): Either[DbError, Buffer[OpSession]] is
+        var cursor: Cursor := start(&~db, selectLiveSessions, noValues());
+        if spanLength(subject) > 0 then
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return Left(left => error);
+                when None do
+                    skip;
+            end case;
+            cursor := start(&~db, selectLiveSessionsOf, withText(noValues(), subject));
+        end if;
+        var all: Buffer[OpSession] := allocateEmpty();
+        while advance(&!cursor) do
+            let s: OpSession := sessionAt(&cursor);
+            if isAlive(&s, now, idle, max) then
+                insertBack(&!all, s);
+            else
+                destroySession(s);
+            end if;
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroySessions(all);
+                return Left(left => error);
+            when None do
+                return Right(right => all);
+        end case;
+    end;
+
+    --- Login requests
+
+    function destroyRequest(request: AuthRequest): Unit is
+        let { clientId: String, redirectUri: String, scope: String, state: String, nonce: String, challenge: String,
+            maxAge: Int64, prompt: String, returnTo: String, returnName: String, restarted: Bool } := request;
+        destroyString(clientId);
+        destroyString(redirectUri);
+        destroyString(scope);
+        destroyString(state);
+        destroyString(nonce);
+        destroyString(challenge);
+        destroyString(prompt);
+        destroyString(returnTo);
+        destroyString(returnName);
+        return nil;
+    end;
+
+    generic [T: Region]
+    function directRequest(returnTo: Span[Nat8, T]): AuthRequest is
+        return AuthRequest(clientId => fromSpan(""), redirectUri => fromSpan(""), scope => fromSpan(""), state => fromSpan(""),
+            nonce => fromSpan(""), challenge => fromSpan(""), maxAge => -1, prompt => fromSpan(""),
+            returnTo => fromSpan(returnTo), returnName => fromSpan(""), restarted => false);
+    end;
+
+    -- Writes the member name with value, when value is not empty.
+    generic [W: Region, V: Region]
+    function member(writer: &![JsonWriter, W], name: Span[Nat8, Static], value: Span[Nat8, V]): Unit is
+        if spanLength(value) > 0 then
+            writeName(&~writer, name);
+            writeJsonString(&~writer, value);
+        end if;
+        return nil;
+    end;
+
+    generic [Q: Region]
+    function requestParams(request: &[AuthRequest, Q]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        member(&!writer, "client_id", asSpan(&(request->clientId)));
+        member(&!writer, "redirect_uri", asSpan(&(request->redirectUri)));
+        member(&!writer, "scope", asSpan(&(request->scope)));
+        member(&!writer, "state", asSpan(&(request->state)));
+        member(&!writer, "nonce", asSpan(&(request->nonce)));
+        member(&!writer, "challenge", asSpan(&(request->challenge)));
+        writeName(&!writer, "max_age");
+        writeInteger(&!writer, request->maxAge);
+        member(&!writer, "prompt", asSpan(&(request->prompt)));
+        member(&!writer, "return_to", asSpan(&(request->returnTo)));
+        member(&!writer, "return_name", asSpan(&(request->returnName)));
+        if request->restarted then
+            writeName(&!writer, "restarted");
+            writeBool(&!writer, true);
+        end if;
+        endObject(&!writer);
+        case finishJson(writer) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("{}");
+        end case;
+    end;
+
+    generic [D: Region]
+    function textAt(document: &[Json, D], pointer: Span[Nat8, Static]): String is
+        case stringAt(document, pointer) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [P: Region]
+    function readRequestParams(params: Span[Nat8, P]): Option[AuthRequest] is
+        case readJson(params) of
+            when Right(right as document: Json) do
+                var maxAge: Int64 := -1;
+                case integerAt(&document, "/max_age") of
+                    when Some(value as n: Int64) do
+                        maxAge := n;
+                    when None do
+                        skip;
+                end case;
+                var restarted: Bool := false;
+                case boolAt(&document, "/restarted") of
+                    when Some(value as b: Bool) do
+                        restarted := b;
+                    when None do
+                        skip;
+                end case;
+                let request: AuthRequest := AuthRequest(clientId => textAt(&document, "/client_id"),
+                    redirectUri => textAt(&document, "/redirect_uri"), scope => textAt(&document, "/scope"),
+                    state => textAt(&document, "/state"), nonce => textAt(&document, "/nonce"),
+                    challenge => textAt(&document, "/challenge"), maxAge => maxAge, prompt => textAt(&document, "/prompt"),
+                    returnTo => textAt(&document, "/return_to"), returnName => textAt(&document, "/return_name"),
+                    restarted => restarted);
+                destroyJson(document);
+                return Some(value => request);
+            when Left(left as error: JsonError) do
+                let none: Option[AuthRequest] := None();
+                return none;
+        end case;
+    end;
+
+    function destroySaved(saved: Saved): Unit is
+        let { id: String, flow: String } := saved;
+        destroyString(id);
+        destroyString(flow);
+        return nil;
+    end;
+
+    generic [R: Region, Q: Region]
+    function saveRequest(db: &![Database[Writing], R], request: &[AuthRequest, Q], now: Int64,
+        ttl: Int64): Either[DbError, Option[Saved]] is
+        case randomId() of
+            when Some(value as id: String) do
+                case randomToken() of
+                    when Some(value as flow: String) do
+                        let hash: String := tokenHash(asSpan(&flow));
+                        let params: String := requestParams(request);
+                        let result: Option[DbError] := run(&~db, insertRequest, withInt64(withInt64(withText(withText(withText(
+                            noValues(), asSpan(&id)), asSpan(&hash)), asSpan(&params)), now), now + ttl));
+                        destroyString(hash);
+                        destroyString(params);
+                        case result of
+                            when Some(value as error: DbError) do
+                                destroyString(id);
+                                destroyString(flow);
+                                return Left(left => error);
+                            when None do
+                                return Right(right => Some(value => Saved(id => id, flow => flow)));
+                        end case;
+                    when None do
+                        destroyString(id);
+                        let none: Option[Saved] := None();
+                        return Right(right => none);
+                end case;
+            when None do
+                let none: Option[Saved] := None();
+                return Right(right => none);
+        end case;
+    end;
+
+    -- The flow hash, the params and the end of the request id, as kept.
+    record RequestRow: Linear is
+        flowHash: String;
+        params: String;
+        expires: Int64;
+    end;
+
+    function destroyRequestRow(row: RequestRow): Unit is
+        let { flowHash: String, params: String, expires: Int64 } := row;
+        destroyString(flowHash);
+        destroyString(params);
+        return nil;
+    end;
+
+    generic [R: Region, I: Region]
+    function requestRow(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Option[RequestRow]] is
+        var cursor: Cursor := start(&~db, selectRequest, withText(noValues(), id));
+        var found: Option[RequestRow] := None();
+        if advance(&!cursor) then
+            let row: RequestRow := RequestRow(flowHash => fromSpan(columnText(&cursor, 0)),
+                params => fromSpan(columnText(&cursor, 1)), expires => columnInt64(&cursor, 2));
+            case found of
+                when Some(value as earlier: RequestRow) do
+                    destroyRequestRow(earlier);
+                when None do
+                    skip;
+            end case;
+            found := Some(value => row);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                case found of
+                    when Some(value as row: RequestRow) do
+                        destroyRequestRow(row);
+                    when None do
+                        skip;
+                end case;
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    generic [R: Region, I: Region, F: Region]
+    function loadRequest(db: &![Database[Writing], R], id: Span[Nat8, I], flow: Span[Nat8, F],
+        now: Int64): Either[DbError, Either[RequestProblem, AuthRequest]] is
+        if (spanLength(id) = 0) or (spanLength(id) > 64) then
+            return Right(right => Left(left => UnknownRequest()));
+        end if;
+        case requestRow(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[RequestRow]) do
+                case found of
+                    when Some(value as row: RequestRow) do
+                        let { flowHash: String, params: String, expires: Int64 } := row;
+                        if now > expires then
+                            destroyString(flowHash);
+                            destroyString(params);
+                            return Right(right => Left(left => UnknownRequest()));
+                        end if;
+                        let fits: Bool := tokenMatches(flow, asSpan(&flowHash));
+                        destroyString(flowHash);
+                        if not fits then
+                            destroyString(params);
+                            return Right(right => Left(left => FlowMismatch()));
+                        end if;
+                        let request: Option[AuthRequest] := readRequestParams(asSpan(&params));
+                        destroyString(params);
+                        case request of
+                            when Some(value as r: AuthRequest) do
+                                return Right(right => Right(right => r));
+                            when None do
+                                return Right(right => Left(left => UnknownRequest()));
+                        end case;
+                    when None do
+                        return Right(right => Left(left => UnknownRequest()));
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function keptRequest(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Option[KeptRequest]] is
+        if (spanLength(id) = 0) or (spanLength(id) > 64) then
+            let none: Option[KeptRequest] := None();
+            return Right(right => none);
+        end if;
+        case requestRow(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[RequestRow]) do
+                case found of
+                    when Some(value as row: RequestRow) do
+                        let { flowHash: String, params: String, expires: Int64 } := row;
+                        destroyString(flowHash);
+                        let request: Option[AuthRequest] := readRequestParams(asSpan(&params));
+                        destroyString(params);
+                        case request of
+                            when Some(value as r: AuthRequest) do
+                                return Right(right => Some(value => KeptRequest(request => r, expires => expires)));
+                            when None do
+                                let none: Option[KeptRequest] := None();
+                                return Right(right => none);
+                        end case;
+                    when None do
+                        let none: Option[KeptRequest] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function dropRequest(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Option[DbError] is
+        return run(&~db, endRequest, withInt64(withText(withInt64(noValues(), now - 1), id), now));
+    end;
+
+    --- Codes
+
+    function destroyCode(code: CodeRow): Unit is
+        let { clientId: String, subject: String, sessionId: String, redirectUri: String, challenge: String, scope: String,
+            nonce: String, amr: String, family: String, authTime: Int64, expires: Int64, used: Int64 } := code;
+        destroyString(clientId);
+        destroyString(subject);
+        destroyString(sessionId);
+        destroyString(redirectUri);
+        destroyString(challenge);
+        destroyString(scope);
+        destroyString(nonce);
+        destroyString(amr);
+        destroyString(family);
+        return nil;
+    end;
+
+    generic [R: Region, C: Region, S: Region, Q: Region]
+    function issueCode(db: &![Database[Writing], R], clientId: Span[Nat8, C], session: &[OpSession, S],
+        request: &[AuthRequest, Q], now: Int64, ttl: Int64): Either[DbError, Option[String]] is
+        case randomToken() of
+            when Some(value as token: String) do
+                let hash: String := tokenHash(asSpan(&token));
+                let first: Values := withText(withText(withText(withText(noValues(), asSpan(&hash)), clientId),
+                    asSpan(&(session->subject))), asSpan(&(session->id)));
+                let second: Values := withText(withText(withText(withText(first, asSpan(&(request->redirectUri))),
+                    asSpan(&(request->challenge))), asSpan(&(request->scope))), asSpan(&(request->nonce)));
+                let values: Values := withInt64(withText(withInt64(second, session->authTime), asSpan(&(session->amr))), now + ttl);
+                let result: Option[DbError] := run(&~db, insertCode, values);
+                destroyString(hash);
+                case result of
+                    when Some(value as error: DbError) do
+                        destroyString(token);
+                        return Left(left => error);
+                    when None do
+                        return Right(right => Some(value => token));
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return Right(right => none);
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function loadCode(db: &![Database[Writing], R], token: Span[Nat8, T]): Either[DbError, Option[CodeRow]] is
+        if (spanLength(token) = 0) or (spanLength(token) > 200) then
+            let none: Option[CodeRow] := None();
+            return Right(right => none);
+        end if;
+        let hash: String := tokenHash(token);
+        var cursor: Cursor := start(&~db, selectCode, withText(noValues(), asSpan(&hash)));
+        destroyString(hash);
+        var found: Option[CodeRow] := None();
+        if advance(&!cursor) then
+            let row: CodeRow := CodeRow(clientId => fromSpan(columnText(&cursor, 0)), subject => fromSpan(columnText(&cursor, 1)),
+                sessionId => fromSpan(columnText(&cursor, 2)), redirectUri => fromSpan(columnText(&cursor, 3)),
+                challenge => fromSpan(columnText(&cursor, 4)), scope => fromSpan(columnText(&cursor, 5)),
+                nonce => fromSpan(columnText(&cursor, 6)), amr => fromSpan(columnText(&cursor, 7)),
+                family => fromSpan(columnText(&cursor, 8)), authTime => columnInt64(&cursor, 9),
+                expires => columnInt64(&cursor, 10), used => columnInt64(&cursor, 11));
+            dropCode(found);
+            found := Some(value => row);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropCode(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    function dropCode(code: Option[CodeRow]): Unit is
+        case code of
+            when Some(value as c: CodeRow) do
+                destroyCode(c);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, T: Region, F: Region]
+    function spendCode(db: &![Database[Writing], R], token: Span[Nat8, T], family: Span[Nat8, F],
+        now: Int64): Either[DbError, Bool] is
+        let hash: String := tokenHash(token);
+        let result: Either[DbError, Int64] := changedRows(&~db, useCode, withText(withText(withInt64(noValues(), now), family),
+            asSpan(&hash)));
+        destroyString(hash);
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                return Right(right => rows = 1);
+        end case;
+    end;
+
+    --- Refresh tokens
+
+    function destroyRefresh(row: RefreshRow): Unit is
+        let { family: String, clientId: String, subject: String, sessionId: String, device: String, scope: String,
+            amr: String, firstIp: String, authTime: Int64, familyCreated: Int64, created: Int64, expires: Int64,
+            used: Int64, revoked: Int64 } := row;
+        destroyString(family);
+        destroyString(clientId);
+        destroyString(subject);
+        destroyString(sessionId);
+        destroyString(device);
+        destroyString(scope);
+        destroyString(amr);
+        destroyString(firstIp);
+        return nil;
+    end;
+
+    function destroyNewRefresh(fresh: NewRefresh): Unit is
+        let { family: String, clientId: String, subject: String, sessionId: String, device: String, scope: String,
+            amr: String, firstIp: String, lastIp: String, authTime: Int64, familyCreated: Int64 } := fresh;
+        destroyString(family);
+        destroyString(clientId);
+        destroyString(subject);
+        destroyString(sessionId);
+        destroyString(device);
+        destroyString(scope);
+        destroyString(amr);
+        destroyString(firstIp);
+        destroyString(lastIp);
+        return nil;
+    end;
+
+    generic [R: Region, F: Region]
+    function storeRefresh(db: &![Database[Writing], R], fresh: &[NewRefresh, F], now: Int64,
+        ttl: Int64): Either[DbError, Option[String]] is
+        case randomToken() of
+            when Some(value as token: String) do
+                case randomId() of
+                    when Some(value as id: String) do
+                        let hash: String := tokenHash(asSpan(&token));
+                        let first: Values := withText(withText(withText(withText(withText(noValues(), asSpan(&hash)),
+                            asSpan(&id)), asSpan(&(fresh->family))), asSpan(&(fresh->clientId))), asSpan(&(fresh->subject)));
+                        let second: Values := withInt64(withText(withText(withText(first, asSpan(&(fresh->sessionId))),
+                            asSpan(&(fresh->device))), asSpan(&(fresh->scope))), fresh->authTime);
+                        let third: Values := withInt64(withInt64(withInt64(withText(second, asSpan(&(fresh->amr))),
+                            fresh->familyCreated), now), now + ttl);
+                        let values: Values := withText(withText(third, asSpan(&(fresh->firstIp))), asSpan(&(fresh->lastIp)));
+                        let result: Option[DbError] := run(&~db, insertRefresh, values);
+                        destroyString(hash);
+                        destroyString(id);
+                        case result of
+                            when Some(value as error: DbError) do
+                                destroyString(token);
+                                return Left(left => error);
+                            when None do
+                                return Right(right => Some(value => token));
+                        end case;
+                    when None do
+                        destroyString(token);
+                        let none: Option[String] := None();
+                        return Right(right => none);
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return Right(right => none);
+        end case;
+    end;
+
+    function dropRefresh(row: Option[RefreshRow]): Unit is
+        case row of
+            when Some(value as r: RefreshRow) do
+                destroyRefresh(r);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, T: Region]
+    function loadRefresh(db: &![Database[Writing], R], token: Span[Nat8, T]): Either[DbError, Option[RefreshRow]] is
+        if (spanLength(token) = 0) or (spanLength(token) > 200) then
+            let none: Option[RefreshRow] := None();
+            return Right(right => none);
+        end if;
+        let hash: String := tokenHash(token);
+        var cursor: Cursor := start(&~db, selectRefresh, withText(noValues(), asSpan(&hash)));
+        destroyString(hash);
+        var found: Option[RefreshRow] := None();
+        if advance(&!cursor) then
+            let row: RefreshRow := RefreshRow(family => fromSpan(columnText(&cursor, 0)),
+                clientId => fromSpan(columnText(&cursor, 1)), subject => fromSpan(columnText(&cursor, 2)),
+                sessionId => fromSpan(columnText(&cursor, 3)), device => fromSpan(columnText(&cursor, 4)),
+                scope => fromSpan(columnText(&cursor, 5)), amr => fromSpan(columnText(&cursor, 6)),
+                firstIp => fromSpan(columnText(&cursor, 13)), authTime => columnInt64(&cursor, 7),
+                familyCreated => columnInt64(&cursor, 8), created => columnInt64(&cursor, 9),
+                expires => columnInt64(&cursor, 10), used => columnInt64(&cursor, 11), revoked => columnInt64(&cursor, 12));
+            dropRefresh(found);
+            found := Some(value => row);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropRefresh(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function spendRefresh(db: &![Database[Writing], R], token: Span[Nat8, T], now: Int64): Either[DbError, Bool] is
+        let hash: String := tokenHash(token);
+        let result: Either[DbError, Int64] := changedRows(&~db, useRefresh, withText(withInt64(noValues(), now), asSpan(&hash)));
+        destroyString(hash);
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                return Right(right => rows = 1);
+        end case;
+    end;
+
+    generic [R: Region, F: Region]
+    function revokeFamily(db: &![Database[Writing], R], family: Span[Nat8, F], now: Int64): Option[DbError] is
+        if spanLength(family) = 0 then
+            let none: Option[DbError] := None();
+            return none;
+        end if;
+        return run(&~db, revokeOfFamily, withText(withInt64(noValues(), now), family));
+    end;
+
+    function destroyDevices(devices: Buffer[Device]): Unit is
+        var all: Buffer[Device] := devices;
+        while bufferLength(&all) > 0 do
+            let { family: String, clientId: String, clientName: String, label: String, created: Int64, lastUsed: Int64,
+                firstIp: String, lastIp: String } := removeLast(&!all);
+            destroyString(family);
+            destroyString(clientId);
+            destroyString(clientName);
+            destroyString(label);
+            destroyString(firstIp);
+            destroyString(lastIp);
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    generic [R: Region, U: Region]
+    function devicesOf(db: &![Database[Writing], R], subject: Span[Nat8, U], nativeOnly: Bool,
+        now: Int64): Either[DbError, Buffer[Device]] is
+        let sql: Span[Nat8, Static] := if nativeOnly then selectNative else selectBound;
+        var cursor: Cursor := start(&~db, sql, withInt64(withText(noValues(), subject), now));
+        var all: Buffer[Device] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!all, Device(family => fromSpan(columnText(&cursor, 0)), clientId => fromSpan(columnText(&cursor, 1)),
+                clientName => fromSpan(columnText(&cursor, 2)), label => fromSpan(columnText(&cursor, 3)),
+                created => columnInt64(&cursor, 4), lastUsed => columnInt64(&cursor, 5),
+                firstIp => fromSpan(columnText(&cursor, 6)), lastIp => fromSpan(columnText(&cursor, 7))));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyDevices(all);
+                return Left(left => error);
+            when None do
+                return Right(right => all);
+        end case;
+    end;
+
+    generic [R: Region, U: Region, F: Region]
+    function revokeDevice(db: &![Database[Writing], R], subject: Span[Nat8, U], family: Span[Nat8, F],
+        now: Int64): Either[DbError, Bool] is
+        var result: Either[DbError, Int64] := Right(right => 0);
+        if spanLength(subject) = 0 then
+            result := changedRows(&~db, revokeOfFamily, withText(withInt64(noValues(), now), family));
+        else
+            result := changedRows(&~db, revokeFamilyOf, withText(withText(withInt64(noValues(), now), family), subject));
+        end if;
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                return Right(right => rows > 0);
+        end case;
+    end;
+
+    --- Roles
+
+    generic [T: Region]
+    function isRole(text: Span[Nat8, T]): Bool is
+        if (spanLength(text) = 0) or (spanLength(text) > 32) then
+            return false;
+        end if;
+        if (text[0] < 'a') or (text[0] > 'z') then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            if not (((c >= 'a') and (c <= 'z')) or ((c >= '0') and (c <= '9')) or (c = '_') or (c = '-')) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function mostRoles(): Int64 is
+        return 16;
+    end;
+
+    generic [R: Region, C: Region, U: Region, O: Region]
+    function grantRole(db: &![Database[Writing], R], clientId: Span[Nat8, C], subject: Span[Nat8, U],
+        role: Span[Nat8, O], now: Int64): Either[DbError, Granted] is
+        let values: Values := withInt64(withText(withText(withInt64(withText(withText(withText(noValues(), clientId), subject),
+            role), now), clientId), subject), mostRoles());
+        case changedRows(&~db, insertRole, values) of
+            when Left(left as error: DbError) do
+                if isUniqueViolation(error) then
+                    return Right(right => RoleHeldAlready());
+                end if;
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                if rows = 1 then
+                    return Right(right => RoleAdded());
+                end if;
+                return Right(right => TooManyRoles());
+        end case;
+    end;
+
+    generic [R: Region, C: Region, U: Region, O: Region]
+    function revokeRole(db: &![Database[Writing], R], clientId: Span[Nat8, C], subject: Span[Nat8, U],
+        role: Span[Nat8, O]): Either[DbError, Bool] is
+        case changedRows(&~db, deleteRole, withText(withText(withText(noValues(), clientId), subject), role)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                return Right(right => rows = 1);
+        end case;
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var all: Buffer[String] := strings;
+        while bufferLength(&all) > 0 do
+            destroyString(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    generic [R: Region, C: Region, U: Region]
+    function rolesFor(db: &![Database[Writing], R], clientId: Span[Nat8, C], subject: Span[Nat8, U]): Either[DbError, Buffer[String]] is
+        var cursor: Cursor := start(&~db, selectRolesFor, withText(withText(noValues(), clientId), subject));
+        var all: Buffer[String] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!all, fromSpan(columnText(&cursor, 0)));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyStrings(all);
+                return Left(left => error);
+            when None do
+                return Right(right => all);
+        end case;
+    end;
+
+    function destroyGrants(grants: Buffer[RoleGrant]): Unit is
+        var all: Buffer[RoleGrant] := grants;
+        while bufferLength(&all) > 0 do
+            let { clientId: String, subject: String, role: String, created: Int64 } := removeLast(&!all);
+            destroyString(clientId);
+            destroyString(subject);
+            destroyString(role);
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    generic [R: Region, C: Region, U: Region]
+    function listRoles(db: &![Database[Writing], R], clientId: Span[Nat8, C], subject: Span[Nat8, U]): Either[DbError, Buffer[RoleGrant]] is
+        var cursor: Cursor := start(&~db, selectRoles, withText(withText(withText(withText(noValues(), clientId), clientId),
+            subject), subject));
+        var all: Buffer[RoleGrant] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!all, RoleGrant(clientId => fromSpan(columnText(&cursor, 0)), subject => fromSpan(columnText(&cursor, 1)),
+                role => fromSpan(columnText(&cursor, 2)), created => columnInt64(&cursor, 3)));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyGrants(all);
+                return Left(left => error);
+            when None do
+                return Right(right => all);
+        end case;
+    end;
+
+    generic [R: Region, U: Region]
+    function forgetSubject(db: &![Database[Writing], R], subject: Span[Nat8, U]): Either[DbError, Int64] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                var total: Int64 := 0;
+                var failed: Option[DbError] := None();
+                var step: Index := 0;
+                while step < 4 do
+                    let sql: Span[Nat8, Static] := forgetStatement(step);
+                    case failed of
+                        when Some(value as error: DbError) do
+                            failed := Some(value => error);
+                        when None do
+                            case changedRows(&~db, sql, withText(noValues(), subject)) of
+                                when Left(left as error: DbError) do
+                                    failed := Some(value => error);
+                                when Right(right as rows: Int64) do
+                                    total := total + rows;
+                                    failed := None();
+                            end case;
+                    end case;
+                    step := step + 1;
+                end while;
+                case settle(&~db, transaction, failed) of
+                    when Some(value as error: DbError) do
+                        return Left(left => error);
+                    when None do
+                        return Right(right => total);
+                end case;
+        end case;
+    end;
+
+    function forgetStatement(step: Index): Span[Nat8, Static] is
+        if step = 0 then
+            return forgetRoles;
+        end if;
+        if step = 1 then
+            return forgetRefresh;
+        end if;
+        if step = 2 then
+            return forgetCodes;
+        end if;
+        return forgetSessions;
+    end;
+
+    --- Cleanup
+
+    generic [R: Region]
+    function cleanup(db: &![Database[Writing], R], now: Int64, max: Int64): Either[DbError, Int64] is
+        let old: Int64 := now - keepSpent;
+        var total: Int64 := 0;
+        case changedRows(&~db, cleanRequests, withInt64(noValues(), now - restartWindow)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                total := total + rows;
+        end case;
+        case changedRows(&~db, cleanCodes, withInt64(noValues(), now - 3600)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                total := total + rows;
+        end case;
+        case changedRows(&~db, cleanRefresh, withInt64(withInt64(withInt64(noValues(), old), old), old)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                total := total + rows;
+        end case;
+        case changedRows(&~db, cleanSessions, withInt64(withInt64(withInt64(noValues(), old), now - max), old)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Int64) do
+                total := total + rows;
+        end case;
+        return Right(right => total);
+    end;
+end module body.

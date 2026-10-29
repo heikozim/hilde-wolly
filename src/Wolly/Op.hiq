@@ -1,0 +1,1276 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    nthRef,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    indexOfByte,
+    parseInt,
+    constantTimeEqual
+);
+import Standard.Libcrypto (
+    sha256,
+    hmacSha256
+);
+import Standard.Jws (
+    base64UrlEncode
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam
+);
+import Standard.Log (
+    Log
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish as finishResponse
+);
+import Wolly.OpKey (
+    RingKey,
+    Verified,
+    keySet,
+    verify,
+    destroyVerified
+);
+import Wolly.OpUrl (
+    QueryPair,
+    queryEscape,
+    destroyPairs,
+    encodeQuery,
+    setPair,
+    withQuery
+);
+import Wolly.OpClient (
+    OpClient,
+    ClientKind,
+    WebClient,
+    NativeClient,
+    ServiceClient,
+    Limits,
+    destroyClient,
+    getClient,
+    redirectAllowed,
+    logoutAllowed,
+    effectiveLimits,
+    startUrl
+);
+import Wolly.OpStore (
+    OpSession,
+    AuthRequest,
+    RequestProblem,
+    UnknownRequest,
+    FlowMismatch,
+    Saved,
+    KeptRequest,
+    Started,
+    destroySession,
+    destroyRequest,
+    destroySaved,
+    directRequest,
+    saveRequest,
+    loadRequest,
+    keptRequest,
+    dropRequest,
+    sessionById,
+    touchSession,
+    startSession,
+    endSession,
+    issueCode
+);
+import Wolly.OpToken (
+    Hint,
+    destroyHint,
+    readHint,
+    isState,
+    isVerifier,
+    normalScope,
+    discoveryDocument,
+    idTokenType
+);
+import Wolly.OpBase (
+    OpSettings,
+    Subject,
+    destroySubject,
+    formOf,
+    valueOf,
+    hasValue,
+    isPost,
+    cookieOf,
+    flowCookieName,
+    cookieHeader,
+    errorPage,
+    redirectTo,
+    jsonOutput,
+    activeSubject,
+    cookieSession,
+    audit,
+    htmlEscape
+);
+
+module body Wolly.Op is
+    constant noCookies: Index := 0;
+
+    function emptyCookies(): Buffer[String] is
+        let none: Buffer[String] := allocateEmpty();
+        return none;
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var all: Buffer[String] := strings;
+        while bufferLength(&all) > 0 do
+            destroyString(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    -- A redirect without cookies.
+    generic [L: Region]
+    function plainRedirect(location: Span[Nat8, L]): String is
+        let none: Buffer[String] := emptyCookies();
+        let output: String := redirectTo(302, location, &none);
+        destroyStrings(none);
+        return output;
+    end;
+
+    -- path followed by tail.
+    generic [P: Region]
+    function joined(path: Span[Nat8, P], tail: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, path);
+        writeString(&!out, tail);
+        return finalize(out);
+    end;
+
+    generic [R: Region, S: Region]
+    function discoveryEndpoint(db: &![Database[Writing], R], settings: &[OpSettings, S]): String is
+        let document: String := discoveryDocument(asSpan(&(settings->issuer)));
+        let output: String := jsonOutput(200, "application/json", asSpan(&document), "public, max-age=300");
+        destroyString(document);
+        return output;
+    end;
+
+    generic [K: Region]
+    function jwksEndpoint(ring: &[Buffer[RingKey], K]): String is
+        let keys: String := keySet(ring);
+        let output: String := jsonOutput(200, "application/jwk-set+json", asSpan(&keys), "public, max-age=300");
+        destroyString(keys);
+        return output;
+    end;
+
+    --- The authorization endpoint
+
+    -- An OAuth error for the redirect of a request.
+    record OauthError: Free is
+        code: Span[Nat8, Static];
+        description: Span[Nat8, Static];
+    end;
+
+    -- The redirect of an error to redirect, with state when it is a state.
+    generic [S: Region, D: Region, T: Region]
+    function redirectError(settings: &[OpSettings, S], redirect: Span[Nat8, D], state: Span[Nat8, T],
+        error: OauthError): String is
+        var set: Buffer[QueryPair] := allocateEmpty();
+        setPair(&!set, "error", error.code);
+        setPair(&!set, "error_description", error.description);
+        setPair(&!set, "iss", asSpan(&(settings->issuer)));
+        if isState(state) then
+            setPair(&!set, "state", state);
+        end if;
+        let target: Option[String] := withQuery(redirect, &set);
+        destroyPairs(set);
+        case target of
+            when Some(value as url: String) do
+                let output: String := plainRedirect(asSpan(&url));
+                destroyString(url);
+                return output;
+            when None do
+                return errorPage(settings, "bad redirect");
+        end case;
+    end;
+
+    -- The authorization request of pairs for client, or the error to
+    -- redirect.
+    generic [P: Region, C: Region]
+    function parseAuthRequest(pairs: &[Buffer[QueryPair], P], client: &[OpClient, C]): Either[OauthError, AuthRequest] is
+        let request: String := valueOf(pairs, "request");
+        let requestUri: String := valueOf(pairs, "request_uri");
+        let objects: Bool := (length(&request) > 0) or (length(&requestUri) > 0);
+        destroyString(request);
+        destroyString(requestUri);
+        if objects then
+            return Left(left => OauthError(code => "request_not_supported", description => "request objects are not supported"));
+        end if;
+        let responseType: String := valueOf(pairs, "response_type");
+        let code: Bool := equal(asSpan(&responseType), "code");
+        destroyString(responseType);
+        if not code then
+            return Left(left => OauthError(code => "unsupported_response_type", description => "only code"));
+        end if;
+        let rawScope: String := valueOf(pairs, "scope");
+        let scope: Option[String] := normalScope(asSpan(&rawScope));
+        destroyString(rawScope);
+        case scope of
+            when Some(value as normal: String) do
+                return checkedRequest(pairs, client, normal);
+            when None do
+                return Left(left => OauthError(code => "invalid_scope",
+                    description => "openid is required; known scopes: openid email profile"));
+        end case;
+    end;
+
+    generic [P: Region, C: Region]
+    function checkedRequest(pairs: &[Buffer[QueryPair], P], client: &[OpClient, C], scope: String): Either[OauthError, AuthRequest] is
+        let rawState: String := valueOf(pairs, "state");
+        var state: String := fromSpan("");
+        if isState(asSpan(&rawState)) then
+            destroyString(state);
+            state := fromSpan(asSpan(&rawState));
+        end if;
+        destroyString(rawState);
+        let nonce: String := valueOf(pairs, "nonce");
+        let challenge: String := valueOf(pairs, "code_challenge");
+        let challengeMethod: String := valueOf(pairs, "code_challenge_method");
+        let prompt: String := valueOf(pairs, "prompt");
+        let request: AuthRequest := AuthRequest(clientId => fromSpan(asSpan(&(client->id))),
+            redirectUri => valueOf(pairs, "redirect_uri"), scope => scope, state => state, nonce => nonce,
+            challenge => challenge, maxAge => -1, prompt => prompt, returnTo => fromSpan(""), returnName => fromSpan(""),
+            restarted => false);
+        let problem: Option[OauthError] := requestProblem(&request, asSpan(&challengeMethod), client->laxAuth);
+        destroyString(challengeMethod);
+        case problem of
+            when Some(value as error: OauthError) do
+                destroyRequest(request);
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        let maxAge: String := valueOf(pairs, "max_age");
+        if length(&maxAge) = 0 then
+            destroyString(maxAge);
+            return Right(right => request);
+        end if;
+        let parsed: Option[Int64] := parseInt(asSpan(&maxAge));
+        destroyString(maxAge);
+        case parsed of
+            when Some(value as n: Int64) do
+                if (n >= 0) and (n <= 315360000) then
+                    return Right(right => withMaxAge(request, n));
+                end if;
+            when None do
+                skip;
+        end case;
+        destroyRequest(request);
+        return Left(left => OauthError(code => "invalid_request", description => "max_age must be a non-negative number of seconds"));
+    end;
+
+    function withMaxAge(request: AuthRequest, maxAge: Int64): AuthRequest is
+        let { clientId: String, redirectUri: String, scope: String, state: String, nonce: String, challenge: String,
+            maxAge as unset: Int64, prompt: String, returnTo: String, returnName: String, restarted: Bool } := request;
+        return AuthRequest(clientId => clientId, redirectUri => redirectUri, scope => scope, state => state, nonce => nonce,
+            challenge => challenge, maxAge => maxAge, prompt => prompt, returnTo => returnTo, returnName => returnName,
+            restarted => restarted);
+    end;
+
+    -- The checks of state, nonce, code challenge and prompt, in the order an
+    -- earlier provider written in Go makes them: a lax client without a
+    -- challenge skips the rest.
+    generic [Q: Region, M: Region]
+    function requestProblem(request: &[AuthRequest, Q], challengeMethod: Span[Nat8, M], lax: Bool): Option[OauthError] is
+        let nonce: Span[Nat8, Q] := asSpan(&(request->nonce));
+        let challenge: Span[Nat8, Q] := asSpan(&(request->challenge));
+        let prompt: Span[Nat8, Q] := asSpan(&(request->prompt));
+        if length(&(request->state)) = 0 then
+            return Some(value => OauthError(code => "invalid_request", description => "state is required"));
+        end if;
+        if (spanLength(nonce) > 512) or ((spanLength(nonce) = 0) and (not lax)) then
+            return Some(value => OauthError(code => "invalid_request", description => "nonce is required (at most 512 bytes)"));
+        end if;
+        if lax and (spanLength(challenge) = 0) and (spanLength(challengeMethod) = 0) then
+            let none: Option[OauthError] := None();
+            return none;
+        end if;
+        if (not equal(challengeMethod, "S256")) or (not isVerifier(challenge)) then
+            return Some(value => OauthError(code => "invalid_request", description => "PKCE with S256 is required"));
+        end if;
+        if (spanLength(prompt) > 0) and (not equal(prompt, "none")) and (not equal(prompt, "login")) then
+            return Some(value => OauthError(code => "invalid_request", description => "prompt must be none or login"));
+        end if;
+        let none: Option[OauthError] := None();
+        return none;
+    end;
+
+    generic [C: Region]
+    function usableClient(client: &[OpClient, C]): Bool is
+        if client->disabled then
+            return false;
+        end if;
+        case client->kind of
+            when ServiceClient do
+                return false;
+            when WebClient | NativeClient do
+                return true;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, A: Region]
+    function authorizeEndpoint(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        log: &![Log, L], ip: Span[Nat8, A], now: Int64): String is
+        case formOf(request) of
+            when Some(value as pairs: Buffer[QueryPair]) do
+                let output: String := authorizeWith(request, &~db, settings, &~log, ip, now, &pairs);
+                destroyPairs(pairs);
+                return output;
+            when None do
+                return errorPage(settings, "malformed request");
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, A: Region, P: Region]
+    function authorizeWith(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        log: &![Log, L], ip: Span[Nat8, A], now: Int64, pairs: &[Buffer[QueryPair], P]): String is
+        let clientId: String := valueOf(pairs, "client_id");
+        let found: Either[DbError, Option[OpClient]] := getClient(&~db, asSpan(&clientId));
+        destroyString(clientId);
+        case found of
+            when Right(right as maybe: Option[OpClient]) do
+                case maybe of
+                    when Some(value as client: OpClient) do
+                        if not usableClient(&client) then
+                            destroyClient(client);
+                            return errorPage(settings, "unknown client");
+                        end if;
+                        let output: String := authorizeFor(request, &~db, settings, &~log, ip, now, pairs, &client);
+                        destroyClient(client);
+                        return output;
+                    when None do
+                        return errorPage(settings, "unknown client");
+                end case;
+            when Left(left as error: DbError) do
+                return errorPage(settings, "unknown client");
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, A: Region, P: Region, C: Region]
+    function authorizeFor(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        log: &![Log, L], ip: Span[Nat8, A], now: Int64, pairs: &[Buffer[QueryPair], P],
+        client: &[OpClient, C]): String is
+        let redirect: String := valueOf(pairs, "redirect_uri");
+        if not redirectAllowed(client, asSpan(&redirect)) then
+            destroyString(redirect);
+            return errorPage(settings, "redirect_uri is not registered for this client");
+        end if;
+        case parseAuthRequest(pairs, client) of
+            when Left(left as error: OauthError) do
+                let state: String := valueOf(pairs, "state");
+                let output: String := redirectError(settings, asSpan(&redirect), asSpan(&state), error);
+                destroyString(state);
+                destroyString(redirect);
+                return output;
+            when Right(right as parsed: AuthRequest) do
+                destroyString(redirect);
+                let output: String := authorizeRequest(request, &~db, settings, &~log, ip, now, pairs, client, &parsed);
+                destroyRequest(parsed);
+                return output;
+        end case;
+    end;
+
+    generic [Q: Region, S: Region]
+    function hasSessionCookie(request: &[Request, Q], settings: &[OpSettings, S]): Bool is
+        case requestParam(request, "HTTP_COOKIE") of
+            when Some(value as header: String) do
+                destroyString(header);
+                let value: String := cookieOf(request, asSpan(&(settings->cookieName)));
+                let present: Bool := length(&value) > 0;
+                destroyString(value);
+                return present or cookieNamed(request, settings);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the Cookie header names the session cookie, even with an empty
+    -- value.
+    generic [Q: Region, S: Region]
+    function cookieNamed(request: &[Request, Q], settings: &[OpSettings, S]): Bool is
+        case requestParam(request, "HTTP_COOKIE") of
+            when Some(value as header: String) do
+                var name: StringBuilder := makeStringBuilder();
+                writeString(&!name, asSpan(&(settings->cookieName)));
+                writeByte(&!name, '=');
+                let wanted: String := finalize(name);
+                let found: Bool := containsPair(asSpan(&header), asSpan(&wanted));
+                destroyString(wanted);
+                destroyString(header);
+                return found;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether header holds wanted at its start or after a semicolon and
+    -- blanks.
+    generic [H: Region, W: Region]
+    function containsPair(header: Span[Nat8, H], wanted: Span[Nat8, W]): Bool is
+        var i: Index := 0;
+        var atStart: Bool := true;
+        while i < spanLength(header) do
+            let c: Nat8 := header[i];
+            if c = ';' then
+                atStart := true;
+            else if c = ' ' then
+                skip;
+            else
+                if atStart and startsWith(spanPart(header, i, spanLength(header) - i), wanted) then
+                    return true;
+                end if;
+                atStart := false;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The session found, or none on an error of the database: the browser
+    -- then signs in again.
+    function orNone(found: Either[DbError, Option[OpSession]]): Option[OpSession] is
+        case found of
+            when Right(right as session: Option[OpSession]) do
+                return session;
+            when Left(left as error: DbError) do
+                let none: Option[OpSession] := None();
+                return none;
+        end case;
+    end;
+
+    generic [S: Region, C: Region, Q: Region, X: Region]
+    function sessionSatisfies(settings: &[OpSettings, S], session: &[OpSession, X], client: &[OpClient, C],
+        request: &[AuthRequest, Q], now: Int64): Bool is
+        let limits: Limits := effectiveLimits(client->limits, settings->session);
+        let age: Int64 := now - session->authTime;
+        let fresh: Bool := (request->maxAge < 0) or (age <= request->maxAge);
+        return (not equal(asSpan(&(request->prompt)), "login")) and fresh and (age <= limits.max) and
+            ((now - session->lastSeen) <= limits.idle);
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, A: Region, P: Region, C: Region, U: Region]
+    function authorizeRequest(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        log: &![Log, L], ip: Span[Nat8, A], now: Int64, pairs: &[Buffer[QueryPair], P],
+        client: &[OpClient, C], parsed: &[AuthRequest, U]): String is
+        let session: Option[OpSession] := orNone(cookieSession(request, &~db, settings, now));
+        case session of
+            when Some(value as s: OpSession) do
+                var live: OpSession := s;
+                if sessionSatisfies(settings, &live, client, parsed, now) then
+                    let touched: Option[DbError] := touchSession(&~db, &!live, ip, now);
+                    let none: Buffer[String] := emptyCookies();
+                    let output: String := redirectCode(&~db, settings, &~log, ip, now, client, parsed, &live, none);
+                    destroySession(live);
+                    return output;
+                end if;
+                destroySession(live);
+            when None do
+                if (not hasValue(pairs, "_rs")) and (not hasSessionCookie(request, settings)) then
+                    return bounce(settings, pairs);
+                end if;
+        end case;
+        if equal(asSpan(&(parsed->prompt)), "none") then
+            return redirectError(settings, asSpan(&(parsed->redirectUri)), asSpan(&(parsed->state)),
+                OauthError(code => "login_required", description => "no session"));
+        end if;
+        case saveRequest(&~db, parsed, now, settings->requestTtl) of
+            when Right(right as made: Option[Saved]) do
+                case made of
+                    when Some(value as saved: Saved) do
+                        let output: String := toLogin(settings, &saved);
+                        destroySaved(saved);
+                        return output;
+                    when None do
+                        return errorPage(settings, "temporary failure");
+                end case;
+            when Left(left as error: DbError) do
+                return errorPage(settings, "temporary failure");
+        end case;
+    end;
+
+    -- The redirect to the login page of the saved request, with its flow
+    -- cookie.
+    generic [S: Region, V: Region]
+    function toLogin(settings: &[OpSettings, S], saved: &[Saved, V]): String is
+        let handover: Handover := loginHandover(settings, saved);
+        let output: String := handoverOutput(&handover);
+        destroyHandover(handover);
+        return output;
+    end;
+
+    generic [S: Region, V: Region]
+    function loginHandover(settings: &[OpSettings, S], saved: &[Saved, V]): Handover is
+        var location: StringBuilder := makeStringBuilder();
+        writeString(&!location, asSpan(&(settings->loginPath)));
+        writeString(&!location, "?req=");
+        let id: String := queryEscape(asSpan(&(saved->id)));
+        writeString(&!location, asSpan(&id));
+        destroyString(id);
+        var cookies: Buffer[String] := allocateEmpty();
+        let name: String := flowCookieName(settings);
+        insertBack(&!cookies, cookieHeader(asSpan(&name), asSpan(&(saved->flow)), settings->requestTtl));
+        destroyString(name);
+        return Handover(status => 302, location => finalize(location), cookies => cookies);
+    end;
+
+    -- A page that navigates to the same request once more, with _rs set.
+    generic [S: Region, P: Region]
+    function bounce(settings: &[OpSettings, S], pairs: &[Buffer[QueryPair], P]): String is
+        var next: Buffer[QueryPair] := copyPairs(pairs);
+        setPair(&!next, "_rs", "1");
+        let query: String := encodeQuery(&next);
+        destroyPairs(next);
+        var target: StringBuilder := makeStringBuilder();
+        writeString(&!target, "/authorize?");
+        writeString(&!target, asSpan(&query));
+        destroyString(query);
+        let url: String := finalize(target);
+        let escaped: String := htmlEscape(asSpan(&url));
+        destroyString(url);
+        let name: String := htmlEscape(asSpan(&(settings->name)));
+        var page: StringBuilder := makeStringBuilder();
+        writeString(&!page, "<!doctype html><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0;url=");
+        writeString(&!page, asSpan(&escaped));
+        writeString(&!page, "\"><title>");
+        writeString(&!page, asSpan(&name));
+        writeString(&!page, "</title><a href=\"");
+        writeString(&!page, asSpan(&escaped));
+        writeString(&!page, "\">continue</a>");
+        destroyString(escaped);
+        destroyString(name);
+        let text: String := finalize(page);
+        let response: Response := addHeader(addHeader(addHeader(makeResponse(200, "text/html; charset=utf-8"),
+            "Content-Security-Policy", "default-src 'none'"), "Cache-Control", "no-store"), "Referrer-Policy", "no-referrer");
+        let output: String := finishResponse(response, asSpan(&text));
+        destroyString(text);
+        return output;
+    end;
+
+    generic [P: Region]
+    function copyPairs(pairs: &[Buffer[QueryPair], P]): Buffer[QueryPair] is
+        var out: Buffer[QueryPair] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(pairs) do
+            let pair: &[QueryPair, P] := nthRef(pairs, i);
+            insertBack(&!out, QueryPair(name => fromSpan(asSpan(&(pair->name))), value => fromSpan(asSpan(&(pair->value)))));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The redirect with a new code for session to the client of request,
+    -- with the cookies given.
+    generic [R: Region, S: Region, L: Region, A: Region, C: Region, U: Region, X: Region]
+    function redirectCode(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], ip: Span[Nat8, A],
+        now: Int64, client: &[OpClient, C], request: &[AuthRequest, U], session: &[OpSession, X],
+        cookies: Buffer[String]): String is
+        let handover: Handover := codeHandover(&~db, settings, &~log, ip, now, client, request, session, cookies);
+        let output: String := handoverOutput(&handover);
+        destroyHandover(handover);
+        return output;
+    end;
+
+    generic [R: Region, S: Region, L: Region, A: Region, C: Region, U: Region, X: Region]
+    function codeHandover(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], ip: Span[Nat8, A],
+        now: Int64, client: &[OpClient, C], request: &[AuthRequest, U], session: &[OpSession, X],
+        cookies: Buffer[String]): Handover is
+        var set: Buffer[QueryPair] := allocateEmpty();
+        case issueCode(&~db, asSpan(&(client->id)), session, request, now, settings->codeTtl) of
+            when Right(right as made: Option[String]) do
+                case made of
+                    when Some(value as code: String) do
+                        audit(&~log, "code.issue", asSpan(&(client->id)), asSpan(&(session->subject)), asSpan(&(session->id)),
+                            "", "ok", ip);
+                        setPair(&!set, "code", asSpan(&code));
+                        setPair(&!set, "state", asSpan(&(request->state)));
+                        setPair(&!set, "iss", asSpan(&(settings->issuer)));
+                        destroyString(code);
+                    when None do
+                        errorPairs(&!set, settings, request);
+                end case;
+            when Left(left as error: DbError) do
+                errorPairs(&!set, settings, request);
+        end case;
+        let target: Option[String] := withQuery(asSpan(&(request->redirectUri)), &set);
+        destroyPairs(set);
+        case target of
+            when Some(value as url: String) do
+                return Handover(status => 302, location => url, cookies => cookies);
+            when None do
+                return Handover(status => 302, location => fromSpan(asSpan(&(settings->loginPath))), cookies => cookies);
+        end case;
+    end;
+
+    generic [P: Region, S: Region, U: Region]
+    function errorPairs(set: &![Buffer[QueryPair], P], settings: &[OpSettings, S], request: &[AuthRequest, U]): Unit is
+        setPair(&~set, "error", "server_error");
+        setPair(&~set, "error_description", "try again");
+        setPair(&~set, "iss", asSpan(&(settings->issuer)));
+        if length(&(request->state)) > 0 then
+            setPair(&~set, "state", asSpan(&(request->state)));
+        end if;
+        return nil;
+    end;
+
+    --- Handing a login over
+
+    function destroyPending(waiting: Pending): Unit is
+        let { id: String, clientId: String, clientName: String, reauth: Bool, restarted: Bool } := waiting;
+        destroyString(id);
+        destroyString(clientId);
+        destroyString(clientName);
+        return nil;
+    end;
+
+    function destroyHandover(handover: Handover): Unit is
+        let { status: Nat16, location: String, cookies: Buffer[String] } := handover;
+        destroyString(location);
+        destroyStrings(cookies);
+        return nil;
+    end;
+
+    generic [H: Region]
+    function handoverOutput(handover: &[Handover, H]): String is
+        var status: Nat16 := handover->status;
+        if (status < 300) or (status > 399) then
+            status := 302;
+        end if;
+        return redirectTo(status, asSpan(&(handover->location)), &(handover->cookies));
+    end;
+
+    generic [Q: Region, R: Region, S: Region, I: Region]
+    function pending(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], id: Span[Nat8, I],
+        now: Int64): Either[DbError, Either[RequestProblem, Pending]] is
+        let name: String := flowCookieName(settings);
+        let flow: String := cookieOf(request, asSpan(&name));
+        destroyString(name);
+        let loaded: Either[DbError, Either[RequestProblem, AuthRequest]] := loadRequest(&~db, id, asSpan(&flow), now);
+        destroyString(flow);
+        case loaded of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as result: Either[RequestProblem, AuthRequest]) do
+                case result of
+                    when Left(left as problem: RequestProblem) do
+                        return Right(right => Left(left => problem));
+                    when Right(right as found: AuthRequest) do
+                        let { clientId: String, redirectUri: String, scope: String, state: String, nonce: String,
+                            challenge: String, maxAge: Int64, prompt: String, returnTo: String, returnName: String,
+                            restarted: Bool } := found;
+                        let reauth: Bool := equal(asSpan(&prompt), "login") or (maxAge >= 0);
+                        destroyString(redirectUri);
+                        destroyString(scope);
+                        destroyString(state);
+                        destroyString(nonce);
+                        destroyString(challenge);
+                        destroyString(prompt);
+                        destroyString(returnTo);
+                        if length(&clientId) = 0 then
+                            return Right(right => Right(right => Pending(id => fromSpan(id), clientId => clientId,
+                                clientName => returnName, reauth => reauth, restarted => restarted)));
+                        end if;
+                        destroyString(returnName);
+                        case getClient(&~db, asSpan(&clientId)) of
+                            when Left(left as error: DbError) do
+                                destroyString(clientId);
+                                return Left(left => error);
+                            when Right(right as maybe: Option[OpClient]) do
+                                case maybe of
+                                    when Some(value as client: OpClient) do
+                                        let clientName: String := nameOf(&client);
+                                        destroyClient(client);
+                                        return Right(right => Right(right => Pending(id => fromSpan(id), clientId => clientId,
+                                            clientName => clientName, reauth => reauth, restarted => restarted)));
+                                    when None do
+                                        destroyString(clientId);
+                                        return Right(right => Left(left => UnknownRequest()));
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [C: Region]
+    function nameOf(client: &[OpClient, C]): String is
+        return fromSpan(asSpan(&(client->name)));
+    end;
+
+    -- Whether path is a local absolute path: a slash first, no second slash
+    -- after it, no backslash, CR or LF.
+    generic [T: Region]
+    function isLocalPath(path: Span[Nat8, T]): Bool is
+        if (spanLength(path) = 0) or (path[0] /= '/') then
+            return false;
+        end if;
+        if (spanLength(path) > 1) and (path[1] = '/') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(path) do
+            let c: Nat8 := path[i];
+            if (c = 92) or (c = 13) or (c = 10) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function beginDirect(db: &![Database[Writing], R], settings: &[OpSettings, S], returnTo: Span[Nat8, T],
+        now: Int64): Either[DbError, Option[Handover]] is
+        if not isLocalPath(returnTo) then
+            let none: Option[Handover] := None();
+            return Right(right => none);
+        end if;
+        let direct: AuthRequest := directRequest(returnTo);
+        let made: Either[DbError, Option[Saved]] := saveRequest(&~db, &direct, now, settings->requestTtl);
+        destroyRequest(direct);
+        case made of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as saved: Option[Saved]) do
+                case saved of
+                    when Some(value as s: Saved) do
+                        let handover: Handover := loginHandover(settings, &s);
+                        destroySaved(s);
+                        return Right(right => Some(value => handover));
+                    when None do
+                        let none: Option[Handover] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, I: Region, U: Region, M: Region, A: Region]
+    function finish(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        id: Span[Nat8, I], subject: Span[Nat8, U], amr: Span[Nat8, M], ip: Span[Nat8, A],
+        now: Int64): Either[DbError, Either[FinishProblem, Handover]] is
+        let name: String := flowCookieName(settings);
+        let flow: String := cookieOf(request, asSpan(&name));
+        destroyString(name);
+        let loaded: Either[DbError, Either[RequestProblem, AuthRequest]] := loadRequest(&~db, id, asSpan(&flow), now);
+        destroyString(flow);
+        case loaded of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as result: Either[RequestProblem, AuthRequest]) do
+                case result of
+                    when Left(left as problem: RequestProblem) do
+                        return Right(right => Left(left => FinishRequest(problem => problem)));
+                    when Right(right as found: AuthRequest) do
+                        let done: Either[DbError, Either[FinishProblem, Handover]] := finishFound(request, &~db, settings,
+                            &~log, id, subject, amr, ip, now, &found);
+                        destroyRequest(found);
+                        return done;
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, I: Region, U: Region, M: Region, A: Region, F: Region]
+    function finishFound(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        log: &![Log, L], id: Span[Nat8, I], subject: Span[Nat8, U], amr: Span[Nat8, M],
+        ip: Span[Nat8, A], now: Int64, found: &[AuthRequest, F]): Either[DbError, Either[FinishProblem, Handover]] is
+        case activeSubject(&~db, subject) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as who: Option[Subject]) do
+                case who of
+                    when Some(value as s: Subject) do
+                        destroySubject(s);
+                    when None do
+                        return Right(right => Left(left => SubjectInactive()));
+                end case;
+        end case;
+        if spanLength(amr) = 0 then
+            return Right(right => Left(left => NoMethods()));
+        end if;
+        let current: String := cookieOf(request, asSpan(&(settings->cookieName)));
+        let given: Option[String] := unlessEmpty(current);
+        var agent: String := fromSpan("");
+        case requestParam(request, "HTTP_USER_AGENT") of
+            when Some(value as ua: String) do
+                destroyString(agent);
+                agent := ua;
+            when None do
+                skip;
+        end case;
+        let limits: Limits := settings->session;
+        let started: Either[DbError, Option[Started]] := startSession(&~db, given, subject, amr, ip, asSpan(&agent), now,
+            limits.idle, limits.max);
+        destroyString(agent);
+        case started of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as made: Option[Started]) do
+                case made of
+                    when Some(value as s: Started) do
+                        let { session: OpSession, token: String } := s;
+                        if isNewSession(&session, now) then
+                            audit(&~log, "session.start", "", subject, sessionIdOf(&session), "", "ok", ip);
+                        end if;
+                        let dropped: Option[DbError] := dropRequest(&~db, id, now);
+                        var cookies: Buffer[String] := allocateEmpty();
+                        insertBack(&!cookies, cookieHeader(asSpan(&(settings->cookieName)), asSpan(&token), 0));
+                        let flowName: String := flowCookieName(settings);
+                        insertBack(&!cookies, cookieHeader(asSpan(&flowName), "", -1));
+                        destroyString(flowName);
+                        destroyString(token);
+                        let handed: Either[DbError, Either[FinishProblem, Handover]] := handOn(&~db, settings, &~log, ip,
+                            now, found, &session, cookies);
+                        destroySession(session);
+                        return handed;
+                    when None do
+                        return Right(right => Left(left => NoRandom()));
+                end case;
+        end case;
+    end;
+
+    function unlessEmpty(text: String): Option[String] is
+        if length(&text) > 0 then
+            return Some(value => text);
+        end if;
+        destroyString(text);
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    generic [X: Region]
+    function sessionIdOf(session: &[OpSession, X]): Span[Nat8, X] is
+        return asSpan(&(session->id));
+    end;
+
+    -- Whether session was made at now, not renewed.
+    generic [X: Region]
+    function isNewSession(session: &[OpSession, X], now: Int64): Bool is
+        return (session->created = now) and (session->authTime = now);
+    end;
+
+    generic [C: Region]
+    function clientDisabled(client: &[OpClient, C]): Bool is
+        return client->disabled;
+    end;
+
+    -- Whether session is of subject and not ended.
+    generic [X: Region, U: Region]
+    function ownSession(session: &[OpSession, X], subject: Span[Nat8, U]): Bool is
+        return equal(asSpan(&(session->subject)), subject) and (session->ended = 0);
+    end;
+
+    -- The browser goes on to the return path, or with a code to the client.
+    generic [R: Region, S: Region, L: Region, A: Region, F: Region, X: Region]
+    function handOn(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], ip: Span[Nat8, A],
+        now: Int64, found: &[AuthRequest, F], session: &[OpSession, X],
+        cookies: Buffer[String]): Either[DbError, Either[FinishProblem, Handover]] is
+        if length(&(found->clientId)) = 0 then
+            return Right(right => Right(right => Handover(status => 302, location => fromSpan(asSpan(&(found->returnTo))),
+                cookies => cookies)));
+        end if;
+        case getClient(&~db, asSpan(&(found->clientId))) of
+            when Left(left as error: DbError) do
+                destroyStrings(cookies);
+                return Left(left => error);
+            when Right(right as maybe: Option[OpClient]) do
+                case maybe of
+                    when Some(value as client: OpClient) do
+                        if clientDisabled(&client) then
+                            destroyClient(client);
+                            destroyStrings(cookies);
+                            return Right(right => Left(left => ClientGone()));
+                        end if;
+                        let handover: Handover := codeHandover(&~db, settings, &~log, ip, now, &client, found, session, cookies);
+                        destroyClient(client);
+                        return Right(right => Right(right => handover));
+                    when None do
+                        destroyStrings(cookies);
+                        return Right(right => Left(left => ClientGone()));
+                end case;
+        end case;
+    end;
+
+    function destroyRestarted(restarted: Restarted): Unit is
+        let { id: String, name: String, url: String, cookies: Buffer[String] } := restarted;
+        destroyString(id);
+        destroyString(name);
+        destroyString(url);
+        destroyStrings(cookies);
+        return nil;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, I: Region, F: Region]
+    function restart(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], id: Span[Nat8, I],
+        fallback: Span[Nat8, F], now: Int64): Either[DbError, Either[RequestProblem, Restarted]] is
+        if (spanLength(id) = 0) or (spanLength(id) > 64) or (not isLocalPath(fallback)) then
+            return Right(right => Left(left => UnknownRequest()));
+        end if;
+        case keptRequest(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[KeptRequest]) do
+                case found of
+                    when Some(value as kept: KeptRequest) do
+                        let { request as old: AuthRequest, expires: Int64 } := kept;
+                        let result: Either[DbError, Either[RequestProblem, Restarted]] := restartFrom(request, &~db, settings,
+                            fallback, now, &old, expires);
+                        destroyRequest(old);
+                        return result;
+                    when None do
+                        return Right(right => Left(left => UnknownRequest()));
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, F: Region, O: Region]
+    function restartFrom(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        fallback: Span[Nat8, F], now: Int64, old: &[AuthRequest, O],
+        expires: Int64): Either[DbError, Either[RequestProblem, Restarted]] is
+        if old->restarted and (now <= expires) then
+            return Right(right => Left(left => FlowMismatch()));
+        end if;
+        var name: String := fromSpan(asSpan(&(old->returnName)));
+        var target: String := fromSpan(asSpan(&(old->returnTo)));
+        if length(&(old->clientId)) > 0 then
+            case getClient(&~db, asSpan(&(old->clientId))) of
+                when Left(left as error: DbError) do
+                    destroyString(name);
+                    destroyString(target);
+                    return Left(left => error);
+                when Right(right as maybe: Option[OpClient]) do
+                    case maybe of
+                        when Some(value as client: OpClient) do
+                            if not usableClient(&client) then
+                                destroyClient(client);
+                                destroyString(name);
+                                destroyString(target);
+                                return Right(right => Left(left => UnknownRequest()));
+                            end if;
+                            destroyString(name);
+                            destroyString(target);
+                            name := nameOf(&client);
+                            target := startUrl(&client, asSpan(&(settings->issuer)));
+                            destroyClient(client);
+                        when None do
+                            destroyString(name);
+                            destroyString(target);
+                            return Right(right => Left(left => UnknownRequest()));
+                    end case;
+            end case;
+        end if;
+        if length(&target) = 0 then
+            destroyString(target);
+            target := fromSpan(fallback);
+        end if;
+        case cookieSession(request, &~db, settings, now) of
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as s: OpSession) do
+                        destroySession(s);
+                        return Right(right => Right(right => Restarted(id => fromSpan(""), name => name, url => target,
+                            cookies => emptyCookies())));
+                    when None do
+                        skip;
+                end case;
+            when Left(left as error: DbError) do
+                skip;
+        end case;
+        let fresh: AuthRequest := AuthRequest(clientId => fromSpan(""), redirectUri => fromSpan(""), scope => fromSpan(""),
+            state => fromSpan(""), nonce => fromSpan(""), challenge => fromSpan(""), maxAge => -1, prompt => fromSpan(""),
+            returnTo => fromSpan(asSpan(&target)), returnName => fromSpan(asSpan(&name)), restarted => true);
+        let made: Either[DbError, Option[Saved]] := saveRequest(&~db, &fresh, now, settings->requestTtl);
+        destroyRequest(fresh);
+        case made of
+            when Left(left as error: DbError) do
+                destroyString(name);
+                destroyString(target);
+                return Left(left => error);
+            when Right(right as saved: Option[Saved]) do
+                case saved of
+                    when Some(value as s: Saved) do
+                        let { id as newId: String, flow: String } := s;
+                        var cookies: Buffer[String] := allocateEmpty();
+                        let flowName: String := flowCookieName(settings);
+                        insertBack(&!cookies, cookieHeader(asSpan(&flowName), asSpan(&flow), settings->requestTtl));
+                        destroyString(flowName);
+                        destroyString(flow);
+                        return Right(right => Right(right => Restarted(id => newId, name => name, url => target,
+                            cookies => cookies)));
+                    when None do
+                        destroyString(name);
+                        destroyString(target);
+                        return Right(right => Left(left => UnknownRequest()));
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, A: Region]
+    function currentSession(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ip: Span[Nat8, A], now: Int64): Either[DbError, Option[OpSession]] is
+        case cookieSession(request, &~db, settings, now) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as s: OpSession) do
+                        var live: OpSession := s;
+                        let touched: Option[DbError] := touchSession(&~db, &!live, ip, now);
+                        return Right(right => Some(value => live));
+                    when None do
+                        let none: Option[OpSession] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, S: Region, A: Region]
+    function csrfToken(request: &[Request, Q], settings: &[OpSettings, S], action: Span[Nat8, A]): String is
+        let value: String := cookieOf(request, asSpan(&(settings->cookieName)));
+        if length(&value) = 0 then
+            return value;
+        end if;
+        case sha256(asSpan(&value)) of
+            when Some(value as key: String) do
+                destroyString(value);
+                case hmacSha256(asSpan(&key), action) of
+                    when Some(value as mac: String) do
+                        destroyString(key);
+                        let token: String := base64UrlEncode(asSpan(&mac));
+                        destroyString(mac);
+                        return token;
+                    when None do
+                        destroyString(key);
+                        return fromSpan("");
+                end case;
+            when None do
+                destroyString(value);
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [Q: Region, S: Region, A: Region, T: Region]
+    function csrfHolds(request: &[Request, Q], settings: &[OpSettings, S], action: Span[Nat8, A], token: Span[Nat8, T]): Bool is
+        let want: String := csrfToken(request, settings, action);
+        let holds: Bool := (length(&want) > 0) and constantTimeEqual(asSpan(&want), token);
+        destroyString(want);
+        return holds;
+    end;
+
+    generic [S: Region]
+    function sessionCookieGone(settings: &[OpSettings, S]): String is
+        return cookieHeader(asSpan(&(settings->cookieName)), "", -1);
+    end;
+
+    --- Logout
+
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region]
+    function logoutEndpoint(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], now: Int64): String is
+        case formOf(request) of
+            when Some(value as pairs: Buffer[QueryPair]) do
+                let output: String := logoutWith(request, &~db, settings, ring, &~log, now, &pairs);
+                destroyPairs(pairs);
+                return output;
+            when None do
+                return errorPage(settings, "malformed request");
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region, P: Region]
+    function logoutWith(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], now: Int64, pairs: &[Buffer[QueryPair], P]): String is
+        let hint: String := valueOf(pairs, "id_token_hint");
+        if length(&hint) > 0 then
+            let output: String := logoutWithHint(request, &~db, settings, ring, &~log, now, pairs, asSpan(&hint));
+            destroyString(hint);
+            return output;
+        end if;
+        destroyString(hint);
+        let csrf: String := valueOf(pairs, "csrf");
+        let allowed: Bool := isPost(request) and csrfHolds(request, settings, "logout", asSpan(&csrf));
+        destroyString(csrf);
+        if allowed then
+            case cookieSession(request, &~db, settings, now) of
+                when Right(right as found: Option[OpSession]) do
+                    case found of
+                        when Some(value as s: OpSession) do
+                            let ended: Option[DbError] := endSession(&~db, sessionIdOf(&s), "logout", now);
+                            case ended of
+                                when Some(value as error: DbError) do
+                                    destroySession(s);
+                                    return errorPage(settings, "temporary failure");
+                                when None do
+                                    audit(&~log, "session.end", "", "", sessionIdOf(&s), "logout", "ok", "");
+                                    destroySession(s);
+                            end case;
+                        when None do
+                            skip;
+                    end case;
+                when Left(left as error: DbError) do
+                    skip;
+            end case;
+            var cookies: Buffer[String] := allocateEmpty();
+            insertBack(&!cookies, sessionCookieGone(settings));
+            let target: String := joined(asSpan(&(settings->loginPath)), "?logged_out=1");
+            let output: String := redirectTo(302, asSpan(&target), &cookies);
+            destroyString(target);
+            destroyStrings(cookies);
+            return output;
+        end if;
+        return plainRedirect(asSpan(&(settings->logoutPath)));
+    end;
+
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region, P: Region, H: Region]
+    function logoutWithHint(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], now: Int64, pairs: &[Buffer[QueryPair], P],
+        hint: Span[Nat8, H]): String is
+        case verify(hint, ring) of
+            when Some(value as verified: Verified) do
+                let { typ: String, payload: String } := verified;
+                let isId: Bool := equal(asSpan(&typ), idTokenType());
+                destroyString(typ);
+                if not isId then
+                    destroyString(payload);
+                    return plainRedirect(asSpan(&(settings->logoutPath)));
+                end if;
+                let read: Option[Hint] := readHint(asSpan(&payload));
+                destroyString(payload);
+                case read of
+                    when Some(value as claims: Hint) do
+                        let output: String := logoutClaims(request, &~db, settings, &~log, now, pairs, &claims);
+                        destroyHint(claims);
+                        return output;
+                    when None do
+                        return plainRedirect(asSpan(&(settings->logoutPath)));
+                end case;
+            when None do
+                return plainRedirect(asSpan(&(settings->logoutPath)));
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, P: Region, H: Region]
+    function logoutClaims(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        log: &![Log, L], now: Int64, pairs: &[Buffer[QueryPair], P], claims: &[Hint, H]): String is
+        if not equal(asSpan(&(claims->issuer)), asSpan(&(settings->issuer))) then
+            return plainRedirect(asSpan(&(settings->logoutPath)));
+        end if;
+        let clientId: Span[Nat8, H] := asSpan(&(claims->audience));
+        let given: String := valueOf(pairs, "client_id");
+        let mismatch: Bool := (length(&given) > 0) and (not equal(asSpan(&given), clientId));
+        destroyString(given);
+        if mismatch then
+            return errorPage(settings, "client_id does not match the ID token");
+        end if;
+        let sid: Span[Nat8, H] := asSpan(&(claims->sessionId));
+        case sessionById(&~db, sid) of
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as s: OpSession) do
+                        let ours: Bool := ownSession(&s, asSpan(&(claims->subject)));
+                        destroySession(s);
+                        if ours then
+                            case endSession(&~db, sid, "logout", now) of
+                                when Some(value as error: DbError) do
+                                    return errorPage(settings, "temporary failure");
+                                when None do
+                                    audit(&~log, "session.end", "", "", sid, "logout", "ok", "");
+                            end case;
+                        end if;
+                    when None do
+                        skip;
+                end case;
+            when Left(left as error: DbError) do
+                skip;
+        end case;
+        var cookies: Buffer[String] := allocateEmpty();
+        var clearCookie: Bool := true;
+        case cookieSession(request, &~db, settings, now) of
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as s: OpSession) do
+                        clearCookie := equal(sessionIdOf(&s), sid);
+                        destroySession(s);
+                    when None do
+                        skip;
+                end case;
+            when Left(left as error: DbError) do
+                skip;
+        end case;
+        if clearCookie then
+            insertBack(&!cookies, sessionCookieGone(settings));
+        end if;
+        let target: String := valueOf(pairs, "post_logout_redirect_uri");
+        var location: String := joined(asSpan(&(settings->loginPath)), "?logged_out=1");
+        if length(&target) > 0 then
+            case getClient(&~db, clientId) of
+                when Right(right as maybe: Option[OpClient]) do
+                    case maybe of
+                        when Some(value as client: OpClient) do
+                            if logoutAllowed(&client, asSpan(&target)) then
+                                var set: Buffer[QueryPair] := allocateEmpty();
+                                let state: String := valueOf(pairs, "state");
+                                if isState(asSpan(&state)) then
+                                    setPair(&!set, "state", asSpan(&state));
+                                end if;
+                                destroyString(state);
+                                case withQuery(asSpan(&target), &set) of
+                                    when Some(value as url: String) do
+                                        destroyString(location);
+                                        location := url;
+                                    when None do
+                                        skip;
+                                end case;
+                                destroyPairs(set);
+                            end if;
+                            destroyClient(client);
+                        when None do
+                            skip;
+                    end case;
+                when Left(left as error: DbError) do
+                    skip;
+            end case;
+        end if;
+        destroyString(target);
+        let output: String := redirectTo(302, asSpan(&location), &cookies);
+        destroyString(location);
+        destroyStrings(cookies);
+        return output;
+    end;
+end module body.

@@ -1,0 +1,283 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    createNewFile,
+    readAll,
+    writeAll,
+    syncFile,
+    closeFile
+);
+import Wolly.Pki (
+    newKey
+);
+import Wolly.Secret (
+    readKey
+);
+import Wolly.Acme (
+    renewalSeconds,
+    needsRenewal,
+    obtainHttp01
+);
+
+import Wolly.Confine (
+    sandboxAsked,
+    toolPolicy,
+    directoryOf,
+    confineTool,
+    printToolSandbox
+);
+import Standard.Sandbox (
+    Policy,
+    allowPath
+);
+import Wolly.Version (
+    answerAbout,
+    library,
+    destroyLibraries
+);
+import Standard.Libcrypto (
+    libraryVersion as cryptoVersion
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack
+);
+
+module body Wolly.Example.Acme is
+    generic [A: Region, B: Region]
+    function sameWord(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function now(): Int64 is
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                abort("the clock does not fit");
+                return 0;
+        end case;
+    end;
+
+    -- Writes text to a new file at path with mode.
+    generic [P: Region, T: Region]
+    function writeNew(path: Span[Nat8, P], text: Span[Nat8, T], mode: Nat32): Bool is
+        case createNewFile(path, mode) of
+            when Some(value as made: FileDescriptor) do
+                var file: FileDescriptor := made;
+                let written: Bool := writeAll(&!file, text);
+                let synced: Bool := syncFile(&!file);
+                let closed: Bool := closeFile(file);
+                return (written and synced) and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [P: Region]
+    function readWhole(path: Span[Nat8, P]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let content: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return content;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [P: Region]
+    function newKeyCommand(path: Span[Nat8, P]): ExitCode is
+        case newKey() of
+            when Some(value as pem: String) do
+                let written: Bool := writeNew(path, asSpan(&pem), #o600);
+                destroyString(pem);
+                if written then
+                    printLn("acme: key written");
+                    return ExitSuccess();
+                end if;
+                printLn("acme: the key could not be written (a file is there, or no access)");
+                return ExitFailure();
+            when None do
+                printLn("acme: libcrypto made no key");
+                return ExitFailure();
+        end case;
+    end;
+
+    generic [P: Region]
+    function dueCommand(path: Span[Nat8, P]): ExitCode is
+        case readWhole(path) of
+            when Some(value as pem: String) do
+                let due: Bool := needsRenewal(asSpan(&pem), now(), renewalSeconds());
+                destroyString(pem);
+                if due then
+                    printLn("due");
+                else
+                    printLn("not due");
+                end if;
+                return ExitSuccess();
+            when None do
+                printLn("acme: the certificate file could not be read");
+                return ExitFailure();
+        end case;
+    end;
+
+    generic [D: Region, F: Region, A: Region, K: Region, W: Region, N: Region, O: Region]
+    function obtainWith(directory: Span[Nat8, D], caFile: Span[Nat8, F], accountKey: Span[Nat8, A],
+                        domainKey: Span[Nat8, K], webroot: Span[Nat8, W], names: Span[Nat8, N],
+                        out: Span[Nat8, O], privateCa: Bool): ExitCode is
+        case readKey(accountKey) of
+            when None do
+                printLn("acme: the account key is unfit: mode 0600, 32 to 4096 bytes");
+                return ExitFailure();
+            when Some(value as account: String) do
+                case readKey(domainKey) of
+                    when None do
+                        destroyString(account);
+                        printLn("acme: the domain key is unfit: mode 0600, 32 to 4096 bytes");
+                        return ExitFailure();
+                    when Some(value as domain: String) do
+                        let result: Either[String, String] := obtainHttp01(directory, caFile, asSpan(&account), "", names, webroot, asSpan(&domain), privateCa);
+                        destroyString(account);
+                        destroyString(domain);
+                        case result of
+                            when Left(left as words: String) do
+                                printLn(asSpan(&words));
+                                destroyString(words);
+                                return ExitFailure();
+                            when Right(right as chain: String) do
+                                let written: Bool := writeNew(out, asSpan(&chain), #o644);
+                                destroyString(chain);
+                                if written then
+                                    printLn("acme: certificate written");
+                                    return ExitSuccess();
+                                end if;
+                                printLn("acme: the chain could not be written (a file is there, or no access)");
+                                return ExitFailure();
+                        end case;
+                end case;
+        end case;
+    end;
+
+    constant keyPromises: Span[Nat8, Static] := "stdio rpath wpath cpath fattr";
+    constant duePromises: Span[Nat8, Static] := "stdio rpath";
+    constant obtainPromises: Span[Nat8, Static] := "stdio rpath wpath cpath fattr inet dns";
+
+    -- The files of the name service and of OpenSSL, to read: obtain resolves the server of the
+    -- directory and speaks TLS with it.
+    function withNetworkFiles(policy: Policy): Policy is
+        return allowPath(allowPath(allowPath(allowPath(policy, "/etc/resolv.conf", "r"), "/etc/hosts", "r"),
+            "/etc/nsswitch.conf", "r"), "/etc/ssl", "r");
+    end;
+
+    -- policy and the directory of path to read, write and create; an empty path makes the policy
+    -- invalid, so that it is refused.
+    generic [P: Region]
+    function withDirectoryOf(policy: Policy, path: Span[Nat8, P]): Policy is
+        if spanLength(path) = 0 then
+            return allowPath(policy, path, "rwc");
+        end if;
+        let directory: String := directoryOf(path);
+        let widened: Policy := allowPath(policy, asSpan(&directory), "rwc");
+        destroyString(directory);
+        return widened;
+    end;
+
+    -- The policy of obtain: CAFILE, ACCOUNTKEY and DOMAINKEY to read, WEBROOT and the directory of
+    -- OUT to read, write and create, the network.
+    function obtainPolicy(): Policy is
+        let read: Policy := allowPath(allowPath(allowPath(withNetworkFiles(toolPolicy(obtainPromises)), nthArgument(3), "r"),
+            nthArgument(4), "r"), nthArgument(5), "r");
+        return withDirectoryOf(allowPath(read, nthArgument(6), "rwc"), nthArgument(8));
+    end;
+
+    function confined(policy: Policy): Bool is
+        if confineTool(policy) then
+            return true;
+        end if;
+        printLn("acme: the sandbox was refused");
+        return false;
+    end;
+
+    function command(): ExitCode is
+        var libraries: Buffer[String] := allocateEmpty();
+        insertBack(&!libraries, library("libcrypto", cryptoVersion()));
+        let answered: Bool := answerAbout("acme", &libraries);
+        destroyLibraries(libraries);
+        if answered then
+            return ExitSuccess();
+        end if;
+        if sandboxAsked() then
+            -- The widest of the three, obtain; newkey and due take less.
+            printToolSandbox("acme", obtainPromises, allowPath(allowPath(allowPath(allowPath(allowPath(withNetworkFiles(toolPolicy(obtainPromises)),
+                "<CAFILE>", "r"), "<ACCOUNTKEY>", "r"), "<DOMAINKEY>", "r"), "<WEBROOT>", "rwc"), "<directory-of-OUT>", "rwc"));
+            return ExitSuccess();
+        end if;
+        if argumentCount() < 2 then
+            printLn("usage: acme newkey KEYFILE | obtain DIRECTORY CAFILE ACCOUNTKEY DOMAINKEY WEBROOT NAMES OUT [private] | due CERTFILE");
+            return ExitFailure();
+        end if;
+        let verb: Span[Nat8, Static] := nthArgument(1);
+        if (argumentCount() = 3) and sameWord(verb, "newkey") then
+            if not confined(withDirectoryOf(toolPolicy(keyPromises), nthArgument(2))) then
+                return ExitFailure();
+            end if;
+            return newKeyCommand(nthArgument(2));
+        end if;
+        if (argumentCount() = 3) and sameWord(verb, "due") then
+            if not confined(allowPath(toolPolicy(duePromises), nthArgument(2), "r")) then
+                return ExitFailure();
+            end if;
+            return dueCommand(nthArgument(2));
+        end if;
+        if (argumentCount() = 9) and sameWord(verb, "obtain") then
+            if not confined(obtainPolicy()) then
+                return ExitFailure();
+            end if;
+            return obtainWith(nthArgument(2), nthArgument(3), nthArgument(4), nthArgument(5), nthArgument(6), nthArgument(7), nthArgument(8), false);
+        end if;
+        if (argumentCount() = 10) and sameWord(verb, "obtain") then
+            if sameWord(nthArgument(9), "private") then
+                if not confined(obtainPolicy()) then
+                    return ExitFailure();
+                end if;
+                return obtainWith(nthArgument(2), nthArgument(3), nthArgument(4), nthArgument(5), nthArgument(6), nthArgument(7), nthArgument(8), true);
+            end if;
+        end if;
+        printLn("usage: acme newkey KEYFILE | obtain DIRECTORY CAFILE ACCOUNTKEY DOMAINKEY WEBROOT NAMES OUT [private] | due CERTFILE");
+        return ExitFailure();
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        let code: ExitCode := command();
+        surrenderRoot(power);
+        return code;
+    end;
+end module body.

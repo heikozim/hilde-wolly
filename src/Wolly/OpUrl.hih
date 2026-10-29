@@ -1,0 +1,135 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+URLs as an OpenID provider takes them apart and puts them together: the
+parts of an absolute URL, the query as pairs, and the encoding of a query
+the way Go's net/url writes it, so that a redirect is the one a client of a
+Go provider would get.
+
+A query is written with its pairs sorted by name, a name keeping the order
+of its values; a byte stays as it is when it is a letter, a digit or one of
+- . _ ~, a blank becomes a plus, every other byte a percent sign and two
+uppercase hex digits.  A path segment keeps the sub-delimiters, colon and
+at sign as well.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Wolly.OpUrl is
+    """
+    The parts of a URL as it was written: scheme (lowercase), whether it has
+    an authority (//) and the authority as written, whether it has userinfo
+    before an at sign, host without the port, port without the colon, path,
+    query and fragment.  hasQuery and hasFragment tell an empty part from a
+    missing one.
+    """
+    record UrlParts: Linear is
+        scheme: String;
+        hasAuthority: Bool;
+        authority: String;
+        hasUser: Bool;
+        host: String;
+        port: String;
+        path: String;
+        query: String;
+        hasQuery: Bool;
+        fragment: String;
+        hasFragment: Bool;
+    end;
+
+    """
+    Frees parts.
+    No contract: it only frees.
+    """
+    function destroyUrlParts(parts: UrlParts): Unit;
+
+    """
+    The parts of text: a scheme of a letter followed by letters, digits, +, -
+    and ., a colon, then the rest.  None for a text without a scheme, with a
+    blank, a control byte or a byte outside ASCII, or longer than 2048
+    bytes.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function parseUrl(text: Span[Nat8, T]): Option[UrlParts];
+
+    """
+    text with every byte escaped as a query value needs it.
+    """
+    generic [T: Region]
+    function queryEscape(text: Span[Nat8, T]): String
+        ensures length(&result) >= spanLength(text);
+
+    """
+    text with every byte escaped as a path segment needs it.
+    """
+    generic [T: Region]
+    function pathEscape(text: Span[Nat8, T]): String
+        ensures length(&result) >= spanLength(text);
+
+    """
+    The bytes a query value stands for: a plus is a blank, a percent sign
+    and two hex digits one byte.  None for a percent sign without two hex
+    digits.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function queryUnescape(text: Span[Nat8, T]): Option[String];
+
+    """
+    A name and a value of a query.
+    """
+    record QueryPair: Linear is
+        name: String;
+        value: String;
+    end;
+
+    """
+    Frees pairs.
+    No contract: it only frees.
+    """
+    function destroyPairs(pairs: Buffer[QueryPair]): Unit;
+
+    """
+    The pairs of the raw query text, decoded, in their order; a part without
+    an equals sign has the empty value, an empty part is left out.  None
+    when a part does not decode.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function parseQuery(text: Span[Nat8, T]): Option[Buffer[QueryPair]];
+
+    """
+    The query of pairs, sorted by name, each escaped.
+    No contract: its length follows the input.
+    """
+    generic [P: Region]
+    function encodeQuery(pairs: &[Buffer[QueryPair], P]): String;
+
+    """
+    Sets name to value in pairs: every pair of that name goes and one with
+    value takes its place at the end.
+    No contract: it changes pairs in place.
+    """
+    generic [P: Region, N: Region, V: Region]
+    function setPair(pairs: &![Buffer[QueryPair], P], name: Span[Nat8, N], value: Span[Nat8, V]): Unit;
+
+    """
+    The URL text with the pairs set added to its query, which is then
+    written sorted, as Go's net/url writes a URL whose query was set: the
+    pairs of the query of text, those of set put in their place.  None when
+    text is no URL or its query does not decode.
+    No contract: an Option read from text.
+    """
+    generic [T: Region, S: Region]
+    function withQuery(text: Span[Nat8, T], set: &[Buffer[QueryPair], S]): Option[String];
+end module.

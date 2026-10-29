@@ -1,0 +1,124 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Named secrets of an application -- the password of a database, the token
+of an API -- in a file of their own, each sealed (Wolly.Seal) under a key
+that lives in another file (Wolly.Secret).
+Whoever has the vault file without the key file has nothing; the two can
+lie on different disks or belong to different users.
+
+The vault file holds a line NAME=SEALED for each secret, the sealed value
+in hex, sealed for the purpose wolly-vault and bound to its name: a value
+copied to another line does not open there.  A name is 1 to 64 bytes of
+A to Z, 0 to 9 and underscore; a value at most mostSecretBytes.  Every
+change writes a new file next to the vault, mode 0600, synced, and renames
+it over the old one, so a crash leaves the old vault or the new one,
+never half of one.
+
+A key is rotated by rotateVault: every secret opened under the old key
+and sealed under the new one, in one rename.  The new key file must be
+made first (Wolly.Secret.makeKey); the old one is removed by the caller
+after the rotation, so that a crash in between leaves a vault whose key is
+still there.
+"""
+import Standard.String (
+    String
+);
+import Standard.Vault (
+    VaultError
+);
+
+module Wolly.Vault is
+    """
+    What convertVault did: the number of secrets it carried over, and the names it
+    refused, one a line (a name that starts with a digit, which Standard.Vault does not
+    take; nothing is renamed on its own, so no secret changes its name unseen).
+    """
+    record Conversion: Linear is
+        converted: Index;
+        refused: String;
+    end;
+
+    """
+    Gives a Conversion back.
+    No contract: it returns memory and nothing to check.
+    """
+    function destroyConversion(conversion: Conversion): Unit;
+
+    """
+    Every secret of the vault at vaultPath, opened under the key in keyPath, carried into
+    the vault of Standard.Vault at envPath with the pepper at pepperPath and the key in the
+    line keyName, each read back from there and compared.  The pepper and the
+    key line are made when they are not there and kept when they are.  Every old secret
+    is opened first: one that does not open is Left Damaged before anything is written.
+    A value read back as another is Left Damaged; the names before it are carried over.
+    The old files are the caller's to remove, as after rotateVault.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [V: Region, K: Region, E: Region, P: Region, N: Region]
+    function convertVault(vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], envPath: Span[Nat8, E],
+                          pepperPath: Span[Nat8, P], keyName: Span[Nat8, N]): Either[VaultError, Conversion];
+
+    """
+    The most bytes of a secret: 4096.
+    """
+    function mostSecretBytes(): Index
+        ensures result = 4096;
+
+    """
+    Whether name may name a secret.
+    No contract: it is the check over outside input; false is its answer for a bad
+    one, and reading every byte costs more than O(1).
+    """
+    generic [N: Region]
+    function isSecretName(name: Span[Nat8, N]): Bool;
+
+    """
+    The secret name of the vault at vaultPath under the key in keyPath.
+    None when there is no such secret, a file cannot be read, the key is
+    unfit (Wolly.Secret.readKey) or the sealed value does not open.
+    No contract: the outcome is the result of I/O; None is its answer for a bad name.
+    """
+    generic [V: Region, K: Region, N: Region]
+    function getSecret(vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], name: Span[Nat8, N]): Option[String];
+
+    """
+    Keeps value as the secret name, in place of what name had; the vault is
+    made when it is not there.  False, and the vault as it was, when name
+    is no secret name, value is empty or longer than mostSecretBytes, the
+    key is unfit, or the file cannot be written.
+    No contract: the outcome is the result of I/O; false is its answer for bad input.
+    """
+    generic [V: Region, K: Region, N: Region, S: Region]
+    function setSecret(vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], name: Span[Nat8, N], value: Span[Nat8, S]): Bool;
+
+    """
+    Removes the secret name.  True when it was there and the vault was
+    written without it.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [V: Region, N: Region]
+    function deleteSecret(vaultPath: Span[Nat8, V], name: Span[Nat8, N]): Bool;
+
+    """
+    The names of the secrets in the vault, one a line, in the order of the
+    file; empty when there is no vault.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [V: Region]
+    function secretNames(vaultPath: Span[Nat8, V]): String;
+
+    """
+    Every secret opened under the key in oldKeyPath and sealed under the
+    one in newKeyPath, written in one rename.  False, and the vault as it
+    was, when a key is unfit, the two keys are the same, or a secret does
+    not open under the old key.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [V: Region, O: Region, N: Region]
+    function rotateVault(vaultPath: Span[Nat8, V], oldKeyPath: Span[Nat8, O], newKeyPath: Span[Nat8, N]): Bool;
+end module.

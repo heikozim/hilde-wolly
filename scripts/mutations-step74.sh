@@ -1,0 +1,45 @@
+# The mutations of the templates of tenants (Wolly.View and its
+# modules): the names a template may read, the limits of a load and of a
+# render, the refusals of the dialect and the choice of the escaping by
+# the place of a value.  Sourced by scripts/mutate.sh and
+# scripts/mutate-target.sh; the tests that name the modules on their line
+# "-- Checks:" see them.
+mutations+=(
+	"src/Wolly/ViewCompile.hiq|s/if name\[0\] = '\/' then/if false then/|an absolute name passes the first check"
+	"src/Wolly/ViewCompile.hiq|s/if leavesDirectory(name) then/if false then/|a name that leaves the directory passes the first check"
+	"src/Wolly/ViewCompile.hiq|s/if linkBelow(\&~s, d, name) then/if false then/|a symbolic link is followed"
+	"src/Wolly/ViewCompile.hiq|0,/if name\[i\] = '\/' then/s//if false then/|a link in the middle of a name is followed"
+	"src/Wolly/ViewCompile.hiq|s/if found.size > 1048576 then/if false then/;s/large := now.size > 1048576;/large := false;/|a file of any size is read"
+	"src/Wolly/ViewCompile.hiq|s/if not sameKind(found.kind, kindRegular) then/if false then/|a directory or a socket is read as a template"
+	"src/Wolly/ViewCompile.hiq|s/if count >= mostBindings() then/if false then/|names bound without a limit"
+	"src/Wolly/ViewCompile.hiq|s/if s->textBytes > mostTextBytes() then/if false then/|text expanded without a limit"
+	"src/Wolly/ViewCompile.hiq|/function parseConcat/,/^    end;/s/if not enter(\&~s) then/if false then/|a chain of ~ nests without a limit"
+	"src/Wolly/ViewContext.hiq|s/if spanLength(name) >= mostNameBytes then/if false then/|a value stands in an attribute whose name was cut"
+	"src/Wolly/ViewContext.hiq|0,/else if kind = longKind then/s//else if false then/|an attribute whose name was cut has a writer"
+	"src/Wolly/View.hiq|s/if run->made > mostMadeBytes() then/if false then/|a render makes text without a limit"
+	"src/Wolly/View.hiq|s/if filteredBound(program, e, asSpan(\&text)) > mostMadeBytes() then/if false then/|a filter is tried however large it grows"
+	"src/Wolly/View.hiq|s/if run->nodes > mostMadeNodes() then/if false then/g|functions are given nodes without a limit"
+	"src/Wolly/View.hiq|s/if run->searched > mostComparedBytes() then/if false then/g|texts are searched without a limit"
+	"src/Wolly/View.hiq|s/runWith(program, \&functions, \&catalogs, data, \&!page)/runWith(program, \&functions, \&catalogs, data, \&~out)/|a page that fails halfway is left in out"
+	"src/Wolly/ViewFunctions.hiq|s/if commasIn(textArgument(\&call, 0)) >= mostOptions then/if false then/|selectOptions reads any number of options"
+	"src/Wolly/ViewCompile.hiq|s/if s->nesting > mostNesting() then/if false then/|tags and brackets nest without a limit"
+	"src/Wolly/ViewCompile.hiq|s/if fileNamesCount(\&~s) >= mostFiles() then/if false then/|a template of any number of files"
+	"src/Wolly/ViewCompile.hiq|s/if lengthMut(\&~stack) >= mostDepth() then/if false then/|templates inside one another without a limit"
+	"src/Wolly/ViewCompile.hiq|s/if env.callDepth >= mostDepth() then/if false then/|macros inside one another without a limit"
+	"src/Wolly/ViewCompile.hiq|s/if at >= mostSteps() then/if false then/|a template of any number of steps"
+	"src/Wolly/ViewCompile.hiq|s/if stackHoldsMut(\&~s, \&~stack, name) then/if false then/|a template that includes itself is not named"
+	"src/Wolly/ViewCompile.hiq|s/if calling(\&~s, env, m.key) then/if false then/|a macro that calls itself is not named"
+	"src/Wolly/ViewCompile.hiq|s/if nameIsEither(\&~s, x.b, \"defined\", \"undefined\") then/if false then/|is defined is not refused"
+	"src/Wolly/ViewCompile.hiq|s/if not sameContext(\&kept, \&ended) then/if false then/|branches that end in different places pass"
+	"src/Wolly/ViewContext.hiq|s/if (state \/= inValue) or (context->quote = ' ') then/if state \/= inValue then/|a value in an unquoted attribute passes"
+	"src/Wolly/ViewContext.hiq|s/return Some(value => UrlWriter());/return Some(value => HtmlWriter());/|a URL is not filtered"
+	"src/Wolly/ViewContext.hiq|s/return Some(value => UrlQueryWriter());/return Some(value => HtmlWriter());/|a value in a query is not percent-encoded"
+	"src/Wolly/ViewContext.hiq|0,/return Some(value => ScriptWriter());/s//return Some(value => HtmlWriter());/|a value in a script is escaped as HTML"
+	"src/Wolly/ViewContext.hiq|0,/return Some(value => JsStringWriter());/s//return Some(value => HtmlWriter());/|a value in a string of a script is escaped as HTML"
+	"src/Wolly/ViewContext.hiq|0,/return Some(value => CssValueWriter());/s//return Some(value => HtmlWriter());/|a value in a style is escaped as HTML"
+	"src/Wolly/ViewContext.hiq|s/equal(name, \"href\") or //|href is no attribute of a URL"
+	"src/Wolly/View.hiq|s/if run->turns >= mostLoopTurns() then/if false then/|loops turn without a limit"
+	"src/Wolly/View.hiq|s/if total > mostOutputBytes() then/if false then/|a page grows without a limit"
+	"src/Wolly/View.hiq|s/if step.inText and isHtmlWriter(step.writer) then/if true then/|HTML is written as it is anywhere"
+	"src/Wolly/ViewData.hiq|s/return putTextual(\&~data, map, key, htmlCode, sanitize(html, policy));/return putTextual(\&~data, map, key, htmlCode, fromSpan(html));/|HTML is not cleaned"
+)

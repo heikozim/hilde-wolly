@@ -1,0 +1,243 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Checks: View ViewCompile ViewContext ViewData
+--
+-- The templates are written into a directory of the working directory of
+-- the test, view-test-root, and read from there by the engine.  The data
+-- is JSON read with Wolly.ViewData.readViewJson.  A test that does not see
+-- the output it expects prints what it saw.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory,
+    removeFileIfThere
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData,
+    makeMapData
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    renderView,
+    renderPage
+);
+
+module body Wolly.View.Test is
+    constant root: Span[Nat8, Static] := "view-test-root";
+
+    generic [N: Region]
+    function pathOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, root);
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [N: Region, T: Region]
+    function written(name: Span[Nat8, N], text: Span[Nat8, T]): Bool is
+        let made: Bool := createDirectory(root);
+        let path: String := pathOf(name);
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                destroyString(path);
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                destroyString(path);
+                return false;
+        end case;
+    end;
+
+    function removed(name: Span[Nat8, Static]): Unit is
+        let path: String := pathOf(name);
+        let gone: Bool := removeFileIfThere(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    -- The template rendered with the JSON data: Right with the output, Left
+    -- with the error.
+    function rendered(template: Span[Nat8, Static], json: Span[Nat8, Static]): Either[String, String] is
+        assertTrue(written("page.jinja", template), "the template is written");
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, root);
+        case readViewJson(json) of
+            when Left(left as message: String) do
+                destroyViewEngine(engine);
+                return Left(left => message);
+            when Right(right as data: ViewData) do
+                var out: StringBuilder := makeStringBuilder();
+                let result: Either[String, Unit] := renderView(&!engine, "page.jinja", &data, &!out);
+                destroyViewData(data);
+                destroyViewEngine(engine);
+                let text: String := finalize(out);
+                case result of
+                    when Left(left as message: String) do
+                        destroyString(text);
+                        return Left(left => message);
+                    when Right(right as done: Unit) do
+                        return Right(right => text);
+                end case;
+        end case;
+    end;
+
+    function renders(template: Span[Nat8, Static], json: Span[Nat8, Static], expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case rendered(template, json) of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, message);
+            when Right(right as text: String) do
+                let same: Bool := equal(asSpan(&text), expected);
+                if not same then
+                    printLn(asSpan(&text));
+                end if;
+                destroyString(text);
+                assertTrue(same, message);
+        end case;
+        return nil;
+    end;
+
+    function refuses(template: Span[Nat8, Static], json: Span[Nat8, Static], code: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case rendered(template, json) of
+            when Left(left as failure: String) do
+                let found: Bool := contains(asSpan(&failure), code);
+                if not found then
+                    printLn(asSpan(&failure));
+                end if;
+                destroyString(failure);
+                assertTrue(found, message);
+            when Right(right as text: String) do
+                printLn(asSpan(&text));
+                destroyString(text);
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function testText(): Unit is
+        renders("Hello {{ name }}!", "{\"name\": \"<b>&'\\\"\"}", "Hello &lt;b&gt;&amp;&#39;&#34;!",
+            "a name is printed escaped as MarkupSafe escapes it");
+        renders("a{# no #}b{% raw %}{{ x }}{% endraw %}", "{}", "ab{{ x }}", "a comment is dropped, raw kept");
+        return nil;
+    end;
+
+    function testFor(): Unit is
+        renders("{% for x in items %}{{ loop.index }}:{{ x }}{% if not loop.last %},{% endif %}{% endfor %}",
+            "{\"items\": [\"a\", \"b\", \"c\"]}", "1:a,2:b,3:c", "a for walks the list with loop");
+        renders("{% for x in items %}{{ x }}{% else %}none{% endfor %}", "{\"items\": []}", "none",
+            "an empty list takes the else");
+        renders("{% for x in items if x > 1 %}{{ loop.index }}/{{ loop.length }}={{ x }} {% endfor %}",
+            "{\"items\": [1, 2, 3]}", "1/2=2 2/2=3 ", "a condition counts only the elements it lets through");
+        return nil;
+    end;
+
+    function testIf(): Unit is
+        renders("{% if n > 2 %}big{% elif n == 2 %}two{% else %}small{% endif %}", "{\"n\": 2}", "two",
+            "elif chooses");
+        renders("{% if user is not none %}{{ user.name }}{% else %}nobody{% endif %}", "{\"user\": null}", "nobody",
+            "a missing value is none");
+        return nil;
+    end;
+
+    function testEscapingByPlace(): Unit is
+        renders("<a href=\"{{ u }}\">x</a>", "{\"u\": \"javascript:alert(1)\"}", "<a href=\"#ZgotmplZ\">x</a>",
+            "a javascript: URL is filtered at the start of href");
+        renders("<a href=\"/s?q={{ q }}\">x</a>", "{\"q\": \"a b&c\"}", "<a href=\"/s?q=a%20b%26c\">x</a>",
+            "a value in the query is percent-encoded");
+        renders("<script>var v = {{ s }};var n = {{ n }};</script>", "{\"s\": \"</script>\", \"n\": 3}",
+            "<script>var v = \"\\u003c/script\\u003e\";var n =  3 ;</script>",
+            "a string and a number where JavaScript expressions go");
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        refuses("<script>var t = `{{ x }}`;</script>", "{}", "H7067", "a value in a template literal is refused");
+        refuses("<a href={{ x }}>", "{}", "H7067", "an unquoted attribute is refused");
+        refuses("<a title=a{{ x }}>", "{\"x\": 1}", "H7067", "a value inside an unquoted attribute is refused");
+        refuses("{% if a %}<b>{% else %}<i{% endif %}", "{}", "H7095", "branches that end apart are refused");
+        refuses("{{ x is defined }}", "{}", "H7082", "is defined is refused as in the dialect");
+        refuses("{{ x|default('y') }}", "{}", "H7076", "the filter default is refused as in the dialect");
+        refuses("{{ nobody }}", "{}", "V1001", "a name the data lacks is an error of the render");
+        refuses("{{ items }}", "{\"items\": [1]}", "V1003", "a list cannot be printed");
+        refuses("{{ m }}", "{\"m\": null}", "V1004", "a missing value printed unasked is an error");
+        return nil;
+    end;
+
+    function testInheritance(): Unit is
+        assertTrue(written("base.jinja", "<title>{% block t %}base{% endblock %}</title>{% block b %}{% endblock %}"),
+            "the base is written");
+        renders("{% extends \"base.jinja\" %}{% block t %}{{ super() }}+child{% endblock %}{% block b %}[{{ x }}]{% endblock %}",
+            "{\"x\": \"&\"}", "<title>base+child</title>[&amp;]", "a child fills the blocks of its base");
+        removed("base.jinja");
+        return nil;
+    end;
+
+    function testPage(): Unit is
+        assertTrue(written("layout.jinja", "<main>{% block content %}{% endblock %}</main>"), "the layout is written");
+        assertTrue(written("one.jinja", "{% block content %}{{ t }}{% endblock %}"), "the page is written");
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, root);
+        var data: ViewData := makeMapData();
+        case readViewJson("{\"t\": \"<x>\"}") of
+            when Right(right as read: ViewData) do
+                destroyViewData(data);
+                data := read;
+            when Left(left as message: String) do
+                destroyString(message);
+        end case;
+        var out: StringBuilder := makeStringBuilder();
+        let result: Either[String, Unit] := renderPage(&!engine, "one.jinja", "layout.jinja", &data, &!out);
+        let text: String := finalize(out);
+        case result of
+            when Left(left as message: String) do
+                printLn(asSpan(&message));
+                destroyString(message);
+                assertTrue(false, "the page renders inside the layout");
+            when Right(right as done: Unit) do
+                assertTrue(equal(asSpan(&text), "<main>&lt;x&gt;</main>"), "the page renders inside the layout");
+        end case;
+        destroyString(text);
+        destroyViewData(data);
+        destroyViewEngine(engine);
+        removed("layout.jinja");
+        removed("one.jinja");
+        return nil;
+    end;
+end module body.

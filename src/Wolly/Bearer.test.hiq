@@ -1,0 +1,197 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A database in memory.  The header of a request is tried end to end in
+-- examples/login, where Hiawatha makes it.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    startsWith,
+    contains,
+    toUpper,
+    equal
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Bearer (
+    tokenDigits,
+    prepareTokens,
+    issueToken,
+    tokenOwner,
+    revokeTokens,
+    tokenIn,
+    unauthorized
+);
+
+module body Wolly.Bearer.Test is
+
+    generic [R: Region]
+    function issued(db: &![Database[Writing], R], name: Span[Nat8, Static]): String is
+        case issueToken(&~db, name, 1000) of
+            when Right(right as given: Option[String]) do
+                case given of
+                    when Some(value as token: String) do
+                        return token;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when Left(left as error: DbError) do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function ownerIs(db: &![Database[Writing], R], token: Span[Nat8, T], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case tokenOwner(&~db, token) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as name: String) do
+                        assertTrue(equal(asSpan(&name), wanted) and (spanLength(wanted) > 0), message);
+                        destroyString(name);
+                    when None do
+                        assertTrue(spanLength(wanted) = 0, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runTokens(db: &![Database[Writing], R]): Unit is
+        case prepareTokens(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table is made");
+            when None do
+                skip;
+        end case;
+        case prepareTokens(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a second prepareTokens fails");
+            when None do
+                skip;
+        end case;
+        let first: String := issued(&~db, "backup");
+        let second: String := issued(&~db, "backup");
+        let other: String := issued(&~db, "monitor");
+        assertTrue((length(&first) = 64) and (tokenDigits() = 64), "64 hex digits");
+        assertFalse(equal(asSpan(&first), asSpan(&second)), "two tokens of one name differ");
+        ownerIs(&~db, asSpan(&first), "backup", "the first token names backup");
+        ownerIs(&~db, asSpan(&second), "backup", "so does the second");
+        ownerIs(&~db, asSpan(&other), "monitor", "the third names monitor");
+        let shouted: String := toUpper(asSpan(&first));
+        ownerIs(&~db, asSpan(&shouted), "", "the token in capitals is no token");
+        destroyString(shouted);
+        ownerIs(&~db, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "", "a token of the form that was never given out");
+        ownerIs(&~db, "a8ae6e6ee929abea3afcfc5258c8ccd6f85273e0d4626d26c7279f3250f77c8e", "", "the digest of that token is no token either");
+        ownerIs(&~db, "", "", "the empty token");
+        case revokeTokens(&~db, "backup") of
+            when Right(right as revoked: Bool) do
+                assertTrue(revoked, "the tokens of backup are revoked");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the tokens of backup are revoked");
+        end case;
+        ownerIs(&~db, asSpan(&first), "", "the first opens nothing now");
+        ownerIs(&~db, asSpan(&second), "", "nor the second");
+        ownerIs(&~db, asSpan(&other), "monitor", "the control: monitor keeps its token");
+        case revokeTokens(&~db, "backup") of
+            when Right(right as again: Bool) do
+                assertFalse(again, "a second revocation finds nothing");
+            when Left(left as error: DbError) do
+                assertTrue(false, "a second revocation finds nothing");
+        end case;
+        let refused: String := issued(&~db, "Bad Name");
+        assertTrue(length(&refused) = 0, "a name that is no name gets no token");
+        destroyString(refused);
+        destroyString(first);
+        destroyString(second);
+        destroyString(other);
+        return nil;
+    end;
+
+    function testTokens(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runTokens(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    -- The token in header, which must be wanted.
+    generic [H: Region]
+    function takes(header: Span[Nat8, H], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case tokenIn(header) of
+            when Some(value as token: String) do
+                assertTrue(equal(asSpan(&token), wanted), message);
+                destroyString(token);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- header holds no token.
+    generic [H: Region]
+    function refuses(header: Span[Nat8, H], message: Span[Nat8, Static]): Unit is
+        case tokenIn(header) of
+            when Some(value as token: String) do
+                destroyString(token);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    -- The scheme and the space after it.  Only a scheme of six letters
+    -- reaches the check of the space, so Digest and Bearex tell the check of
+    -- the scheme from the check of the space.
+    function testTokenIn(): Unit is
+        takes("Bearer abc123", "abc123", "Bearer and a token");
+        takes("bEaReR  abc123", "abc123", "the scheme in any case, two spaces");
+        takes("BEARER abc123", "abc123", "the scheme in capitals");
+        refuses("", "an empty header");
+        refuses("Bearer", "the scheme alone");
+        refuses("Bearer ", "the scheme and a space");
+        refuses("Bearer      ", "the scheme and only spaces");
+        refuses("Bearerabc123", "no space after the scheme");
+        refuses("Bearer\tabc123", "a tab is no space");
+        refuses("Basic abc123", "Basic, five letters, is no bearer");
+        refuses("Digest abc123", "Digest, six letters, is no bearer");
+        refuses("Bearex abc123", "Bearex, one letter off, is no bearer");
+        refuses("Beare abc1234", "Beare, five letters, is no bearer");
+        takes("Bearer a", "a", "a token of one byte");
+        return nil;
+    end;
+
+    function testUnauthorized(): Unit is
+        let answer: String := unauthorized();
+        assertTrue(startsWith(asSpan(&answer), "Status: 401 "), "401");
+        assertTrue(contains(asSpan(&answer), "\r\nWWW-Authenticate: Bearer\r\n"), "with the scheme to use");
+        destroyString(answer);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,1002 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Wolly.Limit: every statement is a
+-- constant, every value is bound, the tables are strict.  Every change runs
+-- in one transaction, begun before the look at the field, so that a field
+-- dropped meanwhile cannot be written.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.Utf8 (
+    isValid
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Values,
+    Transaction,
+    noValues,
+    withInt64,
+    withText,
+    withNull,
+    start,
+    execute,
+    advance,
+    isNullColumn,
+    columnInt64,
+    columnText,
+    finish,
+    begin,
+    commit,
+    rollback
+);
+import Wolly.Role (
+    isName
+);
+import Wolly.Dialect (
+    pick
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Entity is
+    constant makeFields: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_fields (kind TEXT NOT NULL, field TEXT NOT NULL, type TEXT NOT NULL CHECK (type IN ('text', 'integer')), required INTEGER NOT NULL CHECK (required IN (0, 1)), is_unique INTEGER NOT NULL CHECK (is_unique IN (0, 1)), max_length INTEGER NOT NULL CHECK (max_length BETWEEN 1 AND 65536), PRIMARY KEY (kind, field)) STRICT";
+    constant makeFieldsPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_fields (kind TEXT NOT NULL, field TEXT NOT NULL, type TEXT NOT NULL CHECK (type IN ('text', 'integer')), required BIGINT NOT NULL CHECK (required IN (0, 1)), is_unique BIGINT NOT NULL CHECK (is_unique IN (0, 1)), max_length BIGINT NOT NULL CHECK (max_length BETWEEN 1 AND 65536), PRIMARY KEY (kind, field))";
+    constant makeEntities: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_entities (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL) STRICT";
+    constant makeEntitiesPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_entities (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, kind TEXT NOT NULL, created_at BIGINT NOT NULL, created_by TEXT NOT NULL, updated_at BIGINT NOT NULL, updated_by TEXT NOT NULL)";
+    constant makeValues: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_values (entity INTEGER NOT NULL, kind TEXT NOT NULL, field TEXT NOT NULL, text_value TEXT, integer_value INTEGER, PRIMARY KEY (entity, field), CHECK ((text_value IS NULL) <> (integer_value IS NULL))) STRICT";
+    constant makeValuesPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_values (entity BIGINT NOT NULL, kind TEXT NOT NULL, field TEXT NOT NULL, text_value TEXT, integer_value BIGINT, PRIMARY KEY (entity, field), CHECK ((text_value IS NULL) <> (integer_value IS NULL)))";
+    constant makeTextIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_values_text ON wolly_values (kind, field, text_value)";
+    constant makeIntegerIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_values_integer ON wolly_values (kind, field, integer_value)";
+    -- The key is the guarantee of a unique field: a second entity with the
+    -- same value cannot be inserted, whatever was looked at before.
+    constant makeUnique: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_unique (kind TEXT NOT NULL, field TEXT NOT NULL, value ANY NOT NULL, entity INTEGER NOT NULL, PRIMARY KEY (kind, field, value)) STRICT";
+    constant makeUniquePg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_unique (kind TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, entity BIGINT NOT NULL, PRIMARY KEY (kind, field, value))";
+    constant makeUniqueIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_unique_entity ON wolly_unique (entity, field)";
+    constant makeAudit: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_entity_audit (at INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL CHECK (action IN ('define', 'drop', 'create', 'set', 'clear', 'delete')), kind TEXT NOT NULL, entity INTEGER, field TEXT) STRICT";
+    constant makeAuditPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_entity_audit (at BIGINT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL CHECK (action IN ('define', 'drop', 'create', 'set', 'clear', 'delete')), kind TEXT NOT NULL, entity BIGINT, field TEXT)";
+
+    constant fieldShape: Span[Nat8, Static] := "SELECT type, required, is_unique, max_length FROM wolly_fields WHERE kind = ? AND field = ?";
+    constant countFields: Span[Nat8, Static] := "SELECT count(*) FROM wolly_fields WHERE kind = ?";
+    constant putField: Span[Nat8, Static] := "INSERT INTO wolly_fields (kind, field, type, required, is_unique, max_length) VALUES (?, ?, ?, ?, ?, ?)";
+    constant dropFieldRow: Span[Nat8, Static] := "DELETE FROM wolly_fields WHERE kind = ? AND field = ?";
+    constant dropFieldValues: Span[Nat8, Static] := "DELETE FROM wolly_values WHERE kind = ? AND field = ?";
+    constant dropFieldUnique: Span[Nat8, Static] := "DELETE FROM wolly_unique WHERE kind = ? AND field = ?";
+    constant putEntity: Span[Nat8, Static] := "INSERT INTO wolly_entities (kind, created_at, created_by, updated_at, updated_by) VALUES (?, ?, ?, ?, ?) RETURNING id";
+    constant touch: Span[Nat8, Static] := "UPDATE wolly_entities SET updated_at = ?, updated_by = ? WHERE id = ?";
+    constant lookup: Span[Nat8, Static] := "SELECT e.kind, coalesce(f.type, ''), f.required, f.is_unique, f.max_length FROM wolly_entities e LEFT JOIN wolly_fields f ON f.kind = e.kind AND f.field = ? WHERE e.id = ?";
+    constant putText: Span[Nat8, Static] := "INSERT INTO wolly_values (entity, kind, field, text_value, integer_value) VALUES (?, ?, ?, ?, NULL) ON CONFLICT (entity, field) DO UPDATE SET text_value = excluded.text_value, integer_value = NULL";
+    constant putInteger: Span[Nat8, Static] := "INSERT INTO wolly_values (entity, kind, field, text_value, integer_value) VALUES (?, ?, ?, NULL, ?) ON CONFLICT (entity, field) DO UPDATE SET text_value = NULL, integer_value = excluded.integer_value";
+    constant dropValue: Span[Nat8, Static] := "DELETE FROM wolly_values WHERE entity = ? AND field = ?";
+    constant releaseUnique: Span[Nat8, Static] := "DELETE FROM wolly_unique WHERE entity = ? AND field = ?";
+    constant claimValue: Span[Nat8, Static] := "INSERT INTO wolly_unique (kind, field, value, entity) VALUES (?, ?, ?, ?) ON CONFLICT (kind, field, value) DO NOTHING";
+    constant dropEntityValues: Span[Nat8, Static] := "DELETE FROM wolly_values WHERE entity = ?";
+    constant dropEntityUnique: Span[Nat8, Static] := "DELETE FROM wolly_unique WHERE entity = ?";
+    constant dropEntityRow: Span[Nat8, Static] := "DELETE FROM wolly_entities WHERE id = ?";
+    constant addAudit: Span[Nat8, Static] := "INSERT INTO wolly_entity_audit (at, actor, action, kind, entity, field) VALUES (?, ?, ?, ?, ?, ?)";
+    constant textValue: Span[Nat8, Static] := "SELECT text_value FROM wolly_values WHERE entity = ? AND field = ? AND text_value IS NOT NULL";
+    constant integerValue: Span[Nat8, Static] := "SELECT integer_value FROM wolly_values WHERE entity = ? AND field = ?";
+    constant kindRow: Span[Nat8, Static] := "SELECT kind FROM wolly_entities WHERE id = ?";
+    constant missingRow: Span[Nat8, Static] := "SELECT f.field FROM wolly_entities e JOIN wolly_fields f ON f.kind = e.kind LEFT JOIN wolly_values v ON v.entity = e.id AND v.field = f.field WHERE e.id = ? AND f.required = 1 AND v.entity IS NULL ORDER BY f.field LIMIT 1";
+    constant findTextRows: Span[Nat8, Static] := "SELECT entity FROM wolly_values WHERE kind = ? AND field = ? AND text_value = ? ORDER BY entity LIMIT 1000";
+    constant findIntegerRows: Span[Nat8, Static] := "SELECT entity FROM wolly_values WHERE kind = ? AND field = ? AND integer_value = ? ORDER BY entity LIMIT 1000";
+    constant countAudit: Span[Nat8, Static] := "SELECT count(*) FROM wolly_entity_audit";
+
+    -- What the look at field of entity found.
+    union Slot: Linear is
+        case NoSuchEntity;
+        case NoSuchField is
+            owner: String;
+        case Field is
+            owner: String;
+            valueType: ValueType;
+            required: Bool;
+            unique: Bool;
+            maxLength: Int64;
+    end;
+
+    function mostFields(): Int64 is
+        return 64;
+    end;
+
+    function mostLength(): Int64 is
+        return 65536;
+    end;
+
+    function mostFound(): Int64 is
+        return 1000;
+    end;
+
+    -- The length of text as an Int64; a length that does not fit is taken
+    -- as longer than any field.
+    generic [T: Region]
+    function lengthOf(text: Span[Nat8, T]): Int64 is
+        case toInt64(spanLength(text)) of
+            when Some(value as size: Int64) do
+                return size;
+            when None do
+                return mostLength() + 1;
+        end case;
+    end;
+
+    generic [N: Region]
+    function isFieldName(name: Span[Nat8, N]): Bool is
+        if (spanLength(name) = 0) or (spanLength(name) > 31) then
+            return false;
+        end if;
+        if not ((name[0] >= 'a') and (name[0] <= 'z')) then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            let letter: Bool := (byte >= 'a') and (byte <= 'z');
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            if not ((letter or digit) or (byte = '_')) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        -- The columns a table of its own has, so that a kind can move into
+        -- one without renaming a field.
+        let first: Bool := (equal(name, "id") or equal(name, "kind")) or equal(name, "version");
+        let second: Bool := equal(name, "created_at") or equal(name, "created_by");
+        let third: Bool := equal(name, "updated_at") or equal(name, "updated_by");
+        return not ((first or second) or third);
+    end;
+
+    function typeName(valueType: ValueType): Span[Nat8, Static] is
+        case valueType of
+            when TextValue do
+                return "text";
+            when IntegerValue do
+                return "integer";
+        end case;
+    end;
+
+    function isText(valueType: ValueType): Bool is
+        case valueType of
+            when TextValue do
+                return true;
+            when IntegerValue do
+                return false;
+        end case;
+    end;
+
+    function flag(value: Bool): Int64 is
+        if value then
+            return 1;
+        else
+            return 0;
+        end if;
+    end;
+
+    function isStored(change: Change): Bool is
+        case change of
+            when Stored do
+                return true;
+            when NoEntity do
+                return false;
+            when UnknownField do
+                return false;
+            when WrongType do
+                return false;
+            when EntityTooLong do
+                return false;
+            when NotUtf8 do
+                return false;
+            when Taken do
+                return false;
+            when Required do
+                return false;
+            when BadActor do
+                return false;
+        end case;
+    end;
+
+    function answer(change: Change): Either[DbError, Change] is
+        return Right(right => change);
+    end;
+
+    -- Runs one statement that returns no rows.
+    generic [R: Region]
+    function run(db: &![Database[Writing], R], sql: Span[Nat8, Static], values: Values): Option[DbError] is
+        case execute(&~db, sql, values) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    -- An Int64 or null as the next value (Standard.Database has no OrNull
+    -- forms).
+    function withInt64OrNull(values: Values, given: Option[Int64]): Values is
+        case given of
+            when Some(value as number: Int64) do
+                return withInt64(values, number);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    -- A text or null as the next value.
+    generic [F: Region]
+    function withTextOrNull(values: Values, given: Option[Span[Nat8, F]]): Values is
+        case given of
+            when Some(value as text: Span[Nat8, F]) do
+                return withText(values, text);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    -- The column as an Int64, None when it is null.
+    generic [R: Region]
+    function columnInt64OrNone(cursor: &[Cursor, R], index: Int32): Option[Int64] is
+        var found: Option[Int64] := None();
+        if not isNullColumn(cursor, index) then
+            found := Some(value => columnInt64(cursor, index));
+        end if;
+        return found;
+    end;
+
+    -- One line of the audit; entity and field may be absent.
+    generic [R: Region, A: Region, K: Region, F: Region]
+    function audit(db: &![Database[Writing], R], now: Int64, actor: Span[Nat8, A], action: Span[Nat8, Static],
+                   kind: Span[Nat8, K], entity: Option[Int64], field: Option[Span[Nat8, F]]): Option[DbError] is
+        let values: Values := withTextOrNull(withInt64OrNull(withText(withText(withText(withInt64(noValues(), now), actor), action), kind), entity), field);
+        return run(&~db, addAudit, values);
+    end;
+
+    -- The first column of the one row of sql as an Int64, 0 without a row.
+    generic [M: Free, R: Region]
+    function single(db: &![Database[M], R], sql: Span[Nat8, Static], values: Values): Either[DbError, Int64] is
+        var cursor: Cursor := start(&~db, sql, values);
+        var total: Int64 := 0;
+        if advance(&!cursor) then
+            total := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => total);
+        end case;
+    end;
+
+    -- The first column of every row of sql, at most mostFound.
+    generic [M: Free, R: Region]
+    function numbers(db: &![Database[M], R], sql: Span[Nat8, Static], values: Values): Either[DbError, Buffer[Int64]] is
+        var cursor: Cursor := start(&~db, sql, values);
+        var found: Buffer[Int64] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!found, columnInt64(&cursor, 0));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyFree(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    -- The first column of the one row of sql as a text, None without a row;
+    -- sql leaves out a row whose column is null.
+    generic [M: Free, R: Region]
+    function textRow(db: &![Database[M], R], sql: Span[Nat8, Static], values: Values): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, sql, values);
+        var found: Option[String] := None();
+        if advance(&!cursor) then
+            dropText(found);
+            found := Some(value => fromSpan(columnText(&cursor, 0)));
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropText(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    function dropText(text: Option[String]): Unit is
+        case text of
+            when Some(value as there: String) do
+                destroyString(there);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function prepareEntities(db: &![Database[Writing], R]): Option[DbError] is
+        let makeFieldsSql: Span[Nat8, Static] := pick(&db, makeFields, makeFieldsPg);
+        case run(&~db, makeFieldsSql, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        let makeEntitiesSql: Span[Nat8, Static] := pick(&db, makeEntities, makeEntitiesPg);
+        case run(&~db, makeEntitiesSql, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        let makeValuesSql: Span[Nat8, Static] := pick(&db, makeValues, makeValuesPg);
+        case run(&~db, makeValuesSql, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeTextIndex, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeIntegerIndex, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        let makeUniqueSql: Span[Nat8, Static] := pick(&db, makeUnique, makeUniquePg);
+        case run(&~db, makeUniqueSql, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, makeUniqueIndex, noValues()) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        let makeAuditSql: Span[Nat8, Static] := pick(&db, makeAudit, makeAuditPg);
+        return run(&~db, makeAuditSql, noValues());
+    end;
+
+    -- Ends transaction after a change: commits it when the change was
+    -- stored, rolls it back otherwise.
+    generic [R: Region]
+    function settle(db: &![Database[Writing], R], transaction: Transaction, result: Either[DbError, Change]): Either[DbError, Change] is
+        case result of
+            when Left(left as error: DbError) do
+                rollback(&~db, transaction);
+                return Left(left => error);
+            when Right(right as change: Change) do
+                if isStored(change) then
+                    case commit(&~db, transaction) of
+                        when Left(left as failure: DbError) do
+                            return Left(left => failure);
+                        when Right(right as done: Unit) do
+                            return Right(right => change);
+                    end case;
+                else
+                    rollback(&~db, transaction);
+                    return Right(right => change);
+                end if;
+        end case;
+    end;
+
+    -- The same for a change that answers whether it did anything.
+    generic [R: Region]
+    function settleBool(db: &![Database[Writing], R], transaction: Transaction, result: Either[DbError, Bool]): Either[DbError, Bool] is
+        case result of
+            when Left(left as error: DbError) do
+                rollback(&~db, transaction);
+                return Left(left => error);
+            when Right(right as done: Bool) do
+                if done then
+                    case commit(&~db, transaction) of
+                        when Left(left as failure: DbError) do
+                            return Left(left => failure);
+                        when Right(right as committed: Unit) do
+                            return Right(right => true);
+                    end case;
+                else
+                    rollback(&~db, transaction);
+                    return Right(right => false);
+                end if;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function defineField(db: &![Database[Writing], R], kind: Span[Nat8, K], field: Span[Nat8, F], valueType: ValueType,
+                         required: Bool, unique: Bool, maxLength: Int64, actor: Span[Nat8, A], now: Int64): Either[DbError, Bool] is
+        if not ((isFieldName(kind) and isFieldName(field)) and isName(actor)) then
+            return Right(right => false);
+        end if;
+        if (maxLength < 1) or (maxLength > mostLength()) then
+            return Right(right => false);
+        end if;
+        if (not isText(valueType)) and (maxLength /= 1) then
+            return Right(right => false);
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                let result: Either[DbError, Bool] := defineIn(&~db, kind, field, valueType, required, unique, maxLength, actor, now);
+                return settleBool(&~db, transaction, result);
+        end case;
+    end;
+
+    -- defineField inside its transaction.  Right true also for a field
+    -- that is there with the same shape: nothing is written then, and the
+    -- empty transaction is committed.
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function defineIn(db: &![Database[Writing], R], kind: Span[Nat8, K], field: Span[Nat8, F], valueType: ValueType,
+                      required: Bool, unique: Bool, maxLength: Int64, actor: Span[Nat8, A], now: Int64): Either[DbError, Bool] is
+        var cursor: Cursor := start(&~db, fieldShape, withText(withText(noValues(), kind), field));
+        var there: Bool := false;
+        var same: Bool := false;
+        if advance(&!cursor) then
+            there := true;
+            let sameType: Bool := equal(columnText(&cursor, 0), typeName(valueType));
+            let sameFlags: Bool := (columnInt64(&cursor, 1) = flag(required)) and (columnInt64(&cursor, 2) = flag(unique));
+            same := (sameType and sameFlags) and (columnInt64(&cursor, 3) = maxLength);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        if there then
+            return Right(right => same);
+        end if;
+        case single(&~db, countFields, withText(noValues(), kind)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as fields: Int64) do
+                if fields >= mostFields() then
+                    return Right(right => false);
+                end if;
+        end case;
+        let values: Values := withInt64(withInt64(withInt64(withText(withText(withText(noValues(), kind), field), typeName(valueType)), flag(required)), flag(unique)), maxLength);
+        case run(&~db, putField, values) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        let nobody: Option[Int64] := None();
+        case audit(&~db, now, actor, "define", kind, nobody, Some(value => field)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => true);
+        end case;
+    end;
+
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function dropField(db: &![Database[Writing], R], kind: Span[Nat8, K], field: Span[Nat8, F], actor: Span[Nat8, A],
+                       now: Int64): Either[DbError, Bool] is
+        if not isName(actor) then
+            return Right(right => false);
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                let result: Either[DbError, Bool] := dropIn(&~db, kind, field, actor, now);
+                return settleBool(&~db, transaction, result);
+        end case;
+    end;
+
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function dropIn(db: &![Database[Writing], R], kind: Span[Nat8, K], field: Span[Nat8, F], actor: Span[Nat8, A],
+                    now: Int64): Either[DbError, Bool] is
+        case execute(&~db, dropFieldRow, withText(withText(noValues(), kind), field)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as changed: Nat64) do
+                if changed = 0 then
+                    return Right(right => false);
+                end if;
+        end case;
+        case run(&~db, dropFieldValues, withText(withText(noValues(), kind), field)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, dropFieldUnique, withText(withText(noValues(), kind), field)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        let nobody: Option[Int64] := None();
+        case audit(&~db, now, actor, "drop", kind, nobody, Some(value => field)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => true);
+        end case;
+    end;
+
+    generic [R: Region, K: Region, A: Region]
+    function createEntity(db: &![Database[Writing], R], kind: Span[Nat8, K], actor: Span[Nat8, A],
+                          now: Int64): Either[DbError, Option[Int64]] is
+        if not (isFieldName(kind) and isName(actor)) then
+            return Right(right => None());
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                case createIn(&~db, kind, actor, now) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Left(left => error);
+                    when Right(right as made: Int64) do
+                        if made = 0 then
+                            rollback(&~db, transaction);
+                            return Right(right => None());
+                        else
+                            case commit(&~db, transaction) of
+                                when Left(left as failure: DbError) do
+                                    return Left(left => failure);
+                                when Right(right as done: Unit) do
+                                    return Right(right => Some(value => made));
+                            end case;
+                        end if;
+                end case;
+        end case;
+    end;
+
+    -- createEntity inside its transaction: the number of the new entity,
+    -- or 0 when kind has no field (SQLite numbers rows from 1).
+    generic [R: Region, K: Region, A: Region]
+    function createIn(db: &![Database[Writing], R], kind: Span[Nat8, K], actor: Span[Nat8, A],
+                      now: Int64): Either[DbError, Int64] is
+        case single(&~db, countFields, withText(noValues(), kind)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as fields: Int64) do
+                if fields = 0 then
+                    let none: Int64 := 0;
+                    return Right(right => none);
+                end if;
+        end case;
+        let values: Values := withText(withInt64(withText(withInt64(withText(noValues(), kind), now), actor), now), actor);
+        var cursor: Cursor := start(&~db, putEntity, values);
+        var id: Int64 := 0;
+        if advance(&!cursor) then
+            id := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        let nofield: Option[Span[Nat8, Static]] := None();
+        case audit(&~db, now, actor, "create", kind, Some(value => id), nofield) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => id);
+        end case;
+    end;
+
+    -- The field of entity, as the look inside a transaction found it.
+    generic [M: Free, R: Region, F: Region]
+    function slotOf(db: &![Database[M], R], entity: Int64, field: Span[Nat8, F]): Either[DbError, Slot] is
+        var cursor: Cursor := start(&~db, lookup, withInt64(withText(noValues(), field), entity));
+        var slot: Slot := NoSuchEntity();
+        if advance(&!cursor) then
+            let owner: String := fromSpan(columnText(&cursor, 0));
+            let shaped: Slot := shapeOf(&cursor, owner);
+            destroySlot(slot);
+            slot := shaped;
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroySlot(slot);
+                return Left(left => error);
+            when None do
+                return Right(right => slot);
+        end case;
+    end;
+
+    -- The slot of the row of the cursor, whose entity is of kind owner.
+    generic [R: Region]
+    function shapeOf(cursor: &[Cursor, R], owner: String): Slot is
+        var found: ValueType := TextValue();
+        if equal(columnText(cursor, 1), "integer") then
+            found := IntegerValue();
+        end if;
+        if spanLength(columnText(cursor, 1)) = 0 then
+            return NoSuchField(owner => owner);
+        else
+            return Field(owner => owner, valueType => found, required => columnInt64(cursor, 2) = 1,
+                         unique => columnInt64(cursor, 3) = 1, maxLength => columnInt64(cursor, 4));
+        end if;
+    end;
+
+    function destroySlot(slot: Slot): Unit is
+        case slot of
+            when NoSuchEntity do
+                skip;
+            when NoSuchField(owner: String) do
+                destroyString(owner);
+            when Field(owner: String, valueType: ValueType, required: Bool, unique: Bool, maxLength: Int64) do
+                destroyString(owner);
+        end case;
+        return nil;
+    end;
+
+    -- The time and actor of a change on entity, and its line in the audit.
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function touched(db: &![Database[Writing], R], entity: Int64, kind: Span[Nat8, K], field: Span[Nat8, F],
+                     actor: Span[Nat8, A], now: Int64, action: Span[Nat8, Static]): Either[DbError, Change] is
+        case run(&~db, touch, withInt64(withText(withInt64(noValues(), now), actor), entity)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        case audit(&~db, now, actor, action, kind, Some(value => entity), Some(value => field)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => Stored());
+        end case;
+    end;
+
+    -- Gives up the claim of entity on field, when the field is unique.
+    generic [R: Region, F: Region]
+    function release(db: &![Database[Writing], R], entity: Int64, field: Span[Nat8, F], unique: Bool): Option[DbError] is
+        if not unique then
+            return None();
+        end if;
+        return run(&~db, releaseUnique, withText(withInt64(noValues(), entity), field));
+    end;
+
+    -- Right true when the claim was made, false when another entity holds
+    -- the value.
+    generic [R: Region]
+    function claimed(db: &![Database[Writing], R], values: Values): Either[DbError, Bool] is
+        case execute(&~db, claimValue, values) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as changed: Nat64) do
+                let made: Bool := changed > 0;
+                return Right(right => made);
+        end case;
+    end;
+
+    generic [R: Region, F: Region, V: Region, A: Region]
+    function setText(db: &![Database[Writing], R], entity: Int64, field: Span[Nat8, F], value: Span[Nat8, V],
+                     actor: Span[Nat8, A], now: Int64): Either[DbError, Change] is
+        if not isName(actor) then
+            return Right(right => BadActor());
+        end if;
+        if not isValid(value) then
+            return Right(right => NotUtf8());
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                case slotOf(&~db, entity, field) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Left(left => error);
+                    when Right(right as slot: Slot) do
+                        let result: Either[DbError, Change] := textInto(&~db, slot, entity, field, value, actor, now);
+                        return settle(&~db, transaction, result);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, F: Region, V: Region, A: Region]
+    function textInto(db: &![Database[Writing], R], slot: Slot, entity: Int64, field: Span[Nat8, F], value: Span[Nat8, V],
+                      actor: Span[Nat8, A], now: Int64): Either[DbError, Change] is
+        case slot of
+            when NoSuchEntity do
+                return Right(right => NoEntity());
+            when NoSuchField(owner: String) do
+                destroyString(owner);
+                return Right(right => UnknownField());
+            when Field(owner: String, valueType: ValueType, required: Bool, unique: Bool, maxLength: Int64) do
+                var result: Either[DbError, Change] := Right(right => WrongType());
+                if isText(valueType) then
+                    if lengthOf(value) > maxLength then
+                        result := answer(EntityTooLong());
+                    else
+                        result := writeText(&~db, entity, asSpan(&owner), field, value, unique, actor, now);
+                    end if;
+                end if;
+                destroyString(owner);
+                return result;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, F: Region, V: Region, A: Region]
+    function writeText(db: &![Database[Writing], R], entity: Int64, kind: Span[Nat8, K], field: Span[Nat8, F],
+                       value: Span[Nat8, V], unique: Bool, actor: Span[Nat8, A], now: Int64): Either[DbError, Change] is
+        case release(&~db, entity, field, unique) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        if unique then
+            case claimed(&~db, withInt64(withText(withText(withText(noValues(), kind), field), value), entity)) of
+                when Left(left as error: DbError) do
+                    return Left(left => error);
+                when Right(right as made: Bool) do
+                    if not made then
+                        return Right(right => Taken());
+                    end if;
+            end case;
+        end if;
+        case run(&~db, putText, withText(withText(withText(withInt64(noValues(), entity), kind), field), value)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return touched(&~db, entity, kind, field, actor, now, "set");
+        end case;
+    end;
+
+    generic [R: Region, F: Region, A: Region]
+    function setInteger(db: &![Database[Writing], R], entity: Int64, field: Span[Nat8, F], value: Int64,
+                        actor: Span[Nat8, A], now: Int64): Either[DbError, Change] is
+        if not isName(actor) then
+            return Right(right => BadActor());
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                case slotOf(&~db, entity, field) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Left(left => error);
+                    when Right(right as slot: Slot) do
+                        let result: Either[DbError, Change] := integerInto(&~db, slot, entity, field, value, actor, now);
+                        return settle(&~db, transaction, result);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, F: Region, A: Region]
+    function integerInto(db: &![Database[Writing], R], slot: Slot, entity: Int64, field: Span[Nat8, F], value: Int64,
+                         actor: Span[Nat8, A], now: Int64): Either[DbError, Change] is
+        case slot of
+            when NoSuchEntity do
+                return Right(right => NoEntity());
+            when NoSuchField(owner: String) do
+                destroyString(owner);
+                return Right(right => UnknownField());
+            when Field(owner: String, valueType: ValueType, required: Bool, unique: Bool, maxLength: Int64) do
+                var result: Either[DbError, Change] := Right(right => WrongType());
+                if not isText(valueType) then
+                    result := writeInteger(&~db, entity, asSpan(&owner), field, value, unique, actor, now);
+                end if;
+                destroyString(owner);
+                return result;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function writeInteger(db: &![Database[Writing], R], entity: Int64, kind: Span[Nat8, K], field: Span[Nat8, F],
+                          value: Int64, unique: Bool, actor: Span[Nat8, A], now: Int64): Either[DbError, Change] is
+        case release(&~db, entity, field, unique) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        if unique then
+            case claimed(&~db, withInt64(withInt64(withText(withText(noValues(), kind), field), value), entity)) of
+                when Left(left as error: DbError) do
+                    return Left(left => error);
+                when Right(right as made: Bool) do
+                    if not made then
+                        return Right(right => Taken());
+                    end if;
+            end case;
+        end if;
+        case run(&~db, putInteger, withInt64(withText(withText(withInt64(noValues(), entity), kind), field), value)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return touched(&~db, entity, kind, field, actor, now, "set");
+        end case;
+    end;
+
+    generic [R: Region, F: Region, A: Region]
+    function clearValue(db: &![Database[Writing], R], entity: Int64, field: Span[Nat8, F], actor: Span[Nat8, A],
+                        now: Int64): Either[DbError, Change] is
+        if not isName(actor) then
+            return Right(right => BadActor());
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                case slotOf(&~db, entity, field) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Left(left => error);
+                    when Right(right as slot: Slot) do
+                        let result: Either[DbError, Change] := clearIn(&~db, slot, entity, field, actor, now);
+                        return settle(&~db, transaction, result);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, F: Region, A: Region]
+    function clearIn(db: &![Database[Writing], R], slot: Slot, entity: Int64, field: Span[Nat8, F], actor: Span[Nat8, A],
+                     now: Int64): Either[DbError, Change] is
+        case slot of
+            when NoSuchEntity do
+                return Right(right => NoEntity());
+            when NoSuchField(owner: String) do
+                destroyString(owner);
+                return Right(right => UnknownField());
+            when Field(owner: String, valueType: ValueType, required: Bool, unique: Bool, maxLength: Int64) do
+                var result: Either[DbError, Change] := Right(right => Required());
+                if not required then
+                    result := clearWrite(&~db, entity, asSpan(&owner), field, unique, actor, now);
+                end if;
+                destroyString(owner);
+                return result;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function clearWrite(db: &![Database[Writing], R], entity: Int64, kind: Span[Nat8, K], field: Span[Nat8, F],
+                        unique: Bool, actor: Span[Nat8, A], now: Int64): Either[DbError, Change] is
+        case release(&~db, entity, field, unique) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, dropValue, withText(withInt64(noValues(), entity), field)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return touched(&~db, entity, kind, field, actor, now, "clear");
+        end case;
+    end;
+
+    generic [R: Region, A: Region]
+    function deleteEntity(db: &![Database[Writing], R], entity: Int64, actor: Span[Nat8, A],
+                          now: Int64): Either[DbError, Bool] is
+        if not isName(actor) then
+            return Right(right => false);
+        end if;
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                let result: Either[DbError, Bool] := deleteIn(&~db, entity, actor, now);
+                return settleBool(&~db, transaction, result);
+        end case;
+    end;
+
+    generic [R: Region, A: Region]
+    function deleteIn(db: &![Database[Writing], R], entity: Int64, actor: Span[Nat8, A], now: Int64): Either[DbError, Bool] is
+        case textRow(&~db, kindRow, withInt64(noValues(), entity)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[String]) do
+                case found of
+                    when None do
+                        return Right(right => false);
+                    when Some(value as kind: String) do
+                        let result: Either[DbError, Bool] := deleteRows(&~db, entity, asSpan(&kind), actor, now);
+                        destroyString(kind);
+                        return result;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, A: Region]
+    function deleteRows(db: &![Database[Writing], R], entity: Int64, kind: Span[Nat8, K], actor: Span[Nat8, A],
+                        now: Int64): Either[DbError, Bool] is
+        case run(&~db, dropEntityValues, withInt64(noValues(), entity)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, dropEntityUnique, withInt64(noValues(), entity)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        case run(&~db, dropEntityRow, withInt64(noValues(), entity)) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        let nofield: Option[Span[Nat8, Static]] := None();
+        case audit(&~db, now, actor, "delete", kind, Some(value => entity), nofield) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => true);
+        end case;
+    end;
+
+    generic [M: Free, R: Region, F: Region]
+    function textOf(db: &![Database[M], R], entity: Int64, field: Span[Nat8, F]): Either[DbError, Option[String]] is
+        return textRow(&~db, textValue, withText(withInt64(noValues(), entity), field));
+    end;
+
+    generic [M: Free, R: Region, F: Region]
+    function integerField(db: &![Database[M], R], entity: Int64, field: Span[Nat8, F]): Either[DbError, Option[Int64]] is
+        var cursor: Cursor := start(&~db, integerValue, withText(withInt64(noValues(), entity), field));
+        var found: Option[Int64] := None();
+        if advance(&!cursor) then
+            found := columnInt64OrNone(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function kindOf(db: &![Database[M], R], entity: Int64): Either[DbError, Option[String]] is
+        return textRow(&~db, kindRow, withInt64(noValues(), entity));
+    end;
+
+    generic [M: Free, R: Region]
+    function missingField(db: &![Database[M], R], entity: Int64): Either[DbError, Option[String]] is
+        return textRow(&~db, missingRow, withInt64(noValues(), entity));
+    end;
+
+    generic [M: Free, R: Region, K: Region, F: Region, V: Region]
+    function findText(db: &![Database[M], R], kind: Span[Nat8, K], field: Span[Nat8, F],
+                      value: Span[Nat8, V]): Either[DbError, Buffer[Int64]] is
+        return numbers(&~db, findTextRows, withText(withText(withText(noValues(), kind), field), value));
+    end;
+
+    generic [M: Free, R: Region, K: Region, F: Region]
+    function findInteger(db: &![Database[M], R], kind: Span[Nat8, K], field: Span[Nat8, F],
+                         value: Int64): Either[DbError, Buffer[Int64]] is
+        return numbers(&~db, findIntegerRows, withInt64(withText(withText(noValues(), kind), field), value));
+    end;
+
+    generic [M: Free, R: Region]
+    function auditCount(db: &![Database[M], R]): Either[DbError, Int64] is
+        return single(&~db, countAudit, noValues());
+    end;
+end module body.

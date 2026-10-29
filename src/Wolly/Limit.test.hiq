@@ -1,0 +1,156 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database in memory.  The limit is 3 calls in 60
+-- seconds; the fourth call is the one past it.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    startsWith,
+    contains
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Limit (
+    Verdict,
+    Allowed,
+    Limited,
+    prepareLimits,
+    hit,
+    tooManyRequests
+);
+
+module body Wolly.Limit.Test is
+    constant limit: Int64 := 3;
+    constant window: Int64 := 60;
+
+    function allowed(result: Either[DbError, Verdict], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as verdict: Verdict) do
+                case verdict of
+                    when Allowed do
+                        assertTrue(true, message);
+                    when Limited(retryAfter: Int64) do
+                        assertTrue(false, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function limited(result: Either[DbError, Verdict], wait: Int64, message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as verdict: Verdict) do
+                case verdict of
+                    when Allowed do
+                        assertTrue(false, message);
+                    when Limited(retryAfter: Int64) do
+                        assertTrue(retryAfter = wait, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R]): Unit is
+        case prepareLimits(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table could not be made");
+            when None do
+                skip;
+        end case;
+        case prepareLimits(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a second prepareLimits fails");
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runWindow(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        allowed(hit(&~db, "form", "10.0.0.1", 100, limit, window), "the first call");
+        allowed(hit(&~db, "form", "10.0.0.1", 101, limit, window), "the second call");
+        allowed(hit(&~db, "form", "10.0.0.1", 102, limit, window), "the third call, the last within the limit");
+        limited(hit(&~db, "form", "10.0.0.1", 103, limit, window), 57, "the fourth call is limited until the first leaves the window");
+        limited(hit(&~db, "form", "10.0.0.1", 159, limit, window), 1, "a second before, the wait is 1");
+        allowed(hit(&~db, "form", "10.0.0.1", 160, limit, window), "the first call has left the window; the refusals were not counted");
+        limited(hit(&~db, "form", "10.0.0.1", 160, limit, window), 1, "and the place is taken again");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runApart(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        allowed(hit(&~db, "form", "10.0.0.1", 100, limit, window), "a, first");
+        allowed(hit(&~db, "form", "10.0.0.1", 100, limit, window), "a, second");
+        allowed(hit(&~db, "form", "10.0.0.1", 100, limit, window), "a, third");
+        limited(hit(&~db, "form", "10.0.0.1", 100, limit, window), 60, "the control: a is limited");
+        allowed(hit(&~db, "form", "10.0.0.2", 100, limit, window), "another key is not");
+        allowed(hit(&~db, "search", "10.0.0.1", 100, limit, window), "another scope of the same key is not");
+        return nil;
+    end;
+
+    function testWindow(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runWindow(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testApart(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runApart(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testTooManyRequests(): Unit is
+        let answer: String := tooManyRequests(57);
+        assertTrue(startsWith(asSpan(&answer), "Status: 429 "), "the status is 429");
+        assertTrue(contains(asSpan(&answer), "\r\nRetry-After: 57\r\n"), "with the seconds to wait");
+        assertTrue(contains(asSpan(&answer), "\r\n\r\ntoo many requests\n"), "and the text");
+        destroyString(answer);
+        let long: String := tooManyRequests(9223372036854775807);
+        assertTrue(contains(asSpan(&long), "\r\nRetry-After: 9223372036854775807\r\n"), "the largest Int64, every digit");
+        destroyString(long);
+        let one: String := tooManyRequests(1);
+        assertTrue(contains(asSpan(&one), "\r\nRetry-After: 1\r\n"), "one digit");
+        destroyString(one);
+        let ten: String := tooManyRequests(10);
+        assertTrue(contains(asSpan(&ten), "\r\nRetry-After: 10\r\n"), "a zero inside");
+        destroyString(ten);
+        return nil;
+    end;
+end module body.

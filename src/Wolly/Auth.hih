@@ -1,0 +1,325 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Users, login and logout over server-side sessions in SQLite.
+
+A user is a name and an Argon2id hash of the password (Standard.Password);
+the password itself is never stored and never logged.  A name is 1 to 64
+bytes of lowercase letters, digits, dot, hyphen and underscore.  A
+password follows the rules of Wolly.Passphrase (NIST SP 800-63B-4) when it
+is set, and is brought to NFKC before it is hashed and before it is
+checked at a login.  A login refuses a password shorter than the shortest
+any user may have, or longer than Wolly.Passphrase.mostBytes, before it is
+hashed, so a request cannot make the server hash a megabyte.
+
+A session is Standard.Session's: its token goes to the browser in the
+cookie named by cookieName, with Secure, HttpOnly, SameSite=Strict and
+Path=/, and the database keeps only its digest.  A visitor gets a session
+before the login, for the token of the form against forgery; the login gives the
+session a new token, so a token set by someone else before the login
+opens nothing after it; the logout removes the session on the server.
+
+A client, the address the web server names, that failed failureLimit
+times within failureWindowSeconds is refused without its password being
+looked at, and so is a user name that failed as often from any number of
+clients.  The second limit lets anyone who knows a name keep its user out
+for the window; it is the price of stopping many addresses from trying
+one name.  A login clears the failures of its client and of its name.  A name that does not exist costs the same hash as one that
+does, so the time of an answer does not tell whether a name is taken.
+
+A user who turned on the second factor of Wolly.Totp is not logged in by
+the password alone: login then answers CodeNeeded, and the session holds
+the user as waiting for a code, which sessionUser does not count as
+logged in.  loginCode takes the code within pendingSeconds of the
+password and logs the user in under yet another token.  A wrong code is a
+failure of the client and of the name, as a wrong password is, and the
+right password does not clear the failures of such a user: only the
+right code does, so knowing the password does not buy more tries at the
+code.
+
+Every login, failure, refusal and logout is a line of JSON in the audit
+log the caller names: the event, the user name, the client and the
+outcome, never a password or a token.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Response (
+    Response
+);
+
+module Wolly.Auth is
+    """
+    Why a call did not do its work.
+    """
+    union AuthError: Free is
+        """
+        SQLite refused a statement.
+        """
+        case AuthStorage is
+            error: DbError;
+        """
+        The random source, the digest or the password hash failed.
+        """
+        case AuthCrypto;
+        """
+        A time below 0 was passed.
+        """
+        case AuthBadTime;
+    end;
+
+    """
+    What a login came to.  Linear: LoggedIn carries the new token.
+    """
+    union LoginResult: Linear is
+        """
+        The name and the password fit.  token is the new token of the
+        session, for the cookie.
+        """
+        case LoggedIn is
+            token: String;
+        """
+        The name and the password fit, and the user has the second factor
+        on.  token is the new token of the session, which waits for the
+        code: loginCode takes it.
+        """
+        case CodeNeeded is
+            token: String;
+        """
+        The name or the password did not fit, or the name is no name.
+        """
+        case Refused;
+        """
+        The client failed too often of late; nothing was checked.
+        """
+        case Throttled;
+        """
+        The work could not be done.
+        """
+        case LoginFailed is
+            error: AuthError;
+    end;
+
+    """
+    How many failures within failureWindowSeconds throttle a client, and
+    as many a user name: 5.
+    """
+    function failureLimit(): Int64
+        ensures result = 5;
+
+    """
+    The time over which failures are counted: 900 seconds.
+    """
+    function failureWindowSeconds(): Int64
+        ensures result = 900;
+
+    """
+    The name of the session cookie.
+    """
+    function cookieName(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    How long a session waits for the code after the password: 300 seconds.
+    """
+    function pendingSeconds(): Int64
+        ensures result = 300;
+
+    """
+    Makes the tables of users, of failures by client and by name, of the
+    seeds of Wolly.Totp and of sessions when the database has none.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareAuth(db: &![Database[Writing], R]): Either[AuthError, Unit];
+
+    """
+    Whether name is a user name: 1 to 64 bytes of a to z, 0 to 9, dot,
+    hyphen and underscore.
+    No contract: a walk over name.
+    """
+    generic [N: Region]
+    function isUserName(name: Span[Nat8, N]): Bool;
+
+    """
+    Adds the user name with the hash of password in NFKC.  Right false
+    when name is no user name, the name is taken, or the password does not
+    fit the rules of Wolly.Passphrase for a user without a second factor,
+    with the list of known passwords at listPath.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region, P: Region, L: Region]
+    function addUser(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P],
+                     listPath: Span[Nat8, L]): Either[AuthError, Bool];
+
+    """
+    Changes the password of name from current to next.  Right false when
+    current is not the password of name, or next does not fit the rules of
+    Wolly.Passphrase: with a second factor on, 8 characters are enough.
+    The sessions of name stay.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region, C: Region, P: Region, L: Region]
+    function changePassword(db: &![Database[Writing], R], name: Span[Nat8, N], current: Span[Nat8, C],
+                            next: Span[Nat8, P], listPath: Span[Nat8, L]): Either[AuthError, Bool];
+
+    """
+    A new session for a visitor who is not logged in, made at now.  Right
+    holds its token.
+    """
+    generic [R: Region]
+    function startSession(db: &![Database[Writing], R], now: Int64): Either[AuthError, String]
+        requires now >= 0;
+
+    """
+    The token of a live session for a visitor at now: token itself when
+    it opens a session that is within its limits, else the token of a new
+    one, so that a page asked for again does not make a session each time.
+    """
+    generic [R: Region, T: Region]
+    function visitorSession(db: &![Database[Writing], R], token: Span[Nat8, T], now: Int64): Either[AuthError, String]
+        requires now >= 0;
+
+    """
+    The login of name with password from client at now, in the session
+    of token, which may be empty or no session at all.  Writes a line to
+    the audit log at auditPath.
+    """
+    generic [R: Region, T: Region, N: Region, P: Region, C: Region, A: Region]
+    function login(db: &![Database[Writing], R], token: Span[Nat8, T], name: Span[Nat8, N],
+                   password: Span[Nat8, P], client: Span[Nat8, C], now: Int64, auditPath: Span[Nat8, A]): LoginResult
+        requires now >= 0;
+
+    """
+    The code of the second factor from client at now, in the session of
+    token that login left waiting for it.  The seed opens under key.
+    LoggedIn with a new token when the code fits; Refused when it does
+    not, when token opens no waiting session, or when the session waited
+    longer than pendingSeconds; Throttled as login is.  Writes a line to
+    the audit log at auditPath.
+    """
+    generic [R: Region, K: Region, T: Region, C: Region, D: Region, A: Region]
+    function loginCode(db: &![Database[Writing], R], key: Span[Nat8, K], token: Span[Nat8, T], code: Span[Nat8, C],
+                       client: Span[Nat8, D], now: Int64, auditPath: Span[Nat8, A]): LoginResult
+        requires now >= 0;
+
+    """
+    Removes the user name and the failures counted for it.  Right true when
+    there was such a user.  A session of name opens nothing afterwards,
+    since sessionUser asks whether the user is there.  What other modules
+    keep of name (roles, passkeys, the second factor, tokens) is theirs to
+    remove; examples/login removes it all with login deluser.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function removeUser(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[AuthError, Bool];
+
+    """
+    Whether password is the one of name, asked again before a change that
+    must not follow from a session alone, such as a new passkey.  Counts as
+    login does: a wrong password is a failure of client and of name, and
+    Right false comes without a check once either is throttled.
+    """
+    generic [R: Region, N: Region, P: Region, C: Region]
+    function confirmPassword(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P],
+                             client: Span[Nat8, C], now: Int64): Either[AuthError, Bool]
+        requires now >= 0;
+
+    """
+    The login with a passkey from client at now, in the session of token:
+    Wolly.Passkey.authenticate checks the credential, the client data, the
+    authenticator data and the signature, and only when it passes is the
+    session given to the user of the credential, under a new token.  There
+    is no login without a check here: the check is this function's.  A
+    second factor is not asked, since a passkey that verified the user is
+    one already.  A refusal counts as a failure of client, as a wrong
+    password does, and Throttled comes as for login; a name is not
+    throttled, since it is known only after the check.  Writes a line to
+    the audit log at auditPath.
+    """
+    generic [R: Region, T: Region, D: Region, X: Region, U: Region, S: Region, I: Region, O: Region, C: Region, A: Region]
+    function passkeyLogin(db: &![Database[Writing], R], token: Span[Nat8, T], credential: Span[Nat8, D],
+                          clientData: Span[Nat8, X], authenticatorData: Span[Nat8, U], signature: Span[Nat8, S],
+                          rpId: Span[Nat8, I], origin: Span[Nat8, O], client: Span[Nat8, C], now: Int64,
+                          auditPath: Span[Nat8, A]): LoginResult
+        requires now > 0;
+
+    """
+    Writes one line of the audit log at auditPath: the event, the user (-
+    when it is no user name), the client and the outcome.  The line is
+    written only under a writing transaction of db, so that it waits while
+    Wolly.AuditLog rewrites the log and lands in the new one: when the busy
+    time of the database passes, begin is tried again until it holds, and
+    the line carries lock_retries, the number of tries that failed.  False
+    when the log could not be written, or begin failed otherwise than busy;
+    the line is then lost, never written without the lock.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [R: Region, A: Region, U: Region, C: Region]
+    function audit(db: &![Database[Writing], R], auditPath: Span[Nat8, A], event: Span[Nat8, Static], user: Span[Nat8, U],
+                   client: Span[Nat8, C], outcome: Span[Nat8, Static]): Bool;
+
+    """
+    Logs name in for a sign-in another service vouched for, such as RAMBO
+    after Wolly.Rambo checked its ID token: no password, no code and no
+    count of failures here, the service did that.  The session of token
+    goes on under a new token, or a new one is made, holding the user, as
+    after login.  Right Some the new token; Right None when name is no
+    user of this application, which keeps who may do what.  The outcome
+    goes to the audit log at auditPath (event login-external).
+    """
+    generic [R: Region, T: Region, N: Region, A: Region, C: Region]
+    function externalLogin(db: &![Database[Writing], R], token: Span[Nat8, T], name: Span[Nat8, N], auditPath: Span[Nat8, A],
+                           client: Span[Nat8, C], now: Int64): Either[AuthError, Option[String]]
+        requires now >= 0;
+
+    """
+    The user of the session of token at now: Right None when there is no
+    such session, it is over its limits, or nobody logged in with it.
+    """
+    generic [R: Region, T: Region]
+    function sessionUser(db: &![Database[Writing], R], token: Span[Nat8, T], now: Int64): Either[AuthError, Option[String]]
+        requires now >= 0;
+
+    """
+    Ends the session of token on the server and writes a line to the
+    audit log at auditPath.  A token that opens nothing is no failure.
+    """
+    generic [R: Region, T: Region, C: Region, A: Region]
+    function logout(db: &![Database[Writing], R], token: Span[Nat8, T], client: Span[Nat8, C], now: Int64,
+                    auditPath: Span[Nat8, A]): Either[AuthError, Unit]
+        requires now >= 0;
+
+    """
+    The session token the request carries in its cookie, when it has the
+    form of one.
+    No contract: an Option read from the request.
+    """
+    generic [R: Region]
+    function sessionToken(request: &[Request, R]): Option[String];
+
+    """
+    The response with the Set-Cookie header that gives the browser token.
+    No contract: what the opaque response holds is not stated in O(1).
+    """
+    generic [T: Region]
+    function withSessionCookie(response: Response, token: Span[Nat8, T]): Response;
+
+    """
+    The response with the Set-Cookie header that removes the cookie.
+    No contract: what the opaque response holds is not stated in O(1).
+    """
+    function withoutSessionCookie(response: Response): Response;
+end module.

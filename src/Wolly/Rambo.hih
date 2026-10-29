@@ -1,0 +1,349 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A client of RAMBO, an OpenID Connect sign-in service
+(with RAMBO's fixed paths under the issuer: /authorize,
+/token, /logout, /jwks; no discovery request).
+
+A sign-in starts with beginLogin: a state, a nonce and a PKCE verifier,
+32 random bytes each, which the application keeps on its server
+(keepPending) bound to the browser's session, and the URL to send the
+browser to.  The callback brings a code and the state; takePending gives
+the nonce and the verifier back once, within ten minutes; exchangeCode
+redeems the code; idTokenProblem checks the ID token against RAMBO's keys,
+the issuer, the client, the nonce and the times.  Then Wolly.Auth's
+externalLogin opens the session for the local user RAMBO vouches for.
+
+A token never goes into a cookie: the ID token is kept on the server
+(keepIdToken), for RAMBO's logout and nothing else.
+
+RAMBO signs with ML-DSA (RFC 9964): its keys are JWKs of kty AKP, which
+Standard.Jws.publicKeyFromJwk reads; akpPublicDer takes such a key and no
+other kind, and Standard.Jws.verifyCompact checks the signature.  Wolly
+has no encoding or cryptography of its own here.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Rambo is
+    """
+    The settings of one client: RAMBO's issuer URL (https, no slash at its
+    end), the client's id, its secret (empty for a public client; from a
+    vault, never an argument), the redirect URI RAMBO calls back, and the
+    file of CA certificates its TLS is checked against.
+    """
+    type RamboConfig: Linear;
+
+    """
+    The settings, when issuer is https://host[:port][/path] without a slash
+    at its end, a query or a fragment, clientId 1 to 128 bytes of letters,
+    digits and - _ . : and redirectUri an https URL, or an http URL on
+    127.0.0.1 or localhost for a tool on the machine.  None otherwise.
+    No contract: an Option over outside input; None is its answer for a bad
+    one.
+    """
+    generic [I: Region, C: Region, S: Region, U: Region, A: Region]
+    function makeRamboConfig(issuer: Span[Nat8, I], clientId: Span[Nat8, C], clientSecret: Span[Nat8, S],
+                             redirectUri: Span[Nat8, U], caFile: Span[Nat8, A]): Option[RamboConfig];
+
+    """
+    Gives the settings back.
+    No contract: it only gives the value back.
+    """
+    function destroyRamboConfig(config: RamboConfig): Unit;
+
+    """
+    How old RAMBO's sign-in may be, sent as max_age and checked again on
+    the ID token: 900 seconds, fifteen minutes.
+    """
+    function reauthSeconds(): Int64
+        ensures result = 900;
+
+    """
+    How long a started sign-in waits for its callback: 600 seconds.
+    """
+    function pendingSeconds(): Int64
+        ensures result = 600;
+
+    """
+    The slack on exp, nbf and iat for the clocks of RAMBO and the server:
+    60 seconds.
+    """
+    function leewaySeconds(): Int64
+        ensures result = 60;
+
+    """
+    A sign-in started: the URL to send the browser to, and the state, the
+    nonce and the PKCE verifier the server keeps.
+    """
+    record RamboStart: Linear is
+        url: String;
+        state: String;
+        nonce: String;
+        verifier: String;
+    end;
+
+    """
+    A new sign-in: maxAge seconds as max_age (none when it is negative; 0
+    forces a fresh sign-in), prompt=none when silent.  None when the random
+    source fails.
+    No contract: an Option over the random source, the result of I/O.
+    """
+    generic [C: Region]
+    function beginLogin(config: &[RamboConfig, C], maxAge: Int64, silent: Bool): Option[RamboStart];
+
+    """
+    Gives a started sign-in back.
+    No contract: it only gives the value back.
+    """
+    function destroyStart(begun: RamboStart): Unit;
+
+    """
+    The S256 challenge of a PKCE verifier (RFC 7636 4.2): base64url of its
+    SHA-256, without padding, 43 characters.
+    """
+    generic [V: Region]
+    function pkceChallenge(verifier: Span[Nat8, V]): String
+        ensures length(&result) = 43;
+
+    """
+    Where to send the browser to end the RAMBO session: /logout with the
+    client id, and the ID token as hint, the address to come back to and
+    the state when they are not empty.  With a real ID token as hint the
+    address is some 4000 bytes, and RAMBO's web server answers 414 from
+    1001 on: behind it, end the session with logoutForm.
+    """
+    generic [C: Region, I: Region, P: Region, S: Region]
+    function logoutUrl(config: &[RamboConfig, C], idTokenHint: Span[Nat8, I], postLogout: Span[Nat8, P],
+                       state: Span[Nat8, S]): String
+        ensures length(&result) > 0;
+
+    """
+    The page that ends the RAMBO session: one form that posts the client
+    id, and the ID token as hint, the address to come back to and the state
+    when they are not empty, to /logout, and submits itself by the one
+    script logoutPolicy allows; with scripting off, its button does it.  A
+    body has no length limit, a query has (logoutUrl).  Every value is
+    escaped for HTML.  Send it with logoutPolicy as Content-Security-Policy
+    and Cache-Control no-store, since it holds the ID token.
+    """
+    generic [C: Region, I: Region, P: Region, S: Region]
+    function logoutForm(config: &[RamboConfig, C], idTokenHint: Span[Nat8, I], postLogout: Span[Nat8, P],
+                        state: Span[Nat8, S]): String
+        ensures length(&result) > 0;
+
+    """
+    The Content-Security-Policy of logoutForm's page: no source but the
+    hash of its script, forms to this origin and to RAMBO's /logout (the
+    browser checks the redirect back against the same list, so the address
+    to come back to belongs to this origin), no base, no frame.
+    """
+    generic [C: Region]
+    function logoutPolicy(config: &[RamboConfig, C]): String
+        ensures length(&result) > 0;
+
+    """
+    Why a call to RAMBO gave no tokens.
+    """
+    union RamboError: Linear is
+        """
+        No answer: the request failed (the sentence of Standard.HttpClient).
+        """
+        case Unreachable is
+            detail: String;
+        """
+        An OAuth error of RFC 6749 5.2: the status, error and its
+        description; error is http_error when the body names none.
+        """
+        case Refused is
+            status: Nat16;
+            code: String;
+            description: String;
+        """
+        A 200 that is not a token response with a bearer access token.
+        """
+        case Malformed;
+    end;
+
+    """
+    Gives an error back.
+    No contract: it only gives the value back.
+    """
+    function destroyRamboError(error: RamboError): Unit;
+
+    """
+    The tokens of a token response.  idToken and refreshToken are empty
+    when the response has none; expiresIn is 0 when it names none.
+    """
+    record RamboTokens: Linear is
+        accessToken: String;
+        idToken: String;
+        refreshToken: String;
+        expiresIn: Int64;
+    end;
+
+    """
+    Gives the tokens back.
+    No contract: it only gives the value back.
+    """
+    function destroyTokens(tokens: RamboTokens): Unit;
+
+    """
+    The tokens of an answer of the token endpoint with status and body:
+    200 with an access_token and token_type Bearer in any case, or the
+    error.
+    No contract: an Either over outside input; the error is its answer for
+    a bad one.
+    """
+    generic [B: Region]
+    function readTokens(status: Nat16, answer: Span[Nat8, B]): Either[RamboError, RamboTokens];
+
+    """
+    Redeems the code of a callback with its verifier at /token.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [C: Region, D: Region, V: Region]
+    function exchangeCode(config: &[RamboConfig, C], code: Span[Nat8, D], verifier: Span[Nat8, V]): Either[RamboError, RamboTokens];
+
+    """
+    Trades a refresh token for new tokens; the old one is spent, the answer
+    carries its successor.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [C: Region, T: Region]
+    function refreshTokens(config: &[RamboConfig, C], refresh: Span[Nat8, T]): Either[RamboError, RamboTokens];
+
+    """
+    RAMBO's JWK set from /jwks, at most 1 MiB.  None when it cannot be had;
+    the caller keeps the set it has (keepJwks, knownJwks).
+    No contract: the outcome is the result of I/O.
+    """
+    generic [C: Region]
+    function fetchJwks(config: &[RamboConfig, C]): Option[String];
+
+    """
+    The DER SubjectPublicKeyInfo (RFC 9881) of a JWK of kty AKP and alg
+    ML-DSA-44, ML-DSA-65 or ML-DSA-87, whose pub is the raw public key in
+    base64url: 1312, 1952 or 2592 bytes, as Standard.Jws.publicKeyFromJwk
+    reads it.  None for any other JWK, of another kty too, since RAMBO
+    publishes no other kind.
+    No contract: an Option over outside input; None is its answer for a bad
+    one.
+    """
+    generic [J: Region]
+    function akpPublicDer(jwk: Span[Nat8, J]): Option[String];
+
+    """
+    The payload of token when its header's kid names a key of the JWK set
+    jwks whose alg is the header's alg and the signature holds under it
+    (Standard.Jws.verifyCompact).  None otherwise.
+    No contract: an Option over a signature of outside input; None is its
+    answer for a bad one.
+    """
+    generic [T: Region, J: Region]
+    function verifiedPayload(token: Span[Nat8, T], jwks: Span[Nat8, J]): Option[String];
+
+    """
+    Why the ID token does not hold, or None when it does: the signature by
+    a key of jwks, iss the issuer of config, aud the client (and azp the
+    client when aud names more than one), exp and nbf with leewaySeconds
+    of slack, the nonce, and auth_time no older than maxAge seconds when
+    maxAge is not negative.  An Option of a reason, so no ensures.
+    """
+    generic [C: Region, T: Region, J: Region, N: Region]
+    function idTokenProblem(config: &[RamboConfig, C], token: Span[Nat8, T], jwks: Span[Nat8, J], nonce: Span[Nat8, N],
+                            maxAge: Int64, now: Int64): Option[String]
+        requires now >= 0;
+
+    """
+    The claim name of a verified payload when it is a string: sub, email,
+    preferred_username.  None otherwise.
+    No contract: an Option over outside input; None is its answer for a
+    claim that is no string or not there.
+    """
+    generic [P: Region, N: Region]
+    function claimText(payload: Span[Nat8, P], name: Span[Nat8, N]): Option[String];
+
+    """
+    Makes the tables of pending sign-ins, of ID tokens kept for logout,
+    and of RAMBO's keys, if they are not there.  None when they exist
+    afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareRambo(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    What takePending gives back.
+    """
+    record RamboPending: Linear is
+        nonce: String;
+        verifier: String;
+    end;
+
+    """
+    Gives a pending sign-in back.
+    No contract: it only gives the value back.
+    """
+    function destroyPending(pending: RamboPending): Unit;
+
+    """
+    Keeps the nonce and verifier of start under its state for the session
+    of token, from now; a sign-in older than pendingSeconds is gone.
+    Right false when the state is there already.
+    """
+    generic [R: Region, T: Region, P: Region]
+    function keepPending(db: &![Database[Writing], R], session: Span[Nat8, T], begun: &[RamboStart, P], now: Int64): Either[DbError, Bool]
+        requires now >= 0;
+
+    """
+    The nonce and the verifier kept under state for the session of token,
+    once: the entry is taken out whether it fits or not.  Right None when
+    there is none, it belongs to another session, or it is older than
+    pendingSeconds.
+    """
+    generic [R: Region, T: Region, S: Region]
+    function takePending(db: &![Database[Writing], R], session: Span[Nat8, T], state: Span[Nat8, S], now: Int64): Either[DbError, Option[RamboPending]]
+        requires now >= 0;
+
+    """
+    Keeps the ID token of the session of token, for the hint of the logout,
+    in place of one kept before.
+    """
+    generic [R: Region, T: Region, I: Region]
+    function keepIdToken(db: &![Database[Writing], R], session: Span[Nat8, T], idToken: Span[Nat8, I], now: Int64): Option[DbError]
+        requires now >= 0;
+
+    """
+    The ID token kept for the session of token, taken out: Right None when
+    there is none.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, T: Region]
+    function takeIdToken(db: &![Database[Writing], R], session: Span[Nat8, T]): Either[DbError, Option[String]];
+
+    """
+    Keeps jwks as RAMBO's key set, in place of the one before.
+    """
+    generic [R: Region, J: Region]
+    function keepJwks(db: &![Database[Writing], R], jwks: Span[Nat8, J], now: Int64): Option[DbError]
+        requires now >= 0;
+
+    """
+    The key set kept last and when: Right None when none was kept.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region]
+    function knownJwks(db: &![Database[M], R]): Either[DbError, Option[String]];
+end module.

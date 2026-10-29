@@ -1,0 +1,194 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    indexOf,
+    substring,
+    toLower,
+    formatInt,
+    equal
+);
+import Standard.Http (
+    headerValue
+);
+import Standard.Cookie (
+    CookieOptions,
+    isCookieName,
+    setCookie
+);
+import Standard.FcgiServer (
+    cgiResponse,
+    cgiResponseWith,
+    isHeaderBlock
+);
+
+module body Wolly.Response is
+    -- The header lines so far each end in CRLF.  A refused header leaves
+    -- them as they were and sets refused, which stays set.
+    record Response: Linear is
+        status: Nat16;
+        contentType: Span[Nat8, Static];
+        headers: String;
+        refused: Bool;
+        invariant (status >= 100) and (status <= 599);
+    end;
+
+    function makeResponse(status: Nat16, contentType: Span[Nat8, Static]): Response is
+        return Response(status => status, contentType => contentType, headers => fromLiteral(""), refused => false);
+    end;
+
+    generic [V: Region]
+    function isHeaderValue(value: Span[Nat8, V]): Bool is
+        var i: Index := 0;
+        while i < spanLength(value) do
+            let byte: Nat8 := value[i];
+            if (byte /= 9) and ((byte < 32) or (byte > 126)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Status and Content-Type are written by finish; a second one from a
+    -- handler would give the web server two answers to choose from.
+    generic [N: Region]
+    function isOwnHeader(name: Span[Nat8, N]): Bool is
+        let lower: String := toLower(name);
+        let own: Bool := equal(asSpan(&lower), "status") or equal(asSpan(&lower), "content-type");
+        destroyString(lower);
+        return own;
+    end;
+
+    generic [N: Region, V: Region]
+    function addHeader(response: Response, name: Span[Nat8, N], value: Span[Nat8, V]): Response is
+        let { status: Nat16, contentType: Span[Nat8, Static], headers: String, refused: Bool } := response;
+        if ((not isCookieName(name)) or isOwnHeader(name)) or (not isHeaderValue(value)) then
+            return Response(status => status, contentType => contentType, headers => headers, refused => true);
+        else
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, asSpan(&headers));
+            destroyString(headers);
+            writeString(&!out, name);
+            writeString(&!out, ": ");
+            writeString(&!out, value);
+            writeString(&!out, "\r\n");
+            return Response(status => status, contentType => contentType, headers => finalize(out), refused => refused);
+        end if;
+    end;
+
+    -- formatInt of Standard.Text; the requires of the declaration keeps the minus sign out.
+    function decimalText(value: Int64): String is
+        return formatInt(value);
+    end;
+
+    generic [N: Region]
+    function addNumberHeader(response: Response, name: Span[Nat8, N], value: Int64): Response is
+        let text: String := decimalText(value);
+        let added: Response := addHeader(response, name, asSpan(&text));
+        destroyString(text);
+        return added;
+    end;
+
+    generic [N: Region, V: Region, P: Region]
+    function addCookie(response: Response, name: Span[Nat8, N], value: Span[Nat8, V], path: Span[Nat8, P],
+                       options: CookieOptions): Response is
+        case setCookie(name, value, path, options) of
+            when Some(value as header: String) do
+                let added: Response := addHeader(response, "Set-Cookie", asSpan(&header));
+                destroyString(header);
+                return added;
+            when None do
+                let { status: Nat16, contentType: Span[Nat8, Static], headers: String, refused: Bool } := response;
+                return Response(status => status, contentType => contentType, headers => headers, refused => true);
+        end case;
+    end;
+
+    generic [R: Region]
+    function wasRefused(response: &[Response, R]): Bool is
+        return response->refused;
+    end;
+
+    function failed(): String is
+        return cgiResponse(500, "text/plain", "internal server error\n");
+    end;
+
+    generic [O: Region, N: Region]
+    function hasHeader(head: Span[Nat8, O], name: Span[Nat8, N]): Bool is
+        case headerValue(head, name) of
+            when Some(value as found: String) do
+                destroyString(found);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [N: Region, V: Region]
+    function withHeader(output: String, name: Span[Nat8, N], value: Span[Nat8, V]): String is
+        if ((not isCookieName(name)) or isOwnHeader(name)) or (not isHeaderValue(value)) then
+            destroyString(output);
+            return failed();
+        else
+            return insertHeader(output, name, value);
+        end if;
+    end;
+
+    -- The header goes after the CRLF of the last header line, before the
+    -- CRLF of the empty line.
+    generic [N: Region, V: Region]
+    function insertHeader(output: String, name: Span[Nat8, N], value: Span[Nat8, V]): String is
+        case indexOf(asSpan(&output), "\r\n\r\n") of
+            when Some(value as at: Index) do
+                if hasHeader(substring(asSpan(&output), 0, at + 2), name) then
+                    return output;
+                else
+                    let size: Index := length(&output);
+                    var out: StringBuilder := makeStringBuilder();
+                    writeString(&!out, substring(asSpan(&output), 0, at + 2));
+                    writeString(&!out, name);
+                    writeString(&!out, ": ");
+                    writeString(&!out, value);
+                    writeString(&!out, "\r\n");
+                    writeString(&!out, substring(asSpan(&output), at + 2, size));
+                    destroyString(output);
+                    return finalize(out);
+                end if;
+            when None do
+                destroyString(output);
+                return failed();
+        end case;
+    end;
+
+    generic [B: Region]
+    function finish(response: Response, content: Span[Nat8, B]): String is
+        let { status: Nat16, contentType: Span[Nat8, Static], headers: String, refused: Bool } := response;
+        -- Standard.FcgiServer writes the headers between the Content-Type line and the empty line; a block it
+        -- would not take is refused here as a refused header is, so that its requires never stops the programme.
+        if refused or (not isHeaderBlock(asSpan(&headers))) then
+            destroyString(headers);
+            return cgiResponse(500, "text/plain", "internal server error\n");
+        else
+            let answer: String := cgiResponseWith(status, contentType, asSpan(&headers), content);
+            destroyString(headers);
+            return answer;
+        end if;
+    end;
+end module body.

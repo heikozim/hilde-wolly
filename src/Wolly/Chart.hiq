@@ -1,0 +1,137 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    destroyFree
+);
+-- The instance TotalOrder(Int64) lives in Standard.Order, and only a
+-- module that imports from it sees it.
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Sort (
+    sort
+);
+import Wolly.Response (
+    decimalText
+);
+
+module body Wolly.Chart is
+    constant thousand: Int64 := 1000;
+    constant million: Int64 := 1000000;
+    constant billion: Int64 := 1000000000;
+    constant largest: Int64 := 9223372036854775807;
+    constant minusOne: Int64 := -1;
+
+    -- value in tenths of unit, rounded half up, as digits, a dot, the
+    -- tenth, a space and suffix.
+    function inUnits(value: Int64, unit: Int64, suffix: Span[Nat8, Static]): String is
+        let tenth: Int64 := unit / 10;
+        -- Rounded by the rest, not by adding half a tenth to value, which
+        -- could pass the largest Int64.
+        var tenths: Int64 := value / tenth;
+        if ((value - (tenths * tenth)) * 2) >= tenth then
+            tenths := tenths + 1;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        let whole: String := decimalText(tenths / 10);
+        writeString(&!out, asSpan(&whole));
+        destroyString(whole);
+        writeString(&!out, ".");
+        let part: String := decimalText(tenths - ((tenths / 10) * 10));
+        writeString(&!out, asSpan(&part));
+        destroyString(part);
+        writeString(&!out, " ");
+        writeString(&!out, suffix);
+        return finalize(out);
+    end;
+
+    function readableNumber(value: Int64): String is
+        if value >= billion then
+            return inUnits(value, billion, "G");
+        end if;
+        if value >= million then
+            return inUnits(value, million, "M");
+        end if;
+        if value >= thousand then
+            return inUnits(value, thousand, "k");
+        end if;
+        return decimalText(value);
+    end;
+
+    generic [R: Region]
+    function median(values: &[Buffer[Int64], R]): Int64 is
+        let count: Index := length(values);
+        if count = 0 then
+            return 0;
+        end if;
+        var copy: Buffer[Int64] := allocateEmpty();
+        var i: Index := 0;
+        while i < count do
+            insertBack(&!copy, nth(values, i));
+            i := i + 1;
+        end while;
+        let sorted: Buffer[Int64] := sort(copy);
+        let middle: Index := count / 2;
+        var found: Int64 := nth(&sorted, middle);
+        if (middle * 2) = count then
+            let below: Int64 := nth(&sorted, middle - 1);
+            -- The mean without the sum, which could pass the largest Int64.
+            found := below + ((found - below) / 2);
+        end if;
+        destroyFree(sorted);
+        return found;
+    end;
+
+    function barHeight(value: Int64, most: Int64): Int64 is
+        if (most <= 0) or (value <= 0) then
+            return 0;
+        end if;
+        if value >= most then
+            return 100;
+        end if;
+        -- value is below most, so value / most is below 1; the order of
+        -- the division keeps value * 100 from passing the largest Int64.
+        if value <= (largest / 100) then
+            return (value * 100) / most;
+        else
+            return value / (most / 100);
+        end if;
+    end;
+
+    function mostChangeValue(): Int64 is
+        return 1000000000000000;
+    end;
+
+    function changeTenths(today: Int64, middle: Int64): Int64 is
+        if middle = 0 then
+            return today * 10;
+        end if;
+        let difference: Int64 := (today - middle) * 10;
+        if difference >= 0 then
+            return (difference + (middle / 2)) / middle;
+        else
+            let away: Int64 := difference * minusOne;
+            return ((away + (middle / 2)) / middle) * minusOne;
+        end if;
+    end;
+end module body.

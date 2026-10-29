@@ -1,0 +1,1027 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The authenticator is played here: a key of Standard.X509, its COSE form,
+-- the authenticator data, the attestation object of the format none and
+-- the client data JSON are made by hand, as a browser sends them, and
+-- signed with the key.  Each test opens a database in memory.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    equal
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.X509 (
+    KeyKind,
+    EcP256,
+    Ed25519Key,
+    PrivateKey,
+    generateKey,
+    publicKeyDer,
+    signMessage,
+    destroyPrivateKey
+);
+import Standard.Buffer (
+    Buffer,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Standard.Cose (
+    publicKeyFromCose
+);
+import Wolly.Passkey (
+    Purpose,
+    Create,
+    Get,
+    Refusal,
+    BadName,
+    PasskeyMalformed,
+    PasskeyWrongType,
+    WrongChallenge,
+    WrongOrigin,
+    WrongParty,
+    NotVerified,
+    Attested,
+    BadKey,
+    Known,
+    Unknown,
+    BadSignature,
+    PasskeyReplayed,
+    PasskeyTooMany,
+    PasskeyEntry,
+    destroyPasskeyEntries,
+    challengeSeconds,
+    mostPasskeys,
+    removePasskeys,
+    removePasskey,
+    listPasskeys,
+    passkeyOwner,
+    registerCredential,
+    newDiscoverableChallenge,
+    authenticateDiscoverable,
+    preparePasskeys,
+    newChallenge,
+    register,
+    authenticate,
+    passkeyCount,
+    toBase64Url,
+    fromBase64Url,
+    relyingPartyId
+);
+
+module body Wolly.Passkey.Test is
+    constant rp: Span[Nat8, Static] := "wolly.example";
+    constant origin: Span[Nat8, Static] := "https://wolly.example";
+    -- The credential id the authenticator gives, 16 bytes.
+    constant credentialHex: Span[Nat8, Static] := "00112233445566778899aabbccddeeff";
+    -- A flag byte: user present 1, user verified 4, attested data 64.
+    constant presentVerifiedAttested: Nat8 := 69;
+    constant presentVerified: Nat8 := 5;
+    constant presentOnly: Nat8 := 1;
+    constant verifiedAttested: Nat8 := 68;
+    constant presentAttested: Nat8 := 65;
+
+    function nibble(digit: Nat8): Nat8 is
+        if (digit >= '0') and (digit <= '9') then
+            return digit - '0';
+        end if;
+        return (digit - 'a') + 10;
+    end;
+
+    generic [B: Region]
+    function writeHex(out: &![StringBuilder, B], hex: Span[Nat8, Static]): Unit is
+        var i: Index := 0;
+        while (i + 1) < spanLength(hex) do
+            writeByte(&~out, (nibble(hex[i]) * 16) + nibble(hex[i + 1]));
+            i := i + 2;
+        end while;
+        return nil;
+    end;
+
+    function bytesOf(hex: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeHex(&!out, hex);
+        return finalize(out);
+    end;
+
+    -- The head of a CBOR byte string of size bytes, size below 65536.
+    generic [B: Region]
+    function writeBytesHead(out: &![StringBuilder, B], size: Index): Unit is
+        case toNat8(size) of
+            when Some(value as small: Nat8) do
+                if small < 24 then
+                    writeByte(&~out, small + 64);
+                else
+                    writeByte(&~out, 88);
+                    writeByte(&~out, small);
+                end if;
+            when None do
+                case toNat16(size) of
+                    when Some(value as wide: Nat16) do
+                        writeByte(&~out, 89);
+                        writeByte(&~out, low(wide / 256));
+                        writeByte(&~out, low(wide - ((wide / 256) * 256)));
+                    when None do
+                        skip;
+                end case;
+        end case;
+        return nil;
+    end;
+
+    function low(value: Nat16): Nat8 is
+        case toNat8(value) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The COSE key of the public key der: ES256 on P-256, x and y the last
+    -- 64 bytes of its SubjectPublicKeyInfo, or EdDSA, x its last 32.
+    generic [D: Region]
+    function coseOf(der: Span[Nat8, D], ec: Bool): String is
+        let size: Index := spanLength(der);
+        var out: StringBuilder := makeStringBuilder();
+        if ec then
+            writeHex(&!out, "a5010203262001215820");
+            writeString(&!out, substring(der, size - 64, size - 32));
+            writeHex(&!out, "225820");
+            writeString(&!out, substring(der, size - 32, size));
+        else
+            writeHex(&!out, "a4010103272006215820");
+            writeString(&!out, substring(der, size - 32, size));
+        end if;
+        return finalize(out);
+    end;
+
+    -- The COSE key of der on P-256 with the alg of ES384 (-35).
+    generic [D: Region]
+    function coseOtherAlg(der: Span[Nat8, D]): String is
+        let size: Index := spanLength(der);
+        var out: StringBuilder := makeStringBuilder();
+        writeHex(&!out, "a50102033822200121");
+        writeHex(&!out, "5820");
+        writeString(&!out, substring(der, size - 64, size - 32));
+        writeHex(&!out, "225820");
+        writeString(&!out, substring(der, size - 32, size));
+        return finalize(out);
+    end;
+
+    -- The COSE key of der as coseOf writes it, without the alg: Standard.Cose
+    -- takes such a key, Wolly does not.
+    generic [D: Region]
+    function coseNoAlg(der: Span[Nat8, D], ec: Bool): String is
+        let size: Index := spanLength(der);
+        var out: StringBuilder := makeStringBuilder();
+        if ec then
+            writeHex(&!out, "a401022001215820");
+            writeString(&!out, substring(der, size - 64, size - 32));
+            writeHex(&!out, "225820");
+            writeString(&!out, substring(der, size - 32, size));
+        else
+            writeHex(&!out, "a301012006215820");
+            writeString(&!out, substring(der, size - 32, size));
+        end if;
+        return finalize(out);
+    end;
+
+    -- Authenticator data for party with flags and counter, and the
+    -- credential with cose after it when cose is not empty.
+    generic [P: Region, K: Region]
+    function authData(party: Span[Nat8, P], flags: Nat8, counter: Nat8, cose: Span[Nat8, K]): String is
+        var out: StringBuilder := makeStringBuilder();
+        case sha256(party) of
+            when Some(value as hash: String) do
+                writeString(&!out, asSpan(&hash));
+                destroyString(hash);
+            when None do
+                skip;
+        end case;
+        writeByte(&!out, flags);
+        writeHex(&!out, "000000");
+        writeByte(&!out, counter);
+        if spanLength(cose) > 0 then
+            writeHex(&!out, "00000000000000000000000000000000");
+            writeHex(&!out, "0010");
+            writeHex(&!out, credentialHex);
+            writeString(&!out, cose);
+        end if;
+        return finalize(out);
+    end;
+
+    -- Authenticator data with an attested credential whose id ends in last.
+    generic [K: Region]
+    function authDataWithId(cose: Span[Nat8, K], last: Nat8): String is
+        var out: StringBuilder := makeStringBuilder();
+        case sha256(rp) of
+            when Some(value as hash: String) do
+                writeString(&!out, asSpan(&hash));
+                destroyString(hash);
+            when None do
+                skip;
+        end case;
+        writeByte(&!out, presentVerifiedAttested);
+        writeHex(&!out, "00000000");
+        writeHex(&!out, "00000000000000000000000000000000");
+        writeHex(&!out, "0010");
+        writeHex(&!out, "00112233445566778899aabbccddee");
+        writeByte(&!out, last);
+        writeString(&!out, cose);
+        return finalize(out);
+    end;
+
+    -- An attestation object of format with the statement given in hex.
+    generic [D: Region]
+    function attestationOf(format: Span[Nat8, Static], statement: Span[Nat8, Static], data: Span[Nat8, D]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeHex(&!out, "a3");
+        writeHex(&!out, "63666d74");
+        case toNat8(spanLength(format)) of
+            when Some(value as size: Nat8) do
+                writeByte(&!out, size + 96);
+            when None do
+                skip;
+        end case;
+        writeString(&!out, format);
+        writeHex(&!out, "6761747453746d74");
+        writeHex(&!out, statement);
+        writeHex(&!out, "686175746844617461");
+        writeBytesHead(&!out, spanLength(data));
+        writeString(&!out, data);
+        return finalize(out);
+    end;
+
+    generic [C: Region, O: Region]
+    function clientOf(kind: Span[Nat8, Static], challenge: Span[Nat8, C], place: Span[Nat8, O], cross: Bool): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{\"type\":\"");
+        writeString(&!out, kind);
+        writeString(&!out, "\",\"challenge\":\"");
+        writeString(&!out, challenge);
+        writeString(&!out, "\",\"origin\":\"");
+        writeString(&!out, place);
+        if cross then
+            writeString(&!out, "\",\"crossOrigin\":true}");
+        else
+            writeString(&!out, "\",\"crossOrigin\":false}");
+        end if;
+        return finalize(out);
+    end;
+
+    -- The number of each refusal, 0 for none, -1 for an error.
+    function refusalNumber(refusal: Refusal): Int64 is
+        case refusal of
+            when BadName do
+                return 1;
+            when PasskeyMalformed do
+                return 2;
+            when PasskeyWrongType do
+                return 3;
+            when WrongChallenge do
+                return 4;
+            when WrongOrigin do
+                return 5;
+            when WrongParty do
+                return 6;
+            when NotVerified do
+                return 7;
+            when Attested do
+                return 8;
+            when BadKey do
+                return 9;
+            when Known do
+                return 10;
+            when Unknown do
+                return 11;
+            when BadSignature do
+                return 12;
+            when PasskeyReplayed do
+                return 13;
+            when PasskeyTooMany do
+                return 14;
+        end case;
+    end;
+
+    function registered(result: Either[DbError, Option[Refusal]]): Int64 is
+        case result of
+            when Left(left as error: DbError) do
+                return -1;
+            when Right(right as outcome: Option[Refusal]) do
+                case outcome of
+                    when Some(value as refusal: Refusal) do
+                        return refusalNumber(refusal);
+                    when None do
+                        return 0;
+                end case;
+        end case;
+    end;
+
+    -- 0 when the login passed for wanted, the refusal otherwise; 99 for a
+    -- login of another name.
+    function loggedIn(result: Either[DbError, Either[Refusal, String]], wanted: Span[Nat8, Static]): Int64 is
+        case result of
+            when Left(left as error: DbError) do
+                return -1;
+            when Right(right as verdict: Either[Refusal, String]) do
+                case verdict of
+                    when Left(left as refusal: Refusal) do
+                        return refusalNumber(refusal);
+                    when Right(right as name: String) do
+                        let same: Bool := equal(asSpan(&name), wanted);
+                        destroyString(name);
+                        if same then
+                            return 0;
+                        end if;
+                        return 99;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region]
+    function challengeFor(db: &![Database[Writing], R], name: Span[Nat8, Static], purpose: Purpose, now: Int64): String is
+        case newChallenge(&~db, name, purpose, now) of
+            when Right(right as made: Option[String]) do
+                case made of
+                    when Some(value as challenge: String) do
+                        return challenge;
+                    when None do
+                        assertTrue(false, "a challenge is made");
+                        return toBase64Url("");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a challenge is made");
+                return toBase64Url("");
+        end case;
+    end;
+
+    -- A registration of name with a new challenge: the client data of kind
+    -- from where, the attestation of format and statement over data.
+    generic [R: Region, D: Region]
+    function registerWith(db: &![Database[Writing], R], name: Span[Nat8, Static], challengeName: Span[Nat8, Static],
+        purpose: Purpose, kind: Span[Nat8, Static], where: Span[Nat8, Static], format: Span[Nat8, Static],
+        statement: Span[Nat8, Static], data: Span[Nat8, D], now: Int64): Int64 is
+        let challenge: String := challengeFor(&~db, challengeName, purpose, now);
+        let client: String := clientOf(kind, asSpan(&challenge), where, false);
+        let attestation: String := attestationOf(format, statement, data);
+        let result: Int64 := registered(register(&~db, name, asSpan(&client), asSpan(&attestation), rp, origin, now + 1));
+        destroyString(challenge);
+        destroyString(client);
+        destroyString(attestation);
+        return result;
+    end;
+
+    -- A login with a new challenge of challengeName, made at now and used
+    -- at at, signed by key over data, the signature changed when spoil.
+    generic [R: Region, K: Region, D: Region]
+    function loginWith(db: &![Database[Writing], R], key: &[PrivateKey, K], challengeName: Span[Nat8, Static],
+        kind: Span[Nat8, Static], where: Span[Nat8, Static], cross: Bool, data: Span[Nat8, D],
+        spoil: Bool, now: Int64, at: Int64): Int64 is
+        let challenge: String := challengeFor(&~db, challengeName, Get(), now);
+        let client: String := clientOf(kind, asSpan(&challenge), where, cross);
+        destroyString(challenge);
+        var signed: StringBuilder := makeStringBuilder();
+        writeString(&!signed, data);
+        case sha256(asSpan(&client)) of
+            when Some(value as hash: String) do
+                writeString(&!signed, asSpan(&hash));
+                destroyString(hash);
+            when None do
+                skip;
+        end case;
+        let message: String := finalize(signed);
+        let raw: String := bytesOf(credentialHex);
+        let credential: String := toBase64Url(asSpan(&raw));
+        destroyString(raw);
+        var result: Int64 := -2;
+        case signMessage(key, asSpan(&message)) of
+            when Some(value as signature: String) do
+                var spoilt: StringBuilder := makeStringBuilder();
+                writeString(&!spoilt, asSpan(&signature));
+                if spoil then
+                    writeByte(&!spoilt, 0);
+                end if;
+                let sent: String := finalize(spoilt);
+                destroyString(signature);
+                result := loggedIn(authenticate(&~db, asSpan(&credential), asSpan(&client), data, asSpan(&sent), rp, origin, at), "ann");
+                destroyString(sent);
+            when None do
+                assertTrue(false, "the key signs");
+        end case;
+        destroyString(message);
+        destroyString(credential);
+        destroyString(client);
+        return result;
+    end;
+
+    function decodes(text: Span[Nat8, Static], wanted: Span[Nat8, Static]): Bool is
+        case fromBase64Url(text) of
+            when Some(value as bytes: String) do
+                let same: Bool := equal(asSpan(&bytes), wanted);
+                destroyString(bytes);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refused(text: Span[Nat8, Static]): Bool is
+        case fromBase64Url(text) of
+            when Some(value as bytes: String) do
+                destroyString(bytes);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The public key of key as DER, empty when there is none.
+    generic [K: Region]
+    function derOf(key: &[PrivateKey, K]): String is
+        case publicKeyDer(key) of
+            when Some(value as der: String) do
+                return der;
+            when None do
+                assertTrue(false, "the public key");
+                return bytesOf("");
+        end case;
+    end;
+
+    function count(result: Either[DbError, Int64]): Int64 is
+        case result of
+            when Right(right as total: Int64) do
+                return total;
+            when Left(left as error: DbError) do
+                return -1;
+        end case;
+    end;
+
+    -- Registration and login of ann with a key of kind; ec for P-256.
+    generic [R: Region]
+    function runKey(db: &![Database[Writing], R], kind: KeyKind, ec: Bool): Unit is
+        case generateKey(kind) of
+            when Some(value as key: PrivateKey) do
+                let der: String := derOf(&key);
+                let cose: String := coseOf(asSpan(&der), ec);
+                let noAlg: String := coseNoAlg(asSpan(&der), ec);
+                case publicKeyFromCose(asSpan(&cose)) of
+                    when Some(value as made: String) do
+                        assertTrue(equal(asSpan(&made), asSpan(&der)), "the key of Standard.Cose is the DER of the key");
+                        destroyString(made);
+                    when None do
+                        assertTrue(false, "the key of Standard.Cose is the DER of the key");
+                end case;
+                destroyString(der);
+                let noAlgData: String := authData(rp, presentVerifiedAttested, 0, asSpan(&noAlg));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&noAlgData), 990) = 9, "a key that names no alg");
+                assertTrue(count(passkeyCount(&~db, "ann")) = 0, "and is not kept");
+                destroyString(noAlgData);
+                destroyString(noAlg);
+                let data: String := authData(rp, presentVerifiedAttested, 0, asSpan(&cose));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&data), 1000) = 0, "a registration passes");
+                assertTrue(count(passkeyCount(&~db, "ann")) = 1, "and keeps one passkey");
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&data), 1010) = 10, "the same credential again is known");
+                assertTrue(count(passkeyCount(&~db, "ann")) = 1, "and keeps none more");
+                destroyString(data);
+                destroyString(cose);
+                let first: String := authData(rp, presentVerified, 1, "");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&first), false, 1100, 1101) = 0, "a login passes and names ann");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&first), false, 1110, 1111) = 13, "the same counter again is replayed");
+                destroyString(first);
+                let second: String := authData(rp, presentVerified, 2, "");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&second), true, 1120, 1121) = 12, "a spoilt signature does not fit");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&second), false, 1130, 1131) = 0, "the control: the counter did not move, 2 passes");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", "https://evil.example", false, asSpan(&second), false, 1140, 1141) = 5, "another origin");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.create", origin, false, asSpan(&second), false, 1150, 1151) = 3, "client data of a registration");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, true, asSpan(&second), false, 1160, 1161) = 3, "cross-origin");
+                assertTrue(loginWith(&~db, &key, "bob", "webauthn.get", origin, false, asSpan(&second), false, 1170, 1171) = 4, "a challenge of bob");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&second), false, 1180, challengeSeconds() + 1181) = 4, "a challenge 301 seconds old");
+                destroyString(second);
+                let third: String := authData(rp, presentVerified, 3, "");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&third), false, 1190, challengeSeconds() + 1190) = 0, "the control: 300 seconds old passes");
+                destroyString(third);
+                let other: String := authData("evil.example", presentVerified, 4, "");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&other), false, 1200, 1201) = 6, "authenticator data of another party");
+                destroyString(other);
+                let unverified: String := authData(rp, presentOnly, 5, "");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&unverified), false, 1210, 1211) = 7, "a user present, not verified");
+                destroyString(unverified);
+                let absent: String := authData(rp, 4, 6, "");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&absent), false, 1220, 1221) = 7, "a user verified, not present");
+                destroyString(absent);
+                let short: String := bytesOf("0011");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&short), false, 1230, 1231) = 2, "authenticator data cut short");
+                destroyString(short);
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key is made");
+        end case;
+        return nil;
+    end;
+
+    -- A passkey that does not count reports the counter 0 every time: it passes again and again; once a
+    -- counter above 0 has been seen, 0 is a replay.
+    generic [R: Region]
+    function runUncounted(db: &![Database[Writing], R]): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                let der: String := derOf(&key);
+                let cose: String := coseOf(asSpan(&der), true);
+                destroyString(der);
+                let data: String := authData(rp, presentVerifiedAttested, 0, asSpan(&cose));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&data), 3000) = 0, "a registration passes");
+                destroyString(data);
+                destroyString(cose);
+                let zero: String := authData(rp, presentVerified, 0, "");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&zero), false, 3010, 3011) = 0, "a login at the counter 0 passes");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&zero), false, 3020, 3021) = 0, "and again: a passkey that does not count");
+                let one: String := authData(rp, presentVerified, 1, "");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&one), false, 3030, 3031) = 0, "the counter moves from 0 to 1");
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, asSpan(&zero), false, 3040, 3041) = 13, "and 0 after that is a replay");
+                destroyString(one);
+                destroyString(zero);
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key is made");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runRefusals(db: &![Database[Writing], R]): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                let der: String := derOf(&key);
+                let cose: String := coseOf(asSpan(&der), true);
+                destroyString(der);
+                let data: String := authData(rp, presentVerifiedAttested, 0, asSpan(&cose));
+                assertTrue(registerWith(&~db, "Ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&data), 2000) = 1, "a name that is no name");
+                assertTrue(registerWith(&~db, "ann", "bob", Create(), "webauthn.create", origin, "none", "a0", asSpan(&data), 2010) = 4, "a challenge of bob");
+                assertTrue(registerWith(&~db, "ann", "ann", Get(), "webauthn.create", origin, "none", "a0", asSpan(&data), 2020) = 4, "a challenge of a login");
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.get", origin, "none", "a0", asSpan(&data), 2030) = 3, "client data of a login");
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", "https://evil.example", "none", "a0", asSpan(&data), 2040) = 5, "another origin");
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "packed", "a0", asSpan(&data), 2050) = 8, "the format packed");
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a163616c6726", asSpan(&data), 2060) = 8, "a statement in the format none");
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "80", asSpan(&data), 2065) = 8, "an empty array is no empty statement");
+                destroyString(data);
+                let unverified: String := authData(rp, presentAttested, 0, asSpan(&cose));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&unverified), 2070) = 7, "a user present, not verified");
+                destroyString(unverified);
+                let absent: String := authData(rp, verifiedAttested, 0, asSpan(&cose));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&absent), 2080) = 7, "a user verified, not present");
+                destroyString(absent);
+                let other: String := authData("evil.example", presentVerifiedAttested, 0, asSpan(&cose));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&other), 2090) = 6, "another party");
+                destroyString(other);
+                let extended: String := authData(rp, presentVerifiedAttested + 128, 0, asSpan(&cose));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&extended), 2095) = 2, "extensions are not taken");
+                destroyString(extended);
+                let bare: String := authData(rp, presentVerified, 0, asSpan(&cose));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&bare), 2100) = 2, "no attested data flag");
+                destroyString(bare);
+                destroyString(cose);
+                let keyDer: String := derOf(&key);
+                let otherAlg: String := coseOtherAlg(asSpan(&keyDer));
+                destroyString(keyDer);
+                let otherData: String := authData(rp, presentVerifiedAttested, 0, asSpan(&otherAlg));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&otherData), 2105) = 9, "a P-256 key that says ES384");
+                destroyString(otherData);
+                destroyString(otherAlg);
+                -- RS256 (kty 3, alg -257) is no key taken here.
+                let rsa: String := bytesOf("a40103033901002001215820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+                let rsaData: String := authData(rp, presentVerifiedAttested, 0, asSpan(&rsa));
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&rsaData), 2110) = 9, "a key of RS256");
+                destroyString(rsaData);
+                destroyString(rsa);
+                assertTrue(count(passkeyCount(&~db, "ann")) = 0, "none of them was kept");
+                let broken: String := bytesOf("a3ff");
+                let challenge: String := challengeFor(&~db, "ann", Create(), 2120);
+                let client: String := clientOf("webauthn.create", asSpan(&challenge), origin, false);
+                assertTrue(registered(register(&~db, "ann", asSpan(&client), asSpan(&broken), rp, origin, 2121)) = 2, "an attestation that is no CBOR");
+                assertTrue(registered(register(&~db, "ann", asSpan(&client), asSpan(&broken), rp, origin, 2122)) = 4, "the challenge was spent all the same");
+                assertTrue(registered(register(&~db, "ann", "{not json", asSpan(&broken), rp, origin, 2123)) = 2, "client data that is no JSON");
+                destroyString(client);
+                destroyString(challenge);
+                destroyString(broken);
+                assertTrue(loginWith(&~db, &key, "ann", "webauthn.get", origin, false, "", false, 2130, 2131) = 11, "a login of a credential nobody has");
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key is made");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runCap(db: &![Database[Writing], R]): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                let der: String := derOf(&key);
+                let cose: String := coseOf(asSpan(&der), true);
+                destroyString(der);
+                var last: Nat8 := 0;
+                var kept: Int64 := 0;
+                while last < 20 do
+                    let data: String := authDataWithId(asSpan(&cose), last);
+                    if registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&data), 4000) = 0 then
+                        kept := kept + 1;
+                    end if;
+                    destroyString(data);
+                    last := last + 1;
+                end while;
+                assertTrue(kept = mostPasskeys(), "20 passkeys are kept");
+                let more: String := authDataWithId(asSpan(&cose), 20);
+                assertTrue(registerWith(&~db, "ann", "ann", Create(), "webauthn.create", origin, "none", "a0", asSpan(&more), 4100) = 14, "a 21st is refused");
+                destroyString(more);
+                assertTrue(count(passkeyCount(&~db, "ann")) = 20, "and not kept");
+                case removePasskeys(&~db, "ann") of
+                    when Right(right as removed: Bool) do
+                        assertTrue(removed, "the passkeys of ann are removed");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the passkeys of ann are removed");
+                end case;
+                assertTrue(count(passkeyCount(&~db, "ann")) = 0, "all of them");
+                case removePasskeys(&~db, "ann") of
+                    when Right(right as removed: Bool) do
+                        assertFalse(removed, "a second removal finds none");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "a second removal finds none");
+                end case;
+                -- A new challenge takes the place of the one before.
+                let first: String := challengeFor(&~db, "ann", Create(), 4200);
+                let second: String := challengeFor(&~db, "ann", Create(), 4200);
+                let client: String := clientOf("webauthn.create", asSpan(&first), origin, false);
+                let data: String := authDataWithId(asSpan(&cose), 1);
+                let attestation: String := attestationOf("none", "a0", asSpan(&data));
+                assertTrue(registered(register(&~db, "ann", asSpan(&client), asSpan(&attestation), rp, origin, 4201)) = 4, "the challenge before a new one is spent");
+                let fresh: String := clientOf("webauthn.create", asSpan(&second), origin, false);
+                assertTrue(registered(register(&~db, "ann", asSpan(&fresh), asSpan(&attestation), rp, origin, 4202)) = 0, "the control: the new one passes");
+                destroyString(fresh);
+                destroyString(attestation);
+                destroyString(data);
+                destroyString(client);
+                destroyString(second);
+                destroyString(first);
+                destroyString(cose);
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key is made");
+        end case;
+        return nil;
+    end;
+
+    -- A discoverable challenge for bound, or a named one for ann when bound
+    -- is empty; empty when none is made.
+    generic [R: Region]
+    function challengeOf(db: &![Database[Writing], R], bound: Span[Nat8, Static], now: Int64): String is
+        if spanLength(bound) = 0 then
+            return challengeFor(&~db, "ann", Get(), now);
+        end if;
+        case newDiscoverableChallenge(&~db, bound, now) of
+            when Right(right as made: Option[String]) do
+                case made of
+                    when Some(value as challenge: String) do
+                        return challenge;
+                    when None do
+                        return toBase64Url("");
+                end case;
+            when Left(left as error: DbError) do
+                return toBase64Url("");
+        end case;
+    end;
+
+    -- A login signed by key over data with a challenge of challengeOf for
+    -- made, checked as a discoverable login for check, or as a named one
+    -- when check is empty.
+    generic [R: Region, K: Region, D: Region]
+    function discoverWith(db: &![Database[Writing], R], key: &[PrivateKey, K], made: Span[Nat8, Static],
+        check: Span[Nat8, Static], data: Span[Nat8, D], now: Int64): Int64 is
+        let challenge: String := challengeOf(&~db, made, now);
+        let client: String := clientOf("webauthn.get", asSpan(&challenge), origin, false);
+        destroyString(challenge);
+        var signed: StringBuilder := makeStringBuilder();
+        writeString(&!signed, data);
+        case sha256(asSpan(&client)) of
+            when Some(value as hash: String) do
+                writeString(&!signed, asSpan(&hash));
+                destroyString(hash);
+            when None do
+                skip;
+        end case;
+        let message: String := finalize(signed);
+        let raw: String := bytesOf(credentialHex);
+        let credential: String := toBase64Url(asSpan(&raw));
+        destroyString(raw);
+        var result: Int64 := -2;
+        case signMessage(key, asSpan(&message)) of
+            when Some(value as signature: String) do
+                if spanLength(check) = 0 then
+                    result := loggedIn(authenticate(&~db, asSpan(&credential), asSpan(&client), data, asSpan(&signature), rp, origin, now + 1), "ann");
+                else
+                    result := loggedIn(authenticateDiscoverable(&~db, check, asSpan(&credential), asSpan(&client), data, asSpan(&signature), rp, origin, now + 1), "ann");
+                end if;
+                destroyString(signature);
+            when None do
+                assertTrue(false, "the key signs");
+        end case;
+        destroyString(message);
+        destroyString(credential);
+        destroyString(client);
+        return result;
+    end;
+
+    -- The one credential of name and when it was made, or nothing.
+    generic [R: Region]
+    function onlyPasskey(db: &![Database[Writing], R], name: Span[Nat8, Static], credential: Span[Nat8, Static],
+        made: Int64): Bool is
+        case listPasskeys(&~db, name) of
+            when Right(right as entries: Buffer[PasskeyEntry]) do
+                let fits: Bool := entriesFit(&entries, credential, made);
+                destroyPasskeyEntries(entries);
+                return fits;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    -- Whether entries is the one credential made at made, or empty when
+    -- credential is.
+    generic [E: Region]
+    function entriesFit(entries: &[Buffer[PasskeyEntry], E], credential: Span[Nat8, Static], made: Int64): Bool is
+        if spanLength(credential) = 0 then
+            return bufferLength(entries) = 0;
+        end if;
+        if bufferLength(entries) /= 1 then
+            return false;
+        end if;
+        let entry: &[PasskeyEntry, E] := nthRef(entries, 0);
+        return equal(asSpan(&(entry->credential)), credential) and (entry->createdAt = made);
+    end;
+
+    function removedCount(result: Either[DbError, Bool]): Int64 is
+        case result of
+            when Right(right as there: Bool) do
+                if there then
+                    return 1;
+                end if;
+                return 0;
+            when Left(left as error: DbError) do
+                return -1;
+        end case;
+    end;
+
+    generic [R: Region]
+    function ownerIs(db: &![Database[Writing], R], credential: Span[Nat8, Static], wanted: Span[Nat8, Static]): Bool is
+        case passkeyOwner(&~db, credential) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as owner: String) do
+                        let same: Bool := equal(asSpan(&owner), wanted);
+                        destroyString(owner);
+                        return same;
+                    when None do
+                        return spanLength(wanted) = 0;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    -- A login that names nobody: the passkey names its user.  The list, the
+    -- owner and the removal of one passkey.
+    generic [R: Region]
+    function runDiscoverable(db: &![Database[Writing], R]): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                let der: String := derOf(&key);
+                let cose: String := coseOf(asSpan(&der), true);
+                destroyString(der);
+                let data: String := authData(rp, presentVerifiedAttested, 0, asSpan(&cose));
+                let attestation: String := attestationOf("none", "a0", asSpan(&data));
+                let challenge: String := challengeFor(&~db, "ann", Create(), 5000);
+                let client: String := clientOf("webauthn.create", asSpan(&challenge), origin, false);
+                let raw: String := bytesOf(credentialHex);
+                let expected: String := toBase64Url(asSpan(&raw));
+                destroyString(raw);
+                case registerCredential(&~db, "ann", asSpan(&client), asSpan(&attestation), rp, origin, 5001) of
+                    when Right(right as verdict: Either[Refusal, String]) do
+                        case verdict of
+                            when Right(right as credential: String) do
+                                assertTrue(equal(asSpan(&credential), asSpan(&expected)), "the registration gives the credential id");
+                                destroyString(credential);
+                            when Left(left as refusal: Refusal) do
+                                assertTrue(false, "the registration gives the credential id");
+                        end case;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the registration gives the credential id");
+                end case;
+                destroyString(expected);
+                destroyString(client);
+                destroyString(challenge);
+                destroyString(attestation);
+                destroyString(data);
+                destroyString(cose);
+                assertTrue(onlyPasskey(&~db, "ann", "ABEiM0RVZneImaq7zN3u_w", 5001), "the list has the passkey and its time");
+                assertTrue(onlyPasskey(&~db, "bob", "", 0), "bob has none");
+                assertTrue(ownerIs(&~db, "ABEiM0RVZneImaq7zN3u_w", "ann"), "the credential is ann's");
+                assertTrue(ownerIs(&~db, "AAAA", ""), "an unknown credential has no owner");
+                let one: String := authData(rp, presentVerified, 1, "");
+                assertTrue(discoverWith(&~db, &key, "login-1", "login-1", asSpan(&one), 5100) = 0, "a login that names nobody logs ann in");
+                destroyString(one);
+                let two: String := authData(rp, presentVerified, 2, "");
+                assertTrue(discoverWith(&~db, &key, "login-1", "login-2", asSpan(&two), 5110) = 4, "a challenge of another login");
+                assertTrue(discoverWith(&~db, &key, "", "login-1", asSpan(&two), 5120) = 4, "a challenge for ann is no discoverable one");
+                assertTrue(discoverWith(&~db, &key, "login-1", "", asSpan(&two), 5130) = 4, "a discoverable challenge names no user");
+                assertTrue(discoverWith(&~db, &key, "login-1", "Login!", asSpan(&two), 5140) = 1, "a bound that is no name");
+                assertTrue(discoverWith(&~db, &key, "login-1", "login-1", asSpan(&two), 5150) = 0, "the control: the same login with its own challenge passes");
+                destroyString(two);
+                assertTrue(removedCount(removePasskey(&~db, "bob", "ABEiM0RVZneImaq7zN3u_w")) = 0, "bob cannot remove the passkey of ann");
+                assertTrue(ownerIs(&~db, "ABEiM0RVZneImaq7zN3u_w", "ann"), "it is still ann's");
+                assertTrue(removedCount(removePasskey(&~db, "ann", "ABEiM0RVZneImaq7zN3u_w")) = 1, "ann removes it");
+                assertTrue(onlyPasskey(&~db, "ann", "", 0), "ann has none left");
+                let three: String := authData(rp, presentVerified, 3, "");
+                assertTrue(discoverWith(&~db, &key, "login-1", "login-1", asSpan(&three), 5200) = 11, "the removed passkey logs nobody in");
+                destroyString(three);
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key is made");
+        end case;
+        return nil;
+    end;
+
+    function withDatabase(run: Int64): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case preparePasskeys(&!db) of
+                    when Some(value as error: DbError) do
+                        assertTrue(false, "the tables are made");
+                    when None do
+                        skip;
+                end case;
+                if run = 0 then
+                    runKey(&!db, EcP256(), true);
+                end if;
+                if run = 1 then
+                    runKey(&!db, Ed25519Key(), false);
+                end if;
+                if run = 2 then
+                    runRefusals(&!db);
+                end if;
+                if run = 3 then
+                    runCap(&!db);
+                end if;
+                if run = 4 then
+                    runUncounted(&!db);
+                end if;
+                if run = 5 then
+                    runDiscoverable(&!db);
+                end if;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testEs256(): Unit is
+        withDatabase(0);
+        return nil;
+    end;
+
+    function testEd25519(): Unit is
+        withDatabase(1);
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        withDatabase(2);
+        return nil;
+    end;
+
+    function testCap(): Unit is
+        withDatabase(3);
+        return nil;
+    end;
+
+    function testUncounted(): Unit is
+        withDatabase(4);
+        return nil;
+    end;
+
+    function testDiscoverable(): Unit is
+        withDatabase(5);
+        return nil;
+    end;
+
+    function testChallenge(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case preparePasskeys(&!db) of
+                    when Some(value as error: DbError) do
+                        assertTrue(false, "the tables are made");
+                    when None do
+                        skip;
+                end case;
+                let first: String := challengeFor(&!db, "ann", Create(), 3000);
+                let second: String := challengeFor(&!db, "ann", Create(), 3000);
+                assertTrue(length(&first) = 43, "32 bytes in base64url");
+                assertFalse(equal(asSpan(&first), asSpan(&second)), "two challenges differ");
+                destroyString(first);
+                destroyString(second);
+                case newChallenge(&!db, "Ann", Get(), 3000) of
+                    when Right(right as made: Option[String]) do
+                        case made of
+                            when Some(value as challenge: String) do
+                                destroyString(challenge);
+                                assertTrue(false, "no challenge for a name that is no name");
+                            when None do
+                                assertTrue(true, "no challenge for a name that is no name");
+                        end case;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "no challenge for a name that is no name");
+                end case;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testBase64Url(): Unit is
+        let question: String := toBase64Url("???");
+        assertTrue(equal(asSpan(&question), "Pz8_"), "a slash becomes an underscore");
+        destroyString(question);
+        let greater: String := toBase64Url(">>>");
+        assertTrue(equal(asSpan(&greater), "Pj4-"), "a plus becomes a hyphen");
+        destroyString(greater);
+        let short: String := toBase64Url("a");
+        assertTrue(equal(asSpan(&short), "YQ"), "no padding");
+        destroyString(short);
+        assertTrue(decodes("Pz8_", "???"), "an underscore is read as a slash");
+        assertTrue(decodes("Pj4-", ">>>"), "a hyphen as a plus");
+        assertTrue(decodes("YQ", "a"), "without padding");
+        assertTrue(decodes("", ""), "nothing is nothing");
+        assertTrue(refused("Pz8/"), "the slash of the standard alphabet is refused");
+        assertTrue(refused("Pj4+"), "and its plus");
+        assertTrue(refused("YQ=="), "and padding");
+        assertTrue(refused("Y"), "and a length no encoding has");
+        return nil;
+    end;
+
+    function partyIs(given: Span[Nat8, Static], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let id: String := relyingPartyId(given);
+        if not equal(asSpan(&id), expected) then
+            printLn(asSpan(&id));
+        end if;
+        assertTrue(equal(asSpan(&id), expected), message);
+        destroyString(id);
+        return nil;
+    end;
+
+    -- The e2e of examples/login reaches only 127.0.0.1; the brackets of
+    -- IPv6 are held here.
+    function testRelyingPartyId(): Unit is
+        partyIs("https://wolly.example", "wolly.example", "a name without a port");
+        partyIs("https://wolly.example:8443", "wolly.example", "a name, the port dropped");
+        partyIs("https://127.0.0.1:8443", "127.0.0.1", "an IPv4 address, the port dropped");
+        partyIs("https://[::1]:8443", "::1", "an IPv6 address: between the brackets, its colons kept");
+        partyIs("https://[2001:db8::7]", "2001:db8::7", "an IPv6 address without a port");
+        partyIs("http://[fe80::1", "fe80::1", "a bracket never closed: up to the end");
+        partyIs("wolly.example:8443", "wolly.example", "no scheme: the host up to its port");
+        partyIs("a://b://c.example:1", "c.example", "after the last scheme mark");
+        partyIs("https://", "", "no host at all");
+        partyIs("", "", "nothing");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,109 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+An image a visitor uploads, made safe to keep and show, after Ted Unangst's
+webs/image Vacuum: read with a bound on its pixels, scaled down to
+fit a box, and written again, so that nothing of the file comes through but
+its pixels -- no text, no EXIF, no chunk a reader might trip over.
+
+PNG only: this module has no codec for JPEG, GIF or WebP, so neither the
+rotation EXIF asks for nor the step down to JPEG when a PNG stays too large.  A PNG that is still above
+maxBytes after scaling is scaled down by a quarter again, at most eight
+times; then it is refused.  Scaling averages the source pixels each pixel of
+the result covers, in the bytes as they are (no gamma).
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Image is
+    """
+    Why an upload was not taken.
+    """
+    union ImageError: Free is
+        """
+        Not a PNG of 8 bits per channel that Standard.Png reads.
+        """
+        case NotAnImage;
+        """
+        More pixels than allowed, or a side above 16000.
+        """
+        case ImageTooLarge;
+        """
+        Still more than maxBytes after scaling down eight times.
+        """
+        case ImageTooManyBytes;
+    end;
+
+    """
+    The pixels of an image as red, green and blue, three bytes a pixel, row
+    by row: what Wolly.Bunti draws and Wolly.BuntiScan reads.
+    """
+    record RgbImage: Linear is
+        width: Index;
+        height: Index;
+        pixels: String;
+    end;
+
+    """
+    The most pixels on a side that are read: 16000, as webs/image.
+    """
+    function mostSide(): Index
+        ensures result = 16000;
+
+    """
+    The width of an image of width by height scaled to fit within maxWidth
+    by maxHeight, the proportions kept; the width as it is when it fits.
+    At least 1.  Each side above mostSide counts as mostSide.
+    """
+    function fittedWidth(width: Index, height: Index, maxWidth: Index, maxHeight: Index): Index
+        requires (width > 0) and (height > 0)
+        requires (maxWidth > 0) and (maxHeight > 0)
+        ensures (result >= 1) and (result <= width);
+
+    """
+    The height to fittedWidth.
+    """
+    function fittedHeight(width: Index, height: Index, maxWidth: Index, maxHeight: Index): Index
+        requires (width > 0) and (height > 0)
+        requires (maxWidth > 0) and (maxHeight > 0)
+        ensures (result >= 1) and (result <= height);
+
+    """
+    The PNG of width by height pixels of red, green and blue, row by row;
+    None when pixels is not width * height * 3 bytes.
+    """
+    function pngOfRgb(width: Index, height: Index, pixels: String): Option[String]
+        requires (width > 0) and (height > 0);
+
+    """
+    The pixels of the PNG in data as red, green and blue, read with at
+    most maxPixels pixels: gray is made the same in all three, alpha is
+    left out.
+    """
+    generic [R: Region]
+    function rgbOfPng(data: Span[Nat8, R], maxPixels: Index): Either[ImageError, RgbImage]
+        requires maxPixels > 0;
+
+    """
+    Frees the pixels of image.
+    No contract: it only gives the value back.
+    """
+    function destroyRgb(image: RgbImage): Unit;
+
+    """
+    The PNG in data, read with at most maxPixels pixels, scaled down to fit
+    maxWidth by maxHeight, written again; Right the bytes of the new PNG,
+    at most maxBytes.
+    """
+    generic [R: Region]
+    function vacuumPng(data: Span[Nat8, R], maxPixels: Index, maxWidth: Index, maxHeight: Index, maxBytes: Index): Either[ImageError, String]
+        requires maxPixels > 0
+        requires (maxWidth > 0) and (maxWidth <= 16000)
+        requires (maxHeight > 0) and (maxHeight <= 16000)
+        requires maxBytes > 0;
+end module.

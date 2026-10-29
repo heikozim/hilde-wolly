@@ -1,0 +1,281 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromLiteral,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    substring,
+    formatInt
+);
+import Standard.Sandbox (
+    Policy,
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    describeReport,
+    describePaths,
+    reportHas,
+    reportRefused,
+    mechanismNoNewPrivileges,
+    mechanismPledge,
+    mechanismUnveil,
+    mechanismLandlock,
+    mechanismSeccomp,
+    mechanismSeatbelt,
+    mechanismCapsicum,
+    discardPolicy
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Sort (
+    sort
+);
+import Standard.Platform (
+    systemName,
+    machineName
+);
+
+module body Wolly.Confine is
+    function serverPromises(): Span[Nat8, Static] is
+        return "stdio rpath wpath cpath flock unix fattr";
+    end;
+
+    function serverPolicy(): Policy is
+        return withSystem(allowPath(allowPromises(makePolicy(), serverPromises()), ".", "rwc"));
+    end;
+
+    function confineServer(program: Span[Nat8, Static]): Unit is
+        let report: String := describeReport(applyPolicy(serverPolicy()));
+        print(program);
+        print(": ");
+        printLn(asSpan(&report));
+        destroyString(report);
+        return nil;
+    end;
+
+    function sandboxAsked(): Bool is
+        if argumentCount() /= 2 then
+            return false;
+        end if;
+        let asked: Span[Nat8, Static] := nthArgument(1);
+        return equal(asked, "sandbox") or equal(asked, "-s");
+    end;
+
+    -- Writes text after a comma when it holds and others came before; the
+    -- count of words written so far.
+    generic [B: Region]
+    function word(b: &![StringBuilder, B], n: Index, holds: Bool, text: Span[Nat8, Static]): Index is
+        if not holds then
+            return n;
+        end if;
+        if n > 0 then
+            writeString(&~b, ", ");
+        end if;
+        writeString(&~b, text);
+        return n + 1;
+    end;
+
+    -- The words of the mechanisms that took effect, in the order the system
+    -- applies them, or the report itself when none did.
+    function mechanismWords(report: Report): String is
+        var b: StringBuilder := makeStringBuilder();
+        var n: Index := 0;
+        n := word(&!b, n, reportHas(report, mechanismNoNewPrivileges), "no-new-privileges");
+        n := word(&!b, n, reportHas(report, mechanismPledge), "pledge");
+        n := word(&!b, n, reportHas(report, mechanismUnveil), "unveil");
+        n := word(&!b, n, reportHas(report, mechanismLandlock), "landlock");
+        n := word(&!b, n, reportHas(report, mechanismSeccomp), "seccomp");
+        n := word(&!b, n, reportHas(report, mechanismSeatbelt), "seatbelt");
+        n := word(&!b, n, reportHas(report, mechanismCapsicum), "capsicum");
+        let words: String := finalize(b);
+        if n = 0 then
+            destroyString(words);
+            return describeReport(report);
+        end if;
+        var line: StringBuilder := makeStringBuilder();
+        writeString(&!line, "sandbox:     ");
+        writeString(&!line, asSpan(&words));
+        destroyString(words);
+        return finalize(line);
+    end;
+
+    -- The word for a path in the sandbox output: the name of what confines
+    -- paths on this system.
+    function pathLabel(): Span[Nat8, Static] is
+        if equal(systemName(), "openbsd") then
+            return "unveil";
+        end if;
+        if equal(systemName(), "linux") then
+            return "landlock";
+        end if;
+        if equal(systemName(), "darwin") or equal(systemName(), "macos") then
+            return "seatbelt";
+        end if;
+        return "path";
+    end;
+
+    -- The lines of paths, a path, a blank and its permissions each, as lines
+    -- of the sandbox output: the label, the path, the permissions in
+    -- parentheses.  The permissions follow the last blank of a line.
+    generic [T: Region]
+    function pathLines(paths: Span[Nat8, T]): Buffer[String] is
+        var lines: Buffer[String] := allocateEmpty();
+        var start: Index := 0;
+        var blank: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(paths) do
+            if paths[i] = ' ' then
+                blank := i;
+            end if;
+            if (paths[i] = '\n') and (blank > start) then
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "  ");
+                writeString(&!b, pathLabel());
+                writeString(&!b, ": ");
+                writeString(&!b, substring(paths, start, blank));
+                writeString(&!b, " (");
+                writeString(&!b, substring(paths, blank + 1, i));
+                writeByte(&!b, ')');
+                insertBack(&!lines, finalize(b));
+            end if;
+            if paths[i] = '\n' then
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return lines;
+    end;
+
+    -- The promises and the paths of policy, the paths sorted and each once,
+    -- one on a line, and when counted their number; the policy is given back.
+    function profileBody(promises: Span[Nat8, Static], policy: Policy, counted: Bool): String is
+        let paths: String := describePaths(&policy);
+        discardPolicy(policy);
+        var lines: Buffer[String] := sort(pathLines(asSpan(&paths)));
+        destroyString(paths);
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "  promises: ");
+        writeString(&!b, promises);
+        var distinct: Int64 := 0;
+        var i: Index := 0;
+        while i < bufferLength(&lines) do
+            var repeated: Bool := false;
+            if i > 0 then
+                repeated := equal(asSpan(nthRef(&lines, i)), asSpan(nthRef(&lines, i - 1)));
+            end if;
+            if not repeated then
+                writeByte(&!b, '\n');
+                writeString(&!b, asSpan(nthRef(&lines, i)));
+                distinct := distinct + 1;
+            end if;
+            i := i + 1;
+        end while;
+        while bufferLength(&lines) > 0 do
+            destroyString(removeLast(&!lines));
+        end while;
+        destroyEmpty(lines);
+        if counted then
+            writeString(&!b, "\n  paths: ");
+            let number: String := formatInt(distinct);
+            writeString(&!b, asSpan(&number));
+            destroyString(number);
+        end if;
+        return finalize(b);
+    end;
+
+    function printSandbox(program: Span[Nat8, Static]): Unit is
+        printProfiles(program, serverPromises(), serverPolicy());
+        return nil;
+    end;
+
+    function withSystem(policy: Policy): Policy is
+        if equal(systemName(), "linux") then
+            return allowPath(allowPath(policy, "/lib", "r"), "/usr/lib", "r");
+        end if;
+        return policy;
+    end;
+
+    function toolPolicy(promises: Span[Nat8, Static]): Policy is
+        return withSystem(allowPromises(makePolicy(), promises));
+    end;
+
+    generic [P: Region]
+    function directoryOf(path: Span[Nat8, P]): String is
+        var last: Index := spanLength(path);
+        var i: Index := 0;
+        while i < spanLength(path) do
+            if path[i] = '/' then
+                last := i;
+            end if;
+            i := i + 1;
+        end while;
+        if last = spanLength(path) then
+            return fromLiteral(".");
+        end if;
+        if last = 0 then
+            return fromLiteral("/");
+        end if;
+        return fromSpan(substring(path, 0, last));
+    end;
+
+    function confineTool(policy: Policy): Bool is
+        return not reportRefused(applyPolicy(policy));
+    end;
+
+    function printToolSandbox(program: Span[Nat8, Static], promises: Span[Nat8, Static], policy: Policy): Unit is
+        printProfiles(program, promises, policy);
+        return nil;
+    end;
+
+    -- The sandbox output: the line of this process under stdio, its profile, and the profile of
+    -- program with promises and policy.
+    function printProfiles(program: Span[Nat8, Static], promises: Span[Nat8, Static], policy: Policy): Unit is
+        let line: String := mechanismWords(applyPolicy(allowPromises(makePolicy(), "stdio")));
+        printLn(asSpan(&line));
+        destroyString(line);
+        printLn("");
+        let own: String := profileBody("stdio", makePolicy(), false);
+        printLn(asSpan(&own));
+        destroyString(own);
+        printLn("");
+        print("sandbox profile \"");
+        print(program);
+        print("\" (");
+        print(systemName());
+        print("/");
+        print(machineName());
+        printLn(")");
+        let server: String := profileBody(promises, policy, true);
+        printLn(asSpan(&server));
+        destroyString(server);
+        return nil;
+    end;
+end module body.

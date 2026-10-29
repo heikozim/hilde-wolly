@@ -1,0 +1,205 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    substring,
+    contains,
+    toLower,
+    equal
+);
+import Standard.Normalization (
+    toNfkc
+);
+import Standard.Utf8 (
+    isValid,
+    countCodePoints
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile
+);
+
+module body Wolly.Passphrase is
+    function fewestCharacters(secondFactor: Bool): Index is
+        if secondFactor then
+            return 8;
+        else
+            return 15;
+        end if;
+    end;
+
+    function mostCharacters(): Index is
+        return 256;
+    end;
+
+    function mostBytes(): Index is
+        return 1024;
+    end;
+
+    generic [P: Region]
+    function normalizedPassword(password: Span[Nat8, P]): Option[String] is
+        if (spanLength(password) > mostBytes()) or (not isValid(password)) then
+            return None();
+        end if;
+        case toNfkc(password) of
+            when Some(value as normal: String) do
+                if length(&normal) > mostBytes() then
+                    destroyString(normal);
+                    return None();
+                else
+                    return Some(value => normal);
+                end if;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [P: Region]
+    function characterCount(normalized: Span[Nat8, P]): Index is
+        case countCodePoints(normalized) of
+            when Some(value as count: Index) do
+                return count;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Whether a line of list, without its line end, is wanted, which is
+    -- in lower case already.
+    generic [L: Region, W: Region]
+    function listHolds(list: Span[Nat8, L], wanted: Span[Nat8, W]): Bool is
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(list) do
+            if (i = spanLength(list)) or (list[i] = '\n') then
+                var stop: Index := i;
+                if (stop > start) and (list[stop - 1] = '\r') then
+                    stop := stop - 1;
+                end if;
+                let line: String := toLower(substring(list, start, stop));
+                let same: Bool := equal(asSpan(&line), wanted);
+                destroyString(line);
+                if same then
+                    return true;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The content of the file at path, None when it cannot be read.
+    generic [L: Region]
+    function content(path: Span[Nat8, L]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return read;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The checks after the normalisation: lower is the password in NFKC
+    -- and in lower case, count its characters.  No linear value is held
+    -- here but the list, so each check may return at once.
+    generic [W: Region, N: Region, L: Region]
+    function judged(lower: Span[Nat8, W], count: Index, name: Span[Nat8, N], secondFactor: Bool,
+                    listPath: Span[Nat8, L]): PassphraseCheck is
+        if count < fewestCharacters(secondFactor) then
+            return TooShort();
+        end if;
+        if count > mostCharacters() then
+            return TooLong();
+        end if;
+        case content(listPath) of
+            when Some(value as list: String) do
+                let listed: Bool := listHolds(asSpan(&list), lower);
+                destroyString(list);
+                if listed then
+                    return Listed();
+                end if;
+            when None do
+                return ListUnreadable();
+        end case;
+        let named: String := toLower(name);
+        let holds: Bool := (spanLength(name) > 0) and contains(lower, asSpan(&named));
+        destroyString(named);
+        if holds then
+            return HoldsName();
+        else
+            return PassphraseFits();
+        end if;
+    end;
+
+    generic [P: Region, N: Region, L: Region]
+    function checkPassphrase(password: Span[Nat8, P], name: Span[Nat8, N], secondFactor: Bool,
+                             listPath: Span[Nat8, L]): PassphraseCheck is
+        if not isValid(password) then
+            return NotText();
+        end if;
+        case normalizedPassword(password) of
+            when Some(value as normal: String) do
+                let count: Index := characterCount(asSpan(&normal));
+                let lower: String := toLower(asSpan(&normal));
+                destroyString(normal);
+                let verdict: PassphraseCheck := judged(asSpan(&lower), count, name, secondFactor, listPath);
+                destroyString(lower);
+                return verdict;
+            when None do
+                return TooLong();
+        end case;
+    end;
+
+    function isFit(check: PassphraseCheck): Bool is
+        case check of
+            when PassphraseFits do
+                return true;
+            when TooShort do
+                return false;
+            when TooLong do
+                return false;
+            when NotText do
+                return false;
+            when Listed do
+                return false;
+            when HoldsName do
+                return false;
+            when ListUnreadable do
+                return false;
+        end case;
+    end;
+
+    function describeCheck(check: PassphraseCheck): Span[Nat8, Static] is
+        case check of
+            when PassphraseFits do
+                return "the password fits";
+            when TooShort do
+                return "the password is too short: at least 15 characters, 8 with a second factor";
+            when TooLong do
+                return "the password is too long: at most 256 characters and 1024 bytes";
+            when NotText do
+                return "the password is no UTF-8 text";
+            when Listed do
+                return "the password is on the list of known passwords";
+            when HoldsName do
+                return "the password holds the user name";
+            when ListUnreadable do
+                return "the list of known passwords cannot be read";
+        end case;
+    end;
+end module body.

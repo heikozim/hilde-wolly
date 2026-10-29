@@ -1,0 +1,132 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The key is made of the bytes of a test, not a key of any server.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Guard (
+    csrfFieldName,
+    formToken,
+    expectedOrigin,
+    changeAllowed
+);
+
+module body Wolly.Guard.Test is
+    constant testKey: Span[Nat8, Static] := "key-of-the-guard-test-32-bytes-x";
+    constant session: Span[Nat8, Static] := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    constant otherSession: Span[Nat8, Static] := "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+    generic [R: Region, S: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, S]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    -- A request from a browser: method, Sec-Fetch-Site and Origin (each
+    -- left out when empty), Host 127.0.0.1:8080, a form as content.
+    generic [B: Region]
+    function browser(verb: Span[Nat8, Static], site: Span[Nat8, Static], origin: Span[Nat8, Static],
+                     content: Span[Nat8, B]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", verb);
+        addPair(&!params, "REQUEST_URI", "/change");
+        addPair(&!params, "HTTP_HOST", "127.0.0.1:8080");
+        addPair(&!params, "CONTENT_TYPE", "application/x-www-form-urlencoded");
+        if spanLength(site) > 0 then
+            addPair(&!params, "HTTP_SEC_FETCH_SITE", site);
+        end if;
+        if spanLength(origin) > 0 then
+            addPair(&!params, "HTTP_ORIGIN", origin);
+        end if;
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(content));
+    end;
+
+    -- The form body csrf=<token of session>.
+    function goodForm(): String is
+        var form: StringBuilder := makeStringBuilder();
+        writeString(&!form, csrfFieldName());
+        writeString(&!form, "=");
+        case formToken(testKey, session) of
+            when Some(value as token: String) do
+                writeString(&!form, asSpan(&token));
+                destroyString(token);
+            when None do
+                assertTrue(false, "a token for the test session");
+        end case;
+        return finalize(form);
+    end;
+
+    function allowed(request: Request, wanted: Bool, message: Span[Nat8, Static]): Unit is
+        let answer: Bool := changeAllowed(&request, testKey, session);
+        destroyRequest(request);
+        assertTrue(answer = wanted, message);
+        return nil;
+    end;
+
+    function testChanges(): Unit is
+        let form: String := goodForm();
+        allowed(browser("POST", "same-origin", "http://127.0.0.1:8080", asSpan(&form)), true, "the control: the own page with the token");
+        allowed(browser("POST", "", "http://127.0.0.1:8080", asSpan(&form)), true, "no Sec-Fetch-Site, the own Origin");
+        allowed(browser("POST", "", "", asSpan(&form)), true, "no browser headers: the token decides");
+        allowed(browser("POST", "cross-site", "https://evil.example", asSpan(&form)), false, "another site, even with the token");
+        allowed(browser("POST", "same-site", "http://a.127.0.0.1:8080", asSpan(&form)), false, "a sibling site");
+        allowed(browser("POST", "", "http://evil.example", asSpan(&form)), false, "a foreign Origin");
+        allowed(browser("POST", "same-origin", "http://127.0.0.1:8080", "csrf="), false, "an empty token");
+        allowed(browser("POST", "same-origin", "http://127.0.0.1:8080", "other=1"), false, "no token");
+        allowed(browser("POST", "same-origin", "http://127.0.0.1:8080", "csrf=00112233"), false, "a wrong token");
+        allowed(browser("DELETE", "same-origin", "http://127.0.0.1:8080", "x=1"), false, "DELETE needs the token too");
+        allowed(browser("GET", "cross-site", "https://evil.example", "x=1"), true, "a GET changes nothing and is allowed");
+        let r1: Request := browser("POST", "same-origin", "http://127.0.0.1:8080", asSpan(&form));
+        let theirs: Bool := changeAllowed(&r1, testKey, otherSession);
+        destroyRequest(r1);
+        assertFalse(theirs, "the token of one session is worth nothing in another");
+        destroyString(form);
+        return nil;
+    end;
+
+    function testOrigin(): Unit is
+        let r1: Request := browser("GET", "", "", "");
+        case expectedOrigin(&r1) of
+            when Some(value as origin: String) do
+                let text: String := origin;
+                assertTrue(spanLength(asSpan(&text)) = 21, "http://127.0.0.1:8080");
+                destroyString(text);
+            when None do
+                assertTrue(false, "an origin from the Host");
+        end case;
+        destroyRequest(r1);
+        return nil;
+    end;
+end module body.

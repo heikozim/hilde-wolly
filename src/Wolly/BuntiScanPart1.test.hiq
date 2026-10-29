@@ -1,0 +1,370 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Codes drawn by Wolly.Bunti, written as PNG and read from it again (every
+-- picture here goes that way), turned by 0, 90, 180 and 270
+-- degrees, seen in perspective, with a colour cast and noise, read back to
+-- the very payload; pictures without a code refused; and the limits
+-- measured: the strongest perspective, cast and noise still read.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Wolly.Bunti (
+    BuntiCode,
+    BuntiMode,
+    Plain,
+    Dna,
+    BuntiLevel,
+    LevelL,
+    LevelM,
+    LevelQ,
+    LevelH,
+    BuntiError,
+    NotFound,
+    encodeBunti,
+    pixelSide,
+    buntiPixels,
+    buntiPng,
+    destroyBunti
+);
+import Wolly.BuntiScan (
+    decodeBuntiPixels,
+    decodeBuntiPng
+);
+import Wolly.Image (
+    pngOfRgb
+);
+
+module body Wolly.BuntiScanPart1.Test is
+    -- A picture: its side and its pixels.
+    record Picture: Linear is
+        side: Index;
+        pixels: String;
+    end;
+
+    function next(state: Nat32): Nat32 is
+        return modularAdd(modularMultiply(state, (1664525 : Nat32)), (1013904223 : Nat32));
+    end;
+
+    function below(state: Nat32, bound: Index): Index is
+        case toIndex(state / 65536) of
+            when Some(value as high: Index) do
+                return high - ((high / bound) * bound);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        if number > 255 then
+            return 255;
+        end if;
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as number: Index) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function fl(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as f: Float64) do
+                return f;
+            when None do
+                return 0.0;
+        end case;
+    end;
+
+    function whole(f: Float64): Index is
+        if f < 0.0 then
+            return 0;
+        end if;
+        case toInt64(f) of
+            when Some(value as n: Int64) do
+                case toIndex(n) of
+                    when Some(value as i: Index) do
+                        return i;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function payloadOf(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            let value: Index := (i * 13) + 5;
+            writeByte(&!out, narrow(value - ((value / 256) * 256)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The picture of the code of payload at scale; a white square of 30
+    -- pixels when there is no code.
+    generic [P: Region]
+    function drawn(payload: Span[Nat8, P], mode: BuntiMode, level: BuntiLevel, scale: Index): Picture is
+        case encodeBunti(payload, mode, level) of
+            when Right(right as code: BuntiCode) do
+                let side: Index := pixelSide(&code, scale);
+                let pixels: String := buntiPixels(&code, scale);
+                destroyBunti(code);
+                return Picture(side => side, pixels => pixels);
+            when Left(left as error: BuntiError) do
+                return blank(30);
+        end case;
+    end;
+
+    function blank(side: Index): Picture is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < ((side * side) * 3) do
+            writeByte(&!out, (255 : Nat8));
+            i := i + 1;
+        end while;
+        return Picture(side => side, pixels => finalize(out));
+    end;
+
+    -- The picture turned by a quarter, clockwise.
+    function turned(picture: Picture): Picture is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        var out: StringBuilder := makeStringBuilder();
+        var y: Index := 0;
+        while y < side do
+            var x: Index := 0;
+            while x < side do
+                -- the pixel at (x, y) of the turned picture was at (y, side - 1 - x)
+                let at: Index := ((((side - 1) - x) * side) + y) * 3;
+                writeByte(&!out, pixelByte(&pixels, at));
+                writeByte(&!out, pixelByte(&pixels, at + 1));
+                writeByte(&!out, pixelByte(&pixels, at + 2));
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        destroyString(pixels);
+        return Picture(side => side, pixels => finalize(out));
+    end;
+
+    generic [S: Region]
+    function pixelByte(pixels: &[String, S], at: Index): Nat8 is
+        let all: Span[Nat8, S] := asSpan(pixels);
+        return all[at];
+    end;
+
+    -- A colour cast of strength percent: red up, blue down, all a little
+    -- darker; then noise of amplitude up and down on every value.
+    function cast(picture: Picture, strength: Index, amplitude: Index, seed: Nat32): Picture is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        var state: Nat32 := seed;
+        var out: StringBuilder := makeStringBuilder();
+        let count: Index := (side * side) * 3;
+        var i: Index := 0;
+        while i < count do
+            var value: Index := wide(pixelByte(&pixels, i));
+            let channel: Index := i - ((i / 3) * 3);
+            if channel = 0 then
+                value := ((value * ((100 : Index) - (strength / 2))) / 100) + strength;
+            end if;
+            if channel = 1 then
+                value := (value * ((100 : Index) - (strength / 2))) / 100;
+            end if;
+            if channel = 2 then
+                value := (value * ((100 : Index) - strength)) / 100;
+            end if;
+            if amplitude > 0 then
+                state := next(state);
+                let noise: Index := below(state, (amplitude * 2) + 1);
+                value := value + noise;
+                if value >= amplitude then
+                    value := value - amplitude;
+                else
+                    value := (0 : Index);
+                end if;
+            end if;
+            writeByte(&!out, narrow(value));
+            i := i + 1;
+        end while;
+        destroyString(pixels);
+        return Picture(side => side, pixels => finalize(out));
+    end;
+
+    -- Whether the picture, written as PNG and read again, reads to payload.
+    generic [P: Region]
+    function reads(picture: Picture, payload: Span[Nat8, P]): Bool is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        var good: Bool := false;
+        case pngOfRgb(side, side, pixels) of
+            when Some(value as png: String) do
+                case decodeBuntiPng(asSpan(&png), 16000000) of
+                    when Right(right as back: String) do
+                        good := equal(asSpan(&back), payload);
+                        destroyString(back);
+                    when Left(left as error: BuntiError) do
+                        skip;
+                end case;
+                destroyString(png);
+            when None do
+                skip;
+        end case;
+        return good;
+    end;
+
+    -- Measured: the strongest perspective, cast and noise at which a code
+    -- of 120 bytes at M, 6 pixels a cell, still reads, each alone.
+    -- sin and cos of x in radians, |x| <= pi, by their series to x^17.
+    function sine(x: Float64): Float64 is
+        var term: Float64 := x;
+        var sum: Float64 := x;
+        var k: Index := 1;
+        while k <= 8 do
+            term := (0.0 - term) * ((x * x) / (fl(k * 2) * fl((k * 2) + 1)));
+            sum := sum + term;
+            k := k + 1;
+        end while;
+        return sum;
+    end;
+
+    function cosine(x: Float64): Float64 is
+        var term: Float64 := 1.0;
+        var sum: Float64 := 1.0;
+        var k: Index := 1;
+        while k <= 8 do
+            term := (0.0 - term) * ((x * x) / (fl((k * 2) - 1) * fl(k * 2)));
+            sum := sum + term;
+            k := k + 1;
+        end while;
+        return sum;
+    end;
+
+    -- The picture turned by degrees clockwise about its middle, on a white
+    -- canvas half as large again; each pixel the nearest of the picture.
+    function rotatedBy(picture: Picture, degrees: Index): Picture is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        let canvas: Index := (side * 3) / 2;
+        let angle: Float64 := (fl(degrees) * 3.141592653589793) / 180.0;
+        let c: Float64 := cosine(angle);
+        let s: Float64 := sine(angle);
+        let middle: Float64 := fl(canvas) / 2.0;
+        let half: Float64 := fl(side) / 2.0;
+        var out: StringBuilder := makeStringBuilder();
+        var y: Index := 0;
+        while y < canvas do
+            var x: Index := 0;
+            while x < canvas do
+                let dx: Float64 := (fl(x) + 0.5) - middle;
+                let dy: Float64 := (fl(y) + 0.5) - middle;
+                -- the point of the picture that lands here, turned back
+                let px: Float64 := ((c * dx) + (s * dy)) + half;
+                let py: Float64 := ((c * dy) - (s * dx)) + half;
+                if (((px >= 0.0) and (py >= 0.0)) and (px < fl(side))) and (py < fl(side)) then
+                    let at: Index := ((whole(py) * side) + whole(px)) * 3;
+                    writeByte(&!out, pixelByte(&pixels, at));
+                    writeByte(&!out, pixelByte(&pixels, at + 1));
+                    writeByte(&!out, pixelByte(&pixels, at + 2));
+                else
+                    writeByte(&!out, (255 : Nat8));
+                    writeByte(&!out, (255 : Nat8));
+                    writeByte(&!out, (255 : Nat8));
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        destroyString(pixels);
+        return Picture(side => canvas, pixels => finalize(out));
+    end;
+
+    -- The picture scaled by over / under, each pixel the nearest.
+    function scaled(picture: Picture, over: Index, under: Index): Picture is
+        let { side as side: Index, pixels as pixels: String } := picture;
+        let size: Index := (side * over) / under;
+        var out: StringBuilder := makeStringBuilder();
+        var y: Index := 0;
+        while y < size do
+            var x: Index := 0;
+            while x < size do
+                let sx: Index := (x * under) / over;
+                let sy: Index := (y * under) / over;
+                let at: Index := ((sy * side) + sx) * 3;
+                writeByte(&!out, pixelByte(&pixels, at));
+                writeByte(&!out, pixelByte(&pixels, at + 1));
+                writeByte(&!out, pixelByte(&pixels, at + 2));
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        destroyString(pixels);
+        return Picture(side => size, pixels => finalize(out));
+    end;
+
+    -- Free turns, every 5 degrees from 0 to 90 (all 19
+    -- read), and every 15 degrees with cast 20, noise 20 and a scale of 5/4.
+    function testFreeTurns(): Unit is
+        let payload: String := payloadOf(120);
+        var d: Index := 0;
+        var good: Index := 0;
+        while d <= 90 do
+            if reads(rotatedBy(drawn(asSpan(&payload), Plain(), LevelM(), 6), d), asSpan(&payload)) then
+                good := good + 1;
+            end if;
+            d := d + 5;
+        end while;
+        assertTrue(good = 19, "turned by every 5 degrees from 0 to 90: all 19 read");
+        var e: Index := 0;
+        var mixed: Index := 0;
+        while e <= 90 do
+            if reads(cast(scaled(rotatedBy(drawn(asSpan(&payload), Plain(), LevelM(), 6), e), 5, 4), 20, 20, 5), asSpan(&payload)) then
+                mixed := mixed + 1;
+            end if;
+            e := e + 15;
+        end while;
+        assertTrue(mixed = 7, "turned by every 15 degrees, cast 20, noise 20, scaled 5/4: all 7 read");
+        destroyString(payload);
+        return nil;
+    end;
+end module body.

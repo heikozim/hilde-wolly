@@ -1,0 +1,253 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Wolly.Limit: every statement is a
+-- constant, every value is bound, the table is strict.  The use of a value
+-- is a number one above the highest of its scope, not a time: two uses in
+-- one second stay in order.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withInt64,
+    withText,
+    withBytes,
+    begin,
+    commit,
+    rollback,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnBytes,
+    finish
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.Cache is
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_cache (scope TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL, PRIMARY KEY (scope, key)) STRICT";
+    constant makeIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_cache_used ON wolly_cache (scope, used)";
+    constant dropRunOut: Span[Nat8, Static] := "DELETE FROM wolly_cache WHERE scope = ? AND expires <= ?";
+    constant putValue: Span[Nat8, Static] := "INSERT INTO wolly_cache (scope, key, value, expires, used) VALUES (?1, ?2, ?3, ?4, (SELECT coalesce(max(used), 0) + 1 FROM wolly_cache WHERE scope = ?1)) ON CONFLICT (scope, key) DO UPDATE SET value = excluded.value, expires = excluded.expires, used = excluded.used";
+    constant countScope: Span[Nat8, Static] := "SELECT count(*) FROM wolly_cache WHERE scope = ?";
+    constant dropLeastUsed: Span[Nat8, Static] := "DELETE FROM wolly_cache WHERE scope = ?1 AND key IN (SELECT key FROM wolly_cache WHERE scope = ?1 ORDER BY used LIMIT ?2)";
+    constant getValue: Span[Nat8, Static] := "SELECT value FROM wolly_cache WHERE scope = ? AND key = ? AND expires > ?";
+    constant markUsed: Span[Nat8, Static] := "UPDATE wolly_cache SET used = (SELECT max(used) + 1 FROM wolly_cache WHERE scope = ?1) WHERE scope = ?1 AND key = ?2";
+    constant dropKey: Span[Nat8, Static] := "DELETE FROM wolly_cache WHERE scope = ? AND key = ?";
+    constant dropScope: Span[Nat8, Static] := "DELETE FROM wolly_cache WHERE scope = ?";
+
+    function mostCacheBytes(): Index is
+        return 1048576;
+    end;
+
+    function mostKeyBytes(): Index is
+        return 255;
+    end;
+
+    -- The statements PostgreSQL does not take as SQLite does: the table
+    -- without STRICT, BYTEA for BLOB and BIGINT for INTEGER, and the three statements that use a
+    -- number again (?1), which Standard.Database cannot number for PostgreSQL ($1 takes its place).
+    constant makeTablePg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_cache (scope TEXT NOT NULL, key TEXT NOT NULL, value BYTEA NOT NULL, expires BIGINT NOT NULL, used BIGINT NOT NULL, PRIMARY KEY (scope, key))";
+    constant putValuePg: Span[Nat8, Static] := "INSERT INTO wolly_cache (scope, key, value, expires, used) VALUES ($1, $2, $3, $4, (SELECT coalesce(max(used), 0) + 1 FROM wolly_cache WHERE scope = $1)) ON CONFLICT (scope, key) DO UPDATE SET value = excluded.value, expires = excluded.expires, used = excluded.used";
+    constant dropLeastUsedPg: Span[Nat8, Static] := "DELETE FROM wolly_cache WHERE scope = $1 AND key IN (SELECT key FROM wolly_cache WHERE scope = $1 ORDER BY used LIMIT $2)";
+    constant markUsedPg: Span[Nat8, Static] := "UPDATE wolly_cache SET used = (SELECT max(used) + 1 FROM wolly_cache WHERE scope = $1) WHERE scope = $1 AND key = $2";
+
+    -- Runs one statement without values that returns no rows.
+    generic [R: Region]
+    function run(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Option[DbError] is
+        case execute(&~db, sql, noValues()) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepareCache(db: &![Database[Writing], R]): Option[DbError] is
+        let table: Span[Nat8, Static] := pick(&db, makeTable, makeTablePg);
+        case run(&~db, table) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                return run(&~db, makeIndex);
+        end case;
+    end;
+
+    -- The values of scope.
+    generic [R: Region, S: Region]
+    function counted(db: &![Database[Writing], R], scope: Span[Nat8, S]): Either[DbError, Int64] is
+        var cursor: Cursor := start(&~db, countScope, withText(noValues(), scope));
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => count);
+        end case;
+    end;
+
+    -- The work of cachePut inside its transaction.
+    generic [R: Region, S: Region, K: Region, V: Region]
+    function put(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K], value: Span[Nat8, V],
+                 now: Int64, seconds: Int64, most: Int64): Option[DbError] is
+        case execute(&~db, dropRunOut, withInt64(withText(noValues(), scope), now)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        let insert: Span[Nat8, Static] := pick(&db, putValue, putValuePg);
+        case execute(&~db, insert, withInt64(withBytes(withText(withText(noValues(), scope), key), value), now + seconds)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as put: Nat64) do
+                skip;
+        end case;
+        case counted(&~db, scope) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as count: Int64) do
+                if count > most then
+                    let trim: Span[Nat8, Static] := pick(&db, dropLeastUsed, dropLeastUsedPg);
+                    case execute(&~db, trim, withInt64(withText(noValues(), scope), count - most)) of
+                        when Left(left as error: DbError) do
+                            return Some(value => error);
+                        when Right(right as dropped: Nat64) do
+                            return None();
+                    end case;
+                end if;
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, S: Region, K: Region, V: Region]
+    function cachePut(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K],
+                      value: Span[Nat8, V], now: Int64, seconds: Int64, most: Int64): Option[DbError] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as open: Transaction) do
+                case put(&~db, scope, key, value, now, seconds, most) of
+                    when Some(value as error: DbError) do
+                        rollback(&~db, open);
+                        return Some(value => error);
+                    when None do
+                        case commit(&~db, open) of
+                            when Left(left as error: DbError) do
+                                return Some(value => error);
+                            when Right(right as done: Unit) do
+                                return None();
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The work of cacheGet inside its transaction.
+    generic [R: Region, S: Region, K: Region]
+    function get(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K], now: Int64): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, getValue, withInt64(withText(withText(noValues(), scope), key), now));
+        if not advance(&!cursor) then
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return Left(left => error);
+                when None do
+                    return Right(right => None());
+            end case;
+        else
+            let text: String := fromSpan(columnBytes(&cursor, 0));
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    destroyString(text);
+                    return Left(left => error);
+                when None do
+                    return marked(&~db, scope, key, text);
+            end case;
+        end if;
+    end;
+
+    -- text, once its use is counted.
+    generic [R: Region, S: Region, K: Region]
+    function marked(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K], text: String): Either[DbError, Option[String]] is
+        let mark: Span[Nat8, Static] := pick(&db, markUsed, markUsedPg);
+        case execute(&~db, mark, withText(withText(noValues(), scope), key)) of
+            when Left(left as error: DbError) do
+                destroyString(text);
+                return Left(left => error);
+            when Right(right as marked: Nat64) do
+                let some: Option[String] := Some(value => text);
+                return Right(right => some);
+        end case;
+    end;
+
+    generic [R: Region, S: Region, K: Region]
+    function cacheGet(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K],
+                      now: Int64): Either[DbError, Option[String]] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as open: Transaction) do
+                case get(&~db, scope, key, now) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, open);
+                        return Left(left => error);
+                    when Right(right as found: Option[String]) do
+                        case commit(&~db, open) of
+                            when Left(left as error: DbError) do
+                                case found of
+                                    when Some(value as lost: String) do
+                                        destroyString(lost);
+                                    when None do
+                                        skip;
+                                end case;
+                                return Left(left => error);
+                            when Right(right as done: Unit) do
+                                return Right(right => found);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, S: Region, K: Region]
+    function cacheDrop(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K]): Either[DbError, Bool] is
+        case execute(&~db, dropKey, withText(withText(noValues(), scope), key)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                let there: Bool := dropped > 0;
+                return Right(right => there);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function cacheClear(db: &![Database[Writing], R], scope: Span[Nat8, S]): Either[DbError, Int64] is
+        case execute(&~db, dropScope, withText(noValues(), scope)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                case toInt64(dropped) of
+                    when Some(value as count: Int64) do
+                        return Right(right => count);
+                    when None do
+                        let most: Int64 := 9223372036854775807;
+                        return Right(right => most);
+                end case;
+        end case;
+    end;
+end module body.

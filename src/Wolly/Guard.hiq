@@ -1,0 +1,162 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Csrf (
+    csrfToken,
+    csrfValid,
+    changingMethod,
+    sameOriginRequest
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam
+);
+import Wolly.Request (
+    requestMethod,
+    formValue
+);
+
+module body Wolly.Guard is
+    constant fieldName: Span[Nat8, Static] := "csrf";
+
+    function csrfFieldName(): Span[Nat8, Static] is
+        return fieldName;
+    end;
+
+    generic [K: Region, T: Region]
+    function formToken(key: Span[Nat8, K], sessionToken: Span[Nat8, T]): Option[String] is
+        return csrfToken(key, sessionToken);
+    end;
+
+    -- Whether host can be a host and port: letters, digits, dot, hyphen,
+    -- colon, and the brackets of an IPv6 address.
+    generic [H: Region]
+    function isHost(host: Span[Nat8, H]): Bool is
+        if (spanLength(host) = 0) or (spanLength(host) > 255) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(host) do
+            let byte: Nat8 := host[i];
+            let letter: Bool := ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let mark: Bool := (((byte = '.') or (byte = '-')) or (byte = ':')) or ((byte = '[') or (byte = ']'));
+            if not ((letter or digit) or mark) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [F: Region]
+    function isOn(flag: Span[Nat8, F]): Bool is
+        if spanLength(flag) /= 2 then
+            return false;
+        end if;
+        return (flag[0] = 'o') and (flag[1] = 'n');
+    end;
+
+    generic [R: Region]
+    function httpsOn(request: &[Request, R]): Bool is
+        case requestParam(request, "HTTPS") of
+            when Some(value as flag: String) do
+                let on: Bool := isOn(asSpan(&flag));
+                destroyString(flag);
+                return on;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function expectedOrigin(request: &[Request, R]): Option[String] is
+        case requestParam(request, "HTTP_HOST") of
+            when Some(value as host: String) do
+                if not isHost(asSpan(&host)) then
+                    destroyString(host);
+                    return None();
+                else
+                    var origin: StringBuilder := makeStringBuilder();
+                    if httpsOn(request) then
+                        writeString(&!origin, "https://");
+                    else
+                        writeString(&!origin, "http://");
+                    end if;
+                    writeString(&!origin, asSpan(&host));
+                    destroyString(host);
+                    return Some(value => finalize(origin));
+                end if;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- A parameter of the request, or the empty string when there is none.
+    generic [R: Region]
+    function paramOrEmpty(request: &[Request, R], name: Span[Nat8, Static]): String is
+        case requestParam(request, name) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [R: Region]
+    function fromOwnOrigin(request: &[Request, R]): Bool is
+        case expectedOrigin(request) of
+            when Some(value as own: String) do
+                let site: String := paramOrEmpty(request, "HTTP_SEC_FETCH_SITE");
+                let origin: String := paramOrEmpty(request, "HTTP_ORIGIN");
+                let same: Bool := sameOriginRequest(asSpan(&site), asSpan(&origin), asSpan(&own));
+                destroyString(site);
+                destroyString(origin);
+                destroyString(own);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, T: Region]
+    function changeAllowed(request: &[Request, R], key: Span[Nat8, K], sessionToken: Span[Nat8, T]): Bool is
+        var changing: Bool := true;
+        case requestMethod(request) of
+            when Some(value as verb: String) do
+                changing := changingMethod(asSpan(&verb));
+                destroyString(verb);
+            when None do
+                skip;
+        end case;
+        if not changing then
+            return true;
+        end if;
+        if not fromOwnOrigin(request) then
+            return false;
+        end if;
+        case formValue(request, fieldName) of
+            when Some(value as submitted: String) do
+                let valid: Bool := csrfValid(key, sessionToken, asSpan(&submitted));
+                destroyString(submitted);
+                return valid;
+            when None do
+                return false;
+        end case;
+    end;
+end module body.

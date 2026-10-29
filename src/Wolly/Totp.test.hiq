@@ -1,0 +1,301 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database in memory.  The expected codes are made here
+-- from the secret startEnrolment gives out, with Standard.Otp.hotp, at the
+-- steps of now = 1000020, which is step 33334 of 30 seconds.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    startsWith,
+    contains
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Base32 (
+    decodeBase32
+);
+import Standard.Otp (
+    OtpHash,
+    OtpSha1,
+    OtpSha256,
+    hotp
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Totp (
+    stepSeconds,
+    codeDigits,
+    prepareTotp,
+    totpEnabled,
+    startEnrolment,
+    confirmEnrolment,
+    checkCode,
+    removeTotp,
+    otpauthFor,
+    confirmEnrolmentWith,
+    checkCodeWith,
+    otpauthWith
+);
+
+module body Wolly.Totp.Test is
+    constant key: Span[Nat8, Static] := "0123456789abcdef0123456789abcdef";
+    constant otherKey: Span[Nat8, Static] := "0123456789abcdef0123456789abcdeX";
+    constant now: Int64 := 1000020;
+    constant step: Nat64 := 33334;
+    constant one: Nat64 := 1;
+
+    function yes(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertTrue(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function no(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertFalse(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- The code of the base32 secret at counter, or the empty string.
+    generic [S: Region]
+    function codeOf(secret: Span[Nat8, S], counter: Nat64): String is
+        case decodeBase32(secret) of
+            when Some(value as seed: String) do
+                let made: Option[String] := hotp(asSpan(&seed), counter, 6, OtpSha256());
+                destroyString(seed);
+                case made of
+                    when Some(value as code: String) do
+                        return code;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The secret of a start for name, or the empty string.
+    generic [R: Region]
+    function started(db: &![Database[Writing], R], name: Span[Nat8, Static]): String is
+        case startEnrolment(&~db, key, name) of
+            when Right(right as given: Option[String]) do
+                case given of
+                    when Some(value as secret: String) do
+                        return secret;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when Left(left as error: DbError) do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R]): Unit is
+        case prepareTotp(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table could not be made");
+            when None do
+                skip;
+        end case;
+        case prepareTotp(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a second prepareTotp fails");
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runEnrolment(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        no(totpEnabled(&~db, "ann"), "nobody has the factor on at first");
+        let secret: String := started(&~db, "ann");
+        assertTrue(length(&secret) = 32, "20 bytes are 32 digits of base32");
+        no(totpEnabled(&~db, "ann"), "a start does not turn it on");
+        let code: String := codeOf(asSpan(&secret), step);
+        assertTrue(length(&code) = 6, "the expected code has 6 digits");
+        no(checkCode(&~db, key, "ann", asSpan(&code), now), "before the confirmation no code opens");
+        no(confirmEnrolment(&~db, otherKey, "ann", asSpan(&code), now), "under another key the seed does not open");
+        no(confirmEnrolment(&~db, key, "bob", asSpan(&code), now), "nor for another name");
+        no(confirmEnrolment(&~db, key, "ann", "000000", now), "a wrong code does not confirm");
+        yes(confirmEnrolment(&~db, key, "ann", asSpan(&code), now), "the code of the app confirms");
+        yes(totpEnabled(&~db, "ann"), "and the factor is on");
+        no(confirmEnrolment(&~db, key, "ann", asSpan(&code), now), "a second confirmation finds nothing");
+        no(checkCode(&~db, key, "ann", asSpan(&code), now), "the step of the confirmation is taken");
+        case startEnrolment(&~db, key, "ann") of
+            when Right(right as given: Option[String]) do
+                case given of
+                    when Some(value as again: String) do
+                        destroyString(again);
+                        assertTrue(false, "a start while on gives nothing");
+                    when None do
+                        assertTrue(true, "a start while on gives nothing");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a start while on gives nothing");
+        end case;
+        no(checkCode(&~db, key, "ann", asSpan(&code), now), "and leaves the seed: the old step is still taken");
+        destroyString(code);
+        let next: String := codeOf(asSpan(&secret), step + one);
+        yes(checkCode(&~db, key, "ann", asSpan(&next), now), "the code of the step after now fits");
+        destroyString(secret);
+        yes(removeTotp(&~db, "ann"), "the seed is removed");
+        no(totpEnabled(&~db, "ann"), "and the factor is off");
+        no(checkCode(&~db, key, "ann", asSpan(&next), now + 60), "no code opens without a seed");
+        no(removeTotp(&~db, "ann"), "a second removal finds nothing");
+        destroyString(next);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runSteps(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        let first: String := started(&~db, "ann");
+        let second: String := started(&~db, "ann");
+        assertFalse(contains(asSpan(&first), asSpan(&second)), "a second start makes a new seed");
+        let old: String := codeOf(asSpan(&first), step);
+        no(confirmEnrolment(&~db, key, "ann", asSpan(&old), now), "the seed of the first start is replaced");
+        destroyString(old);
+        destroyString(first);
+        let before: String := codeOf(asSpan(&second), step - one);
+        yes(confirmEnrolment(&~db, key, "ann", asSpan(&before), now), "the code of the step before now fits");
+        destroyString(before);
+        let current: String := codeOf(asSpan(&second), step);
+        yes(checkCode(&~db, key, "ann", asSpan(&current), now), "then the code of now");
+        no(checkCode(&~db, key, "ann", asSpan(&current), now), "but not twice");
+        let late: String := codeOf(asSpan(&second), step - one);
+        no(checkCode(&~db, key, "ann", asSpan(&late), now), "nor a code of a step before one taken");
+        destroyString(late);
+        let far: String := codeOf(asSpan(&second), step + 2);
+        no(checkCode(&~db, key, "ann", asSpan(&far), now), "two steps ahead is too far");
+        yes(checkCode(&~db, key, "ann", asSpan(&far), now + stepSeconds()), "and fits a step later");
+        destroyString(far);
+        let gone: String := codeOf(asSpan(&second), step + 3);
+        no(checkCode(&~db, key, "ann", asSpan(&gone), now + 150), "the code of a step two steps past is too old");
+        destroyString(gone);
+        no(checkCode(&~db, key, "ann", "12345", now), "5 digits are no code");
+        no(checkCode(&~db, key, "ann", "1234567", now), "nor 7");
+        no(checkCode(&~db, key, "ann", "12a456", now), "nor a letter among digits");
+        let control: String := codeOf(asSpan(&second), step + 5);
+        yes(checkCode(&~db, key, "ann", asSpan(&control), now + 150), "the control: the code of that time fits");
+        destroyString(control);
+        destroyString(current);
+        destroyString(second);
+        return nil;
+    end;
+
+    function testEnrolment(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runEnrolment(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testSteps(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runSteps(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testUri(): Unit is
+        assertTrue((stepSeconds() = 30) and (codeDigits() = 6), "30 seconds, 6 digits");
+        let uri: String := otpauthFor("Wolly", "ann", "JBSWY3DPEHPK3PXP");
+        assertTrue(startsWith(asSpan(&uri), "otpauth://totp/"), "an otpauth URI of TOTP");
+        assertTrue(contains(asSpan(&uri), "secret=JBSWY3DPEHPK3PXP"), "with the secret");
+        assertTrue(contains(asSpan(&uri), "algorithm=SHA256"), "SHA-256, not SHA-1");
+        assertTrue(contains(asSpan(&uri), "digits=6"), "6 digits");
+        assertTrue(contains(asSpan(&uri), "period=30"), "30 seconds");
+        destroyString(uri);
+        return nil;
+    end;
+
+    -- The code of the base32 secret at counter made by hash, or empty.
+    generic [S: Region]
+    function codeWith(secret: Span[Nat8, S], counter: Nat64, hash: OtpHash): String is
+        case decodeBase32(secret) of
+            when Some(value as seed: String) do
+                let made: Option[String] := hotp(asSpan(&seed), counter, 6, hash);
+                destroyString(seed);
+                case made of
+                    when Some(value as code: String) do
+                        return code;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [R: Region]
+    function runSha1(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        let secret: String := started(&~db, "old");
+        assertTrue(length(&secret) > 0, "a seed");
+        let sha1: String := codeWith(asSpan(&secret), step, OtpSha1());
+        let sha256: String := codeWith(asSpan(&secret), step, OtpSha256());
+        no(confirmEnrolment(&~db, key, "old", asSpan(&sha1), now), "a code of SHA-1 is no code of the default");
+        yes(confirmEnrolmentWith(&~db, key, "old", asSpan(&sha1), now, OtpSha1()), "the code of SHA-1 confirms with SHA-1");
+        let next: String := codeWith(asSpan(&secret), step + one, OtpSha1());
+        yes(checkCodeWith(&~db, key, "old", asSpan(&next), now + 30, OtpSha1()), "the next code of SHA-1");
+        destroyString(next);
+        destroyString(sha1);
+        destroyString(sha256);
+        destroyString(secret);
+        return nil;
+    end;
+
+    function testSha1Choice(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runSha1(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        let uri: String := otpauthWith("RAMBO", "ann", "JBSWY3DPEHPK3PXP", OtpSha1());
+        assertTrue(contains(asSpan(&uri), "algorithm=SHA1"), "the URI names SHA-1");
+        destroyString(uri);
+        return nil;
+    end;
+end module body.

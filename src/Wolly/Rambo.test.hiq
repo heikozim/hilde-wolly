@@ -1,0 +1,730 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertSuccess,
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    startsWith,
+    contains,
+    substring,
+    equal
+);
+import Standard.Base64 (
+    encode as base64Encode
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.Jws (
+    base64UrlEncode,
+    signCompact,
+    algorithmOf
+);
+import Standard.X509 (
+    PrivateKey,
+    KeyKind,
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+    generateKey,
+    publicKeyDer,
+    publicKeyKind,
+    destroyPrivateKey
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Rambo (
+    RamboConfig,
+    RamboStart,
+    RamboError,
+    Unreachable,
+    Refused,
+    Malformed,
+    RamboTokens,
+    RamboPending,
+    makeRamboConfig,
+    destroyRamboConfig,
+    reauthSeconds,
+    pendingSeconds,
+    leewaySeconds,
+    beginLogin,
+    destroyStart,
+    pkceChallenge,
+    logoutUrl,
+    logoutForm,
+    logoutPolicy,
+    destroyRamboError,
+    destroyTokens,
+    readTokens,
+    akpPublicDer,
+    verifiedPayload,
+    idTokenProblem,
+    claimText,
+    prepareRambo,
+    keepPending,
+    takePending,
+    destroyPending,
+    keepIdToken,
+    takeIdToken,
+    keepJwks,
+    knownJwks
+);
+
+module body Wolly.Rambo.Test is
+    -- RFC 9964, Appendix A.1 (all-zero seed): the public key of ML-DSA-44,
+    -- as the reference implementations hold it.
+    constant rfcPub: Span[Nat8, Static] := "unH59k4RuutY-pxvu24U5h8YZD2rSVtHU5qRZsoBmBMcRPgmu9VuNOVdteXi1zNIXjnqJg_GAAxepLqA00Vc3lO0bzRIKu39VFD8Lhuk8l0V-cFEJC-zm7UihxiQMMUEmOFxe3x1ixkKZ0jqmqP3rKryx8tSbtcXyfea64QhT6XNje2SoMP6FViBDxLHBQo2dwjRls0k5a-XSQSu2OTOiHLoaWsLe8pQ5FLNfTDqmkrawDEdZyxr3oSWJAsHQxRjcIiVzZuvwxYy1zl2STiP2vy_fTBaPemkleynQzqPg7oPCyXEE8bjnJbrfWkbNNN8438e6tHPIX4l7zTuzz98YPhLjt_d6EBdT4MldsYe-Y4KLyjaGHcAlTkk9oa5RhRwW89T0z_t1DSO3dvfKLUGXh8gd1BD6Fz5MfgpF5NjoafnQEqDjsAAhrCXY4b-Y3yYJEdX4_dp3dRGdHG_rWcPmgX4JG7lCnser4f8QGnDriqiAzJYEXeS8LzUngg_0bx0lqv_KcyU5IaLISFO0xZSU5mmEPvdSoDnyAcV8pV44qhLtAvd29n0ehG259oRihtljTWeiu9V60a1N2tbZVl5mEqSK-6_xZvNYA1TCdzNctvweH24unV7U3wer9XA9Q6kvJWDVJ4oKaQsKMrCSMlteBJMRxWbGK7ddUq6F7GdQw-3j2M-qdJvVKm9UPjY9rc1lPgol25-oJxTu7nxGlbJUH-4m5pevAN6NyZ6lfhbjWTKlxkrEKZvQXs_Yf6cpXEwpI_ZJeriq1UC1XHIpRkDwdOY9MH3an4RdDl2r9vGl_IwlKPNdh_5aF3jLgn7PCit1FNJAwC8fIncAXgAlgcXIpRXdfJk4bBiO89GGccSyDh2EgXYdpG3XvNgGWy7npuSoNTE7WIyblAk13UQuO4sdCbMIuriCdyfE73mvwj15xgb07RZRQtFGlFTmnFcIdZ90zDrWXDbANntv7KCKwNvoTuv64bY3HiGbj-NQ-U9eMylWVpvr4hrXcES8c9K3PqHWADZC0iIOvlzFv4VBoc_wVflcOrL_SIoaNFCNBAZZq-2v5lAgpJTqVOtqJ_HVraoSfcKy5g45p-qULunXj6Jwq21fobQiKubBKKOZwcJFyJD7F4ACKXOrz-HIvSHMCWW_9dVrRuCpJw0s0aVFbRqopDNhu446nqb4_EDYQM1tTHMozPd_jKxRRD0sH75X8ZoToxFSpLBDbtdWcenxj-zBf6IGWfZnmaetjKEBYJWC7QDQx1A91pJVJCEgieCkoIfTqkeQuePpIyu48g2FG3P1zjRF-kumhUTfSjo5qS0YiZQy0E1BMs6M11EvuxXRsHClLHoy5nLYI2Sj4zjVjYyxSHyPRPGGo9hwB34yWxzYNtPPGiqXS_dNCpi_zRZwRY4lCGrQ-hYTEWIK1Dm5OlttvC4_eiQ1dv63NiGkLRJ5kJA3bICN0fzCDY-MBqnd1cWn8YVBijVkgtaoascjL9EywDgJdeHnXK0eeOvUxHHhXJVkNqcibn8O4RQdpVU60TSA-uiu675ytIjcBHC6kTv8A8pmkj_4oypPd-F92YIJC741swkYQoeIHj8rE-ThcMUkF7KqC5VORbZTRp8HsZSqgiJcIPaouuxd1-8Rxrid3fXkE6p8bkrysPYoxWEJgh7ZFsRCPDWX-yTeJwFN0PKFP1j0F6YtlLfK5wv-c4F8ZQHA_-yc_gODicy7KmWDZgbTP07e7gEWzw4MFRrndjbDQ";
+
+    generic [R: Region]
+    function urlOf(s: &[RamboStart, R]): Span[Nat8, R] is
+        return asSpan(&(s->url));
+    end;
+
+    generic [R: Region]
+    function stateOf(s: &[RamboStart, R]): Span[Nat8, R] is
+        return asSpan(&(s->state));
+    end;
+
+    generic [R: Region]
+    function nonceOf(s: &[RamboStart, R]): Span[Nat8, R] is
+        return asSpan(&(s->nonce));
+    end;
+
+    generic [R: Region]
+    function verifierOf(s: &[RamboStart, R]): Span[Nat8, R] is
+        return asSpan(&(s->verifier));
+    end;
+
+    generic [R: Region]
+    function pendingNonce(s: &[RamboPending, R]): Span[Nat8, R] is
+        return asSpan(&(s->nonce));
+    end;
+
+    generic [R: Region]
+    function pendingVerifier(s: &[RamboPending, R]): Span[Nat8, R] is
+        return asSpan(&(s->verifier));
+    end;
+
+    generic [R: Region]
+    function accessOf(s: &[RamboTokens, R]): Span[Nat8, R] is
+        return asSpan(&(s->accessToken));
+    end;
+
+    generic [R: Region]
+    function idTokenOf(s: &[RamboTokens, R]): Span[Nat8, R] is
+        return asSpan(&(s->idToken));
+    end;
+
+    generic [R: Region]
+    function refreshOf(s: &[RamboTokens, R]): Span[Nat8, R] is
+        return asSpan(&(s->refreshToken));
+    end;
+
+    generic [R: Region]
+    function expiresOf(s: &[RamboTokens, R]): Int64 is
+        return s->expiresIn;
+    end;
+
+    function config(): RamboConfig is
+        case makeRamboConfig("https://auth.example.test", "wolly-test", "", "https://app.example.test/rambo/back", "/etc/ssl/cert.pem") of
+            when Some(value as c: RamboConfig) do
+                return c;
+            when None do
+                assertTrue(false, "the test settings are taken");
+                case makeRamboConfig("https://x.test", "x", "", "https://x.test/b", "") of
+                    when Some(value as fallback: RamboConfig) do
+                        return fallback;
+                    when None do
+                        return config();
+                end case;
+        end case;
+    end;
+
+    generic [I: Region, C: Region, U: Region]
+    function taken(issuer: Span[Nat8, I], clientId: Span[Nat8, C], redirect: Span[Nat8, U]): Bool is
+        case makeRamboConfig(issuer, clientId, "", redirect, "") of
+            when Some(value as c: RamboConfig) do
+                destroyRamboConfig(c);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function testConfig(): Unit is
+        assertTrue(taken("https://auth.example.org", "lucy", "https://lucy.example/oidc/callback"), "the settings of a site");
+        assertTrue(taken("https://auth.example:8443/rambo", "tool.cli:1", "http://127.0.0.1:8765/cb"), "a port and a path, a tool on the machine");
+        assertTrue(taken("https://a.test", "c", "http://localhost/cb"), "localhost over http");
+        assertFalse(taken("http://auth.example", "lucy", "https://lucy.example/cb"), "an issuer over http");
+        assertFalse(taken("https://auth.example/", "lucy", "https://lucy.example/cb"), "an issuer with a slash at its end");
+        assertFalse(taken("https://auth.example?x=1", "lucy", "https://lucy.example/cb"), "an issuer with a query");
+        assertFalse(taken("https://auth.example#f", "lucy", "https://lucy.example/cb"), "an issuer with a fragment");
+        assertFalse(taken("https://auth.example", "", "https://lucy.example/cb"), "no client id");
+        assertFalse(taken("https://auth.example", "lu cy", "https://lucy.example/cb"), "a space in the client id");
+        assertFalse(taken("https://auth.example", "lucy", "http://lucy.example/cb"), "a redirect over http to another host");
+        assertFalse(taken("https://auth.example", "lucy", "http://127.0.0.1.evil.test/cb"), "a name that begins like the loopback");
+        assertTrue((reauthSeconds() = 900) and (pendingSeconds() = 600), "15 minutes for a sign-in, 10 for a callback");
+        assertTrue(leewaySeconds() = 60, "a minute of clock skew");
+        return nil;
+    end;
+
+    -- RFC 7636, Appendix B.
+    function testPkce(): Unit is
+        let challenge: String := pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+        assertTrue(equal(asSpan(&challenge), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"), "the challenge of RFC 7636");
+        destroyString(challenge);
+        return nil;
+    end;
+
+    function testBegin(): Unit is
+        let c: RamboConfig := config();
+        case beginLogin(&c, reauthSeconds(), false) of
+            when Some(value as start: RamboStart) do
+                let url: Span[Nat8, Static] := "https://auth.example.test/authorize?response_type=code&client_id=wolly-test&redirect_uri=https%3A%2F%2Fapp.example.test%2Frambo%2Fback&scope=openid%20email%20profile&state=";
+                assertTrue(startsWith(urlOf(&start), url), "the authorize URL, encoded");
+                assertTrue(contains(urlOf(&start), "&code_challenge_method=S256&max_age=900"), "S256 and max_age");
+                assertFalse(contains(urlOf(&start), "prompt="), "no prompt unless silent");
+                assertTrue(((spanLength(stateOf(&start)) = 43) and (spanLength(nonceOf(&start)) = 43)) and (spanLength(verifierOf(&start)) = 43), "32 random bytes each, base64url");
+                assertFalse(equal(stateOf(&start), nonceOf(&start)), "state and nonce differ");
+                let challenge: String := pkceChallenge(verifierOf(&start));
+                assertTrue(contains(urlOf(&start), asSpan(&challenge)), "the challenge of the verifier kept");
+                assertFalse(contains(urlOf(&start), verifierOf(&start)), "the verifier never leaves the server");
+                destroyString(challenge);
+                destroyStart(start);
+            when None do
+                assertTrue(false, "a sign-in begins");
+        end case;
+        case beginLogin(&c, (-1 : Int64), true) of
+            when Some(value as silent: RamboStart) do
+                assertTrue(contains(urlOf(&silent), "&prompt=none"), "prompt=none when silent");
+                assertFalse(contains(urlOf(&silent), "max_age"), "no max_age when it is negative");
+                destroyStart(silent);
+            when None do
+                assertTrue(false, "a silent sign-in begins");
+        end case;
+        destroyRamboConfig(c);
+        return nil;
+    end;
+
+    function testLogout(): Unit is
+        let c: RamboConfig := config();
+        let full: String := logoutUrl(&c, "a.b.c", "https://app.example.test/?bye=1", "s 1");
+        assertTrue(equal(asSpan(&full), "https://auth.example.test/logout?client_id=wolly-test&id_token_hint=a.b.c&post_logout_redirect_uri=https%3A%2F%2Fapp.example.test%2F%3Fbye%3D1&state=s%201"), "the logout URL with hint, return and state");
+        destroyString(full);
+        let bare: String := logoutUrl(&c, "", "", "");
+        assertTrue(equal(asSpan(&bare), "https://auth.example.test/logout?client_id=wolly-test"), "only the client id when the rest is empty");
+        destroyString(bare);
+        destroyRamboConfig(c);
+        return nil;
+    end;
+
+    function testLogoutForm(): Unit is
+        let c: RamboConfig := config();
+        let page: String := logoutForm(&c, "a\".b<c", "https://app.example.test/?bye=1&x=2", "s 1");
+        assertTrue(contains(asSpan(&page), "<form method=\"post\" action=\"https://auth.example.test/logout\">"), "the form posts to /logout");
+        assertTrue(contains(asSpan(&page), "name=\"client_id\" value=\"wolly-test\""), "the client id");
+        assertTrue(contains(asSpan(&page), "name=\"id_token_hint\" value=\"a&#34;.b&lt;c\""), "the hint, escaped");
+        assertTrue(contains(asSpan(&page), "name=\"post_logout_redirect_uri\" value=\"https://app.example.test/?bye=1&amp;x=2\""), "the return, escaped");
+        assertTrue(contains(asSpan(&page), "name=\"state\" value=\"s 1\""), "the state");
+        assertTrue(contains(asSpan(&page), "<script>document.forms[0].submit();</script>"), "it submits itself");
+        assertTrue(contains(asSpan(&page), "<noscript>"), "and has a button without script");
+        assertTrue(contains(asSpan(&page), "content=\"no-referrer\""), "no referrer");
+        destroyString(page);
+        let bare: String := logoutForm(&c, "", "", "");
+        assertFalse(contains(asSpan(&bare), "id_token_hint"), "no hint when it is empty");
+        assertFalse(contains(asSpan(&bare), "name=\"state\""), "no state when it is empty");
+        destroyString(bare);
+        let policy: String := logoutPolicy(&c);
+        assertTrue(equal(asSpan(&policy), "default-src 'none'; script-src 'sha256-8lDeP0UDwCO6/RhblgeH/ctdBzjVpJxrXizsnIk3cEQ='; form-action 'self' https://auth.example.test/logout; base-uri 'none'; frame-ancestors 'none'"), "the policy");
+        destroyString(policy);
+        case makeRamboConfig("https://auth.example.test/a;b,c", "wolly-test", "", "https://app.example.test/rambo/back", "") of
+            when Some(value as odd: RamboConfig) do
+                let oddPolicy: String := logoutPolicy(&odd);
+                assertTrue(contains(asSpan(&oddPolicy), "form-action 'self' https://auth.example.test/a%3Bb%2Cc/logout; base-uri"), "a semicolon or comma of the issuer ends no directive");
+                destroyString(oddPolicy);
+                destroyRamboConfig(odd);
+            when None do
+                assertTrue(false, "an issuer with a semicolon is taken");
+        end case;
+        -- The hash in the policy is the one of the script on the page.
+        case sha256("document.forms[0].submit();") of
+            when Some(value as digest: String) do
+                let hash: String := base64Encode(asSpan(&digest));
+                assertTrue(equal(asSpan(&hash), "8lDeP0UDwCO6/RhblgeH/ctdBzjVpJxrXizsnIk3cEQ="), "the hash is the script's");
+                destroyString(hash);
+                destroyString(digest);
+            when None do
+                assertTrue(false, "libcrypto gives a SHA-256");
+        end case;
+        destroyRamboConfig(c);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function tokensRead(status: Nat16, answer: Span[Nat8, B]): Bool is
+        case readTokens(status, answer) of
+            when Right(right as tokens: RamboTokens) do
+                destroyTokens(tokens);
+                return true;
+            when Left(left as error: RamboError) do
+                destroyRamboError(error);
+                return false;
+        end case;
+    end;
+
+    generic [B: Region]
+    function refusedCode(status: Nat16, answer: Span[Nat8, B]): String is
+        case readTokens(status, answer) of
+            when Right(right as tokens: RamboTokens) do
+                destroyTokens(tokens);
+                return fromSpan("tokens");
+            when Left(left as error: RamboError) do
+                case error of
+                    when Refused(status as s: Nat16, code as code: String, description as d: String) do
+                        destroyString(d);
+                        return code;
+                    when Unreachable(detail as detail: String) do
+                        destroyString(detail);
+                        return fromSpan("unreachable");
+                    when Malformed do
+                        return fromSpan("malformed");
+                end case;
+        end case;
+    end;
+
+    function testTokens(): Unit is
+        case readTokens(200, "{\"access_token\":\"at\",\"token_type\":\"Bearer\",\"expires_in\":600,\"id_token\":\"h.p.s\",\"refresh_token\":\"rt\"}") of
+            when Right(right as tokens: RamboTokens) do
+                assertTrue(equal(accessOf(&tokens), "at") and equal(idTokenOf(&tokens), "h.p.s"), "access and ID token");
+                assertTrue(equal(refreshOf(&tokens), "rt") and (expiresOf(&tokens) = 600), "refresh token and lifetime");
+                destroyTokens(tokens);
+            when Left(left as error: RamboError) do
+                destroyRamboError(error);
+                assertTrue(false, "a token response is read");
+        end case;
+        assertTrue(tokensRead(200, "{\"access_token\":\"at\",\"token_type\":\"bearer\"}"), "bearer in any case, no ID token, no lifetime");
+        assertFalse(tokensRead(200, "{\"token_type\":\"Bearer\"}"), "no access token");
+        assertFalse(tokensRead(200, "{\"access_token\":\"at\",\"token_type\":\"mac\"}"), "a token type that is not bearer");
+        assertFalse(tokensRead(200, "{\"access_token\":\"at\",\"token_type\":\"bearers\"}"), "a type that only begins with bearer");
+        assertFalse(tokensRead(200, "not json"), "a 200 that is not JSON");
+        let grant: String := refusedCode(400, "{\"error\":\"invalid_grant\",\"error_description\":\"code spent\"}");
+        assertTrue(equal(asSpan(&grant), "invalid_grant"), "an OAuth error is passed on");
+        destroyString(grant);
+        let plain: String := refusedCode(502, "<html>bad gateway</html>");
+        assertTrue(equal(asSpan(&plain), "http_error"), "an answer without an OAuth error");
+        destroyString(plain);
+        let nameless: String := refusedCode(401, "{\"message\":\"no\"}");
+        assertTrue(equal(asSpan(&nameless), "http_error"), "JSON that names no error");
+        destroyString(nameless);
+        let bad: String := refusedCode(200, "{\"access_token\":\"\",\"token_type\":\"Bearer\"}");
+        assertTrue(equal(asSpan(&bad), "malformed"), "an empty access token is malformed");
+        destroyString(bad);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function akpJwk(alg: Span[Nat8, Static], pub: Span[Nat8, P], kid: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{\"kty\":\"AKP\",\"alg\":\"");
+        writeString(&!out, alg);
+        writeString(&!out, "\",\"kid\":\"");
+        writeString(&!out, kid);
+        writeString(&!out, "\",\"pub\":\"");
+        writeString(&!out, pub);
+        writeString(&!out, "\"}");
+        return finalize(out);
+    end;
+
+    -- Whether libcrypto makes an ML-DSA key: LibreSSL 4.3.0 does not.
+    function mlDsaOffered(): Bool is
+        case generateKey(MlDsa44()) of
+            when Some(value as key: PrivateKey) do
+                destroyPrivateKey(key);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Where ML-DSA is not offered: every kind of it is refused, and a line
+    -- says so, which scripts/test.sh refuses on Linux.
+    function notOffered(): Unit is
+        case generateKey(MlDsa65()) of
+            when Some(value as key: PrivateKey) do
+                destroyPrivateKey(key);
+                assertTrue(false, "ML-DSA-65 is refused where ML-DSA-44 is");
+            when None do
+                assertTrue(true, "ML-DSA-65 is refused where ML-DSA-44 is");
+        end case;
+        case generateKey(MlDsa87()) of
+            when Some(value as key: PrivateKey) do
+                destroyPrivateKey(key);
+                assertTrue(false, "ML-DSA-87 is refused where ML-DSA-44 is");
+            when None do
+                assertTrue(true, "ML-DSA-87 is refused where ML-DSA-44 is");
+        end case;
+        assertSuccess("ML-DSA is not offered by this libcrypto");
+        return nil;
+    end;
+
+    function testAkp(): Unit is
+        let jwk: String := akpJwk("ML-DSA-44", rfcPub, "T4xl70S7MT6Zeq6r9V9fPJGVn76wfnXJ21-gyo0Gu6o");
+        case akpPublicDer(asSpan(&jwk)) of
+            when Some(value as der: String) do
+                assertTrue(length(&der) = 1334, "SEQUENCE of 1330 bytes and its head of 4: 1334");
+                case publicKeyKind(asSpan(&der)) of
+                    when Some(value as kind: KeyKind) do
+                        assertTrue(equal(algorithmOf(kind), "ML-DSA-44"), "OpenSSL reads it as an ML-DSA-44 key");
+                    when None do
+                        -- Where libcrypto has no ML-DSA it cannot read the key.
+                        assertFalse(mlDsaOffered(), "OpenSSL reads the DER of RFC 9964's key");
+                end case;
+                destroyString(der);
+            when None do
+                assertTrue(false, "the AKP key of RFC 9964 is read");
+        end case;
+        destroyString(jwk);
+        let wrongAlg: String := akpJwk("ML-DSA-65", rfcPub, "k");
+        assertFalse(isSomeDer(asSpan(&wrongAlg)), "a 1312-byte key named ML-DSA-65");
+        destroyString(wrongAlg);
+        let short: String := akpJwk("ML-DSA-44", substring(rfcPub, 0, 100), "k");
+        assertFalse(isSomeDer(asSpan(&short)), "a key too short");
+        destroyString(short);
+        assertFalse(isSomeDer("{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}"), "an Ed25519 key is not AKP");
+        assertFalse(isSomeDer("{\"kty\":\"AKP\",\"alg\":\"ML-DSA-44\",\"pub\":\"@@@\"}"), "pub that is not base64url");
+        assertFalse(isSomeDer("not json"), "not JSON");
+        return nil;
+    end;
+
+    generic [J: Region]
+    function isSomeDer(jwk: Span[Nat8, J]): Bool is
+        case akpPublicDer(jwk) of
+            when Some(value as der: String) do
+                destroyString(der);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- A JWK set of one AKP key: the raw key is the DER of publicKeyDer after
+    -- its head of 22 bytes.
+    generic [K: Region]
+    function jwksOf(key: &[PrivateKey, K], kid: Span[Nat8, Static], alg: Span[Nat8, Static]): String is
+        case publicKeyDer(key) of
+            when Some(value as der: String) do
+                let raw: String := base64UrlEncode(substring(asSpan(&der), 22, length(&der)));
+                destroyString(der);
+                let jwk: String := akpJwk(alg, asSpan(&raw), kid);
+                destroyString(raw);
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "{\"keys\":[{\"kty\":\"OKP\",\"kid\":\"other\"},");
+                writeString(&!out, asSpan(&jwk));
+                writeString(&!out, "]}");
+                destroyString(jwk);
+                return finalize(out);
+            when None do
+                assertTrue(false, "the public key of a generated key");
+                return fromSpan("{}");
+        end case;
+    end;
+
+    generic [K: Region, P: Region]
+    function signed(key: &[PrivateKey, K], payload: Span[Nat8, P], kid: Span[Nat8, Static]): String is
+        case signCompact(key, payload, kid) of
+            when Some(value as token: String) do
+                return token;
+            when None do
+                assertTrue(false, "a token signed with ML-DSA-44");
+                return fromSpan("x.y.z");
+        end case;
+    end;
+
+    generic [T: Region, J: Region]
+    function holds(token: Span[Nat8, T], jwks: Span[Nat8, J]): Bool is
+        case verifiedPayload(token, jwks) of
+            when Some(value as payload: String) do
+                destroyString(payload);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function claims(nonce: Span[Nat8, Static], authTime: Span[Nat8, Static], aud: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{\"iss\":\"https://auth.example.test\",\"aud\":");
+        writeString(&!out, aud);
+        writeString(&!out, ",\"sub\":\"u-1\",\"email\":\"heiko@example.test\",\"exp\":2000000600,\"iat\":2000000000,\"nonce\":\"");
+        writeString(&!out, nonce);
+        writeString(&!out, "\",\"auth_time\":");
+        writeString(&!out, authTime);
+        writeString(&!out, "}");
+        return finalize(out);
+    end;
+
+    function testVerify(): Unit is
+        if not mlDsaOffered() then
+            notOffered();
+            return nil;
+        end if;
+        case generateKey(MlDsa44()) of
+            when Some(value as key: PrivateKey) do
+                let jwks: String := jwksOf(&key, "k1", "ML-DSA-44");
+                let token: String := signed(&key, "{\"sub\":\"u-1\"}", "k1");
+                case verifiedPayload(asSpan(&token), asSpan(&jwks)) of
+                    when Some(value as payload: String) do
+                        assertTrue(equal(asSpan(&payload), "{\"sub\":\"u-1\"}"), "the payload under the key of its kid");
+                        destroyString(payload);
+                    when None do
+                        assertTrue(false, "a token of RAMBO's form verifies");
+                end case;
+                let stranger: String := signed(&key, "{\"sub\":\"u-1\"}", "k2");
+                assertFalse(holds(asSpan(&stranger), asSpan(&jwks)), "a kid the set does not have");
+                destroyString(stranger);
+                let named: String := jwksOf(&key, "k1", "ML-DSA-65");
+                assertFalse(holds(asSpan(&token), asSpan(&named)), "a key whose alg is not the header's");
+                destroyString(named);
+                var forged: StringBuilder := makeStringBuilder();
+                writeString(&!forged, substring(asSpan(&token), 0, length(&token) - 2));
+                writeString(&!forged, "AA");
+                let broken: String := finalize(forged);
+                assertFalse(holds(asSpan(&broken), asSpan(&jwks)), "a signature changed at its end");
+                destroyString(broken);
+                assertFalse(holds(asSpan(&token), "{\"keys\":[]}"), "an empty key set");
+                assertFalse(holds("no dots", asSpan(&jwks)), "no JWS");
+                -- The ID token.
+                let c: RamboConfig := config();
+                let now: Int64 := 2000000100;
+                let good: String := claims("n-1", "2000000000", "\"wolly-test\"");
+                let id: String := signed(&key, asSpan(&good), "k1");
+                assertTrue(noProblem(idTokenProblem(&c, asSpan(&id), asSpan(&jwks), "n-1", reauthSeconds(), now)), "a good ID token");
+                assertFalse(noProblem(idTokenProblem(&c, asSpan(&id), asSpan(&jwks), "n-2", reauthSeconds(), now)), "another nonce");
+                assertFalse(noProblem(idTokenProblem(&c, asSpan(&id), asSpan(&jwks), "", reauthSeconds(), now)), "no nonce to check");
+                assertFalse(noProblem(idTokenProblem(&c, asSpan(&id), asSpan(&jwks), "n-1", reauthSeconds(), (2000000700 : Int64))), "expired past the leeway");
+                assertTrue(noProblem(idTokenProblem(&c, asSpan(&id), asSpan(&jwks), "n-1", reauthSeconds(), (2000000650 : Int64))), "expired within the leeway");
+                assertFalse(noProblem(idTokenProblem(&c, asSpan(&id), asSpan(&jwks), "n-1", (30 : Int64), now)), "a sign-in older than max_age and the leeway");
+                assertTrue(noProblem(idTokenProblem(&c, asSpan(&id), asSpan(&jwks), "n-1", (-1 : Int64), now)), "no max_age, no check of auth_time");
+                case claimText(asSpan(&good), "email") of
+                    when Some(value as email: String) do
+                        assertTrue(equal(asSpan(&email), "heiko@example.test"), "the email claim");
+                        destroyString(email);
+                    when None do
+                        assertTrue(false, "the email claim");
+                end case;
+                destroyString(id);
+                destroyString(good);
+                let many: String := claims("n-1", "2000000000", "[\"wolly-test\",\"other\"]");
+                let manyId: String := signed(&key, asSpan(&many), "k1");
+                assertFalse(noProblem(idTokenProblem(&c, asSpan(&manyId), asSpan(&jwks), "n-1", reauthSeconds(), now)), "two audiences without azp");
+                destroyString(manyId);
+                destroyString(many);
+                let foreign: String := claims("n-1", "2000000000", "\"other\"");
+                let foreignId: String := signed(&key, asSpan(&foreign), "k1");
+                assertFalse(noProblem(idTokenProblem(&c, asSpan(&foreignId), asSpan(&jwks), "n-1", reauthSeconds(), now)), "another client's token");
+                destroyString(foreignId);
+                destroyString(foreign);
+                let future: String := claims("n-1", "2000000500", "\"wolly-test\"");
+                let futureId: String := signed(&key, asSpan(&future), "k1");
+                assertFalse(noProblem(idTokenProblem(&c, asSpan(&futureId), asSpan(&jwks), "n-1", reauthSeconds(), now)), "an auth_time after now and the leeway");
+                destroyString(futureId);
+                destroyString(future);
+                destroyRamboConfig(c);
+                destroyString(token);
+                destroyString(jwks);
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "an ML-DSA-44 key is made");
+        end case;
+        return nil;
+    end;
+
+    function noProblem(problem: Option[String]): Bool is
+        case problem of
+            when Some(value as reason: String) do
+                destroyString(reason);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function runStore(db: &![Database[Writing], R]): Unit is
+        case prepareRambo(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the tables are made");
+            when None do
+                skip;
+        end case;
+        let c: RamboConfig := config();
+        case beginLogin(&c, reauthSeconds(), false) of
+            when Some(value as start: RamboStart) do
+                case keepPending(&~db, "session-a", &start, (1000 : Int64)) of
+                    when Right(right as kept: Bool) do
+                        assertTrue(kept, "the sign-in is kept");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the sign-in is kept");
+                end case;
+                case keepPending(&~db, "session-a", &start, (1001 : Int64)) of
+                    when Right(right as again: Bool) do
+                        assertFalse(again, "a state is kept once");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "a second keep answers");
+                end case;
+                assertFalse(pendingFound(&~db, "session-b", stateOf(&start), (1010 : Int64)), "another session's sign-in");
+                assertFalse(pendingFound(&~db, "session-a", stateOf(&start), (1020 : Int64)), "taken out by the wrong session's try");
+                destroyStart(start);
+            when None do
+                assertTrue(false, "a sign-in begins");
+        end case;
+        case beginLogin(&c, reauthSeconds(), false) of
+            when Some(value as second: RamboStart) do
+                let kept: Either[DbError, Bool] := keepPending(&~db, "session-a", &second, (2000 : Int64));
+                case kept of
+                    when Right(right as k: Bool) do
+                        skip;
+                    when Left(left as error: DbError) do
+                        skip;
+                end case;
+                case takePending(&~db, "session-a", stateOf(&second), (2000 : Int64) + pendingSeconds()) of
+                    when Right(right as found: Option[RamboPending]) do
+                        case found of
+                            when Some(value as pending: RamboPending) do
+                                assertTrue(equal(pendingNonce(&pending), nonceOf(&second)) and equal(pendingVerifier(&pending), verifierOf(&second)), "nonce and verifier back at the last second");
+                                destroyPending(pending);
+                            when None do
+                                assertTrue(false, "the sign-in is found by its session");
+                        end case;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the sign-in is taken");
+                end case;
+                assertFalse(pendingFound(&~db, "session-a", stateOf(&second), (2001 : Int64)), "a sign-in is taken once");
+                destroyStart(second);
+            when None do
+                assertTrue(false, "a second sign-in begins");
+        end case;
+        case beginLogin(&c, reauthSeconds(), false) of
+            when Some(value as late: RamboStart) do
+                let kept: Either[DbError, Bool] := keepPending(&~db, "session-a", &late, (3000 : Int64));
+                case kept of
+                    when Right(right as k: Bool) do
+                        skip;
+                    when Left(left as error: DbError) do
+                        skip;
+                end case;
+                assertFalse(pendingFound(&~db, "session-a", stateOf(&late), (3001 : Int64) + pendingSeconds()), "a callback a second after ten minutes");
+                destroyStart(late);
+            when None do
+                assertTrue(false, "a third sign-in begins");
+        end case;
+        destroyRamboConfig(c);
+        -- ID tokens and keys.
+        assertTrue(noError(keepIdToken(&~db, "session-a", "h.p.s", (1000 : Int64))), "an ID token is kept");
+        assertTrue(noError(keepIdToken(&~db, "session-a", "h.p.t", (1001 : Int64))), "and replaced");
+        case takeIdToken(&~db, "session-a") of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as token: String) do
+                        assertTrue(equal(asSpan(&token), "h.p.t"), "the ID token kept last");
+                        destroyString(token);
+                    when None do
+                        assertTrue(false, "the ID token is there");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the ID token is read");
+        end case;
+        case takeIdToken(&~db, "session-a") of
+            when Right(right as again: Option[String]) do
+                case again of
+                    when Some(value as token: String) do
+                        destroyString(token);
+                        assertTrue(false, "an ID token is taken out once");
+                    when None do
+                        assertTrue(true, "an ID token is taken out once");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the second read answers");
+        end case;
+        assertTrue(noError(keepJwks(&~db, "{\"keys\":[1]}", (1000 : Int64))), "a key set is kept");
+        assertTrue(noError(keepJwks(&~db, "{\"keys\":[2]}", (1001 : Int64))), "and replaced");
+        case knownJwks(&~db) of
+            when Right(right as known: Option[String]) do
+                case known of
+                    when Some(value as set: String) do
+                        assertTrue(equal(asSpan(&set), "{\"keys\":[2]}"), "the key set kept last");
+                        destroyString(set);
+                    when None do
+                        assertTrue(false, "a key set is known");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the key set is read");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, T: Region, S: Region]
+    function pendingFound(db: &![Database[Writing], R], session: Span[Nat8, T], state: Span[Nat8, S], now: Int64): Bool is
+        case takePending(&~db, session, state, now) of
+            when Right(right as found: Option[RamboPending]) do
+                case found of
+                    when Some(value as pending: RamboPending) do
+                        destroyPending(pending);
+                        return true;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "takePending answers");
+                return false;
+        end case;
+    end;
+
+    function noError(error: Option[DbError]): Bool is
+        case error of
+            when Some(value as e: DbError) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function testStore(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runStore(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

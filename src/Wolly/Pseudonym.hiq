@@ -1,0 +1,48 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    bytesToHex
+);
+import Standard.Libcrypto (
+    hmacSha256
+);
+
+module body Wolly.Pseudonym is
+    constant purpose: Span[Nat8, Static] := "wolly-pseudonym";
+    constant keyBytes: Index := 32;
+
+    function pseudonymDigits(): Index is
+        return 64;
+    end;
+
+    generic [K: Region, V: Region]
+    function pseudonym(key: Span[Nat8, K], value: Span[Nat8, V]): Option[String] is
+        if spanLength(key) < keyBytes then
+            return None();
+        end if;
+        case hmacSha256(key, purpose) of
+            when Some(value as sub: String) do
+                let mac: Option[String] := hmacSha256(asSpan(&sub), value);
+                destroyString(sub);
+                case mac of
+                    when Some(value as digest: String) do
+                        let hex: String := bytesToHex(asSpan(&digest));
+                        destroyString(digest);
+                        return Some(value => hex);
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+end module body.

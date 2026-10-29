@@ -1,0 +1,136 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The cases follow the tests of the client address, host name and request
+-- forgery checks of a Go library; each answer that must be yes has one
+-- beside it that must be no.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Wolly.Net (
+    mostHostnameBytes,
+    validHostname,
+    isPublicAddress,
+    validTrustedProxies,
+    clientAddress
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Net.Test is
+
+    generic [P: Region, F: Region, T: Region]
+    function clientIs(peer: Span[Nat8, P], forwarded: Span[Nat8, F], trusted: Span[Nat8, T], wanted: Span[Nat8, Static],
+                      message: Span[Nat8, Static]): Unit is
+        let found: String := clientAddress(peer, forwarded, trusted);
+        assertTrue(equal(asSpan(&found), wanted), message);
+        destroyString(found);
+        return nil;
+    end;
+
+    function testHostnames(): Unit is
+        assertTrue(mostHostnameBytes() = 253, "253 bytes");
+        assertTrue(validHostname("example.org"), "a name");
+        assertTrue(validHostname("localhost"), "one label");
+        assertTrue(validHostname("a-b.c-d.example.org"), "hyphens inside");
+        assertTrue(validHostname("xn--bcher-kva.example"), "punycode");
+        assertTrue(validHostname("0.example"), "a digit first");
+        assertFalse(validHostname(""), "empty");
+        assertFalse(validHostname("example.org."), "a trailing dot");
+        assertFalse(validHostname(".example.org"), "a leading dot");
+        assertFalse(validHostname("a..b"), "an empty label");
+        assertFalse(validHostname("-a.example"), "a hyphen first");
+        assertFalse(validHostname("a-.example"), "a hyphen last");
+        assertFalse(validHostname("a_b.example"), "an underscore");
+        assertFalse(validHostname("*.example.org"), "a star");
+        assertFalse(validHostname("a b.example"), "a space");
+        assertFalse(validHostname("exämple.org"), "no Unicode");
+        assertFalse(validHostname("a/b"), "a slash");
+        assertFalse(validHostname("a:80"), "a port");
+        assertTrue(validHostname("012345678901234567890123456789012345678901234567890123456789012.example"), "a label of 63");
+        assertFalse(validHostname("0123456789012345678901234567890123456789012345678901234567890123.example"), "a label of 64");
+        return nil;
+    end;
+
+    function testPublicAddresses(): Unit is
+        assertTrue(isPublicAddress("8.8.8.8"), "a public IPv4");
+        assertTrue(isPublicAddress("2606:4700:4700::1111"), "a public IPv6");
+        assertFalse(isPublicAddress("127.0.0.1"), "loopback");
+        assertFalse(isPublicAddress("10.1.2.3"), "RFC 1918");
+        assertFalse(isPublicAddress("172.16.0.1"), "RFC 1918, 172.16");
+        assertFalse(isPublicAddress("192.168.1.1"), "RFC 1918, 192.168");
+        assertFalse(isPublicAddress("169.254.169.254"), "link-local, the metadata address of clouds");
+        assertFalse(isPublicAddress("100.64.0.1"), "carrier-grade NAT");
+        assertFalse(isPublicAddress("0.0.0.0"), "unspecified");
+        assertFalse(isPublicAddress("::1"), "IPv6 loopback");
+        assertFalse(isPublicAddress("fe80::1"), "IPv6 link-local");
+        assertFalse(isPublicAddress("fd00::1"), "IPv6 unique local");
+        assertFalse(isPublicAddress("example.org"), "a name is no address");
+        assertFalse(isPublicAddress(""), "empty");
+        assertFalse(isPublicAddress("8.8.8.8 "), "a space");
+        assertFalse(isPublicAddress("8.8.8"), "three groups");
+        assertFalse(isPublicAddress("08.8.8.8"), "a leading zero");
+        assertTrue(isPublicAddress("8.8.8.0"), "a group that is a single zero");
+        assertTrue(isPublicAddress("8.0.8.8"), "a zero in the middle");
+        assertTrue(isPublicAddress("8.8.80.8"), "a zero that ends a group");
+        return nil;
+    end;
+
+    function testValidList(): Unit is
+        assertTrue(validTrustedProxies(""), "an empty list trusts nobody");
+        assertTrue(validTrustedProxies("10.0.0.1"), "a bare address");
+        assertTrue(validTrustedProxies("10.0.0.0/8"), "a prefix");
+        assertTrue(validTrustedProxies("10.0.0.0/8, 192.168.0.0/16"), "two, with a space");
+        assertTrue(validTrustedProxies("2001:db8::/32,::1"), "IPv6");
+        assertTrue(validTrustedProxies("10.0.0.1/32"), "32 bits");
+        assertTrue(validTrustedProxies("::1/128"), "128 bits");
+        assertFalse(validTrustedProxies("0.0.0.0/0"), "the default route would trust everybody");
+        assertFalse(validTrustedProxies("::/0"), "the default route of IPv6");
+        assertFalse(validTrustedProxies("10.0.0.0/33"), "33 bits of IPv4");
+        assertFalse(validTrustedProxies("10.0.0.0/x"), "bits that are no number");
+        assertFalse(validTrustedProxies("10.0.0.0/"), "no bits after the slash");
+        assertFalse(validTrustedProxies("proxy.example.org"), "a name");
+        assertFalse(validTrustedProxies("10.0.0.1,,10.0.0.2"), "an empty entry");
+        assertFalse(validTrustedProxies("10.0.0.1,"), "a trailing comma");
+        assertFalse(validTrustedProxies("   "), "only space");
+        return nil;
+    end;
+
+    function testClient(): Unit is
+        -- No list: the peer, whatever the header says.
+        clientIs("203.0.113.9", "1.2.3.4", "", "203.0.113.9", "no list: the peer");
+        clientIs("203.0.113.9", "", "10.0.0.0/8", "203.0.113.9", "a peer that is not trusted: the peer");
+        clientIs("203.0.113.9", "1.2.3.4", "10.0.0.0/8", "203.0.113.9", "a forged header from a stranger is ignored");
+        -- A trusted peer: the header counts.
+        clientIs("10.0.0.5", "198.51.100.7", "10.0.0.0/8", "198.51.100.7", "one hop");
+        clientIs("10.0.0.5", "198.51.100.7, 10.0.0.9", "10.0.0.0/8", "198.51.100.7", "a trusted hop in front of the proxy is skipped");
+        clientIs("10.0.0.5", "1.1.1.1, 198.51.100.7, 10.0.0.9", "10.0.0.0/8", "198.51.100.7", "the first untrusted hop from the right, not the leftmost");
+        clientIs("10.0.0.5", "10.0.0.7, 10.0.0.9", "10.0.0.0/8", "10.0.0.5", "a chain wholly trusted: the peer");
+        clientIs("10.0.0.5", "", "10.0.0.0/8", "10.0.0.5", "no header: the peer");
+        clientIs("10.0.0.5", "garbage", "10.0.0.0/8", "10.0.0.5", "a part that is no address: the peer");
+        clientIs("10.0.0.5", "198.51.100.7, garbage", "10.0.0.0/8", "10.0.0.5", "garbage at the right ends the walk");
+        clientIs("10.0.0.5", "garbage, 198.51.100.7", "10.0.0.0/8", "198.51.100.7", "garbage at the left is never reached");
+        clientIs("10.0.0.5", "198.51.100.7,10.0.0.9", "10.0.0.0/8", "198.51.100.7", "no space after the comma");
+        clientIs("10.0.0.5", "  198.51.100.7  ", "10.0.0.0/8", "198.51.100.7", "space around");
+        clientIs("10.0.0.5", "2001:DB8:0:0:0:0:0:1", "10.0.0.0/8", "2001:db8::1", "IPv6 in canonical text");
+        clientIs("2001:db8::5", "198.51.100.7", "2001:db8::/32", "198.51.100.7", "an IPv6 proxy");
+        clientIs("10.0.0.5", "198.51.100.7", "10.0.0.5", "198.51.100.7", "a bare address in the list");
+        clientIs("10.0.0.6", "198.51.100.7", "10.0.0.5", "10.0.0.6", "a bare address is one address");
+        clientIs("10.0.0.5", "198.51.100.7", "0.0.0.0/0", "10.0.0.5", "an invalid list trusts nobody");
+        clientIs("not an address", "198.51.100.7", "10.0.0.0/8", "not an address", "a peer that is no address");
+        clientIs("010.000.000.001", "1.2.3.4", "10.0.0.0/8", "010.000.000.001", "no leading zeros: not an address, not trusted");
+        clientIs("10.0.0.5", "010.0.0.1", "10.0.0.0/8", "10.0.0.5", "a hop with a leading zero ends the walk");
+        return nil;
+    end;
+end module body.

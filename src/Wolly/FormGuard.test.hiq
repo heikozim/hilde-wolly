@@ -1,0 +1,237 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database in memory.  A stamp made at 1000 is too fast
+-- at 1002, good from 1003 to 2800 and expired at 2801.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    constantTimeEqual
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.FormGuard (
+    FormCheck,
+    Passed,
+    Honeypot,
+    BadStamp,
+    TooFast,
+    Expired,
+    TooMany,
+    Replayed,
+    Stamp,
+    makeStamp,
+    destroyStamp,
+    prepareFormGuard,
+    checkSubmission
+);
+
+module body Wolly.FormGuard.Test is
+    constant key: Span[Nat8, Static] := "0123456789abcdef0123456789abcdef";
+    constant otherKey: Span[Nat8, Static] := "fedcba9876543210fedcba9876543210";
+    constant many: Int64 := 100;
+    constant window: Int64 := 60;
+
+    -- The name of a verdict, for a comparison in a test.
+    function nameOf(result: Either[DbError, FormCheck]): Span[Nat8, Static] is
+        case result of
+            when Right(right as check: FormCheck) do
+                case check of
+                    when Passed do
+                        return "passed";
+                    when Honeypot do
+                        return "honeypot";
+                    when BadStamp do
+                        return "bad stamp";
+                    when TooFast do
+                        return "too fast";
+                    when Expired do
+                        return "expired";
+                    when TooMany(retryAfter: Int64) do
+                        return "too many";
+                    when Replayed do
+                        return "replayed";
+                end case;
+            when Left(left as error: DbError) do
+                return "sql error";
+        end case;
+    end;
+
+    function expect(result: Either[DbError, FormCheck], want: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        assertTrue(constantTimeEqual(nameOf(result), want), message);
+        return nil;
+    end;
+
+    function stampAt(now: Int64): Stamp is
+        case makeStamp(key, now) of
+            when Some(value as stamp: Stamp) do
+                return stamp;
+            when None do
+                assertTrue(false, "no stamp could be made");
+                return Stamp(time => fromSpan(""), nonce => fromSpan(""), mac => fromSpan(""));
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R]): Unit is
+        case prepareFormGuard(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the tables could not be made");
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- A submission of stamp from client at now, honeypot empty.
+    generic [R: Region, S: Region]
+    function submit(db: &![Database[Writing], R], stamp: &[Stamp, S], client: Span[Nat8, Static], now: Int64,
+                    limit: Int64): Either[DbError, FormCheck] is
+        return checkSubmission(&~db, key, "", asSpan(&(stamp->time)), asSpan(&(stamp->nonce)), asSpan(&(stamp->mac)),
+                               client, now, limit, window);
+    end;
+
+    -- The three parts of a stamp, for a call.
+    generic [S: Region]
+    function timeOf(stamp: &[Stamp, S]): Span[Nat8, S] is
+        return asSpan(&(stamp->time));
+    end;
+
+    generic [S: Region]
+    function nonceOf(stamp: &[Stamp, S]): Span[Nat8, S] is
+        return asSpan(&(stamp->nonce));
+    end;
+
+    generic [S: Region]
+    function macOf(stamp: &[Stamp, S]): Span[Nat8, S] is
+        return asSpan(&(stamp->mac));
+    end;
+
+    function testStamp(): Unit is
+        let stamp: Stamp := stampAt(1000);
+        assertTrue(constantTimeEqual(timeOf(&stamp), "1000"), "the time in decimal");
+        let other: Stamp := stampAt(1000);
+        assertFalse(constantTimeEqual(nonceOf(&stamp), nonceOf(&other)), "each stamp has a nonce of its own");
+        destroyStamp(stamp);
+        destroyStamp(other);
+        case makeStamp("short key", 1000) of
+            when Some(value as unexpected: Stamp) do
+                destroyStamp(unexpected);
+                assertTrue(false, "a short key makes no stamp");
+            when None do
+                assertTrue(true, "a short key makes no stamp");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runTiming(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        let stamp: Stamp := stampAt(1000);
+        expect(submit(&~db, &stamp, "10.0.0.1", 1002, many), "too fast", "2 seconds are too fast");
+        expect(submit(&~db, &stamp, "10.0.0.1", 1003, many), "passed", "3 seconds are fast enough, and the refusal did not use the stamp");
+        expect(submit(&~db, &stamp, "10.0.0.1", 1004, many), "replayed", "a stamp is good once");
+        destroyStamp(stamp);
+        let late: Stamp := stampAt(1000);
+        expect(submit(&~db, &late, "10.0.0.1", 2801, many), "expired", "1801 seconds are too late");
+        expect(submit(&~db, &late, "10.0.0.1", 2800, many), "passed", "1800 are not");
+        destroyStamp(late);
+        let future: Stamp := stampAt(5000);
+        expect(submit(&~db, &future, "10.0.0.1", 1000, many), "expired", "a stamp from the future");
+        destroyStamp(future);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runForged(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        let stamp: Stamp := stampAt(1000);
+        expect(checkSubmission(&~db, key, "http://spam", timeOf(&stamp), nonceOf(&stamp), macOf(&stamp), "10.0.0.1", 1010, many, window),
+               "honeypot", "a filled honeypot");
+        expect(checkSubmission(&~db, key, "", "1001", nonceOf(&stamp), macOf(&stamp), "10.0.0.1", 1010, many, window),
+               "bad stamp", "another time under the same signature");
+        expect(checkSubmission(&~db, key, "", "01000", nonceOf(&stamp), macOf(&stamp), "10.0.0.1", 1010, many, window),
+               "bad stamp", "the same time with a leading zero");
+        expect(checkSubmission(&~db, key, "", timeOf(&stamp), "00", macOf(&stamp), "10.0.0.1", 1010, many, window),
+               "bad stamp", "a short nonce");
+        expect(checkSubmission(&~db, otherKey, "", timeOf(&stamp), nonceOf(&stamp), macOf(&stamp), "10.0.0.1", 1010, many, window),
+               "bad stamp", "a stamp of another key");
+        expect(checkSubmission(&~db, key, "", "", "", "", "10.0.0.1", 1010, many, window), "bad stamp", "no stamp at all");
+        expect(submit(&~db, &stamp, "10.0.0.1", 1010, many), "passed", "the control: the stamp itself passes");
+        destroyStamp(stamp);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runLimit(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        let one: Stamp := stampAt(1000);
+        let two: Stamp := stampAt(1000);
+        let three: Stamp := stampAt(1000);
+        let four: Stamp := stampAt(1000);
+        expect(submit(&~db, &one, "10.0.0.1", 1010, 2), "passed", "the first of a limit of 2");
+        expect(submit(&~db, &two, "10.0.0.1", 1010, 2), "passed", "the second");
+        expect(submit(&~db, &three, "10.0.0.1", 1010, 2), "too many", "the third is one too many");
+        expect(submit(&~db, &three, "10.0.0.2", 1010, 2), "passed", "another client is not limited, and the refusal did not use the stamp");
+        expect(submit(&~db, &four, "10.0.0.1", 1071, 2), "passed", "after the window the client may post again");
+        destroyStamp(one);
+        destroyStamp(two);
+        destroyStamp(three);
+        destroyStamp(four);
+        return nil;
+    end;
+
+    function testTiming(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runTiming(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testForged(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runForged(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testLimit(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runLimit(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

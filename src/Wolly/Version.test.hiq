@@ -1,0 +1,74 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The release has the form of three numbers; which numbers is held against
+-- CHANGELOG by scripts/check-version.pl, not here.  A test runs without
+-- arguments, so --version is not asked.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Wolly.Version (
+    release,
+    versionAsked,
+    fullVersionAsked,
+    infoAsked,
+    library
+);
+
+module body Wolly.Version.Test is
+    function isDigit(b: Nat8): Bool is
+        return (b >= 48) and (b <= 57);
+    end;
+
+    function testReleaseHasThreeNumbers(): Unit is
+        let r: Span[Nat8, Static] := release();
+        var dots: Index := 0;
+        var digitBefore: Bool := false;
+        var good: Bool := true;
+        var i: Index := 0;
+        while i < spanLength(r) do
+            if r[i] = 46 then
+                if not digitBefore then
+                    good := false;
+                end if;
+                dots := dots + 1;
+                digitBefore := false;
+            else
+                if not isDigit(r[i]) then
+                    good := false;
+                end if;
+                digitBefore := true;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue(good and digitBefore, "only digits and dots, a digit before each dot and at the end");
+        assertTrue(dots = 2, "three numbers, two dots");
+        return nil;
+    end;
+
+    function testNotAskedWithoutArguments(): Unit is
+        assertFalse(versionAsked(), "a run without --version is not asked");
+        assertFalse(fullVersionAsked(), "nor version --full");
+        assertFalse(infoAsked(), "nor info");
+        return nil;
+    end;
+
+    function testLibraryLine(): Unit is
+        let line: String := library("libcrypto", "OpenSSL 3.5.1");
+        assertTrue(equal(asSpan(&line), "libcrypto OpenSSL 3.5.1"), "the name, a space, the version");
+        destroyString(line);
+        return nil;
+    end;
+end module body.

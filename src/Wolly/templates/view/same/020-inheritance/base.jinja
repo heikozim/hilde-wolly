@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><title>{% block title %}Site{% endblock %}</title></head>
+<body>
+{% block nav %}<nav>home</nav>{% endblock %}
+<main>
+{% block body %}{% endblock %}
+</main>
+<ol>
+{%- for item in items %}
+{% block row scoped %}<li>{{ item.name }}</li>{% endblock %}
+{%- endfor %}
+</ol>
+<footer>{% block footer %}(c) {{ owner }}{% endblock footer %}</footer>
+</body>
+</html>

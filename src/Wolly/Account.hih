@@ -1,0 +1,386 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Accounts of people who sign in with an e-mail address, a password and a
+code of an authenticator app, kept in the table accounts in the form an
+existing Go implementation keeps them, so that both read the same rows.
+
+An account has an ID of 128 random bits, lowercase base32 without padding,
+26 characters, that never changes; the e-mail address is the name it signs
+in with and may change.  An address is stored lowercase.
+
+A password is stored as $argon2id-hmac$v=19$m=65536,t=3,p=4$ followed by a
+salt of 16 random bytes, a dollar and the HMAC-SHA256 under a pepper of 32
+bytes or more over the Argon2id output of 32 bytes, both parts in standard
+Base64 without padding.  The pepper lives outside the database.
+
+The secret of the second factor is the base32 text of 20 random bytes,
+sealed by Wolly.Fernet under a key outside the database and stored in
+standard Base64 without padding.  Codes are HMAC-SHA1, 6 digits, a step of
+30 seconds; the code of the step before is taken too, and a code taken is
+refused again for 90 seconds.
+
+Delays after failed attempts are not kept here: the caller counts them,
+with Wolly.Backoff for one.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Account is
+    """
+    An account as a page or the command line shows it; the hash and the
+    sealed secret stay in the table.
+    """
+    record Account: Linear is
+        id: String;
+        email: String;
+        name: String;
+        locked: Bool;
+        lockedAt: Int64;
+        mustChangePassword: Bool;
+        hasPassword: Bool;
+        hasTotp: Bool;
+        createdAt: Int64;
+        updatedAt: Int64;
+    end;
+
+    """
+    Frees account.
+    No contract: it only frees.
+    """
+    function destroyAccount(account: Account): Unit;
+
+    """
+    Frees accounts.
+    No contract: it only frees.
+    """
+    function destroyAccounts(accounts: Buffer[Account]): Unit;
+
+    """
+    Why an address or a name was refused.
+    """
+    union AccountProblem: Free is
+        """
+        The e-mail address is no plain address.
+        """
+        case BadEmail;
+        """
+        Another account has the address.
+        """
+        case EmailTaken;
+        """
+        The display name is longer than 200 bytes or holds a control byte.
+        """
+        case BadName;
+    end;
+
+    """
+    The characters of an ID: 26.
+    """
+    function idLength(): Index
+        ensures result = 26;
+
+    """
+    Whether text is an account ID: 26 characters of a to z and 2 to 7.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Region]
+    function isAccountId(text: Span[Nat8, T]): Bool;
+
+    """
+    A new ID from 16 random bytes.  None when the random source fails.
+    No contract: an Option over the random source.
+    """
+    function newAccountId(): Option[String];
+
+    """
+    The address text stands for, trimmed and lowercase: a local part and a
+    domain of letters, digits, the characters RFC 5322 allows in an atom
+    and bytes of UTF-8, dots only between two of them, the domain with a
+    dot, 254 bytes at most.  None for anything else, a quoted local part
+    included.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function normalizeEmail(text: Span[Nat8, T]): Option[String];
+
+    """
+    The display name of text, trimmed of blanks.  None when it is longer
+    than 200 bytes or holds a control byte.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function cleanName(text: Span[Nat8, T]): Option[String];
+
+    """
+    Makes the table accounts, when it is not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareAccounts(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    A new account with the address email and the display name name, made at
+    now, without a password or a second factor and with must change
+    password set.  Right Left names why it was refused.
+    """
+    generic [R: Region, E: Region, N: Region]
+    function createAccount(db: &![Database[Writing], R], email: Span[Nat8, E], name: Span[Nat8, N],
+        now: Int64): Either[DbError, Either[AccountProblem, Account]]
+        requires now > 0;
+
+    """
+    The account with the ID id.  Right None when there is none or id is no
+    ID.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, I: Region]
+    function accountById(db: &![Database[M], R], id: Span[Nat8, I]): Either[DbError, Option[Account]];
+
+    """
+    The account with the address email, normalized first.  Right None when
+    there is none or email is no address.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, E: Region]
+    function accountByEmail(db: &![Database[M], R], email: Span[Nat8, E]): Either[DbError, Option[Account]];
+
+    """
+    Every account, ordered by address.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region]
+    function listAccounts(db: &![Database[M], R]): Either[DbError, Buffer[Account]];
+
+    """
+    Locks or unlocks the account id at now.  Right false when there is no
+    such account.
+    """
+    generic [R: Region, I: Region]
+    function setLocked(db: &![Database[Writing], R], id: Span[Nat8, I], locked: Bool, now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    """
+    Gives the account id the address email.  Right Left when the address is
+    refused or taken, Right Right false when there is no such account.
+    """
+    generic [R: Region, I: Region, E: Region]
+    function setEmail(db: &![Database[Writing], R], id: Span[Nat8, I], email: Span[Nat8, E],
+        now: Int64): Either[DbError, Either[AccountProblem, Bool]]
+        requires now > 0;
+
+    """
+    Gives the account id the display name name.  Right Left when the name is
+    refused, Right Right false when there is no such account.
+    """
+    generic [R: Region, I: Region, N: Region]
+    function setName(db: &![Database[Writing], R], id: Span[Nat8, I], name: Span[Nat8, N],
+        now: Int64): Either[DbError, Either[AccountProblem, Bool]]
+        requires now > 0;
+
+    """
+    Removes the row of the account id.  Right false when there was none.
+    What else hangs off the account is the caller's to remove.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, I: Region]
+    function deleteAccountRow(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Bool];
+
+    --- Passwords
+
+    """
+    Why a new password was refused.
+    """
+    union PasswordProblem: Free is
+        case TooShort;
+        case TooLong;
+        case OnlyBlanks;
+        case IsTheEmail;
+    end;
+
+    """
+    The fewest characters of a password: 12.
+    """
+    function fewestPasswordCharacters(): Index
+        ensures result = 12;
+
+    """
+    The most bytes of a password: 128.
+    """
+    function mostPasswordBytes(): Index
+        ensures result = 128;
+
+    """
+    Why password may not be the password of the account with the address
+    email, or None when it may: 12 characters of UTF-8 at least, 128 bytes
+    at most, not only blanks, not the address in any case.
+    No contract: an Option read from text.
+    """
+    generic [P: Region, E: Region]
+    function passwordProblem(password: Span[Nat8, P], email: Span[Nat8, E]): Option[PasswordProblem];
+
+    """
+    The stored form of password under pepper.  None when pepper is shorter
+    than 32 bytes, password is empty or longer than 128 bytes, or the random
+    source or Argon2id fails.
+    No contract: an Option over the random source.
+    """
+    generic [P: Region, Q: Region]
+    function hashPassword(password: Span[Nat8, P], pepper: Span[Nat8, Q]): Option[String];
+
+    """
+    Whether password is the one encoded was made from under pepper, in
+    constant time over the HMAC.  False for a stored form of other
+    parameters, and when hashPassword would refuse the input.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [P: Region, E: Region, Q: Region]
+    function checkPassword(password: Span[Nat8, P], encoded: Span[Nat8, E], pepper: Span[Nat8, Q]): Bool;
+
+    """
+    A password of 20 letters and digits, drawn evenly, for a person to
+    replace at the first sign-in.  None when the random source fails.
+    No contract: an Option over the random source.
+    """
+    function oneTimePassword(): Option[String];
+
+    """
+    Stores the stored form encoded as the password of the account id, and
+    whether it must be changed at the next sign-in.  Right false when there
+    is no such account.
+    """
+    generic [R: Region, I: Region, E: Region]
+    function storePassword(db: &![Database[Writing], R], id: Span[Nat8, I], encoded: Span[Nat8, E],
+        mustChange: Bool, now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    --- The second factor
+
+    """
+    A new secret: the base32 text of 20 random bytes, 32 characters.  None
+    when the random source fails.
+    No contract: an Option over the random source.
+    """
+    function newTotpSecret(): Option[String];
+
+    """
+    The otpauth URI an app reads from a QR code: the label issuer:email,
+    then algorithm SHA1, digits 6, issuer, period 30 and secret, in this
+    order.
+    """
+    generic [I: Region, E: Region, S: Region]
+    function totpUri(issuer: Span[Nat8, I], email: Span[Nat8, E], secret: Span[Nat8, S]): String
+        ensures length(&result) > 0;
+
+    """
+    Whether code, 6 digits, is the code of the base32 secret at now or at
+    the step before.  False for a secret shorter than 10 bytes.
+    """
+    generic [S: Region, C: Region]
+    function codeFits(secret: Span[Nat8, S], code: Span[Nat8, C], now: Int64): Bool
+        requires now >= 0;
+
+    """
+    Turns the second factor of the account id on with secret when code fits
+    it at now: the secret is sealed under the key totpKey (Wolly.Fernet) and
+    stored, and the code counts as taken.  Right false when code does not
+    fit or there is no such account.
+    """
+    generic [R: Region, I: Region, S: Region, C: Region, K: Region]
+    function confirmTotp(db: &![Database[Writing], R], id: Span[Nat8, I], secret: Span[Nat8, S], code: Span[Nat8, C],
+        totpKey: Span[Nat8, K], now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    """
+    Whether code is a code of the second factor of the account id at now and
+    was not taken in the last 90 seconds; Right true takes it.  Right false
+    when the account has no second factor or its secret does not open under
+    totpKey.
+    """
+    generic [R: Region, I: Region, C: Region, K: Region]
+    function checkTotp(db: &![Database[Writing], R], id: Span[Nat8, I], code: Span[Nat8, C], totpKey: Span[Nat8, K],
+        now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    """
+    Turns the second factor of the account id off.  Right false when there
+    is no such account.
+    """
+    generic [R: Region, I: Region]
+    function resetTotp(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    --- Signing in
+
+    """
+    What a sign-in with an address, a password and a code came to.
+    """
+    union SignIn: Linear is
+        """
+        The address, the password or the code is wrong; which one is not
+        told.
+        """
+        case WrongProof;
+        """
+        The proof holds, but the account is locked.
+        """
+        case LockedOut;
+        """
+        The proof holds.  amr is pwd, or pwd otp mfa with a second factor;
+        the person still owes a new password or a second factor when
+        mustChangePassword or needsTotp is true.
+        """
+        case Passed is
+            account: String;
+            amr: String;
+            mustChangePassword: Bool;
+            needsTotp: Bool;
+    end;
+
+    """
+    Frees outcome.
+    No contract: it only frees.
+    """
+    function destroySignIn(outcome: SignIn): Unit;
+
+    """
+    Checks email, password and code at now.  An unknown address costs the
+    same Argon2id work as a known one.  The lock is looked at only after
+    the proof holds, so that it tells nothing to whoever has no password.
+    """
+    generic [R: Region, E: Region, P: Region, C: Region, Q: Region, K: Region]
+    function signIn(db: &![Database[Writing], R], email: Span[Nat8, E], password: Span[Nat8, P], code: Span[Nat8, C],
+        pepper: Span[Nat8, Q], totpKey: Span[Nat8, K], now: Int64): Either[DbError, SignIn]
+        requires now > 0;
+
+    """
+    Whether password and code are those of the account id, which must have
+    a second factor: the check before a change on the own account page.
+    """
+    generic [R: Region, I: Region, P: Region, C: Region, Q: Region, K: Region]
+    function reauthenticate(db: &![Database[Writing], R], id: Span[Nat8, I], password: Span[Nat8, P], code: Span[Nat8, C],
+        pepper: Span[Nat8, Q], totpKey: Span[Nat8, K], now: Int64): Either[DbError, Bool]
+        requires now > 0;
+
+    """
+    Whether password is the password of the account id.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, I: Region, P: Region, Q: Region]
+    function passwordOf(db: &![Database[Writing], R], id: Span[Nat8, I], password: Span[Nat8, P],
+        pepper: Span[Nat8, Q]): Either[DbError, Bool];
+end module.

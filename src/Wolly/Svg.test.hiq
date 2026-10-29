@@ -1,0 +1,175 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The coordinates in the expected SVG are worked out by hand in the
+-- comments; the plot runs from x 40 to 590 and from y 170 (0) to 10.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    contains,
+    countOf,
+    equal
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Wolly.Svg (
+    mostPoints,
+    lineChart,
+    barChart,
+    tile,
+    tileWithChange
+);
+
+module body Wolly.Svg.Test is
+    constant belowZero: Int64 := -5;
+
+    -- A literal handed to the generic insertBack would be an Int32.
+    generic [R: Region]
+    function put(buffer: &![Buffer[Int64], R], value: Int64): Unit is
+        insertBack(&~buffer, value);
+        return nil;
+    end;
+
+    function shows(made: String, wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let fit: Bool := equal(asSpan(&made), wanted);
+        if not fit then
+            printLn(asSpan(&made));
+        end if;
+        assertTrue(fit, message);
+        destroyString(made);
+        return nil;
+    end;
+
+    -- 1, 3, 2: x 40, 315, 590; y 170 (lowest), 10 (highest), 90 (half).
+    function testLine(): Unit is
+        assertTrue(mostPoints() = 1000, "1000 points");
+        var values: Buffer[Int64] := allocateEmpty();
+        put(&!values, 1);
+        put(&!values, 3);
+        put(&!values, 2);
+        shows(lineChart(&values, "Hits"), "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 600 200\" class=\"wolly-chart\" role=\"img\" aria-label=\"Hits\"><title>Hits</title><text class=\"wolly-axis\" x=\"0\" y=\"20\" font-size=\"12\" fill=\"currentColor\">3</text><text class=\"wolly-axis\" x=\"0\" y=\"170\" font-size=\"12\" fill=\"currentColor\">1</text><polyline class=\"wolly-line\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" points=\"40,170 315,10 590,90\"/></svg>", "a line of three");
+        destroyFree(values);
+        var one: Buffer[Int64] := allocateEmpty();
+        put(&!one, 7);
+        shows(lineChart(&one, "One"), "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 600 200\" class=\"wolly-chart\" role=\"img\" aria-label=\"One\"><title>One</title><text class=\"wolly-axis\" x=\"0\" y=\"20\" font-size=\"12\" fill=\"currentColor\">7</text><text class=\"wolly-axis\" x=\"0\" y=\"170\" font-size=\"12\" fill=\"currentColor\">7</text><circle class=\"wolly-line\" cx=\"315\" cy=\"90\" r=\"3\" fill=\"currentColor\"/></svg>", "one value is a dot");
+        destroyFree(one);
+        var flat: Buffer[Int64] := allocateEmpty();
+        put(&!flat, 5);
+        put(&!flat, 5);
+        let drawn: String := lineChart(&flat, "Flat");
+        assertTrue(contains(asSpan(&drawn), "points=\"40,90 590,90\""), "equal values: a line in the middle");
+        destroyString(drawn);
+        destroyFree(flat);
+        var none: Buffer[Int64] := allocateEmpty();
+        shows(lineChart(&none, "None"), "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 600 200\" class=\"wolly-chart\" role=\"img\" aria-label=\"None\"><title>None</title></svg>", "no values, an empty chart");
+        destroyFree(none);
+        return nil;
+    end;
+
+    -- 2, 4: slot 275, bar 220 wide, 27 in from its slot; heights 80, 160.
+    function testBars(): Unit is
+        var values: Buffer[Int64] := allocateEmpty();
+        put(&!values, 2);
+        put(&!values, 4);
+        shows(barChart(&values, "Mo\nTu", "Days"), "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 600 200\" class=\"wolly-chart\" role=\"img\" aria-label=\"Days\"><title>Days</title><text class=\"wolly-axis\" x=\"0\" y=\"20\" font-size=\"12\" fill=\"currentColor\">4</text><text class=\"wolly-axis\" x=\"0\" y=\"170\" font-size=\"12\" fill=\"currentColor\">0</text><rect class=\"wolly-bar\" x=\"67\" y=\"90\" width=\"220\" height=\"80\" fill=\"currentColor\"><title>Mo: 2</title></rect><text class=\"wolly-axis\" x=\"177\" y=\"190\" font-size=\"12\" text-anchor=\"middle\" fill=\"currentColor\">Mo</text><rect class=\"wolly-bar\" x=\"342\" y=\"10\" width=\"220\" height=\"160\" fill=\"currentColor\"><title>Tu: 4</title></rect><text class=\"wolly-axis\" x=\"452\" y=\"190\" font-size=\"12\" text-anchor=\"middle\" fill=\"currentColor\">Tu</text></svg>", "two bars with labels");
+        let missing: String := barChart(&values, "Mo", "Days");
+        assertTrue(contains(asSpan(&missing), "<title>: 4</title>"), "a missing label is empty");
+        destroyString(missing);
+        destroyFree(values);
+        var negative: Buffer[Int64] := allocateEmpty();
+        put(&!negative, belowZero);
+        put(&!negative, 10);
+        let drawn: String := barChart(&negative, "a\nb", "Neg");
+        assertTrue(contains(asSpan(&drawn), "height=\"0\" fill=\"currentColor\"><title>a: 0</title>"), "a value below 0 is drawn as 0");
+        destroyString(drawn);
+        destroyFree(negative);
+        -- -5, 0, 10 lies as 0, 0, 10: x 40, 315, 590; y 170, 170, 10.
+        var below: Buffer[Int64] := allocateEmpty();
+        put(&!below, belowZero);
+        put(&!below, 0);
+        put(&!below, 10);
+        let line: String := lineChart(&below, "Below");
+        assertTrue(contains(asSpan(&line), "points=\"40,170 315,170 590,10\""), "a value below 0 lies on the baseline with the 0");
+        destroyString(line);
+        destroyFree(below);
+        return nil;
+    end;
+
+    function testLimits(): Unit is
+        var many: Buffer[Int64] := allocateEmpty();
+        var i: Index := 0;
+        while i < 1001 do
+            put(&!many, 1);
+            i := i + 1;
+        end while;
+        let line: String := lineChart(&many, "Many");
+        assertTrue(countOf(asSpan(&line), ",") = 1000, "1001 values: 1000 points drawn");
+        destroyString(line);
+        destroyFree(many);
+        var month: Buffer[Int64] := allocateEmpty();
+        var d: Index := 0;
+        while d < 31 do
+            put(&!month, 3);
+            d := d + 1;
+        end while;
+        let labelled: String := barChart(&month, "", "Month");
+        assertTrue(contains(asSpan(&labelled), "y=\"190\""), "31 bars have labels");
+        destroyString(labelled);
+        put(&!month, 3);
+        let bare: String := barChart(&month, "", "Month");
+        assertFalse(contains(asSpan(&bare), "y=\"190\""), "32 bars have none");
+        destroyString(bare);
+        destroyFree(month);
+        return nil;
+    end;
+
+    function testTiles(): Unit is
+        shows(tile("Users", 1234), "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 200 100\" class=\"wolly-tile\" role=\"img\" aria-label=\"Users: 1.2 k\"><title>Users</title><text x=\"100\" y=\"55\" font-size=\"36\" text-anchor=\"middle\" fill=\"currentColor\">1.2 k</text><text x=\"100\" y=\"85\" font-size=\"14\" text-anchor=\"middle\" fill=\"currentColor\">Users</text></svg>", "a tile");
+        let up: String := tileWithChange("Hits", 15, 10);
+        assertTrue(contains(asSpan(&up), "<text class=\"wolly-up\" x=\"190\" y=\"20\" font-size=\"14\" text-anchor=\"end\" fill=\"currentColor\">+0.5</text>"), "half again as much: +0.5");
+        destroyString(up);
+        let down: String := tileWithChange("Hits", 5, 10);
+        assertTrue(contains(asSpan(&down), "class=\"wolly-down\""), "half: down");
+        assertTrue(contains(asSpan(&down), ">-0.5</text>"), "half: -0.5");
+        destroyString(down);
+        let big: String := tileWithChange("Hits", 35, 10);
+        assertTrue(contains(asSpan(&big), ">+2.5</text>"), "three and a half times: +2.5");
+        destroyString(big);
+        let same: String := tileWithChange("Hits", 10, 10);
+        assertFalse(contains(asSpan(&same), "wolly-up"), "no change, no up");
+        assertFalse(contains(asSpan(&same), "wolly-down"), "no change, no down");
+        destroyString(same);
+        return nil;
+    end;
+
+    function testEscaping(): Unit is
+        var values: Buffer[Int64] := allocateEmpty();
+        put(&!values, 1);
+        let line: String := lineChart(&values, "<script>&\"");
+        assertFalse(contains(asSpan(&line), "<script>"), "no tag from a title");
+        assertTrue(contains(asSpan(&line), "aria-label=\"&lt;script&gt;&amp;&quot;\""), "the title escaped in the label");
+        destroyString(line);
+        let bars: String := barChart(&values, "<i>x</i>", "t");
+        assertFalse(contains(asSpan(&bars), "<i>"), "no tag from a label");
+        destroyString(bars);
+        destroyFree(values);
+        let shown: String := tile("a\"b<c", 1);
+        assertFalse(contains(asSpan(&shown), "a\"b"), "no quote from a label of a tile");
+        destroyString(shown);
+        return nil;
+    end;
+end module body.

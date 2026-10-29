@@ -1,0 +1,780 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    parseInt,
+    substring
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Values,
+    Cursor,
+    noValues,
+    withText,
+    withInt64,
+    execute,
+    start,
+    advance,
+    columnInt64,
+    columnFloat64,
+    columnText,
+    finish,
+    Transaction,
+    begin,
+    commit,
+    rollback
+);
+import Standard.Search (
+    SearchError,
+    SearchStorageFailed,
+    SearchHit,
+    NoWords,
+    prepareSearch,
+    indexDocumentIn,
+    removeDocument,
+    search,
+    searchQuery,
+    destroyHits
+);
+import Wolly.SoundSearch (
+    SoundMode,
+    Both,
+    prepareSounds,
+    indexSoundsWithin,
+    removeSounds,
+    findBySound
+);
+import Wolly.Net (
+    validHostname
+);
+import Wolly.Response (
+    decimalText
+);
+import Wolly.Dialect (
+    onPostgres
+);
+
+module body Wolly.LogStore is
+    constant lineMost: Index := 16384;
+    constant levelMost: Index := 16;
+    constant sourceMost: Index := 255;
+    constant pruneMost: Int64 := 1000;
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_log_lines (id INTEGER PRIMARY KEY, host TEXT NOT NULL, source TEXT NOT NULL, at INTEGER NOT NULL CHECK (at >= 0), level TEXT NOT NULL, line TEXT NOT NULL) STRICT";
+    constant makeIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_log_lines_at ON wolly_log_lines (at)";
+    -- The term host: of Wolly.Query asks lower(host) = lower(?) within a window of at: without this
+    -- index it reads every line of the window (1.3 s of a search of 1.7 s in a store of a million lines).
+    -- The same statement on both backends.
+    constant makeHostIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_log_lines_host ON wolly_log_lines (lower(host), at)";
+    constant putLine: Span[Nat8, Static] := "INSERT INTO wolly_log_lines (host, source, at, level, line) VALUES (?, ?, ?, ?, ?)";
+    constant lastId: Span[Nat8, Static] := "SELECT last_insert_rowid()";
+    constant getLine: Span[Nat8, Static] := "SELECT at, host, source, level, line FROM wolly_log_lines WHERE id = ?";
+    -- The lines a prune takes, ordered by their time, so SQLite searches
+    -- the index on at: ordered by id it would scan the whole table in id
+    -- order, also when no line is old, inside the prune's transaction
+    -- (60 s with nothing to take in a large store, writers blocked
+    -- meanwhile).  Kept with EXPLAIN QUERY PLAN in front, so a test reads
+    -- the plan of exactly this query (oldLinesPlanSql).
+    constant oldLinesPlan: Span[Nat8, Static] := "EXPLAIN QUERY PLAN SELECT id FROM wolly_log_lines WHERE at < ? ORDER BY at, id LIMIT ?";
+    constant dropLine: Span[Nat8, Static] := "DELETE FROM wolly_log_lines WHERE id = ?";
+    constant lineToLevel: Span[Nat8, Static] := "SELECT host, source, line FROM wolly_log_lines WHERE id = ?";
+    constant setLevel: Span[Nat8, Static] := "UPDATE wolly_log_lines SET level = ? WHERE id = ?";
+
+    -- On PostgreSQL the full-text index is the table itself: two columns of words that
+    -- PostgreSQL keeps with each row, words for findLines (the title of a line, its host, source and level, weighted
+    -- ten times its text, as on SQLite) and line_words for Wolly.Query (the text alone), in the configuration wolly:
+    -- simple with unaccent before it, so that cafe finds the accented word.  Standard.Search has FTS5 only.
+    constant makeUnaccent: Span[Nat8, Static] := "CREATE EXTENSION IF NOT EXISTS unaccent";
+    constant makeConfiguration: Span[Nat8, Static] := "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_ts_config WHERE cfgname = 'wolly') THEN CREATE TEXT SEARCH CONFIGURATION wolly (COPY = simple); ALTER TEXT SEARCH CONFIGURATION wolly ALTER MAPPING FOR hword, hword_part, word WITH unaccent, simple; END IF; END $$";
+    constant makeTablePg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_log_lines (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, host TEXT NOT NULL, source TEXT NOT NULL, at BIGINT NOT NULL CHECK (at >= 0), level TEXT NOT NULL, line TEXT NOT NULL, words tsvector GENERATED ALWAYS AS (setweight(to_tsvector('wolly'::regconfig, host || ' ' || source || ' ' || level), 'A') || setweight(to_tsvector('wolly'::regconfig, line), 'D')) STORED, line_words tsvector GENERATED ALWAYS AS (to_tsvector('wolly'::regconfig, line)) STORED)";
+    constant makeWordsIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_log_lines_words ON wolly_log_lines USING GIN (words)";
+    constant makeLineWordsIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_log_lines_line_words ON wolly_log_lines USING GIN (line_words)";
+    constant putLinePg: Span[Nat8, Static] := "INSERT INTO wolly_log_lines (host, source, at, level, line) VALUES (?, ?, ?, ?, ?) RETURNING id";
+    -- The snippet marks the words found with the bytes 1 and 2, which no kept line holds (cleaned makes them spaces),
+    -- in the whole line: without HighlightAll ts_headline drops what looks like markup from the line.  excerpt cuts the
+    -- words around the first one found, marked escapes them for HTML and writes the markers of the caller.
+    constant searchPg: Span[Nat8, Static] := "SELECT id, ts_rank(words, q), ts_headline('wolly'::regconfig, line, q, 'StartSel=' || chr(1) || ', StopSel=' || chr(2) || ', HighlightAll=true') FROM wolly_log_lines, plainto_tsquery('wolly'::regconfig, ?) AS q WHERE words @@ q ORDER BY 2 DESC, id DESC LIMIT ? OFFSET ?";
+
+    function mostLineBytes(): Index is
+        return lineMost;
+    end;
+
+    generic [L: Region]
+    function isLevel(level: Span[Nat8, L]): Bool is
+        let size: Index := spanLength(level);
+        if (size = 0) or (size > levelMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if (level[i] < 97) or (level[i] > 122) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [S: Region]
+    function isSource(source: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(source);
+        if (size = 0) or (size > sourceMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if (source[i] < 32) or (source[i] = 127) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function storageFailed(error: DbError): SearchError is
+        return SearchStorageFailed(error => error);
+    end;
+
+    -- Runs one statement without values that returns no rows.
+    generic [R: Region]
+    function ran(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Option[DbError] is
+        case execute(&~db, sql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as done: Nat64) do
+                return None();
+        end case;
+    end;
+
+    -- The tables of PostgreSQL: the configuration of words, the lines with their words, the indexes, the sounds.
+    generic [R: Region]
+    function preparedOnPostgres(db: &![Database[Writing], R]): Either[SearchError, Unit] is
+        var problem: Option[DbError] := ran(&~db, makeUnaccent);
+        case problem of
+            when None do
+                problem := ran(&~db, makeConfiguration);
+            when Some(value as error: DbError) do
+                problem := Some(value => error);
+        end case;
+        case problem of
+            when None do
+                problem := ran(&~db, makeTablePg);
+            when Some(value as error: DbError) do
+                problem := Some(value => error);
+        end case;
+        case problem of
+            when None do
+                problem := ran(&~db, makeIndex);
+            when Some(value as error: DbError) do
+                problem := Some(value => error);
+        end case;
+        case problem of
+            when None do
+                problem := ran(&~db, makeHostIndex);
+            when Some(value as error: DbError) do
+                problem := Some(value => error);
+        end case;
+        case problem of
+            when None do
+                problem := ran(&~db, makeWordsIndex);
+            when Some(value as error: DbError) do
+                problem := Some(value => error);
+        end case;
+        case problem of
+            when None do
+                problem := ran(&~db, makeLineWordsIndex);
+            when Some(value as error: DbError) do
+                problem := Some(value => error);
+        end case;
+        case problem of
+            when None do
+                problem := prepareSounds(&~db);
+            when Some(value as error: DbError) do
+                problem := Some(value => error);
+        end case;
+        case problem of
+            when Some(value as error: DbError) do
+                return Left(left => storageFailed(error));
+            when None do
+                let done: Either[SearchError, Unit] := Right(right => nil);
+                return done;
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepareLogStore(db: &![Database[Writing], R]): Either[SearchError, Unit] is
+        if onPostgres(&db) then
+            return preparedOnPostgres(&~db);
+        end if;
+        case execute(&~db, makeTable, noValues()) of
+            when Left(left as error: DbError) do
+                return Left(left => storageFailed(error));
+            when Right(right as made: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, makeIndex, noValues()) of
+            when Left(left as error: DbError) do
+                return Left(left => storageFailed(error));
+            when Right(right as indexed: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, makeHostIndex, noValues()) of
+            when Left(left as error: DbError) do
+                return Left(left => storageFailed(error));
+            when Right(right as indexed: Nat64) do
+                skip;
+        end case;
+        case prepareSounds(&~db) of
+            when Some(value as error: DbError) do
+                return Left(left => storageFailed(error));
+            when None do
+                return prepareSearch(&~db);
+        end case;
+    end;
+
+    -- The line as it is kept: control bytes but the tab as spaces, at most
+    -- lineMost bytes.
+    generic [T: Region]
+    function cleaned(line: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while (i < spanLength(line)) and (i < lineMost) do
+            let byte: Nat8 := line[i];
+            if ((byte < 32) and (byte /= 9)) or (byte = 127) then
+                writeByte(&!out, ' ');
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The number of the row just inserted.
+    generic [R: Region]
+    function insertedId(db: &![Database[Writing], R]): Either[DbError, Int64] is
+        var cursor: Cursor := start(&~db, lastId, noValues());
+        var id: Int64 := 0;
+        if advance(&!cursor) then
+            id := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => id);
+        end case;
+    end;
+
+    function keptAs(id: Int64): Either[SearchError, Option[Int64]] is
+        let some: Option[Int64] := Some(value => id);
+        let result: Either[SearchError, Option[Int64]] := Right(right => some);
+        return result;
+    end;
+
+    function notKept(): Either[SearchError, Option[Int64]] is
+        return Right(right => None());
+    end;
+
+    -- The title of a line in the full-text index: its host, source and level
+    -- (Wolly.Query finds a level by it).
+    generic [H: Region, S: Region, L: Region]
+    function titleOf(host: Span[Nat8, H], source: Span[Nat8, S], level: Span[Nat8, L]): String is
+        var title: StringBuilder := makeStringBuilder();
+        writeString(&!title, host);
+        writeByte(&!title, ' ');
+        writeString(&!title, source);
+        writeByte(&!title, ' ');
+        writeString(&!title, level);
+        return finalize(title);
+    end;
+
+    -- Line id into both indexes, in the caller's transaction:
+    -- Standard.Search finds the row of a key by its table of keys, so the
+    -- index is written only through it.
+    generic [R: Region, X: Region, H: Region, S: Region, L: Region, C: Region]
+    function indexLine(db: &![Database[Writing], R], transaction: &[Transaction, X], id: Int64, host: Span[Nat8, H],
+                       source: Span[Nat8, S], level: Span[Nat8, L], line: Span[Nat8, C]): Either[SearchError, Option[Int64]] is
+        let key: String := decimalText(id);
+        let heading: String := titleOf(host, source, level);
+        let indexed: Either[SearchError, Unit] := indexDocumentIn(&~db, transaction, asSpan(&key), asSpan(&heading), line);
+        destroyString(heading);
+        case indexed of
+            when Left(left as failure: SearchError) do
+                destroyString(key);
+                return Left(left => failure);
+            when Right(right as done: Unit) do
+                let sounded: Either[DbError, Bool] := indexSoundsWithin(&~db, asSpan(&key), line, Both());
+                destroyString(key);
+                case sounded of
+                    when Left(left as error: DbError) do
+                        return Left(left => storageFailed(error));
+                    when Right(right as kept: Bool) do
+                        return keptAs(id);
+                end case;
+        end case;
+    end;
+
+    -- keepLineIn on PostgreSQL, line cleaned: the insert gives the id back, the words are PostgreSQL's, the sounds Wolly's.
+    generic [R: Region, H: Region, S: Region, L: Region, T: Region]
+    function keptOnPostgres(db: &![Database[Writing], R], host: Span[Nat8, H], source: Span[Nat8, S], at: Int64,
+                            level: Span[Nat8, L], line: Span[Nat8, T]): Either[SearchError, Option[Int64]] is
+        let values: Values := withText(withText(withInt64(withText(withText(noValues(), host), source), at), level), line);
+        var cursor: Cursor := start(&~db, putLinePg, values);
+        var id: Int64 := 0;
+        var got: Bool := false;
+        if advance(&!cursor) then
+            id := columnInt64(&cursor, 0);
+            got := true;
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => storageFailed(error));
+            when None do
+                skip;
+        end case;
+        if not got then
+            return notKept();
+        end if;
+        let key: String := decimalText(id);
+        let sounded: Either[DbError, Bool] := indexSoundsWithin(&~db, asSpan(&key), line, Both());
+        destroyString(key);
+        case sounded of
+            when Left(left as error: DbError) do
+                return Left(left => storageFailed(error));
+            when Right(right as kept: Bool) do
+                return keptAs(id);
+        end case;
+    end;
+
+    generic [R: Region, X: Region, H: Region, S: Region, L: Region, T: Region]
+    function keepLineIn(db: &![Database[Writing], R], transaction: &[Transaction, X], host: Span[Nat8, H],
+                        source: Span[Nat8, S], at: Int64, level: Span[Nat8, L], line: Span[Nat8, T]): Either[SearchError, Option[Int64]] is
+        if ((not validHostname(host)) or (not isSource(source))) or ((not isLevel(level)) or (at < 0)) then
+            return notKept();
+        end if;
+        let text: String := cleaned(line);
+        if onPostgres(&db) then
+            let keptPg: Either[SearchError, Option[Int64]] := keptOnPostgres(&~db, host, source, at, level, asSpan(&text));
+            destroyString(text);
+            return keptPg;
+        end if;
+        let values: Values := withText(withText(withInt64(withText(withText(noValues(), host), source), at), level), asSpan(&text));
+        case execute(&~db, putLine, values) of
+            when Left(left as error: DbError) do
+                destroyString(text);
+                return Left(left => storageFailed(error));
+            when Right(right as inserted: Nat64) do
+                case insertedId(&~db) of
+                    when Left(left as error: DbError) do
+                        destroyString(text);
+                        return Left(left => storageFailed(error));
+                    when Right(right as id: Int64) do
+                        let result: Either[SearchError, Option[Int64]] := indexLine(&~db, transaction, id, host, source, level, asSpan(&text));
+                        destroyString(text);
+                        return result;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, H: Region, S: Region, L: Region, T: Region]
+    function keepLine(db: &![Database[Writing], R], host: Span[Nat8, H], source: Span[Nat8, S], at: Int64,
+                      level: Span[Nat8, L], line: Span[Nat8, T]): Either[SearchError, Option[Int64]] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => storageFailed(error));
+            when Right(right as open: Transaction) do
+                let result: Either[SearchError, Option[Int64]] := keepLineIn(&~db, &open, host, source, at, level, line);
+                case result of
+                    when Left(left as failure: SearchError) do
+                        rollback(&~db, open);
+                        return Left(left => failure);
+                    when Right(right as kept: Option[Int64]) do
+                        case kept of
+                            when None do
+                                rollback(&~db, open);
+                                return notKept();
+                            when Some(value as id: Int64) do
+                                case commit(&~db, open) of
+                                    when Left(left as error: DbError) do
+                                        return Left(left => storageFailed(error));
+                                    when Right(right as done: Unit) do
+                                        return keptAs(id);
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function changed(done: Bool): Either[SearchError, Bool] is
+        let result: Either[SearchError, Bool] := Right(right => done);
+        return result;
+    end;
+
+    generic [R: Region, X: Region, L: Region]
+    function setLevelIn(db: &![Database[Writing], R], transaction: &[Transaction, X], id: Int64, level: Span[Nat8, L]): Either[SearchError, Bool] is
+        if not isLevel(level) then
+            return changed(false);
+        end if;
+        if onPostgres(&db) then
+            case execute(&~db, setLevel, withInt64(withText(noValues(), level), id)) of
+                when Left(left as error: DbError) do
+                    return Left(left => storageFailed(error));
+                when Right(right as set: Nat64) do
+                    return changed(set > 0);
+            end case;
+        end if;
+        var cursor: Cursor := start(&~db, lineToLevel, withInt64(noValues(), id));
+        if not advance(&!cursor) then
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return Left(left => storageFailed(error));
+                when None do
+                    return changed(false);
+            end case;
+        end if;
+        let key: String := decimalText(id);
+        let heading: String := titleOf(columnText(&cursor, 0), columnText(&cursor, 1), level);
+        let indexed: Either[SearchError, Unit] := indexDocumentIn(&~db, transaction, asSpan(&key), asSpan(&heading), columnText(&cursor, 2));
+        destroyString(key);
+        destroyString(heading);
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => storageFailed(error));
+            when None do
+                skip;
+        end case;
+        case indexed of
+            when Left(left as failure: SearchError) do
+                return Left(left => failure);
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        case execute(&~db, setLevel, withInt64(withText(noValues(), level), id)) of
+            when Left(left as error: DbError) do
+                return Left(left => storageFailed(error));
+            when Right(right as set: Nat64) do
+                return changed(true);
+        end case;
+    end;
+
+    -- The snippet of PostgreSQL escaped for HTML, the bytes 1 and 2 around a word found written as before and after.
+    generic [T: Region, B: Region, A: Region]
+    function marked(raw: Span[Nat8, T], before: Span[Nat8, B], after: Span[Nat8, A]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(raw) do
+            let byte: Nat8 := raw[i];
+            if byte = 1 then
+                writeString(&!out, before);
+            else if byte = 2 then
+                writeString(&!out, after);
+            else if byte = '&' then
+                writeString(&!out, "&amp;");
+            else if byte = '<' then
+                writeString(&!out, "&lt;");
+            else if byte = '>' then
+                writeString(&!out, "&gt;");
+            else if byte = '"' then
+                writeString(&!out, "&quot;");
+            else if byte = 39 then
+                writeString(&!out, "&#39;");
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- At most 16 words of raw, from five before the first word found (the byte 1), with ... where raw goes on before or
+    -- after, as the snippet of FTS5 on SQLite; marked as marked does.
+    generic [T: Region, B: Region, A: Region]
+    function excerpt(raw: Span[Nat8, T], before: Span[Nat8, B], after: Span[Nat8, A]): String is
+        let size: Index := spanLength(raw);
+        var starts: Buffer[Index] := allocateEmpty();
+        var hit: Index := 0;
+        var found: Bool := false;
+        var previous: Nat8 := ' ';
+        var i: Index := 0;
+        while i < size do
+            if (raw[i] /= ' ') and (previous = ' ') then
+                insertBack(&!starts, i);
+            end if;
+            if (raw[i] = 1) and (not found) then
+                hit := length(&starts);
+                found := true;
+            end if;
+            previous := raw[i];
+            i := i + 1;
+        end while;
+        let words: Index := length(&starts);
+        if words = 0 then
+            destroyFree(starts);
+            return marked(raw, before, after);
+        end if;
+        var first: Index := 0;
+        if hit > 6 then
+            first := hit - 6;
+        end if;
+        var last: Index := words;
+        if (first + 16) < words then
+            last := first + 16;
+        end if;
+        let begins: Index := nth(&starts, first);
+        var ends: Index := size;
+        if last < words then
+            ends := nth(&starts, last);
+        end if;
+        destroyFree(starts);
+        while (ends > begins) and (raw[ends - 1] = ' ') do
+            ends := ends - 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        if first > 0 then
+            writeString(&!out, "...");
+        end if;
+        let middle: String := marked(substring(raw, begins, ends), before, after);
+        writeString(&!out, asSpan(&middle));
+        destroyString(middle);
+        if last < words then
+            writeString(&!out, "...");
+        end if;
+        return finalize(out);
+    end;
+
+    -- limit held to 1 to 100 and offset to 0 and more, as Standard.Search holds them.
+    function heldLimit(limit: Int64): Int64 is
+        if limit < 1 then
+            return 1;
+        end if;
+        if limit > 100 then
+            return 100;
+        end if;
+        return limit;
+    end;
+
+    function heldOffset(offset: Int64): Int64 is
+        if offset < 0 then
+            return 0;
+        end if;
+        return offset;
+    end;
+
+    -- findLines on PostgreSQL: the lines whose words hold every word of text, best first.  What counts as a word is
+    -- Standard.Search's: no word, NoWords; PostgreSQL then reads the words of text itself (plainto_tsquery), so a
+    -- word ending in a star is a word, not its beginning.
+    generic [R: Region, T: Region]
+    function foundOnPostgres(db: &![Database[Writing], R], text: Span[Nat8, T], limit: Int64, offset: Int64): Either[SearchError, Buffer[SearchHit]] is
+        case searchQuery(text) of
+            when None do
+                let none: Either[SearchError, Buffer[SearchHit]] := Left(left => NoWords());
+                return none;
+            when Some(value as query: String) do
+                destroyString(query);
+        end case;
+        var cursor: Cursor := start(&~db, searchPg, withInt64(withInt64(withText(noValues(), text), heldLimit(limit)), heldOffset(offset)));
+        var hits: Buffer[SearchHit] := allocateEmpty();
+        while advance(&!cursor) do
+            let key: String := decimalText(columnInt64(&cursor, 0));
+            let rank: Float64 := 0.0 - columnFloat64(&cursor, 1);
+            let snippet: String := excerpt(columnText(&cursor, 2), "<mark>", "</mark>");
+            insertBack(&!hits, SearchHit(key => key, rank => rank, snippet => snippet));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyHits(hits);
+                let failed: Either[SearchError, Buffer[SearchHit]] := Left(left => storageFailed(error));
+                return failed;
+            when None do
+                let found: Either[SearchError, Buffer[SearchHit]] := Right(right => hits);
+                return found;
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function findLines(db: &![Database[Writing], R], text: Span[Nat8, T], limit: Int64, offset: Int64): Either[SearchError, Buffer[SearchHit]] is
+        if onPostgres(&db) then
+            return foundOnPostgres(&~db, text, limit, offset);
+        end if;
+        return search(&~db, text, limit, offset, "<mark>", "</mark>");
+    end;
+
+    generic [R: Region, T: Region]
+    function findLinesBySound(db: &![Database[Writing], R], text: Span[Nat8, T], limit: Int64): Either[DbError, Buffer[String]] is
+        return findBySound(&~db, text, Both(), limit);
+    end;
+
+    generic [R: Region, K: Region]
+    function lineOf(db: &![Database[Writing], R], key: Span[Nat8, K]): Either[DbError, Option[String]] is
+        var id: Int64 := 0;
+        case parseInt(key) of
+            when Some(value as parsed: Int64) do
+                id := parsed;
+            when None do
+                skip;
+        end case;
+        var cursor: Cursor := start(&~db, getLine, withInt64(noValues(), id));
+        if advance(&!cursor) then
+            var out: StringBuilder := makeStringBuilder();
+            let at: String := decimalText(columnInt64(&cursor, 0));
+            writeString(&!out, asSpan(&at));
+            destroyString(at);
+            writeByte(&!out, 9);
+            writeString(&!out, columnText(&cursor, 1));
+            writeByte(&!out, 9);
+            writeString(&!out, columnText(&cursor, 2));
+            writeByte(&!out, 9);
+            writeString(&!out, columnText(&cursor, 3));
+            writeByte(&!out, 9);
+            writeString(&!out, columnText(&cursor, 4));
+            writeByte(&!out, 10);
+            let found: String := finalize(out);
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    destroyString(found);
+                    return Left(left => error);
+                when None do
+                    let some: Option[String] := Some(value => found);
+                    return Right(right => some);
+            end case;
+        else
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return Left(left => error);
+                when None do
+                    return Right(right => None());
+            end case;
+        end if;
+    end;
+
+    function oldLinesPlanSql(): Span[Nat8, Static] is
+        return oldLinesPlan;
+    end;
+
+    -- oldLinesPlan without its first 19 bytes, "EXPLAIN QUERY PLAN ".
+    function oldLinesSql(): Span[Nat8, Static] is
+        return substring(oldLinesPlan, 19, spanLength(oldLinesPlan));
+    end;
+
+    -- The numbers of at most pruneMost lines from before the time before.
+    generic [R: Region]
+    function oldIds(db: &![Database[Writing], R], before: Int64): Either[DbError, Buffer[Int64]] is
+        var cursor: Cursor := start(&~db, oldLinesSql(), withInt64(withInt64(noValues(), before), pruneMost));
+        var ids: Buffer[Int64] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!ids, columnInt64(&cursor, 0));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyFree(ids);
+                return Left(left => error);
+            when None do
+                return Right(right => ids);
+        end case;
+    end;
+
+    -- Takes one line out of both indexes and the table.
+    -- dropOne on PostgreSQL: the words go with the row.
+    generic [R: Region]
+    function droppedOnPostgres(db: &![Database[Writing], R], id: Int64): Option[SearchError] is
+        let key: String := decimalText(id);
+        let unsounded: Either[DbError, Bool] := removeSounds(&~db, asSpan(&key));
+        destroyString(key);
+        case unsounded of
+            when Left(left as error: DbError) do
+                return Some(value => storageFailed(error));
+            when Right(right as hadSounds: Bool) do
+                skip;
+        end case;
+        case execute(&~db, dropLine, withInt64(noValues(), id)) of
+            when Left(left as error: DbError) do
+                return Some(value => storageFailed(error));
+            when Right(right as dropped: Nat64) do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region]
+    function dropOne(db: &![Database[Writing], R], id: Int64): Option[SearchError] is
+        if onPostgres(&db) then
+            return droppedOnPostgres(&~db, id);
+        end if;
+        let key: String := decimalText(id);
+        let unindexed: Either[SearchError, Bool] := removeDocument(&~db, asSpan(&key));
+        let unsounded: Either[DbError, Bool] := removeSounds(&~db, asSpan(&key));
+        destroyString(key);
+        case unindexed of
+            when Left(left as failure: SearchError) do
+                return Some(value => failure);
+            when Right(right as had: Bool) do
+                skip;
+        end case;
+        case unsounded of
+            when Left(left as error: DbError) do
+                return Some(value => storageFailed(error));
+            when Right(right as hadSounds: Bool) do
+                skip;
+        end case;
+        case execute(&~db, dropLine, withInt64(noValues(), id)) of
+            when Left(left as error: DbError) do
+                return Some(value => storageFailed(error));
+            when Right(right as dropped: Nat64) do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region]
+    function pruneLines(db: &![Database[Writing], R], before: Int64): Either[SearchError, Int64] is
+        case oldIds(&~db, before) of
+            when Left(left as error: DbError) do
+                return Left(left => storageFailed(error));
+            when Right(right as ids: Buffer[Int64]) do
+                var removed: Int64 := 0;
+                var problem: Option[SearchError] := None();
+                var going: Bool := true;
+                var i: Index := 0;
+                while going and (i < length(&ids)) do
+                    case dropOne(&~db, nth(&ids, i)) of
+                        when Some(value as failure: SearchError) do
+                            problem := Some(value => failure);
+                            going := false;
+                        when None do
+                            removed := removed + 1;
+                    end case;
+                    i := i + 1;
+                end while;
+                destroyFree(ids);
+                case problem of
+                    when Some(value as failure: SearchError) do
+                        return Left(left => failure);
+                    when None do
+                        return Right(right => removed);
+                end case;
+        end case;
+    end;
+end module body.

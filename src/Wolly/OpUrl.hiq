@@ -1,0 +1,557 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    insert,
+    remove,
+    removeLast,
+    nthRef,
+    length as bufferLength,
+    lengthMut,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    indexOfByte,
+    toLower,
+    equal
+);
+
+module body Wolly.OpUrl is
+    constant mostUrlBytes: Index := 2048;
+    constant hexDigits: Span[Nat8, Static] := "0123456789ABCDEF";
+
+    function destroyUrlParts(parts: UrlParts): Unit is
+        let { scheme: String, hasAuthority: Bool, authority: String, hasUser: Bool, host: String, port: String,
+            path: String, query: String, hasQuery: Bool, fragment: String, hasFragment: Bool } := parts;
+        destroyString(scheme);
+        destroyString(authority);
+        destroyString(host);
+        destroyString(port);
+        destroyString(path);
+        destroyString(query);
+        destroyString(fragment);
+        return nil;
+    end;
+
+    function schemeByte(c: Nat8, first: Bool): Bool is
+        let letter: Bool := ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'));
+        if first then
+            return letter;
+        end if;
+        return letter or ((c >= '0') and (c <= '9')) or (c = '+') or (c = '-') or (c = '.');
+    end;
+
+    -- The first place from start on that holds one of the bytes of stops,
+    -- or the length of text.
+    generic [T: Region]
+    function firstOf(text: Span[Nat8, T], start: Index, stops: Span[Nat8, Static]): Index is
+        var i: Index := start;
+        while i < spanLength(text) do
+            var j: Index := 0;
+            while j < spanLength(stops) do
+                if text[i] = stops[j] then
+                    return i;
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    generic [T: Region]
+    function parseUrl(text: Span[Nat8, T]): Option[UrlParts] is
+        if (spanLength(text) = 0) or (spanLength(text) > mostUrlBytes) then
+            let none: Option[UrlParts] := None();
+            return none;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] <= 32) or (text[i] >= 127) then
+                let none: Option[UrlParts] := None();
+                return none;
+            end if;
+            i := i + 1;
+        end while;
+        case indexOfByte(text, ':') of
+            when Some(value as colon: Index) do
+                if colon = 0 then
+                    let none: Option[UrlParts] := None();
+                    return none;
+                end if;
+                var k: Index := 0;
+                while k < colon do
+                    if not schemeByte(text[k], k = 0) then
+                        let none: Option[UrlParts] := None();
+                        return none;
+                    end if;
+                    k := k + 1;
+                end while;
+                return Some(value => partsAfter(text, colon));
+            when None do
+                let none: Option[UrlParts] := None();
+                return none;
+        end case;
+    end;
+
+    -- The parts of text whose scheme ends at colon.
+    generic [T: Region]
+    function partsAfter(text: Span[Nat8, T], colon: Index): UrlParts is
+        let scheme: String := toLower(substring(text, 0, colon));
+        let size: Index := spanLength(text);
+        var at: Index := colon + 1;
+        var hasAuthority: Bool := false;
+        var authority: String := fromSpan("");
+        var hasUser: Bool := false;
+        var host: String := fromSpan("");
+        var port: String := fromSpan("");
+        if ((at + 1) < size) and ((text[at] = '/') and (text[at + 1] = '/')) then
+            hasAuthority := true;
+            let start: Index := at + 2;
+            let stop: Index := firstOf(text, start, "/?#");
+            let whole: Span[Nat8, T] := substring(text, start, stop);
+            destroyString(authority);
+            authority := fromSpan(whole);
+            var hostStart: Index := 0;
+            case lastAt(whole) of
+                when Some(value as sign: Index) do
+                    hasUser := true;
+                    hostStart := sign + 1;
+                when None do
+                    skip;
+            end case;
+            let hostPort: Span[Nat8, T] := substring(whole, hostStart, spanLength(whole));
+            destroyString(host);
+            destroyString(port);
+            host := hostOf(hostPort);
+            port := portOf(hostPort);
+            at := stop;
+        end if;
+        let pathEnd: Index := firstOf(text, at, "?#");
+        let path: String := fromSpan(substring(text, at, pathEnd));
+        var query: String := fromSpan("");
+        var hasQuery: Bool := false;
+        var queryEnd: Index := pathEnd;
+        if (pathEnd < size) and (text[pathEnd] = '?') then
+            hasQuery := true;
+            queryEnd := firstOf(text, pathEnd + 1, "#");
+            destroyString(query);
+            query := fromSpan(substring(text, pathEnd + 1, queryEnd));
+        end if;
+        var fragment: String := fromSpan("");
+        var hasFragment: Bool := false;
+        if (queryEnd < size) and (text[queryEnd] = '#') then
+            hasFragment := true;
+            destroyString(fragment);
+            fragment := fromSpan(substring(text, queryEnd + 1, size));
+        end if;
+        return UrlParts(scheme => scheme, hasAuthority => hasAuthority, authority => authority, hasUser => hasUser,
+            host => host, port => port, path => path, query => query, hasQuery => hasQuery, fragment => fragment,
+            hasFragment => hasFragment);
+    end;
+
+    -- The place of the last at sign of authority.
+    generic [A: Region]
+    function lastAt(authority: Span[Nat8, A]): Option[Index] is
+        var i: Index := spanLength(authority);
+        while i > 0 do
+            i := i - 1;
+            if authority[i] = '@' then
+                return Some(value => i);
+            end if;
+        end while;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    -- The host of host and port: between the brackets of an IPv6 address,
+    -- else up to the last colon.
+    generic [H: Region]
+    function hostOf(hostPort: Span[Nat8, H]): String is
+        if (spanLength(hostPort) > 0) and (hostPort[0] = '[') then
+            case indexOfByte(hostPort, ']') of
+                when Some(value as close: Index) do
+                    return fromSpan(substring(hostPort, 1, close));
+                when None do
+                    return fromSpan(hostPort);
+            end case;
+        end if;
+        case lastColon(hostPort) of
+            when Some(value as colon: Index) do
+                return fromSpan(substring(hostPort, 0, colon));
+            when None do
+                return fromSpan(hostPort);
+        end case;
+    end;
+
+    -- The port of host and port, empty when there is none.
+    generic [H: Region]
+    function portOf(hostPort: Span[Nat8, H]): String is
+        if (spanLength(hostPort) > 0) and (hostPort[0] = '[') then
+            case indexOfByte(hostPort, ']') of
+                when Some(value as close: Index) do
+                    if ((close + 1) < spanLength(hostPort)) and (hostPort[close + 1] = ':') then
+                        return fromSpan(substring(hostPort, close + 2, spanLength(hostPort)));
+                    end if;
+                    return fromSpan("");
+                when None do
+                    return fromSpan("");
+            end case;
+        end if;
+        case lastColon(hostPort) of
+            when Some(value as colon: Index) do
+                return fromSpan(substring(hostPort, colon + 1, spanLength(hostPort)));
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [H: Region]
+    function lastColon(text: Span[Nat8, H]): Option[Index] is
+        var i: Index := spanLength(text);
+        while i > 0 do
+            i := i - 1;
+            if text[i] = ':' then
+                return Some(value => i);
+            end if;
+        end while;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    function unreservedByte(c: Nat8): Bool is
+        let letter: Bool := ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'));
+        return letter or ((c >= '0') and (c <= '9')) or (c = '-') or (c = '.') or (c = '_') or (c = '~');
+    end;
+
+    generic [B: Region]
+    function writeEscaped(out: &![StringBuilder, B], c: Nat8): Unit is
+        let digits: Span[Nat8, Static] := hexDigits;
+        writeByte(&~out, '%');
+        case toIndex(c / 16) of
+            when Some(value as high: Index) do
+                writeByte(&~out, digits[high]);
+            when None do
+                skip;
+        end case;
+        case toIndex(rem(c, 16)) of
+            when Some(value as low: Index) do
+                writeByte(&~out, digits[low]);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [T: Region]
+    function queryEscape(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            if unreservedByte(c) then
+                writeByte(&!out, c);
+            else if c = ' ' then
+                writeByte(&!out, '+');
+            else
+                writeEscaped(&!out, c);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [T: Region]
+    function pathEscape(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            var keep: Bool := unreservedByte(c);
+            case c of
+                when '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | '=' | ':' | '@' do
+                    keep := true;
+                when _ do
+                    skip;
+            end case;
+            if keep then
+                writeByte(&!out, c);
+            else
+                writeEscaped(&!out, c);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function hexValue(c: Nat8): Option[Nat8] is
+        if (c >= '0') and (c <= '9') then
+            return Some(value => c - '0');
+        end if;
+        if (c >= 'a') and (c <= 'f') then
+            return Some(value => (c - 'a') + 10);
+        end if;
+        if (c >= 'A') and (c <= 'F') then
+            return Some(value => (c - 'A') + 10);
+        end if;
+        let none: Option[Nat8] := None();
+        return none;
+    end;
+
+    generic [T: Region]
+    function queryUnescape(text: Span[Nat8, T]): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        var broken: Bool := false;
+        while (i < spanLength(text)) and (not broken) do
+            let c: Nat8 := text[i];
+            if c = '+' then
+                writeByte(&!out, ' ');
+                i := i + 1;
+            else if c = '%' then
+                if (i + 2) < spanLength(text) then
+                    case hexValue(text[i + 1]) of
+                        when Some(value as high: Nat8) do
+                            case hexValue(text[i + 2]) of
+                                when Some(value as low: Nat8) do
+                                    writeByte(&!out, (high * 16) + low);
+                                when None do
+                                    broken := true;
+                            end case;
+                        when None do
+                            broken := true;
+                    end case;
+                else
+                    broken := true;
+                end if;
+                i := i + 3;
+            else
+                writeByte(&!out, c);
+                i := i + 1;
+            end if;
+        end while;
+        let decoded: String := finalize(out);
+        if broken then
+            destroyString(decoded);
+            let none: Option[String] := None();
+            return none;
+        end if;
+        return Some(value => decoded);
+    end;
+
+    function destroyPairs(pairs: Buffer[QueryPair]): Unit is
+        var all: Buffer[QueryPair] := pairs;
+        while bufferLength(&all) > 0 do
+            let { name: String, value: String } := removeLast(&!all);
+            destroyString(name);
+            destroyString(value);
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    generic [T: Region]
+    function parseQuery(text: Span[Nat8, T]): Option[Buffer[QueryPair]] is
+        var pairs: Buffer[QueryPair] := allocateEmpty();
+        var start: Index := 0;
+        var broken: Bool := false;
+        while (start <= spanLength(text)) and (not broken) do
+            let stop: Index := firstOf(text, start, "&");
+            let part: Span[Nat8, T] := substring(text, start, stop);
+            if spanLength(part) > 0 then
+                let equals: Index := firstOf(part, 0, "=");
+                let rawName: Span[Nat8, T] := substring(part, 0, equals);
+                var rawValue: Span[Nat8, T] := substring(part, equals, equals);
+                if equals < spanLength(part) then
+                    rawValue := substring(part, equals + 1, spanLength(part));
+                end if;
+                case queryUnescape(rawName) of
+                    when Some(value as name: String) do
+                        case queryUnescape(rawValue) of
+                            when Some(value as decoded: String) do
+                                insertBack(&!pairs, QueryPair(name => name, value => decoded));
+                            when None do
+                                destroyString(name);
+                                broken := true;
+                        end case;
+                    when None do
+                        broken := true;
+                end case;
+            end if;
+            start := stop + 1;
+        end while;
+        if broken then
+            destroyPairs(pairs);
+            let none: Option[Buffer[QueryPair]] := None();
+            return none;
+        end if;
+        return Some(value => pairs);
+    end;
+
+    -- Whether the name of the pair at a sorts before the name at b.
+    generic [P: Region]
+    function nameBefore(pairs: &[Buffer[QueryPair], P], a: Index, b: Index): Bool is
+        let pa: &[QueryPair, P] := nthRef(pairs, a);
+        let pb: &[QueryPair, P] := nthRef(pairs, b);
+        let x: Span[Nat8, P] := asSpan(&(pa->name));
+        let y: Span[Nat8, P] := asSpan(&(pb->name));
+        var i: Index := 0;
+        while (i < spanLength(x)) and (i < spanLength(y)) do
+            if x[i] /= y[i] then
+                return x[i] < y[i];
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(x) < spanLength(y);
+    end;
+
+    generic [O: Region]
+    function positionAt(order: &[Buffer[Index], O], i: Index): Index is
+        let p: &[Index, O] := nthRef(order, i);
+        return !p;
+    end;
+
+    function destroyPositions(order: Buffer[Index]): Unit is
+        var o: Buffer[Index] := order;
+        while bufferLength(&o) > 0 do
+            let p: Index := removeLast(&!o);
+        end while;
+        destroyEmpty(o);
+        return nil;
+    end;
+
+    generic [P: Region]
+    function encodeQuery(pairs: &[Buffer[QueryPair], P]): String is
+        -- A stable insertion sort of the positions by name: a name keeps the
+        -- order of its values.
+        var order: Buffer[Index] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(pairs) do
+            var at: Index := bufferLength(&order);
+            while (at > 0) and nameBefore(pairs, i, positionAt(&order, at - 1)) do
+                at := at - 1;
+            end while;
+            insert(&!order, at, i);
+            i := i + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        var j: Index := 0;
+        while j < bufferLength(&order) do
+            if j > 0 then
+                writeByte(&!out, '&');
+            end if;
+            let pair: &[QueryPair, P] := nthRef(pairs, positionAt(&order, j));
+            let n: String := queryEscape(asSpan(&(pair->name)));
+            let v: String := queryEscape(asSpan(&(pair->value)));
+            writeString(&!out, asSpan(&n));
+            writeByte(&!out, '=');
+            writeString(&!out, asSpan(&v));
+            destroyString(n);
+            destroyString(v);
+            j := j + 1;
+        end while;
+        destroyPositions(order);
+        return finalize(out);
+    end;
+
+    generic [P: Region, N: Region]
+    function hasName(pairs: &![Buffer[QueryPair], P], i: Index, name: Span[Nat8, N]): Bool is
+        let view: &[Buffer[QueryPair], P] := pairs: &[Buffer[QueryPair], P];
+        let pair: &[QueryPair, P] := nthRef(view, i);
+        return equal(asSpan(&(pair->name)), name);
+    end;
+
+    generic [P: Region, N: Region, V: Region]
+    function setPair(pairs: &![Buffer[QueryPair], P], name: Span[Nat8, N], value: Span[Nat8, V]): Unit is
+        var i: Index := 0;
+        while i < lengthMut(&~pairs) do
+            if hasName(&~pairs, i, name) then
+                let { name as gone: String, value as old: String } := remove(&~pairs, i);
+                destroyString(gone);
+                destroyString(old);
+            else
+                i := i + 1;
+            end if;
+        end while;
+        insertBack(&~pairs, QueryPair(name => fromSpan(name), value => fromSpan(value)));
+        return nil;
+    end;
+
+    generic [T: Region, S: Region]
+    function withQuery(text: Span[Nat8, T], set: &[Buffer[QueryPair], S]): Option[String] is
+        case parseUrl(text) of
+            when Some(value as parts: UrlParts) do
+                let { scheme: String, hasAuthority: Bool, authority: String, hasUser: Bool, host: String, port: String,
+                    path: String, query: String, hasQuery: Bool, fragment: String, hasFragment: Bool } := parts;
+                destroyString(host);
+                destroyString(port);
+                let existing: Option[Buffer[QueryPair]] := parseQuery(asSpan(&query));
+                destroyString(query);
+                case existing of
+                    when Some(value as found: Buffer[QueryPair]) do
+                        var pairs: Buffer[QueryPair] := found;
+                        var i: Index := 0;
+                        while i < bufferLength(set) do
+                            let pair: &[QueryPair, S] := nthRef(set, i);
+                            setPair(&!pairs, asSpan(&(pair->name)), asSpan(&(pair->value)));
+                            i := i + 1;
+                        end while;
+                        let encoded: String := encodeQuery(&pairs);
+                        destroyPairs(pairs);
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, asSpan(&scheme));
+                        writeByte(&!out, ':');
+                        if hasAuthority then
+                            writeString(&!out, "//");
+                            writeString(&!out, asSpan(&authority));
+                        end if;
+                        writeString(&!out, asSpan(&path));
+                        if length(&encoded) > 0 then
+                            writeByte(&!out, '?');
+                            writeString(&!out, asSpan(&encoded));
+                        end if;
+                        if hasFragment then
+                            writeByte(&!out, '#');
+                            writeString(&!out, asSpan(&fragment));
+                        end if;
+                        destroyString(encoded);
+                        destroyString(scheme);
+                        destroyString(authority);
+                        destroyString(path);
+                        destroyString(fragment);
+                        return Some(value => finalize(out));
+                    when None do
+                        destroyString(scheme);
+                        destroyString(authority);
+                        destroyString(path);
+                        destroyString(fragment);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+end module body.

@@ -1,0 +1,192 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    startsWith
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    createNewFile,
+    writeAll,
+    syncFile,
+    closeFile,
+    removeFileIfThere
+);
+import Wolly.Bunti (
+    BuntiError,
+    BuntiCode,
+    Plain,
+    LevelM,
+    encodeBunti,
+    buntiSize,
+    buntiPng,
+    destroyBunti
+);
+import Wolly.BuntiScan (
+    decodeBuntiPng
+);
+
+import Wolly.Version (
+    answerAboutBare
+);
+import Wolly.Confine (
+    sandboxAsked,
+    toolPolicy,
+    directoryOf,
+    confineTool,
+    printToolSandbox
+);
+import Standard.Sandbox (
+    allowPath
+);
+
+module body Wolly.Example.BuntiPng is
+    -- Whether the two spans hold the same bytes.
+    generic [A: Region, B: Region]
+    function sameBytes(first: Span[Nat8, A], second: Span[Nat8, B]): Bool is
+        return (spanLength(first) = spanLength(second)) and startsWith(first, second);
+    end;
+
+    -- Writes data to path, a file of the owner and its group, replacing an
+    -- old one; true only when every byte is written and synced.
+    generic [P: Region, D: Region]
+    function writeFileOf(path: Span[Nat8, P], data: Span[Nat8, D]): Bool is
+        let removed: Bool := removeFileIfThere(path);
+        case createNewFile(path, #o644) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, data);
+                let synced: Bool := syncFile(&!file);
+                let closed: Bool := closeFile(file);
+                return (written and synced) and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The bytes of the file at path, None when it cannot be read.
+    generic [P: Region]
+    function readFileOf(path: Span[Nat8, P]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let content: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return content;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Reads the PNG at path, decodes it and compares the text with text.
+    generic [P: Region, T: Region]
+    function verify(path: Span[Nat8, P], text: Span[Nat8, T], cells: Index): ExitCode is
+        let limit: Index := 16000000;
+        case readFileOf(path) of
+            when None do
+                printLn("buntipng: the file written could not be read again");
+                return ExitFailure();
+            when Some(value as bytes: String) do
+                let decoded: Either[BuntiError, String] := decodeBuntiPng(asSpan(&bytes), limit);
+                let png: Index := length(&bytes);
+                destroyString(bytes);
+                case decoded of
+                    when Left(left as error: BuntiError) do
+                        printLn("buntipng: the PNG read back does not decode");
+                        return ExitFailure();
+                    when Right(right as payload: String) do
+                        let equal: Bool := sameBytes(asSpan(&payload), text);
+                        destroyString(payload);
+                        printLn("cells on a side:");
+                        printLn(cells);
+                        printLn("bytes of the PNG:");
+                        printLn(png);
+                        if equal then
+                            printLn("buntipng: ok, the text read back from the file is the text");
+                            return ExitSuccess();
+                        else
+                            printLn("buntipng: the text read back is not the text");
+                            return ExitFailure();
+                        end if;
+                end case;
+        end case;
+    end;
+
+    -- Writes the PNG made (None when it could not be made) and checks it.
+    generic [P: Region, T: Region]
+    function finish(path: Span[Nat8, P], text: Span[Nat8, T], made: Option[String], cells: Index): ExitCode is
+        case made of
+            when None do
+                printLn("buntipng: the PNG could not be made");
+                return ExitFailure();
+            when Some(value as png: String) do
+                let written: Bool := writeFileOf(path, asSpan(&png));
+                destroyString(png);
+                if written then
+                    return verify(path, text, cells);
+                else
+                    printLn("buntipng: the file could not be written");
+                    return ExitFailure();
+                end if;
+        end case;
+    end;
+
+    -- The code of text, drawn at 8 pixels a cell, in the file at path.
+    generic [P: Region, T: Region]
+    function makeFile(path: Span[Nat8, P], text: Span[Nat8, T]): ExitCode is
+        let scale: Index := 8;
+        case encodeBunti(text, Plain(), LevelM()) of
+            when Left(left as error: BuntiError) do
+                printLn("buntipng: the text does not fit a code");
+                return ExitFailure();
+            when Right(right as code: BuntiCode) do
+                let made: Option[String] := buntiPng(&code, scale);
+                let cells: Index := buntiSize(&code);
+                destroyBunti(code);
+                return finish(path, text, made, cells);
+        end case;
+    end;
+
+    constant promises: Span[Nat8, Static] := "stdio rpath wpath cpath";
+
+    function command(): ExitCode is
+        if answerAboutBare("buntipng") then
+            return ExitSuccess();
+        end if;
+        if sandboxAsked() then
+            printToolSandbox("buntipng", promises, allowPath(toolPolicy(promises), "<directory-of-FILE>", "rwc"));
+            return ExitSuccess();
+        end if;
+        if (argumentCount() /= 3) or (spanLength(nthArgument(1)) = 0) then
+            printLn("usage: buntipng FILE TEXT");
+            return ExitFailure();
+        end if;
+        -- The file is written and read back: its directory to read, write and create.
+        let directory: String := directoryOf(nthArgument(1));
+        let confined: Bool := confineTool(allowPath(toolPolicy(promises), asSpan(&directory), "rwc"));
+        destroyString(directory);
+        if not confined then
+            printLn("buntipng: the sandbox was refused");
+            return ExitFailure();
+        end if;
+        return makeFile(nthArgument(1), nthArgument(2));
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        let code: ExitCode := command();
+        surrenderRoot(power);
+        return code;
+    end;
+end module body.

@@ -1,0 +1,35 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A QR code as the value of an img src: data:image/png;base64, and the PNG
+of the code, made by Standard.Qr and Standard.Png.  Each module is 4 by 4
+pixels, black on white, with the quiet zone of 4 modules the standard
+asks for, at level medium, which a phone reads from a screen.  The otpauth
+URI of Standard.Otp.otpauthUri is what an authenticator app wants from it.
+
+A page that shows it needs img-src data: in its Content-Security-Policy.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Qr is
+    """
+    The pixels of one module on a side: 4.
+    """
+    function moduleScale(): Index
+        ensures result = 4;
+
+    """
+    The data URI of the QR code of text.  None when text does not fit a
+    code at level medium (2331 bytes at most) or the image cannot be made.
+    No contract: an Option over outside input; None is its answer for a
+    text that does not fit.
+    """
+    generic [R: Region]
+    function qrDataUri(text: Span[Nat8, R]): Option[String];
+end module.

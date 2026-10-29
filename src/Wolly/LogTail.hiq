@@ -1,0 +1,356 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    bytesToHex,
+    equal,
+    formatNat
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.File (
+    FileDescriptor,
+    FileStatus,
+    openRead,
+    closeFile,
+    statusOfOpen,
+    seekFile,
+    seekFromStart,
+    readExactly,
+    kindRegular,
+    sameKind
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    withText,
+    withInt64,
+    execute,
+    start,
+    advance,
+    columnText,
+    columnInt64,
+    finish
+);
+import Wolly.Dialect (
+    pick,
+    onPostgres
+);
+
+module body Wolly.LogTail is
+    constant tailMost: Int64 := 1048576;
+    constant firstMost: Int64 := 4096;
+    constant zero: Int64 := 0;
+    constant makeTable: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_tail (path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, offset INTEGER NOT NULL CHECK (offset >= 0)) STRICT";
+    constant makeTablePg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_tail (path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, \"offset\" BIGINT NOT NULL CHECK (\"offset\" >= 0))";
+    -- file_id came later than the table: a table of before has it added, its rows with '', which matches
+    -- any file until the next read keeps the file's own.
+    constant hasFileId: Span[Nat8, Static] := "SELECT count(*) FROM pragma_table_info('wolly_tail') WHERE name = 'file_id'";
+    constant addFileId: Span[Nat8, Static] := "ALTER TABLE wolly_tail ADD COLUMN file_id TEXT NOT NULL DEFAULT ''";
+    constant addFileIdPg: Span[Nat8, Static] := "ALTER TABLE wolly_tail ADD COLUMN IF NOT EXISTS file_id TEXT NOT NULL DEFAULT ''";
+    constant getKept: Span[Nat8, Static] := "SELECT fingerprint, offset, file_id FROM wolly_tail WHERE path = ?";
+    constant getKeptPg: Span[Nat8, Static] := "SELECT fingerprint, \"offset\", file_id FROM wolly_tail WHERE path = ?";
+    constant putKept: Span[Nat8, Static] := "INSERT INTO wolly_tail (path, fingerprint, offset, file_id) VALUES (?, ?, ?, ?) ON CONFLICT (path) DO UPDATE SET fingerprint = excluded.fingerprint, offset = excluded.offset, file_id = excluded.file_id";
+    constant putKeptPg: Span[Nat8, Static] := "INSERT INTO wolly_tail (path, fingerprint, \"offset\", file_id) VALUES (?, ?, ?, ?) ON CONFLICT (path) DO UPDATE SET fingerprint = excluded.fingerprint, \"offset\" = excluded.\"offset\", file_id = excluded.file_id";
+
+    function mostTailBytes(): Index is
+        return 1048576;
+    end;
+
+    function mostFirstLine(): Index is
+        return 4096;
+    end;
+
+    generic [R: Region]
+    function prepareTail(db: &![Database[Writing], R]): Option[DbError] is
+        let makeTableSql: Span[Nat8, Static] := pick(&db, makeTable, makeTablePg);
+        case execute(&~db, makeTableSql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                return addFileIdColumn(&~db);
+        end case;
+    end;
+
+    -- The column file_id, when the table has it not yet.
+    generic [R: Region]
+    function addFileIdColumn(db: &![Database[Writing], R]): Option[DbError] is
+        if onPostgres(&db) then
+            case execute(&~db, addFileIdPg, noValues()) of
+                when Left(left as error: DbError) do
+                    return Some(value => error);
+                when Right(right as added: Nat64) do
+                    return None();
+            end case;
+        end if;
+        var cursor: Cursor := start(&~db, hasFileId, noValues());
+        var columns: Int64 := 0;
+        if advance(&!cursor) then
+            columns := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                if columns > 0 then
+                    return None();
+                end if;
+        end case;
+        case execute(&~db, addFileId, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as added: Nat64) do
+                return None();
+        end case;
+    end;
+
+    function unreadable(): Either[TailFailure, String] is
+        let failed: Either[TailFailure, String] := Left(left => Unreadable());
+        return failed;
+    end;
+
+    function stored(error: DbError): Either[TailFailure, String] is
+        let failed: Either[TailFailure, String] := Left(left => Storage(error => error));
+        return failed;
+    end;
+
+    function nothingNew(): Either[TailFailure, String] is
+        let empty: String := fromSpan(substring("", 0, 0));
+        let result: Either[TailFailure, String] := Right(right => empty);
+        return result;
+    end;
+
+    -- count bytes from offset at, or None.
+    generic [R: Region]
+    function readAt(file: &![FileDescriptor, R], at: Int64, count: Int64): Option[String] is
+        case seekFile(&~file, at, seekFromStart) of
+            when None do
+                return None();
+            when Some(value as moved: Int64) do
+                case toIndex(count) of
+                    when None do
+                        return None();
+                    when Some(value as bytes: Index) do
+                        return readExactly(&~file, bytes);
+                end case;
+        end case;
+    end;
+
+    -- The length of text up to and with its last line end; 0 for none.
+    generic [T: Region]
+    function wholeLines(text: Span[Nat8, T]): Index is
+        var stop: Index := spanLength(text);
+        while stop > 0 do
+            if text[stop - 1] = 10 then
+                return stop;
+            end if;
+            stop := stop - 1;
+        end while;
+        return 0;
+    end;
+
+    -- The length of the first line of text with its end, or 0 when text
+    -- holds no line end.
+    generic [T: Region]
+    function firstLine(text: Span[Nat8, T]): Index is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] = 10 then
+                return i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return 0;
+    end;
+
+    -- The offset kept for path when its fingerprint is print and the file
+    -- kept is fileId or not yet known (''); 0 otherwise.
+    generic [R: Region, P: Region, F: Region, I: Region]
+    function keptOffset(db: &![Database[Writing], R], path: Span[Nat8, P], print: Span[Nat8, F],
+                        fileId: Span[Nat8, I]): Either[DbError, Int64] is
+        let getKeptSql: Span[Nat8, Static] := pick(&db, getKept, getKeptPg);
+        var cursor: Cursor := start(&~db, getKeptSql, withText(noValues(), path));
+        var offset: Int64 := 0;
+        if advance(&!cursor) then
+            if equal(columnText(&cursor, 0), print) then
+                if (spanLength(columnText(&cursor, 2)) = 0) or equal(columnText(&cursor, 2), fileId) then
+                    offset := columnInt64(&cursor, 1);
+                end if;
+            end if;
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => offset);
+        end case;
+    end;
+
+    -- The new whole lines of the open file of size bytes, the offset
+    -- moved past them.  print is the fingerprint of its first line, fileId
+    -- its device and inode.
+    generic [R: Region, F: Region, P: Region, Q: Region, I: Region]
+    function takeLines(db: &![Database[Writing], R], file: &![FileDescriptor, F], path: Span[Nat8, P], print: Span[Nat8, Q],
+                       fileId: Span[Nat8, I], size: Int64): Either[TailFailure, String] is
+        case keptOffset(&~db, path, print, fileId) of
+            when Left(left as error: DbError) do
+                return stored(error);
+            when Right(right as kept: Int64) do
+                var origin: Int64 := kept;
+                if origin > size then
+                    origin := zero;
+                end if;
+                var count: Int64 := size - origin;
+                if count > tailMost then
+                    count := tailMost;
+                end if;
+                if count = 0 then
+                    return nothingNew();
+                end if;
+                case readAt(&~file, origin, count) of
+                    when None do
+                        return unreadable();
+                    when Some(value as chunk: String) do
+                        var take: Index := wholeLines(asSpan(&chunk));
+                        if (take = 0) and (count = tailMost) then
+                            -- A line longer than one call: given cut, so
+                            -- the file goes on.
+                            take := spanLength(asSpan(&chunk));
+                        end if;
+                        let lines: String := fromSpan(substring(asSpan(&chunk), 0, take));
+                        destroyString(chunk);
+                        case toInt64(take) of
+                            when None do
+                                destroyString(lines);
+                                return unreadable();
+                            when Some(value as taken: Int64) do
+                                let putKeptSql: Span[Nat8, Static] := pick(&db, putKept, putKeptPg);
+                                case execute(&~db, putKeptSql, withText(withInt64(withText(withText(noValues(), path), print), origin + taken), fileId)) of
+                                    when Left(left as error: DbError) do
+                                        destroyString(lines);
+                                        return stored(error);
+                                    when Right(right as kept2: Nat64) do
+                                        let result: Either[TailFailure, String] := Right(right => lines);
+                                        return result;
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The SHA-256 of the first length bytes of text; None for none.
+    generic [T: Region]
+    function digestOf(text: Span[Nat8, T], length: Index): Option[String] is
+        if length = 0 then
+            return None();
+        end if;
+        return sha256(substring(text, 0, length));
+    end;
+
+    -- The fingerprint of the first line of the open file, None when it has
+    -- no whole first line yet.
+    generic [F: Region]
+    function fingerprint(file: &![FileDescriptor, F], size: Int64): Option[String] is
+        var count: Int64 := size;
+        if count > firstMost then
+            count := firstMost;
+        end if;
+        if count = 0 then
+            return None();
+        end if;
+        case readAt(&~file, zero, count) of
+            when None do
+                return None();
+            when Some(value as head: String) do
+                var length: Index := firstLine(asSpan(&head));
+                if (length = 0) and (count = firstMost) then
+                    length := spanLength(asSpan(&head));
+                end if;
+                let digest: Option[String] := digestOf(asSpan(&head), length);
+                destroyString(head);
+                case digest of
+                    when None do
+                        return None();
+                    when Some(value as raw: String) do
+                        let hex: String := bytesToHex(asSpan(&raw));
+                        destroyString(raw);
+                        return Some(value => hex);
+                end case;
+        end case;
+    end;
+
+    -- The device and inode of a file as text: "<device>:<inode>".
+    function fileIdOf(status: FileStatus): String is
+        let device: String := formatNat(status.device);
+        let inode: String := formatNat(status.inode);
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, asSpan(&device));
+        writeString(&!text, ":");
+        writeString(&!text, asSpan(&inode));
+        destroyString(device);
+        destroyString(inode);
+        return finalize(text);
+    end;
+
+    generic [R: Region, F: Region, P: Region]
+    function readOpen(db: &![Database[Writing], R], file: &![FileDescriptor, F], path: Span[Nat8, P],
+                      found: Option[FileStatus]): Either[TailFailure, String] is
+        case found of
+            when None do
+                return unreadable();
+            when Some(value as status: FileStatus) do
+                if not sameKind(status.kind, kindRegular) then
+                    return unreadable();
+                end if;
+                case toInt64(status.size) of
+                    when None do
+                        return unreadable();
+                    when Some(value as size: Int64) do
+                        case fingerprint(&~file, size) of
+                            when None do
+                                return nothingNew();
+                            when Some(value as print: String) do
+                                let fileId: String := fileIdOf(status);
+                                let result: Either[TailFailure, String] := takeLines(&~db, &~file, path, asSpan(&print), asSpan(&fileId), size);
+                                destroyString(fileId);
+                                destroyString(print);
+                                return result;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, P: Region]
+    function readNew(db: &![Database[Writing], R], path: Span[Nat8, P]): Either[TailFailure, String] is
+        case openRead(path) of
+            when None do
+                return unreadable();
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let found: Option[FileStatus] := statusOfOpen(&file);
+                let result: Either[TailFailure, String] := readOpen(&~db, &!file, path, found);
+                let closed: Bool := closeFile(file);
+                return result;
+        end case;
+    end;
+end module body.

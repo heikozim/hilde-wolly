@@ -1,0 +1,138 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Three kinds of case: HTML from elsewhere and the Markdown it must give;
+-- Markdown whose HTML must come back the same through htmlToMarkdown (the
+-- way back is exact for HTML of Wolly.Markdown); and text with marks in it
+-- that must be shown as it was, not read as marks.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Wolly.Markdown (
+    markdownToHtml
+);
+import Wolly.Doc (
+    mostHtmlBytes,
+    htmlToMarkdown,
+    markdownText
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Doc.Test is
+
+    function gives(html: Span[Nat8, Static], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let markdown: String := htmlToMarkdown(html);
+        let fit: Bool := equal(asSpan(&markdown), wanted);
+        if not fit then
+            printLn(asSpan(&markdown));
+        end if;
+        assertTrue(fit, message);
+        destroyString(markdown);
+        return nil;
+    end;
+
+    -- markdownToHtml(htmlToMarkdown(markdownToHtml(m))) = markdownToHtml(m).
+    function roundTrip(markdown: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let first: String := markdownToHtml(markdown);
+        let back: String := htmlToMarkdown(asSpan(&first));
+        let second: String := markdownToHtml(asSpan(&back));
+        let fit: Bool := equal(asSpan(&first), asSpan(&second));
+        if not fit then
+            printLn(asSpan(&back));
+        end if;
+        assertTrue(fit, message);
+        destroyString(first);
+        destroyString(back);
+        destroyString(second);
+        return nil;
+    end;
+
+    -- The HTML of text: a paragraph with the text escaped for HTML.
+    function shownAs(markdown: Span[Nat8, Static], html: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtml(markdown);
+        let fit: Bool := equal(asSpan(&made), html);
+        if not fit then
+            printLn(asSpan(&made));
+        end if;
+        assertTrue(fit, message);
+        destroyString(made);
+        return nil;
+    end;
+
+    function testFromHtml(): Unit is
+        assertTrue(mostHtmlBytes() = 1048576, "1 MiB");
+        gives("<p>Hello</p>", "Hello\n", "a paragraph");
+        gives("<h2>Title</h2><p>Text</p>", "## Title\n\nText\n", "a heading and a paragraph");
+        gives("<p><b>bold</b> and <em>soft</em></p>", "**bold** and *soft*\n", "strong and emphasis");
+        gives("<ul><li>one</li><li>two</li></ul>", "- one\n- two\n", "a list");
+        gives("<ol><li>one</li><li>two</li></ol>", "1. one\n2. two\n", "a numbered list");
+        gives("<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>", "- a\n- b\n- c\n", "an inner list goes on flat");
+        gives("<p><a href=\"https://example.org/x\">site</a></p>", "[site](https://example.org/x)\n", "a link");
+        gives("<p><a href=\"javascript:alert(1)\">x</a></p>", "x\n", "a script link is its text");
+        gives("<p><a href=\"https://e.org/a)b\">x</a></p>", "x\n", "a target with a parenthesis is its text");
+        gives("<p>a<script>alert(1)</script>b</p>", "ab\n", "a script gives nothing");
+        gives("<style>p{}</style><p>x</p>", "x\n", "a style gives nothing");
+        gives("<pre><code>a &lt; b\n  c\n</code></pre>", "```\na < b\n  c\n```\n", "a code block keeps its lines");
+        gives("<p>use <code>x*y</code> here</p>", "use `x*y` here\n", "code is not escaped");
+        gives("<p><code>a`b</code></p>", "a\\`b\n", "code with a backtick becomes text");
+        gives("<blockquote><p>wise</p></blockquote>", "> wise\n", "a quote");
+        gives("<p>a</p><hr><p>b</p>", "a\n\n---\n\nb\n", "a rule");
+        gives("<p>  lots   of\n\n  space  </p>", "lots of\nspace\n", "white space runs");
+        gives("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table>", "a b\n\nc\n", "a table, a row a line");
+        gives("<p><img src=\"x.png\" alt=\"a cat\"></p>", "a cat\n", "an image is its alt text");
+        gives("<p><b></b>x</p>", "x\n", "an empty strong gives nothing");
+        gives("<div><span class=\"x\" onclick=\"y\">text</span></div>", "text\n", "unknown elements give their text");
+        gives("", "", "nothing");
+        return nil;
+    end;
+
+    function testEscapes(): Unit is
+        gives("<p>2 * 3 * 4</p>", "2 \\* 3 \\* 4\n", "stars");
+        gives("<p># not a heading</p>", "\\# not a heading\n", "a hash first");
+        gives("<p>- not a list</p>", "\\- not a list\n", "a hyphen first");
+        gives("<p>1. not a list</p>", "1\\. not a list\n", "a number with a dot first");
+        gives("<p>&gt; not a quote</p>", "\\> not a quote\n", "an angle first");
+        gives("<p>[x](https://e.org)</p>", "\\[x\\](https://e.org)\n", "brackets");
+        gives("<p>a\\b</p>", "a\\\\b\n", "a backslash");
+        gives("<p>a # b - c</p>", "a # b - c\n", "marks inside a line stay");
+        shownAs("2 \\* 3 \\* 4", "<p>2 * 3 * 4</p>\n", "escaped stars are stars");
+        shownAs("\\# x", "<p># x</p>\n", "an escaped hash is no heading");
+        shownAs("1\\. x", "<p>1. x</p>\n", "an escaped dot is no list");
+        shownAs("a\\b", "<p>a\\b</p>\n", "a backslash before a letter stays");
+        shownAs("\\\\*x*", "<p>\\<em>x</em></p>\n", "an escaped backslash");
+        return nil;
+    end;
+
+    function testRoundTrip(): Unit is
+        roundTrip("# Title\n\nSome *soft* and **strong** text.\n", "heading and inline");
+        roundTrip("line one\nline two\n", "a paragraph of two lines");
+        roundTrip("- a\n- b\n\n1. c\n2. d\n", "two lists");
+        roundTrip("> quoted\n> twice\n", "a quote of two lines");
+        roundTrip("```\ncode <here>\n  indented\n```\n", "a code block");
+        roundTrip("Use `x < y` and [a link](/page).\n", "code and a link");
+        roundTrip("a\n\n---\n\nb\n", "a rule");
+        roundTrip("A & B \"quoted\" 'single'\n", "characters HTML escapes");
+        roundTrip("###### Six\n", "the smallest heading");
+        roundTrip("[unsafe](javascript:x)\n", "a link Markdown refused stays text");
+        roundTrip("2 \\* 3\n", "an escape");
+        return nil;
+    end;
+
+    function testText(): Unit is
+        let text: String := markdownText("# Head\n\nSome **bold** [link](/x).\n");
+        assertTrue(equal(asSpan(&text), "Head\nSome bold link.\n"), "the text without marks");
+        destroyString(text);
+        return nil;
+    end;
+end module body.

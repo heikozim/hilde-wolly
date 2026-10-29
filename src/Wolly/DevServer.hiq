@@ -1,0 +1,629 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A loop of its own over Standard.File's sockets: one connection, one
+-- request, one answer.  It is for a developer's machine; Standard.FcgiServer
+-- is the server of a host.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    endsWith,
+    indexOf,
+    indexOfByte,
+    substring,
+    trim,
+    toLower,
+    parseNat
+);
+import Standard.File (
+    FileDescriptor,
+    TcpListener,
+    WaitFailure,
+    kindRegular,
+    sameKind,
+    kindOfTarget,
+    listenTcp,
+    closeTcpListener,
+    acceptTcpWithin,
+    closeFile,
+    makeNonblocking,
+    readWithin,
+    writeWithin,
+    openRead,
+    readAll
+);
+import Standard.Fcgi (
+    makePair,
+    headerToVariable
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest
+);
+
+module body Wolly.DevServer is
+    constant mostHead: Index := 16384;
+    constant mostBody: Index := 1048576;
+    constant waitMillis: Nat32 := 10000;
+
+    --- Paths
+
+    generic [P: Region]
+    function isStaticPath(path: Span[Nat8, P]): Bool is
+        let n: Index := spanLength(path);
+        if n < 2 then
+            return false;
+        end if;
+        if path[0] /= '/' then
+            return false;
+        end if;
+        var start: Index := 1;
+        var i: Index := 1;
+        while i <= n do
+            var cut: Bool := i = n;
+            if not cut then
+                let c: Nat8 := path[i];
+                if (c < 33) or (c = 127) or (c = '\\') then
+                    return false;
+                end if;
+                cut := c = '/';
+            end if;
+            if cut then
+                let part: Span[Nat8, P] := substring(path, start, i);
+                if (spanLength(part) = 0) or equal(part, ".") or equal(part, "..") then
+                    return false;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The content type of the file at path, by its ending.
+    generic [P: Region]
+    function typeOf(path: Span[Nat8, P]): Span[Nat8, Static] is
+        if endsWith(path, ".css") then
+            return "text/css; charset=utf-8";
+        else if endsWith(path, ".js") then
+            return "text/javascript; charset=utf-8";
+        else if endsWith(path, ".svg") then
+            return "image/svg+xml";
+        else if endsWith(path, ".png") then
+            return "image/png";
+        else if endsWith(path, ".ico") then
+            return "image/x-icon";
+        else if endsWith(path, ".html") then
+            return "text/html; charset=utf-8";
+        else if endsWith(path, ".json") then
+            return "application/json";
+        end if;
+        return "application/octet-stream";
+    end;
+
+    --- Answers
+
+    -- A whole answer of HTTP with status, a content type, the headers more
+    -- (each line ending in CR LF) and body, sent with no body for a head.
+    generic [M: Region, B: Region]
+    function answer(status: Span[Nat8, Static], contentType: Span[Nat8, Static], more: Span[Nat8, M], payload: Span[Nat8, B],
+        head: Bool): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "HTTP/1.1 ");
+        writeString(&!b, status);
+        writeString(&!b, "\r\nContent-Type: ");
+        writeString(&!b, contentType);
+        writeString(&!b, "\r\n");
+        writeString(&!b, more);
+        writeContentLength(&!b, spanLength(payload));
+        writeString(&!b, "Connection: close\r\n\r\n");
+        if not head then
+            writeString(&!b, payload);
+        end if;
+        return finalize(b);
+    end;
+
+    generic [R: Region]
+    function writeContentLength(b: &![StringBuilder, R], n: Index): Unit is
+        writeString(&~b, "Content-Length: ");
+        writeDecimal(&~b, n);
+        writeString(&~b, "\r\n");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function writeDecimal(b: &![StringBuilder, R], n: Index): Unit is
+        if n >= 10 then
+            writeDecimal(&~b, n / 10);
+        end if;
+        case toNat8(rem(n, 10)) of
+            when Some(value as d: Nat8) do
+                writeByte(&~b, '0' + d);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [O: Region]
+    function httpOfCgi(output: Span[Nat8, O], head: Bool): String is
+        case indexOf(output, "\r\n\r\n") of
+            when None do
+                return answer("502 Bad Gateway", "text/plain; charset=utf-8", "", "the handler gave no headers\n", head);
+            when Some(value as split: Index) do
+                let headers: Span[Nat8, O] := substring(output, 0, split + 2);
+                let payload: Span[Nat8, O] := substring(output, split + 4, spanLength(output));
+                var status: String := fromSpan("200 OK");
+                var b: StringBuilder := makeStringBuilder();
+                var start: Index := 0;
+                var i: Index := 0;
+                while (i + 1) < spanLength(headers) do
+                    if (headers[i] = 13) and (headers[i + 1] = 10) then
+                        let line: Span[Nat8, O] := substring(headers, start, i);
+                        if startsWith(line, "Status: ") then
+                            destroyString(status);
+                            status := fromSpan(substring(line, 8, spanLength(line)));
+                        else if spanLength(line) > 0 then
+                            writeString(&!b, line);
+                            writeString(&!b, "\r\n");
+                        end if;
+                        start := i + 2;
+                        i := i + 2;
+                    else
+                        i := i + 1;
+                    end if;
+                end while;
+                let more: String := finalize(b);
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "HTTP/1.1 ");
+                writeString(&!out, asSpan(&status));
+                writeString(&!out, "\r\n");
+                writeString(&!out, asSpan(&more));
+                writeContentLength(&!out, spanLength(payload));
+                writeString(&!out, "Connection: close\r\n\r\n");
+                if not head then
+                    writeString(&!out, payload);
+                end if;
+                destroyString(status);
+                destroyString(more);
+                return finalize(out);
+        end case;
+    end;
+
+    --- One request
+
+    -- The head of a request, read up to the empty line, and what came
+    -- after it.  None when the connection ended or took too long; the head
+    -- empty when it was over its limit.
+    record Received: Linear is
+        head: String;
+        rest: String;
+    end;
+
+    generic [C: Region]
+    function received(conn: &![FileDescriptor, C]): Option[Received] is
+        var b: StringBuilder := makeStringBuilder();
+        var n: Index := 0;
+        var going: Bool := true;
+        while going do
+            case readWithin(&~conn, 4096, waitMillis) of
+                when Left(left as failure: WaitFailure) do
+                    let partial: String := finalize(b);
+                    destroyString(partial);
+                    let none: Option[Received] := None();
+                    return none;
+                when Right(right as chunk: String) do
+                    if length(&chunk) = 0 then
+                        destroyString(chunk);
+                        let partial: String := finalize(b);
+                        destroyString(partial);
+                        let none: Option[Received] := None();
+                        return none;
+                    end if;
+                    n := n + length(&chunk);
+                    writeString(&!b, asSpan(&chunk));
+                    destroyString(chunk);
+                    going := n <= mostHead;
+                    if going then
+                        let soFar: String := finalize(b);
+                        case indexOf(asSpan(&soFar), "\r\n\r\n") of
+                            when Some(value as split: Index) do
+                                let head: String := fromSpan(substring(asSpan(&soFar), 0, split + 2));
+                                let rest: String := fromSpan(substring(asSpan(&soFar), split + 4, length(&soFar)));
+                                destroyString(soFar);
+                                return Some(value => Received(head => head, rest => rest));
+                            when None do
+                                b := makeStringBuilder();
+                                writeString(&!b, asSpan(&soFar));
+                                destroyString(soFar);
+                        end case;
+                    end if;
+            end case;
+        end while;
+        let partial: String := finalize(b);
+        destroyString(partial);
+        return Some(value => Received(head => fromSpan(""), rest => fromSpan("")));
+    end;
+
+    -- The value of the header name in head, empty when there is none.
+    generic [H: Region]
+    function headerValue(head: Span[Nat8, H], name: Span[Nat8, Static]): Span[Nat8, H] is
+        var start: Index := 0;
+        var i: Index := 0;
+        while (i + 1) < spanLength(head) do
+            if (head[i] = 13) and (head[i + 1] = 10) then
+                let line: Span[Nat8, H] := substring(head, start, i);
+                case indexOfByte(line, ':') of
+                    when Some(value as colon: Index) do
+                        let lowered: String := toLower(substring(line, 0, colon));
+                        let fits: Bool := equal(asSpan(&lowered), name);
+                        destroyString(lowered);
+                        if fits then
+                            return trim(substring(line, colon + 1, spanLength(line)));
+                        end if;
+                    when None do
+                        skip;
+                end case;
+                start := i + 2;
+                i := i + 2;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        return substring(head, 0, 0);
+    end;
+
+    -- The body: what came after the head and the rest of Content-Length.
+    -- None when it is over its limit or does not come.
+    generic [C: Region, R: Region]
+    function bodyOf(conn: &![FileDescriptor, C], rest: Span[Nat8, R], wanted: Index): Option[String] is
+        if wanted > mostBody then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, substring(rest, 0, wanted));
+        var n: Index := spanLength(substring(rest, 0, wanted));
+        while n < wanted do
+            case readWithin(&~conn, wanted - n, waitMillis) of
+                when Left(left as failure: WaitFailure) do
+                    let partial: String := finalize(b);
+                    destroyString(partial);
+                    let none: Option[String] := None();
+                    return none;
+                when Right(right as chunk: String) do
+                    if length(&chunk) = 0 then
+                        destroyString(chunk);
+                        let partial: String := finalize(b);
+                        destroyString(partial);
+                        let none: Option[String] := None();
+                        return none;
+                    end if;
+                    n := n + length(&chunk);
+                    writeString(&!b, asSpan(&chunk));
+                    destroyString(chunk);
+            end case;
+        end while;
+        return Some(value => finalize(b));
+    end;
+
+    -- One FastCGI pair, when value is not empty.
+    generic [B: Region, N: Region, V: Region]
+    function pair(block: &![StringBuilder, B], name: Span[Nat8, N], value: Span[Nat8, V]): Unit is
+        if spanLength(value) = 0 then
+            return nil;
+        end if;
+        case makePair(name, value) of
+            when Some(value as encoded: String) do
+                writeString(&~block, asSpan(&encoded));
+                destroyString(encoded);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The FastCGI parameters of a request with the line method, target and
+    -- head, as Hiawatha sends them for a plain HTTP connection.
+    generic [M: Region, T: Region, H: Region]
+    function paramsOf(verb: Span[Nat8, M], target: Span[Nat8, T], head: Span[Nat8, H], bodyLength: Index): String is
+        var block: StringBuilder := makeStringBuilder();
+        pair(&!block, "REQUEST_METHOD", verb);
+        pair(&!block, "REQUEST_URI", target);
+        pair(&!block, "SERVER_PROTOCOL", "HTTP/1.1");
+        pair(&!block, "GATEWAY_INTERFACE", "CGI/1.1");
+        pair(&!block, "REMOTE_ADDR", "127.0.0.1");
+        case indexOfByte(target, '?') of
+            when Some(value as q: Index) do
+                pair(&!block, "SCRIPT_NAME", substring(target, 0, q));
+                pair(&!block, "QUERY_STRING", substring(target, q + 1, spanLength(target)));
+            when None do
+                pair(&!block, "SCRIPT_NAME", target);
+        end case;
+        pair(&!block, "CONTENT_TYPE", headerValue(head, "content-type"));
+        if bodyLength > 0 then
+            var digits: StringBuilder := makeStringBuilder();
+            writeDecimal(&!digits, bodyLength);
+            let text: String := finalize(digits);
+            pair(&!block, "CONTENT_LENGTH", asSpan(&text));
+            destroyString(text);
+        end if;
+        var start: Index := 0;
+        var i: Index := 0;
+        var first: Bool := true;
+        while (i + 1) < spanLength(head) do
+            if (head[i] = 13) and (head[i + 1] = 10) then
+                let line: Span[Nat8, H] := substring(head, start, i);
+                if not first then
+                    case headerToVariable(line) of
+                        when Some(value as variable: String) do
+                            case indexOfByte(line, ':') of
+                                when Some(value as colon: Index) do
+                                    pair(&!block, asSpan(&variable), trim(substring(line, colon + 1, spanLength(line))));
+                                when None do
+                                    skip;
+                            end case;
+                            destroyString(variable);
+                        when None do
+                            skip;
+                    end case;
+                end if;
+                first := false;
+                start := i + 2;
+                i := i + 2;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        return finalize(block);
+    end;
+
+    -- The answer for the file below root at path.
+    generic [R: Region, P: Region]
+    function fileAnswer(root: Span[Nat8, R], path: Span[Nat8, P], head: Bool): Option[String] is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, root);
+        writeString(&!b, path);
+        let full: String := finalize(b);
+        if not sameKind(kindOfTarget(asSpan(&full)), kindRegular) then
+            destroyString(full);
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case openRead(asSpan(&full)) of
+            when None do
+                destroyString(full);
+                let none: Option[String] := None();
+                return none;
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let content: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                destroyString(full);
+                case content of
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                    when Some(value as bytes: String) do
+                        let out: String := answer("200 OK", typeOf(path), "Cache-Control: no-cache\r\n", asSpan(&bytes), head);
+                        destroyString(bytes);
+                        return Some(value => out);
+                end case;
+        end case;
+    end;
+
+    -- The answer to the request whose head and first body bytes came.
+    generic [C: Region, H: Region, R: Region, O: Region]
+    function answered(conn: &![FileDescriptor, C], head: Span[Nat8, H], rest: Span[Nat8, R], handler: Fn[Request, String],
+        root: Span[Nat8, O]): String is
+        if spanLength(head) = 0 then
+            return answer("431 Request Header Fields Too Large", "text/plain; charset=utf-8", "", "header too large\n", false);
+        end if;
+        let firstLine: Span[Nat8, H] := substring(head, 0, endOfLine(head));
+        case indexOfByte(firstLine, ' ') of
+            when None do
+                return answer("400 Bad Request", "text/plain; charset=utf-8", "", "bad request\n", false);
+            when Some(value as gap: Index) do
+                let verb: Span[Nat8, H] := substring(firstLine, 0, gap);
+                let afterVerb: Span[Nat8, H] := substring(firstLine, gap + 1, spanLength(firstLine));
+                case indexOfByte(afterVerb, ' ') of
+                    when None do
+                        return answer("400 Bad Request", "text/plain; charset=utf-8", "", "bad request\n", false);
+                    when Some(value as gap2: Index) do
+                        let target: Span[Nat8, H] := substring(afterVerb, 0, gap2);
+                        let isHead: Bool := equal(verb, "HEAD");
+                        var path: Span[Nat8, H] := target;
+                        case indexOfByte(target, '?') of
+                            when Some(value as q: Index) do
+                                path := substring(target, 0, q);
+                            when None do
+                                skip;
+                        end case;
+                        if (equal(verb, "GET") or isHead) and (spanLength(root) > 0) and isStaticPath(path) then
+                            case fileAnswer(root, path, isHead) of
+                                when Some(value as out: String) do
+                                    return out;
+                                when None do
+                                    skip;
+                            end case;
+                        end if;
+                        var wanted: Index := 0;
+                        case parseNat(headerValue(head, "content-length")) of
+                            when Some(value as n: Nat64) do
+                                case toIndex(n) of
+                                    when Some(value as w: Index) do
+                                        wanted := w;
+                                    when None do
+                                        return answer("413 Content Too Large", "text/plain; charset=utf-8", "", "too large\n",
+                                            false);
+                                end case;
+                            when None do
+                                skip;
+                        end case;
+                        case bodyOf(&~conn, rest, wanted) of
+                            when None do
+                                return answer("413 Content Too Large", "text/plain; charset=utf-8", "", "too large\n", false);
+                            when Some(value as content: String) do
+                                let params: String := paramsOf(verb, target, head, length(&content));
+                                let request: Request := makeRequest(params, content);
+                                let output: String := handler(request);
+                                let out: String := httpOfCgi(asSpan(&output), isHead);
+                                destroyString(output);
+                                return out;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [H: Region]
+    function endOfLine(head: Span[Nat8, H]): Index is
+        var i: Index := 0;
+        while (i + 1) < spanLength(head) do
+            if (head[i] = 13) and (head[i + 1] = 10) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(head);
+    end;
+
+    -- Serves the one request of conn and closes it.
+    generic [O: Region]
+    function served(connection: FileDescriptor, handler: Fn[Request, String], root: Span[Nat8, O]): Unit is
+        var conn: FileDescriptor := connection;
+        if makeNonblocking(&!conn) then
+            case received(&!conn) of
+                when Some(value as got: Received) do
+                    let { head: String, rest: String } := got;
+                    let out: String := answered(&!conn, asSpan(&head), asSpan(&rest), handler, root);
+                    case writeWithin(&!conn, asSpan(&out), waitMillis) of
+                        when Left(left as failure: WaitFailure) do
+                            skip;
+                        when Right(right as done: Unit) do
+                            skip;
+                    end case;
+                    destroyString(out);
+                    destroyString(head);
+                    destroyString(rest);
+                when None do
+                    skip;
+            end case;
+        end if;
+        let closed: Bool := closeFile(conn);
+        return nil;
+    end;
+
+    --- Listening
+
+    -- The address bytes and the port of addr on a loopback host, None for
+    -- any other.
+    record Bound: Free is
+        v6: Bool;
+        port: Nat16;
+    end;
+
+    generic [A: Region]
+    function boundOf(addr: Span[Nat8, A]): Option[Bound] is
+        let none: Option[Bound] := None();
+        var host: Span[Nat8, A] := substring(addr, 0, 0);
+        var portText: Span[Nat8, A] := substring(addr, 0, 0);
+        if startsWith(addr, "[") then
+            case indexOf(addr, "]:") of
+                when Some(value as close: Index) do
+                    host := substring(addr, 1, close);
+                    portText := substring(addr, close + 2, spanLength(addr));
+                when None do
+                    return none;
+            end case;
+        else
+            case indexOfByte(addr, ':') of
+                when Some(value as colon: Index) do
+                    host := substring(addr, 0, colon);
+                    portText := substring(addr, colon + 1, spanLength(addr));
+                when None do
+                    return none;
+            end case;
+        end if;
+        var v6: Bool := false;
+        if equal(host, "::1") then
+            v6 := true;
+        else if not (equal(host, "127.0.0.1") or equal(host, "localhost")) then
+            return none;
+        end if;
+        case parseNat(portText) of
+            when Some(value as n: Nat64) do
+                case toNat16(n) of
+                    when Some(value as port: Nat16) do
+                        return Some(value => Bound(v6 => v6, port => port));
+                    when None do
+                        return none;
+                end case;
+            when None do
+                return none;
+        end case;
+    end;
+
+    function loopbackBytes(v6: Bool): Span[Nat8, Static] is
+        if v6 then
+            return "\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{1}";
+        end if;
+        return "\u{7f}\u{0}\u{0}\u{1}";
+    end;
+
+    -- Serves the connections of listener for as long as the process lives.
+    generic [R: Region]
+    function listening(listener: TcpListener, handler: Fn[Request, String], root: Span[Nat8, R]): Option[String] is
+        var l: TcpListener := listener;
+        var going: Bool := true;
+        while going do
+            case acceptTcpWithin(&l, 1000) of
+                when Some(value as conn: FileDescriptor) do
+                    served(conn, handler, root);
+                when None do
+                    skip;
+            end case;
+        end while;
+        let closed: Bool := closeTcpListener(l);
+        return Some(value => fromSpan("the listener stopped"));
+    end;
+
+    generic [A: Region, R: Region]
+    function serveHttp(addr: Span[Nat8, A], handler: Fn[Request, String], root: Span[Nat8, R]): Option[String] is
+        case boundOf(addr) of
+            when None do
+                var b: StringBuilder := makeStringBuilder();
+                writeString(&!b, "http_addr ");
+                writeString(&!b, addr);
+                writeString(&!b, ": http mode listens on loopback only");
+                return Some(value => finalize(b));
+            when Some(value as bound: Bound) do
+                case listenTcp(loopbackBytes(bound.v6), bound.port) of
+                    when None do
+                        var b: StringBuilder := makeStringBuilder();
+                        writeString(&!b, "listen ");
+                        writeString(&!b, addr);
+                        writeString(&!b, ": the port is taken or the kernel refused");
+                        return Some(value => finalize(b));
+                    when Some(value as listener: TcpListener) do
+                        return listening(listener, handler, root);
+                end case;
+        end case;
+    end;
+end module body.

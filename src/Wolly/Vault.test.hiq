@@ -1,0 +1,418 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A vault and two keys under /tmp with a random name each run: secrets
+-- kept, read, replaced, deleted; a value moved to another line does not
+-- open; the vault read with the wrong key gives nothing; a rotation.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    destroyWiped,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex,
+    contains,
+    equal
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    statusOf,
+    openRead,
+    readAll,
+    createNewFile,
+    writeAll,
+    closeFile,
+    removeFileIfThere
+);
+import Wolly.Secret (
+    makeKey,
+    readKey
+);
+import Wolly.Seal (
+    sealValue
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    openVault,
+    closeVault,
+    getSecret as getStandardSecret
+);
+import Wolly.Vault (
+    Conversion,
+    convertVault,
+    destroyConversion,
+    mostSecretBytes,
+    isSecretName,
+    getSecret,
+    setSecret,
+    deleteSecret,
+    secretNames,
+    rotateVault
+);
+
+module body Wolly.Vault.Test is
+
+    function tempPath(suffix: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/tmp/wolly-vault-");
+        case randomBytes(8) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                writeString(&!out, asSpan(&hex));
+                destroyString(hex);
+                destroyString(raw);
+            when None do
+                abort("no random bytes");
+        end case;
+        writeString(&!out, "-");
+        writeString(&!out, suffix);
+        return finalize(out);
+    end;
+
+    generic [V: Region, K: Region]
+    function reads(vault: Span[Nat8, V], key: Span[Nat8, K], name: Span[Nat8, Static], wanted: Span[Nat8, Static],
+                   message: Span[Nat8, Static]): Unit is
+        case getSecret(vault, key, name) of
+            when Some(value as found: String) do
+                assertTrue(equal(asSpan(&found), wanted), message);
+                destroyString(found);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [V: Region, K: Region]
+    function readsNothing(vault: Span[Nat8, V], key: Span[Nat8, K], name: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case getSecret(vault, key, name) of
+            when Some(value as found: String) do
+                destroyString(found);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    generic [P: Region]
+    function contentOf(path: Span[Nat8, P]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let content: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case content of
+                    when Some(value as text: String) do
+                        return text;
+                    when None do
+                        abort("unreadable");
+                        return makeEmptyString();
+                end case;
+            when None do
+                abort("no file");
+                return makeEmptyString();
+        end case;
+    end;
+
+    function makeEmptyString(): String is
+        var out: StringBuilder := makeStringBuilder();
+        return finalize(out);
+    end;
+
+    generic [P: Region, T: Region]
+    function replaceFile(path: Span[Nat8, P], text: Span[Nat8, T]): Unit is
+        let removed: Bool := removeFileIfThere(path);
+        case createNewFile(path, #o600) of
+            when Some(value as made: FileDescriptor) do
+                var file: FileDescriptor := made;
+                assertTrue(writeAll(&!file, text), "rewritten");
+                let closed: Bool := closeFile(file);
+            when None do
+                assertTrue(false, "the file made again");
+        end case;
+        return nil;
+    end;
+
+    -- A value of n bytes x.
+    function filled(n: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < n do
+            writeString(&!out, "x");
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function testNames(): Unit is
+        assertTrue(mostSecretBytes() = 4096, "4096 bytes");
+        assertTrue(isSecretName("DB_PASSWORD"), "a name");
+        assertTrue(isSecretName("A1"), "digits");
+        assertFalse(isSecretName("db_password"), "lower case");
+        assertFalse(isSecretName(""), "empty");
+        assertFalse(isSecretName("A=B"), "an equals sign");
+        assertFalse(isSecretName("A B"), "a space");
+        assertTrue(isSecretName("ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCD"), "64 bytes");
+        assertFalse(isSecretName("ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDE"), "65 bytes");
+        return nil;
+    end;
+
+    function testVault(): Unit is
+        let vault: String := tempPath("vault");
+        let key: String := tempPath("key");
+        let other: String := tempPath("other-key");
+        assertTrue(makeKey(asSpan(&key)), "a key");
+        assertTrue(makeKey(asSpan(&other)), "another key");
+        readsNothing(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "no vault, no secret");
+        assertTrue(setSecret(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "s3cret"), "kept");
+        assertTrue(setSecret(asSpan(&vault), asSpan(&key), "API_TOKEN", "tok-1"), "a second");
+        reads(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "s3cret", "read back");
+        reads(asSpan(&vault), asSpan(&key), "API_TOKEN", "tok-1", "the second read back");
+        let names: String := secretNames(asSpan(&vault));
+        assertTrue(equal(asSpan(&names), "DB_PASSWORD\nAPI_TOKEN\n"), "the names in order");
+        destroyString(names);
+        let raw: String := contentOf(asSpan(&vault));
+        assertFalse(contains(asSpan(&raw), "s3cret"), "the vault holds no secret in clear");
+        assertTrue(contains(asSpan(&raw), "DB_PASSWORD="), "a line for the name");
+        destroyString(raw);
+        assertTrue(setSecret(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "n3w"), "replaced");
+        reads(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "n3w", "the new value");
+        let after: String := secretNames(asSpan(&vault));
+        assertTrue(equal(asSpan(&after), "DB_PASSWORD\nAPI_TOKEN\n"), "replaced in its place, no second line");
+        destroyString(after);
+        readsNothing(asSpan(&vault), asSpan(&other), "DB_PASSWORD", "the wrong key opens nothing");
+        readsNothing(asSpan(&vault), asSpan(&key), "MISSING", "a name the vault has not");
+        assertFalse(setSecret(asSpan(&vault), asSpan(&key), "bad name", "x"), "no secret name");
+        assertFalse(setSecret(asSpan(&vault), asSpan(&key), "EMPTY", ""), "an empty value");
+        assertFalse(setSecret(asSpan(&vault), "/tmp/no-such-wolly-key", "X", "y"), "no key file");
+        assertTrue(deleteSecret(asSpan(&vault), "API_TOKEN"), "deleted");
+        assertFalse(deleteSecret(asSpan(&vault), "API_TOKEN"), "not twice");
+        readsNothing(asSpan(&vault), asSpan(&key), "API_TOKEN", "gone");
+        reads(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "n3w", "the other stays");
+        -- Rotation.
+        assertFalse(rotateVault(asSpan(&vault), asSpan(&key), asSpan(&key)), "the same key is no rotation");
+        assertTrue(rotateVault(asSpan(&vault), asSpan(&key), asSpan(&other)), "rotated");
+        reads(asSpan(&vault), asSpan(&other), "DB_PASSWORD", "n3w", "opens under the new key");
+        readsNothing(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "not under the old one");
+        assertFalse(rotateVault(asSpan(&vault), asSpan(&key), asSpan(&other)), "a rotation with a key that opens nothing changes nothing");
+        reads(asSpan(&vault), asSpan(&other), "DB_PASSWORD", "n3w", "and the vault is as it was");
+        -- The vault is mode 0600.
+        case statusOf(asSpan(&vault)) of
+            when FileFound(status as found: FileStatus) do
+                assertTrue(found.mode = #o600, "the vault is mode 0600");
+            when FileMissing do
+                assertTrue(false, "the vault is there");
+            when FileUnreadable do
+                assertTrue(false, "the vault can be looked at");
+        end case;
+        -- 4096 bytes are a secret, 4097 are not.
+        let most: String := filled(4096);
+        assertTrue(setSecret(asSpan(&vault), asSpan(&other), "BIG", asSpan(&most)), "4096 bytes");
+        destroyString(most);
+        let over: String := filled(4097);
+        assertFalse(setSecret(asSpan(&vault), asSpan(&other), "BIGGER", asSpan(&over)), "4097 bytes");
+        destroyString(over);
+        let a: Bool := removeFileIfThere(asSpan(&vault));
+        let b: Bool := removeFileIfThere(asSpan(&key));
+        let c: Bool := removeFileIfThere(asSpan(&other));
+        destroyString(vault);
+        destroyString(key);
+        destroyString(other);
+        return nil;
+    end;
+
+    -- DB_PASSWORD's sealed value under the name API_TOKEN.
+    function testMovedValue(): Unit is
+        let vault: String := tempPath("vault2");
+        let key: String := tempPath("key2");
+        assertTrue(makeKey(asSpan(&key)), "a key");
+        assertTrue(setSecret(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "s3cret"), "kept");
+        let text: String := contentOf(asSpan(&vault));
+        -- The line is NAME=HEX: put API_TOKEN in front of the hex.
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "API_TOKEN");
+        writeString(&!out, afterName(asSpan(&text)));
+        let forged: String := finalize(out);
+        replaceFile(asSpan(&vault), asSpan(&forged));
+        destroyString(forged);
+        destroyString(text);
+        readsNothing(asSpan(&vault), asSpan(&key), "API_TOKEN", "a value moved to another name does not open");
+        let a: Bool := removeFileIfThere(asSpan(&vault));
+        let b: Bool := removeFileIfThere(asSpan(&key));
+        destroyString(vault);
+        destroyString(key);
+        return nil;
+    end;
+
+    -- A line sealed here with Wolly.Seal for the purpose wolly-vault opens:
+    -- the purpose is part of the format.
+    function testPurpose(): Unit is
+        let vault: String := tempPath("vault3");
+        let key: String := tempPath("key3");
+        assertTrue(makeKey(asSpan(&key)), "a key");
+        case readKey(asSpan(&key)) of
+            when Some(value as k: String) do
+                case sealValue(asSpan(&k), "wolly-vault", "pinned", "NAME") of
+                    when Some(value as sealed: String) do
+                        let hex: String := bytesToHex(asSpan(&sealed));
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, "NAME=");
+                        writeString(&!out, asSpan(&hex));
+                        writeString(&!out, "\n");
+                        let line: String := finalize(out);
+                        replaceFile(asSpan(&vault), asSpan(&line));
+                        destroyString(line);
+                        destroyString(hex);
+                        destroyString(sealed);
+                    when None do
+                        assertTrue(false, "sealed");
+                end case;
+                destroyString(k);
+            when None do
+                assertTrue(false, "the key read");
+        end case;
+        reads(asSpan(&vault), asSpan(&key), "NAME", "pinned", "a value sealed for wolly-vault opens");
+        let a: Bool := removeFileIfThere(asSpan(&vault));
+        let b: Bool := removeFileIfThere(asSpan(&key));
+        destroyString(vault);
+        destroyString(key);
+        return nil;
+    end;
+
+    -- The text from its first = on.
+    generic [T: Region]
+    function afterName(text: Span[Nat8, T]): Span[Nat8, T] is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] = '=' then
+                return spanPart(text, i, spanLength(text) - i);
+            end if;
+            i := i + 1;
+        end while;
+        return text;
+    end;
+
+    -- The value of name in the vault of Standard.Vault at env with pepper and the key line VAULT_KEY is wanted.
+    generic [E: Region, P: Region]
+    function newReads(env: Span[Nat8, E], pepper: Span[Nat8, P], name: Span[Nat8, Static], wanted: Span[Nat8, Static],
+                      message: Span[Nat8, Static]): Unit is
+        case openVault(env, pepper, "VAULT_KEY") of
+            when Right(right as opened: Vault) do
+                var vault: Vault := opened;
+                case getStandardSecret(&vault, name) of
+                    when Right(right as value: String) do
+                        assertTrue(equal(asSpan(&value), wanted), message);
+                        destroyWiped(value);
+                    when Left(left as error: VaultError) do
+                        assertTrue(false, message);
+                end case;
+                closeVault(vault);
+            when Left(left as error: VaultError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- Whether something is at path.
+    generic [P: Region]
+    function there(path: Span[Nat8, P]): Bool is
+        case statusOf(path) of
+            when FileFound(status as found: FileStatus) do
+                return true;
+            when FileMissing do
+                return false;
+            when FileUnreadable do
+                return true;
+        end case;
+    end;
+
+    -- Three secrets and one whose name starts with a digit, carried into Standard.Vault; a wrong old key
+    -- refused before anything is written; a second conversion keeps the pepper and the key line.
+    function testConvert(): Unit is
+        let vault: String := tempPath("old-vault");
+        let key: String := tempPath("old-key");
+        let other: String := tempPath("other-key");
+        let env: String := tempPath("new.env");
+        let pepper: String := tempPath("new.pepper");
+        assertTrue(makeKey(asSpan(&key)), "the old key");
+        assertTrue(makeKey(asSpan(&other)), "another key");
+        assertTrue(setSecret(asSpan(&vault), asSpan(&key), "DB_PASSWORD", "s3cret"), "a first secret");
+        assertTrue(setSecret(asSpan(&vault), asSpan(&key), "API_TOKEN", "tok-1"), "a second");
+        assertTrue(setSecret(asSpan(&vault), asSpan(&key), "1ABC", "digit first"), "a name that starts with a digit");
+        assertTrue(setSecret(asSpan(&vault), asSpan(&key), "MAIL_PASS", "m@il pass"), "a third");
+        case convertVault(asSpan(&vault), asSpan(&other), asSpan(&env), asSpan(&pepper), "VAULT_KEY") of
+            when Right(right as wrong: Conversion) do
+                destroyConversion(wrong);
+                assertTrue(false, "the wrong old key is refused");
+            when Left(left as error: VaultError) do
+                assertTrue(true, "the wrong old key is refused");
+        end case;
+        assertFalse(there(asSpan(&env)), "and no new vault was written");
+        assertFalse(there(asSpan(&pepper)), "nor a pepper");
+        case convertVault(asSpan(&vault), asSpan(&key), asSpan(&env), asSpan(&pepper), "VAULT_KEY") of
+            when Right(right as done: Conversion) do
+                let { converted as count: Index, refused as names: String } := done;
+                assertTrue(count = 3, "three secrets carried over");
+                assertTrue(equal(asSpan(&names), "1ABC\n"), "the name that starts with a digit refused, by name");
+                destroyString(names);
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the conversion");
+        end case;
+        newReads(asSpan(&env), asSpan(&pepper), "DB_PASSWORD", "s3cret", "the first read back through Standard.Vault");
+        newReads(asSpan(&env), asSpan(&pepper), "API_TOKEN", "tok-1", "the second");
+        newReads(asSpan(&env), asSpan(&pepper), "MAIL_PASS", "m@il pass", "the third");
+        let pepperBefore: String := contentOf(asSpan(&pepper));
+        let envBefore: String := contentOf(asSpan(&env));
+        case convertVault(asSpan(&vault), asSpan(&key), asSpan(&env), asSpan(&pepper), "VAULT_KEY") of
+            when Right(right as again: Conversion) do
+                let { converted as count: Index, refused as names: String } := again;
+                assertTrue(count = 3, "a second conversion carries the three again");
+                destroyString(names);
+            when Left(left as error: VaultError) do
+                assertTrue(false, "a second conversion");
+        end case;
+        let pepperAfter: String := contentOf(asSpan(&pepper));
+        assertTrue(equal(asSpan(&pepperBefore), asSpan(&pepperAfter)), "the pepper is kept");
+        destroyWiped(pepperBefore);
+        destroyWiped(pepperAfter);
+        let envAfter: String := contentOf(asSpan(&env));
+        assertTrue(contains(asSpan(&envAfter), "VAULT_KEY="), "the key line is there");
+        destroyWiped(envBefore);
+        destroyWiped(envAfter);
+        newReads(asSpan(&env), asSpan(&pepper), "DB_PASSWORD", "s3cret", "and still opens the values");
+        let a: Bool := removeFileIfThere(asSpan(&vault));
+        let b: Bool := removeFileIfThere(asSpan(&key));
+        let c: Bool := removeFileIfThere(asSpan(&other));
+        let d: Bool := removeFileIfThere(asSpan(&env));
+        let e: Bool := removeFileIfThere(asSpan(&pepper));
+        destroyString(vault);
+        destroyString(key);
+        destroyString(other);
+        destroyString(env);
+        destroyString(pepper);
+        return nil;
+    end;
+end module body.

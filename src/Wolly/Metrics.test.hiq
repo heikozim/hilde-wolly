@@ -1,0 +1,184 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Samples of "hits" around t = 1000000 (seconds), in buckets of 60:
+-- t-1: 9 (before the series), t: 2, t+5: 3, t+65: 7, t+130: 1, t+180: 4
+-- (after three buckets); and "other" at t: 100, which no series of hits
+-- may see.  Totals [5, 7, 1], highest [3, 7, 1].
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Metrics (
+    Fold,
+    Total,
+    Highest,
+    mostBuckets,
+    isMetricName,
+    prepareMetrics,
+    recordMetric,
+    series,
+    latestMetric,
+    pruneMetrics
+);
+
+module body Wolly.Metrics.Test is
+    constant t: Int64 := 1000000;
+    constant minute: Int64 := 60;
+
+    generic [R: Region]
+    function keep(db: &![Database[Writing], R], name: Span[Nat8, Static], at: Int64, value: Int64, wanted: Bool,
+                  message: Span[Nat8, Static]): Unit is
+        case recordMetric(&~db, name, at, value) of
+            when Right(right as kept: Bool) do
+                assertTrue(kept = wanted, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- Whether the series holds exactly a, b, c.
+    function three(buffer: Buffer[Int64], a: Int64, b: Int64, c: Int64): Bool is
+        var fit: Bool := length(&buffer) = 3;
+        if fit then
+            fit := ((nth(&buffer, 0) = a) and (nth(&buffer, 1) = b)) and (nth(&buffer, 2) = c);
+        end if;
+        destroyFree(buffer);
+        return fit;
+    end;
+
+    function sized(buffer: Buffer[Int64], wanted: Index): Bool is
+        let fit: Bool := length(&buffer) = wanted;
+        destroyFree(buffer);
+        return fit;
+    end;
+
+    generic [R: Region]
+    function seriesIs(db: &![Database[Writing], R], since: Int64, buckets: Index, fold: Fold, a: Int64, b: Int64, c: Int64,
+                      message: Span[Nat8, Static]): Unit is
+        case series(&~db, "hits", since, minute, buckets, fold) of
+            when Right(right as buffer: Buffer[Int64]) do
+                assertTrue(three(buffer, a, b, c), message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lengthIs(db: &![Database[Writing], R], name: Span[Nat8, Static], step: Int64, buckets: Index, wanted: Index,
+                      message: Span[Nat8, Static]): Unit is
+        case series(&~db, name, t, step, buckets, Total()) of
+            when Right(right as buffer: Buffer[Int64]) do
+                assertTrue(sized(buffer, wanted), message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function latestIs(db: &![Database[Writing], R], name: Span[Nat8, Static], wanted: Int64, present: Bool,
+                      message: Span[Nat8, Static]): Unit is
+        case latestMetric(&~db, name) of
+            when Right(right as found: Option[Int64]) do
+                case found of
+                    when Some(value as v: Int64) do
+                        assertTrue(present and (v = wanted), message);
+                    when None do
+                        assertFalse(present, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(mostBuckets() = 1000, "1000 buckets");
+        assertTrue(isMetricName("http.requests_5xx"), "a name");
+        assertTrue(isMetricName("a"), "one byte");
+        assertFalse(isMetricName(""), "empty");
+        assertFalse(isMetricName("Hits"), "upper case");
+        assertFalse(isMetricName("a b"), "a space");
+        assertFalse(isMetricName("a/b"), "a slash");
+        assertTrue(isMetricName("0123456789012345678901234567890123456789012345678901234567890123"), "64 bytes");
+        assertFalse(isMetricName("01234567890123456789012345678901234567890123456789012345678901234"), "65 bytes");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        case prepareMetrics(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table");
+            when None do
+                assertTrue(true, "the table");
+        end case;
+        keep(&~db, "hits", t - 1, 9, true, "a sample before");
+        keep(&~db, "hits", t, 2, true, "a sample");
+        keep(&~db, "hits", t + 5, 3, true, "a second in the same minute");
+        keep(&~db, "hits", t + 65, 7, true, "the next minute");
+        keep(&~db, "hits", t + 130, 1, true, "the third");
+        keep(&~db, "hits", t + 180, 4, true, "a sample after");
+        keep(&~db, "other", t, 100, true, "another metric");
+        keep(&~db, "Hits", t, 1, false, "no metric name, nothing kept");
+        keep(&~db, "hits", t, 0 - 1, false, "a value below 0, nothing kept");
+        keep(&~db, "hits", 0 - 1, 1, false, "a time below 0, nothing kept");
+        seriesIs(&~db, t, 3, Total(), 5, 7, 1, "totals");
+        seriesIs(&~db, t, 3, Highest(), 3, 7, 1, "the largest");
+        seriesIs(&~db, t + minute, 3, Total(), 7, 1, 4, "from the next minute");
+        lengthIs(&~db, "hits", minute, 2, 2, "two buckets");
+        lengthIs(&~db, "hits", minute, 2000, 1000, "2000 buckets cut to 1000");
+        lengthIs(&~db, "hits", 0, 3, 0, "a step of 0: none");
+        lengthIs(&~db, "hits", 31622401, 3, 0, "a step above a year: none");
+        lengthIs(&~db, "hits", 31622400, 3, 3, "a step of a year");
+        lengthIs(&~db, "hits", minute, 0, 0, "no buckets: none");
+        lengthIs(&~db, "Hits", minute, 3, 0, "no metric name: none");
+        latestIs(&~db, "hits", 4, true, "the latest sample");
+        latestIs(&~db, "never", 0, false, "no sample: None");
+        keep(&~db, "hits", t + 300, 5, true, "a sample in the last second");
+        keep(&~db, "hits", t + 300, 6, true, "another in the same second");
+        latestIs(&~db, "hits", 6, true, "of two samples in one second the one kept later");
+        case pruneMetrics(&~db, t + 65) of
+            when Right(right as removed: Nat64) do
+                assertTrue(removed = 4, "the four samples before t + 65, of both metrics");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the prune");
+        end case;
+        seriesIs(&~db, t, 3, Total(), 0, 7, 1, "after the prune");
+        latestIs(&~db, "other", 0, false, "the other metric is pruned too");
+        return nil;
+    end;
+
+    function testStore(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

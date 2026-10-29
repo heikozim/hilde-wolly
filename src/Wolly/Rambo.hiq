@@ -1,0 +1,1081 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    fromSpan,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    indexOfByte,
+    substring,
+    startsWith,
+    toLower,
+    formatInt,
+    equal
+);
+import Standard.Base64 (
+    encode as base64Encode
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    readJson,
+    destroyJson,
+    stringAt,
+    integerAt,
+    countAt,
+    valueTextAt
+);
+import Standard.Jws (
+    base64UrlEncode,
+    base64UrlDecode,
+    verifyCompact,
+    publicKeyFromJwk,
+    claimsProblem
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha256
+);
+import Standard.HttpClient (
+    Method,
+    Get,
+    Post,
+    Limits,
+    Failure,
+    FailureKind,
+    Response,
+    request,
+    destroyFailure
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    withInt64,
+    withText,
+    start,
+    execute,
+    advance,
+    columnText,
+    columnInt64,
+    finish
+);
+import Wolly.Dialect (
+    pick
+);
+import Wolly.Highlight (
+    escapeCode
+);
+
+module body Wolly.Rambo is
+    constant randomSize: Index := 32;
+    constant answerMost: Index := 1048576;
+    -- The script of the logout page and base64 of its SHA-256, which the
+    -- page's policy allows and nothing else (the test computes it again).
+    constant logoutScript: Span[Nat8, Static] := "document.forms[0].submit();";
+    constant logoutScriptHash: Span[Nat8, Static] := "8lDeP0UDwCO6/RhblgeH/ctdBzjVpJxrXizsnIk3cEQ=";
+    constant makePending: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_rambo_pending (state TEXT PRIMARY KEY NOT NULL, session TEXT NOT NULL, nonce TEXT NOT NULL, verifier TEXT NOT NULL, made INTEGER NOT NULL) STRICT";
+    constant makePendingPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_rambo_pending (state TEXT PRIMARY KEY NOT NULL, session TEXT NOT NULL, nonce TEXT NOT NULL, verifier TEXT NOT NULL, made BIGINT NOT NULL)";
+    constant makeIdTokens: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_rambo_id_tokens (session TEXT PRIMARY KEY NOT NULL, token TEXT NOT NULL, made INTEGER NOT NULL) STRICT";
+    constant makeIdTokensPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_rambo_id_tokens (session TEXT PRIMARY KEY NOT NULL, token TEXT NOT NULL, made BIGINT NOT NULL)";
+    constant makeKeys: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_rambo_keys (id INTEGER PRIMARY KEY CHECK (id = 1), jwks TEXT NOT NULL, made INTEGER NOT NULL) STRICT";
+    constant makeKeysPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_rambo_keys (id BIGINT PRIMARY KEY CHECK (id = 1), jwks TEXT NOT NULL, made BIGINT NOT NULL)";
+    constant addPending: Span[Nat8, Static] := "INSERT OR IGNORE INTO wolly_rambo_pending (state, session, nonce, verifier, made) VALUES (?, ?, ?, ?, ?)";
+    constant addPendingPg: Span[Nat8, Static] := "INSERT INTO wolly_rambo_pending (state, session, nonce, verifier, made) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING";
+    constant purgePending: Span[Nat8, Static] := "DELETE FROM wolly_rambo_pending WHERE made < ?";
+    constant readPending: Span[Nat8, Static] := "SELECT session, nonce, verifier, made FROM wolly_rambo_pending WHERE state = ?";
+    constant dropPending: Span[Nat8, Static] := "DELETE FROM wolly_rambo_pending WHERE state = ?";
+    constant putIdToken: Span[Nat8, Static] := "INSERT OR REPLACE INTO wolly_rambo_id_tokens (session, token, made) VALUES (?, ?, ?)";
+    constant putIdTokenPg: Span[Nat8, Static] := "INSERT INTO wolly_rambo_id_tokens (session, token, made) VALUES (?, ?, ?) ON CONFLICT (session) DO UPDATE SET token = excluded.token, made = excluded.made";
+    constant readIdToken: Span[Nat8, Static] := "SELECT token FROM wolly_rambo_id_tokens WHERE session = ?";
+    constant dropIdToken: Span[Nat8, Static] := "DELETE FROM wolly_rambo_id_tokens WHERE session = ?";
+    constant putKeys: Span[Nat8, Static] := "INSERT OR REPLACE INTO wolly_rambo_keys (id, jwks, made) VALUES (1, ?, ?)";
+    constant putKeysPg: Span[Nat8, Static] := "INSERT INTO wolly_rambo_keys (id, jwks, made) VALUES (1, ?, ?) ON CONFLICT (id) DO UPDATE SET jwks = excluded.jwks, made = excluded.made";
+    constant readKeys: Span[Nat8, Static] := "SELECT jwks FROM wolly_rambo_keys WHERE id = 1";
+
+    record RamboConfig: Linear is
+        issuer: String;
+        clientId: String;
+        clientSecret: String;
+        redirectUri: String;
+        caFile: String;
+        invariant length(&issuer) > 8;
+        invariant length(&clientId) > 0;
+        invariant length(&redirectUri) > 7;
+    end;
+
+    function dropText(text: Option[String]): Unit is
+        case text of
+            when Some(value as s: String) do
+                destroyString(s);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function dropPendingOption(pending: Option[RamboPending]): Unit is
+        case pending of
+            when Some(value as p: RamboPending) do
+                destroyPending(p);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function reauthSeconds(): Int64 is
+        return 900;
+    end;
+
+    function pendingSeconds(): Int64 is
+        return 600;
+    end;
+
+    function leewaySeconds(): Int64 is
+        return 60;
+    end;
+
+    ---
+    --- Settings
+    ---
+
+    -- Whether text is visible ASCII without space, quote or backslash.
+    generic [T: Region]
+    function isPlainUrlText(text: Span[Nat8, T]): Bool is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if ((byte <= ' ') or (byte > '~')) or (((byte = '"') or (byte = '\\')) or ((byte = '<') or (byte = '>'))) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- https://host... without a slash at its end, a query or a fragment.
+    generic [I: Region]
+    function isIssuer(issuer: Span[Nat8, I]): Bool is
+        let size: Index := spanLength(issuer);
+        if (size <= 8) or (size > 512) then
+            return false;
+        end if;
+        if not startsWith(issuer, "https://") then
+            return false;
+        end if;
+        if issuer[size - 1] = '/' then
+            return false;
+        end if;
+        case indexOfByte(issuer, '?') of
+            when Some(value as at: Index) do
+                return false;
+            when None do
+                skip;
+        end case;
+        case indexOfByte(issuer, '#') of
+            when Some(value as at: Index) do
+                return false;
+            when None do
+                skip;
+        end case;
+        return isPlainUrlText(issuer);
+    end;
+
+    generic [C: Region]
+    function isClientId(id: Span[Nat8, C]): Bool is
+        if (spanLength(id) = 0) or (spanLength(id) > 128) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(id) do
+            let byte: Nat8 := id[i];
+            let letter: Bool := ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let mark: Bool := ((byte = '-') or (byte = '_')) or ((byte = '.') or (byte = ':'));
+            if not ((letter or digit) or mark) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- https://..., or http:// on 127.0.0.1 or localhost (a port may follow).
+    generic [U: Region]
+    function isRedirect(uri: Span[Nat8, U]): Bool is
+        if (spanLength(uri) > 2048) or (not isPlainUrlText(uri)) then
+            return false;
+        end if;
+        if startsWith(uri, "https://") then
+            return spanLength(uri) > 8;
+        end if;
+        let local: Bool := (startsWith(uri, "http://127.0.0.1:") or startsWith(uri, "http://127.0.0.1/")) or (startsWith(uri, "http://localhost:") or startsWith(uri, "http://localhost/"));
+        return local;
+    end;
+
+    generic [I: Region, C: Region, S: Region, U: Region, A: Region]
+    function makeRamboConfig(issuer: Span[Nat8, I], clientId: Span[Nat8, C], clientSecret: Span[Nat8, S],
+                             redirectUri: Span[Nat8, U], caFile: Span[Nat8, A]): Option[RamboConfig] is
+        if not ((isIssuer(issuer) and isClientId(clientId)) and isRedirect(redirectUri)) then
+            return None();
+        end if;
+        let config: RamboConfig := RamboConfig(issuer => fromSpan(issuer), clientId => fromSpan(clientId),
+                                               clientSecret => fromSpan(clientSecret), redirectUri => fromSpan(redirectUri),
+                                               caFile => fromSpan(caFile));
+        return Some(value => config);
+    end;
+
+    function destroyRamboConfig(config: RamboConfig): Unit is
+        let { issuer as i: String, clientId as c: String, clientSecret as s: String, redirectUri as u: String, caFile as a: String } := config;
+        destroyString(i);
+        destroyString(c);
+        destroyString(s);
+        destroyString(u);
+        destroyString(a);
+        return nil;
+    end;
+
+    ---
+    --- Sign-in, logout
+    ---
+
+    function hexDigit(n: Nat8): Nat8 is
+        if n < 10 then
+            return n + '0';
+        end if;
+        return (n - 10) + 'A';
+    end;
+
+    -- value percent-encoded for a query or a form: only A-Z a-z 0-9 - . _ ~
+    -- stay as they are.
+    generic [O: Region, V: Region]
+    function writeEncoded(out: &![StringBuilder, O], value: Span[Nat8, V]): Unit is
+        var i: Index := 0;
+        while i < spanLength(value) do
+            let byte: Nat8 := value[i];
+            let letter: Bool := ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let mark: Bool := ((byte = '-') or (byte = '.')) or ((byte = '_') or (byte = '~'));
+            if (letter or digit) or mark then
+                writeByte(&~out, byte);
+            else
+                writeByte(&~out, '%');
+                writeByte(&~out, hexDigit(byte / 16));
+                writeByte(&~out, hexDigit(byte - ((byte / 16) * 16)));
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- &name=value, or name=value when first.
+    generic [O: Region, N: Region, V: Region]
+    function writeParam(out: &![StringBuilder, O], first: Bool, name: Span[Nat8, N], value: Span[Nat8, V]): Unit is
+        if not first then
+            writeByte(&~out, '&');
+        end if;
+        writeString(&~out, name);
+        writeByte(&~out, '=');
+        writeEncoded(&~out, value);
+        return nil;
+    end;
+
+    -- base64url of 32 random bytes, None when the source fails.
+    function randomText(): Option[String] is
+        case randomBytes(randomSize) of
+            when Some(value as raw: String) do
+                let text: String := base64UrlEncode(asSpan(&raw));
+                destroyString(raw);
+                return Some(value => text);
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [V: Region]
+    function pkceChallenge(verifier: Span[Nat8, V]): String is
+        case sha256(verifier) of
+            when Some(value as digest: String) do
+                let text: String := base64UrlEncode(asSpan(&digest));
+                destroyString(digest);
+                return text;
+            when None do
+                -- libcrypto failed: a challenge no verifier meets, of the
+                -- same length, so that the sign-in fails at RAMBO.
+                return fromLiteral("-------------------------------------------");
+        end case;
+    end;
+
+    function decimal(value: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        let digits1: String := formatInt(value);
+        writeString(&!out, asSpan(&digits1));
+        destroyString(digits1);
+        return finalize(out);
+    end;
+
+    generic [C: Region]
+    function beginLogin(config: &[RamboConfig, C], maxAge: Int64, silent: Bool): Option[RamboStart] is
+        case randomText() of
+            when Some(value as state: String) do
+                case randomText() of
+                    when Some(value as nonce: String) do
+                        case randomText() of
+                            when Some(value as verifier: String) do
+                                let challenge: String := pkceChallenge(asSpan(&verifier));
+                                var out: StringBuilder := makeStringBuilder();
+                                writeString(&!out, asSpan(&(config->issuer)));
+                                writeString(&!out, "/authorize?");
+                                writeParam(&!out, true, "response_type", "code");
+                                writeParam(&!out, false, "client_id", asSpan(&(config->clientId)));
+                                writeParam(&!out, false, "redirect_uri", asSpan(&(config->redirectUri)));
+                                writeParam(&!out, false, "scope", "openid email profile");
+                                writeParam(&!out, false, "state", asSpan(&state));
+                                writeParam(&!out, false, "nonce", asSpan(&nonce));
+                                writeParam(&!out, false, "code_challenge", asSpan(&challenge));
+                                writeParam(&!out, false, "code_challenge_method", "S256");
+                                if maxAge >= 0 then
+                                    let age: String := decimal(maxAge);
+                                    writeParam(&!out, false, "max_age", asSpan(&age));
+                                    destroyString(age);
+                                end if;
+                                if silent then
+                                    writeParam(&!out, false, "prompt", "none");
+                                end if;
+                                destroyString(challenge);
+                                let made: RamboStart := RamboStart(url => finalize(out), state => state, nonce => nonce, verifier => verifier);
+                                return Some(value => made);
+                            when None do
+                                destroyString(state);
+                                destroyString(nonce);
+                                return None();
+                        end case;
+                    when None do
+                        destroyString(state);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    function destroyStart(begun: RamboStart): Unit is
+        let { url as u: String, state as s: String, nonce as n: String, verifier as v: String } := begun;
+        destroyString(u);
+        destroyString(s);
+        destroyString(n);
+        destroyString(v);
+        return nil;
+    end;
+
+    generic [C: Region, I: Region, P: Region, S: Region]
+    function logoutUrl(config: &[RamboConfig, C], idTokenHint: Span[Nat8, I], postLogout: Span[Nat8, P],
+                       state: Span[Nat8, S]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&(config->issuer)));
+        writeString(&!out, "/logout?");
+        writeParam(&!out, true, "client_id", asSpan(&(config->clientId)));
+        if spanLength(idTokenHint) > 0 then
+            writeParam(&!out, false, "id_token_hint", idTokenHint);
+        end if;
+        if spanLength(postLogout) > 0 then
+            writeParam(&!out, false, "post_logout_redirect_uri", postLogout);
+        end if;
+        if spanLength(state) > 0 then
+            writeParam(&!out, false, "state", state);
+        end if;
+        return finalize(out);
+    end;
+
+    -- One hidden field of the logout form, value escaped.
+    generic [O: Region, N: Region, V: Region]
+    function writeField(out: &![StringBuilder, O], name: Span[Nat8, N], value: Span[Nat8, V]): Unit is
+        writeString(&~out, "<input type=\"hidden\" name=\"");
+        writeString(&~out, name);
+        writeString(&~out, "\" value=\"");
+        let escaped: String := escapeCode(value);
+        writeString(&~out, asSpan(&escaped));
+        destroyString(escaped);
+        writeString(&~out, "\">\n");
+        return nil;
+    end;
+
+    generic [C: Region, I: Region, P: Region, S: Region]
+    function logoutForm(config: &[RamboConfig, C], idTokenHint: Span[Nat8, I], postLogout: Span[Nat8, P],
+                        state: Span[Nat8, S]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<!doctype html>\n<html><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>Signing out</title></head>\n<body>\n<form method=\"post\" action=\"");
+        let action: String := escapeCode(asSpan(&(config->issuer)));
+        writeString(&!out, asSpan(&action));
+        destroyString(action);
+        writeString(&!out, "/logout\">\n");
+        writeField(&!out, "client_id", asSpan(&(config->clientId)));
+        if spanLength(idTokenHint) > 0 then
+            writeField(&!out, "id_token_hint", idTokenHint);
+        end if;
+        if spanLength(postLogout) > 0 then
+            writeField(&!out, "post_logout_redirect_uri", postLogout);
+        end if;
+        if spanLength(state) > 0 then
+            writeField(&!out, "state", state);
+        end if;
+        writeString(&!out, "<noscript><p>Signing out at RAMBO. <button type=\"submit\">Continue</button></p></noscript>\n</form>\n<script>");
+        writeString(&!out, logoutScript);
+        writeString(&!out, "</script>\n</body></html>\n");
+        return finalize(out);
+    end;
+
+    generic [C: Region]
+    function logoutPolicy(config: &[RamboConfig, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "default-src 'none'; script-src 'sha256-");
+        writeString(&!out, logoutScriptHash);
+        writeString(&!out, "'; form-action 'self' ");
+        -- The issuer has no space, quote or angle bracket (isIssuer); a
+        -- semicolon or comma would end the directive, so percent-encoded,
+        -- which the browser decodes before it compares the path.
+        let issuer: Span[Nat8, C] := asSpan(&(config->issuer));
+        var i: Index := 0;
+        while i < spanLength(issuer) do
+            let byte: Nat8 := issuer[i];
+            if byte = ';' then
+                writeString(&!out, "%3B");
+            else
+                if byte = ',' then
+                    writeString(&!out, "%2C");
+                else
+                    writeByte(&!out, byte);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        writeString(&!out, "/logout; base-uri 'none'; frame-ancestors 'none'");
+        return finalize(out);
+    end;
+
+    ---
+    --- Tokens
+    ---
+
+    function destroyRamboError(error: RamboError): Unit is
+        case error of
+            when Unreachable(detail as d: String) do
+                destroyString(d);
+            when Refused(status as s: Nat16, code as c: String, description as e: String) do
+                destroyString(c);
+                destroyString(e);
+            when Malformed do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function destroyTokens(tokens: RamboTokens): Unit is
+        let { accessToken as a: String, idToken as i: String, refreshToken as r: String, expiresIn as e: Int64 } := tokens;
+        destroyString(a);
+        destroyString(i);
+        destroyString(r);
+        return nil;
+    end;
+
+    generic [J: Region, P: Region]
+    function textOr(document: &[Json, J], pointer: Span[Nat8, P], fallback: Span[Nat8, Static]): String is
+        case stringAt(document, pointer) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromLiteral(fallback);
+        end case;
+    end;
+
+    function malformed(): Either[RamboError, RamboTokens] is
+        return Left(left => Malformed());
+    end;
+
+    -- The OAuth error of an answer that is not 200.
+    function refusedOf(document: Json, status: Nat16): Either[RamboError, RamboTokens] is
+        let code: String := textOr(&document, "/error", "http_error");
+        let description: String := textOr(&document, "/error_description", "");
+        destroyJson(document);
+        let refused: RamboError := Refused(status => status, code => code, description => description);
+        return Left(left => refused);
+    end;
+
+    -- The tokens of a 200, or Malformed.
+    function tokensOf(document: Json): Either[RamboError, RamboTokens] is
+        let access: String := textOr(&document, "/access_token", "");
+        let kind: String := textOr(&document, "/token_type", "");
+        let lowered: String := toLower(asSpan(&kind));
+        destroyString(kind);
+        let bearer: Bool := (length(&lowered) = 6) and startsWith(asSpan(&lowered), "bearer");
+        destroyString(lowered);
+        var expires: Int64 := 0;
+        case integerAt(&document, "/expires_in") of
+            when Some(value as seconds: Int64) do
+                if seconds > 0 then
+                    expires := seconds;
+                end if;
+            when None do
+                skip;
+        end case;
+        let idToken: String := textOr(&document, "/id_token", "");
+        let refresh: String := textOr(&document, "/refresh_token", "");
+        destroyJson(document);
+        if (length(&access) = 0) or (not bearer) then
+            destroyString(access);
+            destroyString(idToken);
+            destroyString(refresh);
+            return malformed();
+        else
+            let tokens: RamboTokens := RamboTokens(accessToken => access, idToken => idToken, refreshToken => refresh, expiresIn => expires);
+            return Right(right => tokens);
+        end if;
+    end;
+
+    generic [B: Region]
+    function readTokens(status: Nat16, answer: Span[Nat8, B]): Either[RamboError, RamboTokens] is
+        if spanLength(answer) > answerMost then
+            return malformed();
+        end if;
+        case readJson(answer) of
+            when Right(right as document: Json) do
+                if status /= 200 then
+                    return refusedOf(document, status);
+                else
+                    return tokensOf(document);
+                end if;
+            when Left(left as error: JsonError) do
+                if status /= 200 then
+                    let refused: RamboError := Refused(status => status, code => fromLiteral("http_error"), description => fromLiteral(""));
+                    return Left(left => refused);
+                end if;
+                return malformed();
+        end case;
+    end;
+
+    -- The limits of a request to RAMBO: 10 s to connect, 15 s for all, 1 MiB.
+    function ramboLimits(): Limits is
+        return Limits(connectMillis => 10000, totalMillis => 15000, maximumBytes => answerMost, publicOnly => false);
+    end;
+
+    -- POST of form to /token, with Basic authentication when the client has
+    -- a secret, its id in the form when it has none.
+    generic [C: Region, F: Region]
+    function postToken(config: &[RamboConfig, C], form: Span[Nat8, F]): Either[RamboError, RamboTokens] is
+        var sent: StringBuilder := makeStringBuilder();
+        writeString(&!sent, form);
+        var headers: StringBuilder := makeStringBuilder();
+        writeString(&!headers, "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json");
+        if length(&(config->clientSecret)) = 0 then
+            writeParam(&!sent, false, "client_id", asSpan(&(config->clientId)));
+        else
+            var pair: StringBuilder := makeStringBuilder();
+            writeEncoded(&!pair, asSpan(&(config->clientId)));
+            writeByte(&!pair, ':');
+            writeEncoded(&!pair, asSpan(&(config->clientSecret)));
+            let joined: String := finalize(pair);
+            let basic: String := base64Encode(asSpan(&joined));
+            destroyString(joined);
+            writeString(&!headers, "\r\nAuthorization: Basic ");
+            writeString(&!headers, asSpan(&basic));
+            destroyString(basic);
+        end if;
+        var url: StringBuilder := makeStringBuilder();
+        writeString(&!url, asSpan(&(config->issuer)));
+        writeString(&!url, "/token");
+        let target: String := finalize(url);
+        let lines: String := finalize(headers);
+        let payload: String := finalize(sent);
+        let answer: Either[Failure, Response] := request(Post(), asSpan(&target), asSpan(&lines), asSpan(&payload), asSpan(&(config->caFile)), ramboLimits());
+        destroyString(target);
+        destroyString(lines);
+        destroyString(payload);
+        case answer of
+            when Right(right as response: Response) do
+                let { status as status: Nat16, headers as h: String, content as content: String } := response;
+                destroyString(h);
+                let tokens: Either[RamboError, RamboTokens] := readTokens(status, asSpan(&content));
+                destroyString(content);
+                return tokens;
+            when Left(left as failure: Failure) do
+                let { kind as k: FailureKind, detail as detail: String } := failure;
+                let gone: RamboError := Unreachable(detail => detail);
+                return Left(left => gone);
+        end case;
+    end;
+
+    generic [C: Region, D: Region, V: Region]
+    function exchangeCode(config: &[RamboConfig, C], code: Span[Nat8, D], verifier: Span[Nat8, V]): Either[RamboError, RamboTokens] is
+        var form: StringBuilder := makeStringBuilder();
+        writeParam(&!form, true, "grant_type", "authorization_code");
+        writeParam(&!form, false, "code", code);
+        writeParam(&!form, false, "redirect_uri", asSpan(&(config->redirectUri)));
+        writeParam(&!form, false, "code_verifier", verifier);
+        let text: String := finalize(form);
+        let tokens: Either[RamboError, RamboTokens] := postToken(config, asSpan(&text));
+        destroyString(text);
+        return tokens;
+    end;
+
+    generic [C: Region, T: Region]
+    function refreshTokens(config: &[RamboConfig, C], refresh: Span[Nat8, T]): Either[RamboError, RamboTokens] is
+        var form: StringBuilder := makeStringBuilder();
+        writeParam(&!form, true, "grant_type", "refresh_token");
+        writeParam(&!form, false, "refresh_token", refresh);
+        let text: String := finalize(form);
+        let tokens: Either[RamboError, RamboTokens] := postToken(config, asSpan(&text));
+        destroyString(text);
+        return tokens;
+    end;
+
+    generic [C: Region]
+    function fetchJwks(config: &[RamboConfig, C]): Option[String] is
+        var url: StringBuilder := makeStringBuilder();
+        writeString(&!url, asSpan(&(config->issuer)));
+        writeString(&!url, "/jwks");
+        let target: String := finalize(url);
+        let answer: Either[Failure, Response] := request(Get(), asSpan(&target), "Accept: application/json", "", asSpan(&(config->caFile)), ramboLimits());
+        destroyString(target);
+        case answer of
+            when Right(right as response: Response) do
+                let { status as status: Nat16, headers as h: String, content as content: String } := response;
+                destroyString(h);
+                if status = 200 then
+                    return Some(value => content);
+                else
+                    destroyString(content);
+                    return None();
+                end if;
+            when Left(left as failure: Failure) do
+                destroyFailure(failure);
+                return None();
+        end case;
+    end;
+
+    ---
+    --- Keys and tokens checked
+    ---
+
+    -- A JWK of kty AKP (ML-DSA, RFC 9964) as the DER key of Standard.Jws, which reads it: RAMBO
+    -- publishes no other kind, so any other key, EC, OKP or RSA too, is None here.
+    generic [J: Region]
+    function akpPublicDer(jwk: Span[Nat8, J]): Option[String] is
+        case readJson(jwk) of
+            when Right(right as document: Json) do
+                let kty: String := textOr(&document, "/kty", "");
+                destroyJson(document);
+                let akp: Bool := (length(&kty) = 3) and startsWith(asSpan(&kty), "AKP");
+                destroyString(kty);
+                if not akp then
+                    return None();
+                end if;
+                return publicKeyFromJwk(jwk);
+            when Left(left as error: JsonError) do
+                return None();
+        end case;
+    end;
+
+    -- The header of a compact JWS, decoded: None when it has no two dots or
+    -- its first part is not base64url of JSON.
+    generic [T: Region]
+    function headerOf(token: Span[Nat8, T]): Option[Json] is
+        case indexOfByte(token, '.') of
+            when Some(value as dot: Index) do
+                case base64UrlDecode(substring(token, 0, dot)) of
+                    when Some(value as text: String) do
+                        let read: Either[JsonError, Json] := readJson(asSpan(&text));
+                        destroyString(text);
+                        case read of
+                            when Right(right as document: Json) do
+                                return Some(value => document);
+                            when Left(left as error: JsonError) do
+                                return None();
+                        end case;
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [T: Region, J: Region]
+    function verifiedPayload(token: Span[Nat8, T], jwks: Span[Nat8, J]): Option[String] is
+        case headerOf(token) of
+            when Some(value as header: Json) do
+                let kid: String := textOr(&header, "/kid", "");
+                let alg: String := textOr(&header, "/alg", "");
+                destroyJson(header);
+                let result: Option[String] := underKeyOf(token, jwks, asSpan(&kid), asSpan(&alg));
+                destroyString(kid);
+                destroyString(alg);
+                return result;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The payload of token under the key of jwks whose kid and alg are kid
+    -- and alg; None when there is none or the signature does not hold.
+    generic [T: Region, J: Region, K: Region, A: Region]
+    function underKeyOf(token: Span[Nat8, T], jwks: Span[Nat8, J], kid: Span[Nat8, K], alg: Span[Nat8, A]): Option[String] is
+        if spanLength(kid) = 0 then
+            return None();
+        end if;
+        case readJson(jwks) of
+            when Right(right as set: Json) do
+                var count: Index := 0;
+                case countAt(&set, "/keys") of
+                    when Some(value as n: Index) do
+                        count := n;
+                    when None do
+                        skip;
+                end case;
+                var chosen: Index := 0;
+                var found: Bool := false;
+                var i: Index := 0;
+                while (i < count) and (not found) do
+                    let atKid: String := memberPointer(i, "/kid");
+                    let keyKid: String := textOr(&set, asSpan(&atKid), "");
+                    destroyString(atKid);
+                    let atAlg: String := memberPointer(i, "/alg");
+                    let keyAlg: String := textOr(&set, asSpan(&atAlg), "");
+                    destroyString(atAlg);
+                    if equal(asSpan(&keyKid), kid) and equal(asSpan(&keyAlg), alg) then
+                        found := true;
+                        chosen := i;
+                    end if;
+                    destroyString(keyKid);
+                    destroyString(keyAlg);
+                    i := i + 1;
+                end while;
+                var jwk: Option[String] := None();
+                if found then
+                    let atKey: String := memberPointer(chosen, "");
+                    dropText(jwk);
+                    jwk := valueTextAt(&set, asSpan(&atKey));
+                    destroyString(atKey);
+                end if;
+                destroyJson(set);
+                case jwk of
+                    when Some(value as text: String) do
+                        let der: Option[String] := akpPublicDer(asSpan(&text));
+                        destroyString(text);
+                        case der of
+                            when Some(value as key: String) do
+                                let payload: Option[String] := verifyCompact(token, asSpan(&key));
+                                destroyString(key);
+                                return payload;
+                            when None do
+                                return None();
+                        end case;
+                    when None do
+                        return None();
+                end case;
+            when Left(left as error: JsonError) do
+                return None();
+        end case;
+    end;
+
+    -- /keys/i/kid
+    function keyPointer(i: Index): String is
+        return memberPointer(i, "/kid");
+    end;
+
+    -- /keys/i followed by member.
+    function memberPointer(i: Index, member: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/keys/");
+        let n: String := decimal(longOf(i));
+        writeString(&!out, asSpan(&n));
+        destroyString(n);
+        writeString(&!out, member);
+        return finalize(out);
+    end;
+
+    function longOf(n: Index): Int64 is
+        case toInt64(n) of
+            when Some(value as l: Int64) do
+                return l;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [C: Region, T: Region, J: Region, N: Region]
+    function idTokenProblem(config: &[RamboConfig, C], token: Span[Nat8, T], jwks: Span[Nat8, J], nonce: Span[Nat8, N],
+                            maxAge: Int64, now: Int64): Option[String] is
+        case verifiedPayload(token, jwks) of
+            when Some(value as payload: String) do
+                var problem: Option[String] := None();
+                if spanLength(nonce) = 0 then
+                    dropText(problem);
+                    problem := Some(value => fromLiteral("no nonce to check"));
+                else
+                    dropText(problem);
+                    problem := claimsProblem(asSpan(&payload), asSpan(&(config->issuer)), asSpan(&(config->clientId)), nonce, now, leewaySeconds());
+                end if;
+                case problem of
+                    when Some(value as reason: String) do
+                        destroyString(payload);
+                        return Some(value => reason);
+                    when None do
+                        let checked: Option[String] := laterClaimsProblem(config, asSpan(&payload), maxAge, now);
+                        destroyString(payload);
+                        return checked;
+                end case;
+            when None do
+                return Some(value => fromLiteral("signature does not hold under a key of RAMBO"));
+        end case;
+    end;
+
+    -- azp when aud names more than one, and auth_time against maxAge.
+    generic [C: Region, P: Region]
+    function laterClaimsProblem(config: &[RamboConfig, C], payload: Span[Nat8, P], maxAge: Int64, now: Int64): Option[String] is
+        case readJson(payload) of
+            when Right(right as claims: Json) do
+                var azpWrong: Bool := false;
+                case countAt(&claims, "/aud") of
+                    when Some(value as n: Index) do
+                        if n > 1 then
+                            let azp: String := textOr(&claims, "/azp", "");
+                            azpWrong := not equal(asSpan(&azp), asSpan(&(config->clientId)));
+                            destroyString(azp);
+                        end if;
+                    when None do
+                        skip;
+                end case;
+                -- 0 the sign-in is recent enough, 1 too old, 2 no auth_time.
+                var authTime: Index := 0;
+                if maxAge >= 0 then
+                    case integerAt(&claims, "/auth_time") of
+                        when Some(value as at: Int64) do
+                            if (at > (now + leewaySeconds())) or ((now - at) > (maxAge + leewaySeconds())) then
+                                authTime := (1 : Index);
+                            end if;
+                        when None do
+                            authTime := (2 : Index);
+                    end case;
+                end if;
+                destroyJson(claims);
+                if azpWrong then
+                    return Some(value => fromLiteral("azp is not the client"));
+                end if;
+                if authTime = 1 then
+                    return Some(value => fromLiteral("the sign-in at RAMBO is too old"));
+                end if;
+                if authTime = 2 then
+                    return Some(value => fromLiteral("no auth_time"));
+                end if;
+                return None();
+            when Left(left as error: JsonError) do
+                return Some(value => fromLiteral("the payload is not JSON"));
+        end case;
+    end;
+
+    generic [P: Region, N: Region]
+    function claimText(payload: Span[Nat8, P], name: Span[Nat8, N]): Option[String] is
+        case readJson(payload) of
+            when Right(right as claims: Json) do
+                var out: StringBuilder := makeStringBuilder();
+                writeByte(&!out, '/');
+                writeString(&!out, name);
+                let pointer: String := finalize(out);
+                let text: Option[String] := stringAt(&claims, asSpan(&pointer));
+                destroyString(pointer);
+                destroyJson(claims);
+                return text;
+            when Left(left as error: JsonError) do
+                return None();
+        end case;
+    end;
+
+    ---
+    --- Storage
+    ---
+
+    generic [R: Region]
+    function prepareRambo(db: &![Database[Writing], R]): Option[DbError] is
+        let makePendingSql: Span[Nat8, Static] := pick(&db, makePending, makePendingPg);
+        case execute(&~db, makePendingSql, noValues()) of
+            when Right(right as a: Nat64) do
+                let makeIdTokensSql: Span[Nat8, Static] := pick(&db, makeIdTokens, makeIdTokensPg);
+                case execute(&~db, makeIdTokensSql, noValues()) of
+                    when Right(right as b: Nat64) do
+                        let makeKeysSql: Span[Nat8, Static] := pick(&db, makeKeys, makeKeysPg);
+                        case execute(&~db, makeKeysSql, noValues()) of
+                            when Right(right as c: Nat64) do
+                                return None();
+                            when Left(left as error: DbError) do
+                                return Some(value => error);
+                        end case;
+                    when Left(left as error: DbError) do
+                        return Some(value => error);
+                end case;
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    -- The SHA-256 of a session token in base64url: the tables never hold a
+    -- session token itself.
+    generic [T: Region]
+    function sessionKey(session: Span[Nat8, T]): String is
+        return pkceChallenge(session);
+    end;
+
+    function destroyPending(pending: RamboPending): Unit is
+        let { nonce as n: String, verifier as v: String } := pending;
+        destroyString(n);
+        destroyString(v);
+        return nil;
+    end;
+
+    generic [R: Region, T: Region, P: Region]
+    function keepPending(db: &![Database[Writing], R], session: Span[Nat8, T], begun: &[RamboStart, P], now: Int64): Either[DbError, Bool] is
+        case execute(&~db, purgePending, withInt64(noValues(), now - pendingSeconds())) of
+            when Right(right as purged: Nat64) do
+                skip;
+            when Left(left as error: DbError) do
+                return Left(left => error);
+        end case;
+        let key: String := sessionKey(session);
+        let addPendingSql: Span[Nat8, Static] := pick(&db, addPending, addPendingPg);
+        let added: Either[DbError, Nat64] := execute(&~db, addPendingSql,
+            withInt64(withText(withText(withText(withText(noValues(), asSpan(&(begun->state))), asSpan(&key)), asSpan(&(begun->nonce))), asSpan(&(begun->verifier))), now));
+        destroyString(key);
+        case added of
+            when Right(right as changed: Nat64) do
+                let kept: Bool := changed = 1;
+                return Right(right => kept);
+            when Left(left as error: DbError) do
+                return Left(left => error);
+        end case;
+    end;
+
+    generic [R: Region, T: Region, S: Region]
+    function takePending(db: &![Database[Writing], R], session: Span[Nat8, T], state: Span[Nat8, S], now: Int64): Either[DbError, Option[RamboPending]] is
+        let key: String := sessionKey(session);
+        var cursor: Cursor := start(&~db, readPending, withText(noValues(), state));
+        var found: Option[RamboPending] := None();
+        if advance(&!cursor) then
+            let mine: Bool := equal(columnText(&cursor, 0), asSpan(&key));
+            let made: Int64 := columnInt64(&cursor, 3);
+            let fresh: Bool := (made <= now) and ((now - made) <= pendingSeconds());
+            if mine and fresh then
+                let pending: RamboPending := RamboPending(nonce => fromSpan(columnText(&cursor, 1)), verifier => fromSpan(columnText(&cursor, 2)));
+                dropPendingOption(found);
+                found := Some(value => pending);
+            end if;
+        end if;
+        destroyString(key);
+        let finished: Option[DbError] := finish(&~db, cursor);
+        -- Taken out whether it fits or not: a state is good for one try.
+        let dropped: Either[DbError, Nat64] := execute(&~db, dropPending, withText(noValues(), state));
+        case finished of
+            when Some(value as error: DbError) do
+                dropPendingOption(found);
+                return Left(left => error);
+            when None do
+                case dropped of
+                    when Right(right as changed: Nat64) do
+                        return Right(right => found);
+                    when Left(left as error: DbError) do
+                        dropPendingOption(found);
+                        return Left(left => error);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, T: Region, I: Region]
+    function keepIdToken(db: &![Database[Writing], R], session: Span[Nat8, T], idToken: Span[Nat8, I], now: Int64): Option[DbError] is
+        let key: String := sessionKey(session);
+        let putIdTokenSql: Span[Nat8, Static] := pick(&db, putIdToken, putIdTokenPg);
+        let put: Either[DbError, Nat64] := execute(&~db, putIdTokenSql, withInt64(withText(withText(noValues(), asSpan(&key)), idToken), now));
+        destroyString(key);
+        case put of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function takeIdToken(db: &![Database[Writing], R], session: Span[Nat8, T]): Either[DbError, Option[String]] is
+        let key: String := sessionKey(session);
+        var cursor: Cursor := start(&~db, readIdToken, withText(noValues(), asSpan(&key)));
+        var found: Option[String] := None();
+        if advance(&!cursor) then
+            dropText(found);
+            found := Some(value => fromSpan(columnText(&cursor, 0)));
+        end if;
+        let finished: Option[DbError] := finish(&~db, cursor);
+        let dropped: Either[DbError, Nat64] := execute(&~db, dropIdToken, withText(noValues(), asSpan(&key)));
+        destroyString(key);
+        case finished of
+            when Some(value as error: DbError) do
+                dropText(found);
+                return Left(left => error);
+            when None do
+                case dropped of
+                    when Right(right as changed: Nat64) do
+                        return Right(right => found);
+                    when Left(left as error: DbError) do
+                        dropText(found);
+                        return Left(left => error);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, J: Region]
+    function keepJwks(db: &![Database[Writing], R], jwks: Span[Nat8, J], now: Int64): Option[DbError] is
+        let putKeysSql: Span[Nat8, Static] := pick(&db, putKeys, putKeysPg);
+        case execute(&~db, putKeysSql, withInt64(withText(noValues(), jwks), now)) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function knownJwks(db: &![Database[M], R]): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, readKeys, noValues());
+        var found: Option[String] := None();
+        if advance(&!cursor) then
+            dropText(found);
+            found := Some(value => fromSpan(columnText(&cursor, 0)));
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                case found of
+                    when Some(value as dropped: String) do
+                        destroyString(dropped);
+                    when None do
+                        skip;
+                end case;
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+end module body.

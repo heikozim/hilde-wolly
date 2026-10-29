@@ -1,0 +1,1013 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Standard.Session does: every
+-- statement is a constant, every value is bound, every table is strict.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    startsWith,
+    substring,
+    parseNat
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction,
+    begin,
+    commit,
+    Cursor,
+    Values,
+    noValues,
+    withInt64,
+    withText,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+import Standard.Session (
+    SessionError,
+    StorageFailed,
+    CryptoFailed,
+    BadTime,
+    defaultSessionLimits,
+    prepareSessions,
+    isSessionToken,
+    createSession,
+    loadSession,
+    saveSession,
+    rotateSession,
+    destroySession
+);
+import Standard.Password (
+    PasswordCheck,
+    Matches,
+    MatchesStoreAgain,
+    DoesNotMatch,
+    Unreadable,
+    Failed,
+    hashPassword,
+    checkPassword
+);
+import Standard.Cookie (
+    strictOptions,
+    deleteCookie
+);
+import Standard.Log (
+    Log,
+    Entry,
+    Info,
+    JsonLines,
+    logToFile,
+    closeLog,
+    makeEntry,
+    addText,
+    addInteger,
+    writeEntry
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Request (
+    cookie
+);
+import Wolly.Response (
+    Response,
+    addHeader,
+    addCookie,
+    decimalText
+);
+import Wolly.Totp (
+    prepareTotp,
+    totpEnabled,
+    checkCode
+);
+import Wolly.Passphrase (
+    fewestCharacters,
+    normalizedPassword,
+    characterCount,
+    checkPassphrase,
+    isFit
+);
+
+import Wolly.Passkey (
+    Refusal,
+    authenticate
+);
+
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.Auth is
+    constant sessionCookie: Span[Nat8, Static] := "__Host-wolly";
+    constant userPrefix: Span[Nat8, Static] := "user=";
+    -- A session that waits for the code holds code=<seconds>/<name>, the
+    -- time of the password and the user.
+    constant pendingPrefix: Span[Nat8, Static] := "code=";
+    constant notPending: Int64 := -1;
+    -- The failures are kept twice, by client and by user name, each under
+    -- the same limit: the first stops one address trying many names, the
+    -- second many addresses trying one name.
+    constant countByClient: Span[Nat8, Static] := "SELECT count(*) FROM wolly_failures WHERE client = ? AND at > ?";
+    constant countByName: Span[Nat8, Static] := "SELECT count(*) FROM wolly_name_failures WHERE name = ? AND at > ?";
+    constant addByClient: Span[Nat8, Static] := "INSERT INTO wolly_failures (client, at) VALUES (?, ?)";
+    constant addByName: Span[Nat8, Static] := "INSERT INTO wolly_name_failures (name, at) VALUES (?, ?)";
+    constant clearByClient: Span[Nat8, Static] := "DELETE FROM wolly_failures WHERE client = ?";
+    constant clearByName: Span[Nat8, Static] := "DELETE FROM wolly_name_failures WHERE name = ?";
+
+    function failureLimit(): Int64 is
+        return 5;
+    end;
+
+    function failureWindowSeconds(): Int64 is
+        return 900;
+    end;
+
+    function cookieName(): Span[Nat8, Static] is
+        return sessionCookie;
+    end;
+
+    function pendingSeconds(): Int64 is
+        return 300;
+    end;
+
+    function fromSession(error: SessionError): AuthError is
+        case error of
+            when StorageFailed(error as failure: DbError) do
+                return AuthStorage(error => failure);
+            when CryptoFailed do
+                return AuthCrypto();
+            when BadTime do
+                return AuthBadTime();
+        end case;
+    end;
+
+    -- Runs one statement that returns no rows; None when it went through.
+    generic [R: Region]
+    function run(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Option[AuthError] is
+        case execute(&~db, sql, noValues()) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => AuthStorage(error => error));
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepareAuth(db: &![Database[Writing], R]): Either[AuthError, Unit] is
+        let usersSql: Span[Nat8, Static] := pick(&db, "CREATE TABLE IF NOT EXISTS wolly_users (name TEXT PRIMARY KEY NOT NULL, hash TEXT NOT NULL) STRICT", "CREATE TABLE IF NOT EXISTS wolly_users (name TEXT PRIMARY KEY NOT NULL, hash TEXT NOT NULL)");
+        case run(&~db, usersSql) of
+            when Some(value as error: AuthError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        let failuresSql: Span[Nat8, Static] := pick(&db, "CREATE TABLE IF NOT EXISTS wolly_failures (client TEXT NOT NULL, at INTEGER NOT NULL) STRICT", "CREATE TABLE IF NOT EXISTS wolly_failures (client TEXT NOT NULL, at BIGINT NOT NULL)");
+        case run(&~db, failuresSql) of
+            when Some(value as error: AuthError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        let nameFailuresSql: Span[Nat8, Static] := pick(&db, "CREATE TABLE IF NOT EXISTS wolly_name_failures (name TEXT NOT NULL, at INTEGER NOT NULL) STRICT", "CREATE TABLE IF NOT EXISTS wolly_name_failures (name TEXT NOT NULL, at BIGINT NOT NULL)");
+        case run(&~db, nameFailuresSql) of
+            when Some(value as error: AuthError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        case prepareTotp(&~db) of
+            when Some(value as error: DbError) do
+                return Left(left => AuthStorage(error => error));
+            when None do
+                skip;
+        end case;
+        case prepareSessions(&~db) of
+            when Left(left as error: SessionError) do
+                return Left(left => fromSession(error));
+            when Right(right as done: Unit) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    generic [N: Region]
+    function isUserName(name: Span[Nat8, N]): Bool is
+        if (spanLength(name) = 0) or (spanLength(name) > 64) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            let letter: Bool := (byte >= 'a') and (byte <= 'z');
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let mark: Bool := ((byte = '.') or (byte = '-')) or (byte = '_');
+            if not ((letter or digit) or mark) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, N: Region, P: Region, L: Region]
+    function addUser(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P],
+                     listPath: Span[Nat8, L]): Either[AuthError, Bool] is
+        if (not isUserName(name)) or (not isFit(checkPassphrase(password, name, false, listPath))) then
+            return Right(right => false);
+        end if;
+        case normalizedPassword(password) of
+            when Some(value as normal: String) do
+                let added: Either[AuthError, Bool] := storeNew(&~db, name, asSpan(&normal));
+                destroyString(normal);
+                return added;
+            when None do
+                return Right(right => false);
+        end case;
+    end;
+
+    -- The user name with the hash of normal, a password in NFKC.
+    generic [R: Region, N: Region, P: Region]
+    function storeNew(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[AuthError, Bool] is
+        case hashPassword(password) of
+            when Some(value as hash: String) do
+                let values: Values := withText(withText(noValues(), name), asSpan(&hash));
+                let insertSql: Span[Nat8, Static] := pick(&db, "INSERT OR IGNORE INTO wolly_users (name, hash) VALUES (?, ?)", "INSERT INTO wolly_users (name, hash) VALUES (?, ?) ON CONFLICT DO NOTHING");
+                let result: Either[DbError, Nat64] := execute(&~db, insertSql, values);
+                destroyString(hash);
+                case result of
+                    when Right(right as changed: Nat64) do
+                        return Right(right => changed = 1);
+                    when Left(left as error: DbError) do
+                        return Left(left => AuthStorage(error => error));
+                end case;
+            when None do
+                return Left(left => AuthCrypto());
+        end case;
+    end;
+
+    generic [R: Region]
+    function startSession(db: &![Database[Writing], R], now: Int64): Either[AuthError, String] is
+        case createSession(&~db, "", now) of
+            when Right(right as token: String) do
+                return Right(right => token);
+            when Left(left as error: SessionError) do
+                return Left(left => fromSession(error));
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function visitorSession(db: &![Database[Writing], R], token: Span[Nat8, T], now: Int64): Either[AuthError, String] is
+        case loadSession(&~db, token, defaultSessionLimits(), now) of
+            when Right(right as loaded: Option[String]) do
+                case loaded of
+                    when Some(value as data: String) do
+                        destroyString(data);
+                        return Right(right => fromSpan(token));
+                    when None do
+                        return startSession(&~db, now);
+                end case;
+            when Left(left as error: SessionError) do
+                return Left(left => fromSession(error));
+        end case;
+    end;
+
+    -- One line of the audit log.  A log that cannot be opened loses the
+    -- line and says so with false; the request goes on.  A user that is no
+    -- user name is written as -: what was typed into the field of the name
+    -- may be a password.  The line is written only under a writing
+    -- transaction of db, so that it waits while Wolly.AuditLog rewrites the
+    -- log under one and lands in the new log.  When the busy time of the
+    -- database passes, begin is tried again until it holds, and the line
+    -- says how often as lock_retries.  Another failure of begin loses the
+    -- line: it is never written without the lock.
+    generic [R: Region, A: Region, U: Region, C: Region]
+    function audit(db: &![Database[Writing], R], auditPath: Span[Nat8, A], event: Span[Nat8, Static], user: Span[Nat8, U],
+                   client: Span[Nat8, C], outcome: Span[Nat8, Static]): Bool is
+        var retries: Int64 := 0;
+        while true do
+            case begin(&~db) of
+                when Right(right as transaction: Transaction) do
+                    let written: Bool := auditLine(auditPath, event, user, client, outcome, retries);
+                    case commit(&~db, transaction) of
+                        when Right(right as done: Unit) do
+                            return written;
+                        when Left(left as error: DbError) do
+                            return written;
+                    end case;
+                when Left(left as error: DbError) do
+                    if not isBusy(error) then
+                        return false;
+                    end if;
+                    retries := retries + 1;
+            end case;
+        end while;
+        return false;
+    end;
+
+    -- Whether error is SQLITE_BUSY or SQLITE_LOCKED, whose primary code is
+    -- the low byte of the extended one.
+    function isBusy(error: DbError): Bool is
+        let primary: Int32 := error.code - ((error.code / 256) * 256);
+        return (primary = 5) or (primary = 6);
+    end;
+
+    generic [A: Region, U: Region, C: Region]
+    function auditLine(auditPath: Span[Nat8, A], event: Span[Nat8, Static], user: Span[Nat8, U], client: Span[Nat8, C],
+                       outcome: Span[Nat8, Static], retries: Int64): Bool is
+        case logToFile(auditPath, Info(), JsonLines()) of
+            when Some(value as opened: Log) do
+                var log: Log := opened;
+                let named: Entry := if isUserName(user) then addText(makeEntry(Info(), event), "user", user) else addText(makeEntry(Info(), event), "user", "-");
+                let plain: Entry := addText(addText(named, "client", client), "outcome", outcome);
+                var written: Bool := false;
+                if retries > 0 then
+                    written := writeEntry(&!log, addInteger(plain, "lock_retries", retries));
+                else
+                    written := writeEntry(&!log, plain);
+                end if;
+                let closed: Bool := closeLog(log);
+                return written and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- How many failures of key the count sql finds since since.
+    generic [R: Region, K: Region]
+    function failuresSince(db: &![Database[Writing], R], sql: Span[Nat8, Static], key: Span[Nat8, K], since: Int64): Either[AuthError, Int64] is
+        var cursor: Cursor := start(&~db, sql, withInt64(withText(noValues(), key), since));
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => AuthStorage(error => error));
+            when None do
+                return Right(right => count);
+        end case;
+    end;
+
+    -- The stored hash of name, None when there is no such user.
+    generic [R: Region, N: Region]
+    function storedHash(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[AuthError, Option[String]] is
+        var cursor: Cursor := start(&~db, "SELECT hash FROM wolly_users WHERE name = ?", withText(noValues(), name));
+        if advance(&!cursor) then
+            let hash: String := fromSpan(columnText(&cursor, 0));
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    destroyString(hash);
+                    return Left(left => AuthStorage(error => error));
+                when None do
+                    let some: Option[String] := Some(value => hash);
+                    return Right(right => some);
+            end case;
+        else
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return Left(left => AuthStorage(error => error));
+                when None do
+                    return Right(right => None());
+            end case;
+        end if;
+    end;
+
+    -- Whether password fits name.  A name without a user costs a hash all
+    -- the same, so the time does not tell the two apart.
+    generic [R: Region, N: Region, P: Region]
+    function passwordMatches(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[AuthError, Bool] is
+        case storedHash(&~db, name) of
+            when Left(left as error: AuthError) do
+                return Left(left => error);
+            when Right(right as stored: Option[String]) do
+                case stored of
+                    when Some(value as hash: String) do
+                        let check: PasswordCheck := checkPassword(password, asSpan(&hash));
+                        destroyString(hash);
+                        case check of
+                            when Matches do
+                                return Right(right => true);
+                            when MatchesStoreAgain do
+                                return storeAgain(&~db, name, password);
+                            when DoesNotMatch do
+                                return Right(right => false);
+                            when Unreadable do
+                                return Right(right => false);
+                            when Failed do
+                                return Left(left => AuthCrypto());
+                        end case;
+                    when None do
+                        case hashPassword(password) of
+                            when Some(value as wasted: String) do
+                                destroyString(wasted);
+                            when None do
+                                skip;
+                        end case;
+                        return Right(right => false);
+                end case;
+        end case;
+    end;
+
+    -- An old bcrypt hash that matched is replaced by an Argon2id one.
+    generic [R: Region, N: Region, P: Region]
+    function storeAgain(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[AuthError, Bool] is
+        case hashPassword(password) of
+            when Some(value as hash: String) do
+                let result: Either[DbError, Nat64] := execute(&~db, "UPDATE wolly_users SET hash = ? WHERE name = ?", withText(withText(noValues(), asSpan(&hash)), name));
+                destroyString(hash);
+                case result of
+                    when Right(right as changed: Nat64) do
+                        return Right(right => true);
+                    when Left(left as error: DbError) do
+                        return Left(left => AuthStorage(error => error));
+                end case;
+            when None do
+                return Left(left => AuthCrypto());
+        end case;
+    end;
+
+    -- Whether password, in NFKC, is the password of name.  Right false
+    -- without a hash for a password shorter than any user may have or
+    -- longer than mostBytes: so a request cannot make the server hash a
+    -- megabyte.
+    generic [R: Region, N: Region, P: Region]
+    function normalizedMatches(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[AuthError, Bool] is
+        case normalizedPassword(password) of
+            when Some(value as normal: String) do
+                if characterCount(asSpan(&normal)) < fewestCharacters(true) then
+                    destroyString(normal);
+                    return Right(right => false);
+                else
+                    let matched: Either[AuthError, Bool] := passwordMatches(&~db, name, asSpan(&normal));
+                    destroyString(normal);
+                    return matched;
+                end if;
+            when None do
+                return Right(right => false);
+        end case;
+    end;
+
+    generic [R: Region, N: Region, C: Region, P: Region, L: Region]
+    function changePassword(db: &![Database[Writing], R], name: Span[Nat8, N], current: Span[Nat8, C],
+                            next: Span[Nat8, P], listPath: Span[Nat8, L]): Either[AuthError, Bool] is
+        if not isUserName(name) then
+            return Right(right => false);
+        end if;
+        case totpEnabled(&~db, name) of
+            when Left(left as error: DbError) do
+                return Left(left => AuthStorage(error => error));
+            when Right(right as second: Bool) do
+                if not isFit(checkPassphrase(next, name, second, listPath)) then
+                    return Right(right => false);
+                end if;
+        end case;
+        case normalizedMatches(&~db, name, current) of
+            when Left(left as error: AuthError) do
+                return Left(left => error);
+            when Right(right as matched: Bool) do
+                if not matched then
+                    return Right(right => false);
+                end if;
+        end case;
+        case normalizedPassword(next) of
+            when Some(value as normal: String) do
+                let stored: Either[AuthError, Bool] := storeAgain(&~db, name, asSpan(&normal));
+                destroyString(normal);
+                return stored;
+            when None do
+                return Right(right => false);
+        end case;
+    end;
+
+    -- The session for a login: the old one under a new token, or a new one
+    -- when token opens none, holding the user.
+    generic [R: Region, T: Region, N: Region]
+    function sessionForLogin(db: &![Database[Writing], R], token: Span[Nat8, T], name: Span[Nat8, N], now: Int64): Either[AuthError, String] is
+        var data: StringBuilder := makeStringBuilder();
+        writeString(&!data, userPrefix);
+        writeString(&!data, name);
+        return sessionHolding(&~db, token, finalize(data), now);
+    end;
+
+    -- The session for a user who still owes the code: as sessionForLogin,
+    -- holding the time of now and the name.
+    generic [R: Region, T: Region, N: Region]
+    function sessionForCode(db: &![Database[Writing], R], token: Span[Nat8, T], name: Span[Nat8, N], now: Int64): Either[AuthError, String] is
+        var data: StringBuilder := makeStringBuilder();
+        writeString(&!data, pendingPrefix);
+        let seconds: String := decimalText(now);
+        writeString(&!data, asSpan(&seconds));
+        destroyString(seconds);
+        writeString(&!data, "/");
+        writeString(&!data, name);
+        return sessionHolding(&~db, token, finalize(data), now);
+    end;
+
+    -- The old session of token under a new token, or a new one when token
+    -- opens none, holding held.
+    generic [R: Region, T: Region]
+    function sessionHolding(db: &![Database[Writing], R], token: Span[Nat8, T], held: String, now: Int64): Either[AuthError, String] is
+        case rotateSession(&~db, token, defaultSessionLimits(), now) of
+            when Right(right as rotated: Option[String]) do
+                case rotated of
+                    when Some(value as renewed: String) do
+                        case saveSession(&~db, asSpan(&renewed), asSpan(&held), now) of
+                            when Right(right as saved: Bool) do
+                                destroyString(held);
+                                return Right(right => renewed);
+                            when Left(left as error: SessionError) do
+                                destroyString(held);
+                                destroyString(renewed);
+                                return Left(left => fromSession(error));
+                        end case;
+                    when None do
+                        let made: Either[SessionError, String] := createSession(&~db, asSpan(&held), now);
+                        destroyString(held);
+                        case made of
+                            when Right(right as fresh: String) do
+                                return Right(right => fresh);
+                            when Left(left as error: SessionError) do
+                                return Left(left => fromSession(error));
+                        end case;
+                end case;
+            when Left(left as error: SessionError) do
+                destroyString(held);
+                return Left(left => fromSession(error));
+        end case;
+    end;
+
+    generic [R: Region, K: Region]
+    function recordFailure(db: &![Database[Writing], R], sql: Span[Nat8, Static], key: Span[Nat8, K], now: Int64): Option[AuthError] is
+        case execute(&~db, sql, withInt64(withText(noValues(), key), now)) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => AuthStorage(error => error));
+        end case;
+    end;
+
+    generic [R: Region, K: Region]
+    function clearFailures(db: &![Database[Writing], R], sql: Span[Nat8, Static], key: Span[Nat8, K]): Option[AuthError] is
+        case execute(&~db, sql, withText(noValues(), key)) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => AuthStorage(error => error));
+        end case;
+    end;
+
+    generic [R: Region, T: Region, N: Region, P: Region, C: Region, A: Region]
+    function login(db: &![Database[Writing], R], token: Span[Nat8, T], name: Span[Nat8, N],
+                   password: Span[Nat8, P], client: Span[Nat8, C], now: Int64, auditPath: Span[Nat8, A]): LoginResult is
+        case failuresSince(&~db, countByClient, client, now - failureWindowSeconds()) of
+            when Left(left as error: AuthError) do
+                return LoginFailed(error => error);
+            when Right(right as failures: Int64) do
+                if failures >= failureLimit() then
+                    let noted: Bool := audit(&~db, auditPath, "login", name, client, "throttled");
+                    return Throttled();
+                end if;
+        end case;
+        case failuresSince(&~db, countByName, name, now - failureWindowSeconds()) of
+            when Left(left as error: AuthError) do
+                return LoginFailed(error => error);
+            when Right(right as named: Int64) do
+                if named >= failureLimit() then
+                    let noted: Bool := audit(&~db, auditPath, "login", name, client, "throttled-name");
+                    return Throttled();
+                end if;
+        end case;
+        var fits: Bool := false;
+        if isUserName(name) then
+            case normalizedMatches(&~db, name, password) of
+                when Left(left as error: AuthError) do
+                    return LoginFailed(error => error);
+                when Right(right as matched: Bool) do
+                    fits := matched;
+            end case;
+        end if;
+        if not fits then
+            let noted: Bool := audit(&~db, auditPath, "login", name, client, "refused");
+            case recordFailure(&~db, addByClient, client, now) of
+                when Some(value as error: AuthError) do
+                    return LoginFailed(error => error);
+                when None do
+                    skip;
+            end case;
+            -- A name that is no name cannot log in; it is not kept, so
+            -- junk does not fill the table.
+            if not isUserName(name) then
+                return Refused();
+            else
+                case recordFailure(&~db, addByName, name, now) of
+                    when Some(value as error: AuthError) do
+                        return LoginFailed(error => error);
+                    when None do
+                        return Refused();
+                end case;
+            end if;
+        end if;
+        case totpEnabled(&~db, name) of
+            when Left(left as error: DbError) do
+                return LoginFailed(error => AuthStorage(error => error));
+            when Right(right as second: Bool) do
+                if second then
+                    -- The failures stay until the code: the password alone
+                    -- must not buy more tries at it.
+                    case sessionForCode(&~db, token, name, now) of
+                        when Right(right as waiting: String) do
+                            let noted: Bool := audit(&~db, auditPath, "login", name, client, "code-needed");
+                            return CodeNeeded(token => waiting);
+                        when Left(left as error: AuthError) do
+                            return LoginFailed(error => error);
+                    end case;
+                end if;
+        end case;
+        return loggedInAs(&~db, token, name, client, now, auditPath, "login");
+    end;
+
+    generic [R: Region, T: Region, D: Region, X: Region, U: Region, S: Region, I: Region, O: Region, C: Region, A: Region]
+    function passkeyLogin(db: &![Database[Writing], R], token: Span[Nat8, T], credential: Span[Nat8, D],
+                          clientData: Span[Nat8, X], authenticatorData: Span[Nat8, U], signature: Span[Nat8, S],
+                          rpId: Span[Nat8, I], origin: Span[Nat8, O], client: Span[Nat8, C], now: Int64,
+                          auditPath: Span[Nat8, A]): LoginResult is
+        case failuresSince(&~db, countByClient, client, now - failureWindowSeconds()) of
+            when Left(left as error: AuthError) do
+                return LoginFailed(error => error);
+            when Right(right as failures: Int64) do
+                if failures >= failureLimit() then
+                    let noted: Bool := audit(&~db, auditPath, "login-passkey", "", client, "throttled");
+                    return Throttled();
+                end if;
+        end case;
+        case authenticate(&~db, credential, clientData, authenticatorData, signature, rpId, origin, now) of
+            when Left(left as error: DbError) do
+                return LoginFailed(error => AuthStorage(error => error));
+            when Right(right as verdict: Either[Refusal, String]) do
+                case verdict of
+                    when Left(left as refusal: Refusal) do
+                        let noted: Bool := audit(&~db, auditPath, "login-passkey", "", client, "refused");
+                        case recordFailure(&~db, addByClient, client, now) of
+                            when Some(value as error: AuthError) do
+                                return LoginFailed(error => error);
+                            when None do
+                                return Refused();
+                        end case;
+                    when Right(right as name: String) do
+                        let result: LoginResult := loggedInAs(&~db, token, asSpan(&name), client, now, auditPath, "login-passkey");
+                        destroyString(name);
+                        return result;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, N: Region, P: Region, C: Region]
+    function confirmPassword(db: &![Database[Writing], R], name: Span[Nat8, N], password: Span[Nat8, P],
+                             client: Span[Nat8, C], now: Int64): Either[AuthError, Bool] is
+        case failuresSince(&~db, countByClient, client, now - failureWindowSeconds()) of
+            when Left(left as error: AuthError) do
+                return Left(left => error);
+            when Right(right as failures: Int64) do
+                if failures >= failureLimit() then
+                    return Right(right => false);
+                end if;
+        end case;
+        case failuresSince(&~db, countByName, name, now - failureWindowSeconds()) of
+            when Left(left as error: AuthError) do
+                return Left(left => error);
+            when Right(right as named: Int64) do
+                if named >= failureLimit() then
+                    return Right(right => false);
+                end if;
+        end case;
+        case normalizedMatches(&~db, name, password) of
+            when Left(left as error: AuthError) do
+                return Left(left => error);
+            when Right(right as matched: Bool) do
+                if matched then
+                    return Right(right => true);
+                end if;
+        end case;
+        case recordFailure(&~db, addByClient, client, now) of
+            when Some(value as error: AuthError) do
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        case recordFailure(&~db, addByName, name, now) of
+            when Some(value as error: AuthError) do
+                return Left(left => error);
+            when None do
+                return Right(right => false);
+        end case;
+    end;
+
+    -- The end of a login that succeeded: the failures of client and name
+    -- cleared, the session under a new token holding the user.
+    generic [R: Region, T: Region, N: Region, C: Region, A: Region]
+    function loggedInAs(db: &![Database[Writing], R], token: Span[Nat8, T], name: Span[Nat8, N], client: Span[Nat8, C],
+                        now: Int64, auditPath: Span[Nat8, A], event: Span[Nat8, Static]): LoginResult is
+        case clearFailures(&~db, clearByClient, client) of
+            when Some(value as error: AuthError) do
+                return LoginFailed(error => error);
+            when None do
+                skip;
+        end case;
+        case clearFailures(&~db, clearByName, name) of
+            when Some(value as error: AuthError) do
+                return LoginFailed(error => error);
+            when None do
+                skip;
+        end case;
+        case sessionForLogin(&~db, token, name, now) of
+            when Right(right as renewed: String) do
+                let noted: Bool := audit(&~db, auditPath, event, name, client, "ok");
+                return LoggedIn(token => renewed);
+            when Left(left as error: AuthError) do
+                return LoginFailed(error => error);
+        end case;
+    end;
+
+    -- The index of the slash in the data of a waiting session, after the
+    -- prefix; 0 when there is none.
+    generic [D: Region]
+    function slashOf(data: Span[Nat8, D]): Index is
+        var i: Index := spanLength(pendingPrefix);
+        while i < spanLength(data) do
+            if data[i] = '/' then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return 0;
+    end;
+
+    -- The time of the password in the data of a waiting session, -1 when
+    -- data is no such data.
+    generic [D: Region]
+    function pendingSince(data: Span[Nat8, D]): Int64 is
+        let slash: Index := slashOf(data);
+        if (not startsWith(data, pendingPrefix)) or (slash = 0) then
+            return notPending;
+        end if;
+        case parseNat(substring(data, spanLength(pendingPrefix), slash)) of
+            when Some(value as seconds: Nat64) do
+                case toInt64(seconds) of
+                    when Some(value as signed: Int64) do
+                        return signed;
+                    when None do
+                        return notPending;
+                end case;
+            when None do
+                return notPending;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, T: Region, C: Region, D: Region, A: Region]
+    function loginCode(db: &![Database[Writing], R], key: Span[Nat8, K], token: Span[Nat8, T], code: Span[Nat8, C],
+                       client: Span[Nat8, D], now: Int64, auditPath: Span[Nat8, A]): LoginResult is
+        case failuresSince(&~db, countByClient, client, now - failureWindowSeconds()) of
+            when Left(left as error: AuthError) do
+                return LoginFailed(error => error);
+            when Right(right as failures: Int64) do
+                if failures >= failureLimit() then
+                    let noted: Bool := audit(&~db, auditPath, "login-code", "", client, "throttled");
+                    return Throttled();
+                end if;
+        end case;
+        case loadSession(&~db, token, defaultSessionLimits(), now) of
+            when Left(left as error: SessionError) do
+                return LoginFailed(error => fromSession(error));
+            when Right(right as loaded: Option[String]) do
+                case loaded of
+                    when None do
+                        let noted: Bool := audit(&~db, auditPath, "login-code", "", client, "no-session");
+                        return Refused();
+                    when Some(value as data: String) do
+                        let since: Int64 := pendingSince(asSpan(&data));
+                        if (since < 0) or ((now - since) > pendingSeconds()) then
+                            destroyString(data);
+                            let noted: Bool := audit(&~db, auditPath, "login-code", "", client, "no-pending");
+                            return Refused();
+                        else
+                            let name: String := fromSpan(substring(asSpan(&data), slashOf(asSpan(&data)) + 1, spanLength(asSpan(&data))));
+                            destroyString(data);
+                            let outcome: LoginResult := codeOf(&~db, key, token, asSpan(&name), code, client, now, auditPath);
+                            destroyString(name);
+                            return outcome;
+                        end if;
+                end case;
+        end case;
+    end;
+
+    -- The code of name, once its session is known to wait for it.
+    generic [R: Region, K: Region, T: Region, N: Region, C: Region, D: Region, A: Region]
+    function codeOf(db: &![Database[Writing], R], key: Span[Nat8, K], token: Span[Nat8, T], name: Span[Nat8, N],
+                    code: Span[Nat8, C], client: Span[Nat8, D], now: Int64, auditPath: Span[Nat8, A]): LoginResult is
+        case failuresSince(&~db, countByName, name, now - failureWindowSeconds()) of
+            when Left(left as error: AuthError) do
+                return LoginFailed(error => error);
+            when Right(right as named: Int64) do
+                if named >= failureLimit() then
+                    let noted: Bool := audit(&~db, auditPath, "login-code", name, client, "throttled-name");
+                    return Throttled();
+                end if;
+        end case;
+        case checkCode(&~db, key, name, code, now) of
+            when Left(left as error: DbError) do
+                return LoginFailed(error => AuthStorage(error => error));
+            when Right(right as fits: Bool) do
+                if fits then
+                    return loggedInAs(&~db, token, name, client, now, auditPath, "login-code");
+                else
+                    let noted: Bool := audit(&~db, auditPath, "login-code", name, client, "refused");
+                    case recordFailure(&~db, addByClient, client, now) of
+                        when Some(value as error: AuthError) do
+                            return LoginFailed(error => error);
+                        when None do
+                            skip;
+                    end case;
+                    case recordFailure(&~db, addByName, name, now) of
+                        when Some(value as error: AuthError) do
+                            return LoginFailed(error => error);
+                        when None do
+                            return Refused();
+                    end case;
+                end if;
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function sessionUser(db: &![Database[Writing], R], token: Span[Nat8, T], now: Int64): Either[AuthError, Option[String]] is
+        case loadSession(&~db, token, defaultSessionLimits(), now) of
+            when Right(right as loaded: Option[String]) do
+                case loaded of
+                    when Some(value as data: String) do
+                        if startsWith(asSpan(&data), userPrefix) then
+                            let name: String := fromSpan(substring(asSpan(&data), spanLength(userPrefix), spanLength(asSpan(&data))));
+                            destroyString(data);
+                            -- A session outlives nothing: a user removed
+                            -- since is nobody.
+                            case userExists(&~db, asSpan(&name)) of
+                                when Right(right as there: Bool) do
+                                    if there then
+                                        let some: Option[String] := Some(value => name);
+                                        return Right(right => some);
+                                    else
+                                        destroyString(name);
+                                        return Right(right => None());
+                                    end if;
+                                when Left(left as error: AuthError) do
+                                    destroyString(name);
+                                    return Left(left => error);
+                            end case;
+                        else
+                            destroyString(data);
+                            return Right(right => None());
+                        end if;
+                    when None do
+                        return Right(right => None());
+                end case;
+            when Left(left as error: SessionError) do
+                return Left(left => fromSession(error));
+        end case;
+    end;
+
+    generic [R: Region, T: Region, N: Region, A: Region, C: Region]
+    function externalLogin(db: &![Database[Writing], R], token: Span[Nat8, T], name: Span[Nat8, N], auditPath: Span[Nat8, A],
+                           client: Span[Nat8, C], now: Int64): Either[AuthError, Option[String]] is
+        if not isUserName(name) then
+            let noted: Bool := audit(&~db, auditPath, "login-external", "", client, "no-user");
+            return Right(right => None());
+        end if;
+        case userExists(&~db, name) of
+            when Right(right as there: Bool) do
+                if not there then
+                    let noted: Bool := audit(&~db, auditPath, "login-external", name, client, "no-user");
+                    return Right(right => None());
+                end if;
+                case sessionForLogin(&~db, token, name, now) of
+                    when Right(right as fresh: String) do
+                        let noted: Bool := audit(&~db, auditPath, "login-external", name, client, "ok");
+                        let given: Option[String] := Some(value => fresh);
+                        return Right(right => given);
+                    when Left(left as error: AuthError) do
+                        return Left(left => error);
+                end case;
+            when Left(left as error: AuthError) do
+                return Left(left => error);
+        end case;
+    end;
+
+    -- Whether name is a user.
+    generic [R: Region, N: Region]
+    function userExists(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[AuthError, Bool] is
+        var cursor: Cursor := start(&~db, "SELECT count(*) FROM wolly_users WHERE name = ?", withText(noValues(), name));
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => AuthStorage(error => error));
+            when None do
+                let there: Bool := count > 0;
+                return Right(right => there);
+        end case;
+    end;
+
+    generic [R: Region, N: Region]
+    function removeUser(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[AuthError, Bool] is
+        case execute(&~db, "DELETE FROM wolly_users WHERE name = ?", withText(noValues(), name)) of
+            when Left(left as error: DbError) do
+                return Left(left => AuthStorage(error => error));
+            when Right(right as removed: Nat64) do
+                case execute(&~db, clearByName, withText(noValues(), name)) of
+                    when Left(left as failure: DbError) do
+                        return Left(left => AuthStorage(error => failure));
+                    when Right(right as cleared: Nat64) do
+                        let there: Bool := removed > 0;
+                        return Right(right => there);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, T: Region, C: Region, A: Region]
+    function logout(db: &![Database[Writing], R], token: Span[Nat8, T], client: Span[Nat8, C], now: Int64,
+                    auditPath: Span[Nat8, A]): Either[AuthError, Unit] is
+        var user: String := fromSpan("");
+        case sessionUser(&~db, token, now) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as name: String) do
+                        destroyString(user);
+                        user := name;
+                    when None do
+                        skip;
+                end case;
+            when Left(left as error: AuthError) do
+                skip;
+        end case;
+        case destroySession(&~db, token) of
+            when Right(right as done: Unit) do
+                let noted: Bool := audit(&~db, auditPath, "logout", asSpan(&user), client, "ok");
+                destroyString(user);
+                return Right(right => nil);
+            when Left(left as error: SessionError) do
+                destroyString(user);
+                return Left(left => fromSession(error));
+        end case;
+    end;
+
+    generic [R: Region]
+    function sessionToken(request: &[Request, R]): Option[String] is
+        case cookie(request, sessionCookie) of
+            when Some(value as token: String) do
+                if isSessionToken(asSpan(&token)) then
+                    return Some(value => token);
+                else
+                    destroyString(token);
+                    return None();
+                end if;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [T: Region]
+    function withSessionCookie(response: Response, token: Span[Nat8, T]): Response is
+        return addCookie(response, sessionCookie, token, "/", strictOptions());
+    end;
+
+    function withoutSessionCookie(response: Response): Response is
+        case deleteCookie(sessionCookie, "/", strictOptions()) of
+            when Some(value as header: String) do
+                let removed: Response := addHeader(response, "Set-Cookie", asSpan(&header));
+                destroyString(header);
+                return removed;
+            when None do
+                -- The name, the path and the options are constants that
+                -- deleteCookie takes; a refusal here is a bad header, which
+                -- spoils the response and makes it 500.
+                return addHeader(response, "Set-Cookie", "\r");
+        end case;
+    end;
+end module body.

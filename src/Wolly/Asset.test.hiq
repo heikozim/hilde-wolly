@@ -1,0 +1,133 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The files are made in the working directory of the test, in a directory
+-- of its own, and removed again.  The digests are those of sha256sum:
+-- body{color:red} and a newline is 74d94aed..., the empty file e3b0c442...
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory,
+    removeDirectory,
+    removeFileIfThere,
+    createSymlink
+);
+import Wolly.Asset (
+    versionDigits,
+    isAssetPath,
+    assetVersion
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Asset.Test is
+    constant root: Span[Nat8, Static] := "asset-test-root";
+
+    function made(path: Span[Nat8, Static], data: Span[Nat8, Static]): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, data);
+                let closed: Bool := closeFile(file);
+                return written and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function versionIs(path: Span[Nat8, Static], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case assetVersion(root, path) of
+            when Some(value as version: String) do
+                assertTrue(equal(asSpan(&version), expected), message);
+                destroyString(version);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function refused(path: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case assetVersion(root, path) of
+            when Some(value as version: String) do
+                destroyString(version);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function cleared(): Unit is
+        let a: Bool := removeFileIfThere("asset-test-root/static/app.css");
+        let b: Bool := removeFileIfThere("asset-test-root/static/empty.css");
+        let c: Bool := removeFileIfThere("asset-test-root/static/.hidden");
+        let d: Bool := removeFileIfThere("asset-test-root/static/link.css");
+        let e: Bool := removeFileIfThere("asset-test-root/secret.conf");
+        let f: Bool := removeDirectory("asset-test-root/static");
+        let g: Bool := removeDirectory("asset-test-root");
+        return nil;
+    end;
+
+    function testVersion(): Unit is
+        cleared();
+        assertTrue(createDirectory(root) and createDirectory("asset-test-root/static"), "the directories are made");
+        assertTrue(made("asset-test-root/static/app.css", "body{color:red}\n"), "a file");
+        assertTrue(made("asset-test-root/static/empty.css", ""), "an empty file");
+        assertTrue(made("asset-test-root/static/.hidden", "x\n"), "a hidden file");
+        assertTrue(made("asset-test-root/secret.conf", "PEPPER=zzz\n"), "a file above static");
+        assertTrue(createSymlink("app.css", "asset-test-root/static/link.css"), "a link to the first file");
+        versionIs("/static/app.css", "?v=74d94aede163ac74", "the first 16 hex digits of the SHA-256");
+        versionIs("/static/empty.css", "?v=e3b0c44298fc1c14", "an empty file has a version too");
+        versionIs("/secret.conf", "?v=59071a9dd3c3c972", "the control: a file right below the root is taken");
+        refused("/static/link.css", "a symbolic link is refused, though it points to an asset");
+        refused("/static/.hidden", "a hidden file is refused");
+        refused("/static/../secret.conf", "a way up is refused");
+        refused("/static/missing.css", "a missing file has no version");
+        refused("/static", "a directory has no version");
+        case assetVersion("", "/static/app.css") of
+            when Some(value as version: String) do
+                destroyString(version);
+                assertTrue(false, "an empty root is refused");
+            when None do
+                assertTrue(true, "an empty root is refused");
+        end case;
+        cleared();
+        refused("/static/app.css", "after the clean-up the file is gone");
+        return nil;
+    end;
+
+    function testIsAssetPath(): Unit is
+        assertTrue(versionDigits() = 16, "16 digits");
+        assertTrue(isAssetPath("/a"), "the shortest path");
+        assertTrue(isAssetPath("/static/css/App_1-2.min.css"), "letters of both cases, digits and marks");
+        assertFalse(isAssetPath("/"), "a slash alone");
+        assertFalse(isAssetPath(""), "empty");
+        assertFalse(isAssetPath("static/app.css"), "no slash first");
+        assertFalse(isAssetPath("/static/"), "a slash last");
+        assertFalse(isAssetPath("/static//app.css"), "two slashes");
+        assertFalse(isAssetPath("/static/./app.css"), "a dot segment");
+        assertFalse(isAssetPath("/static/../app.css"), "a way up");
+        assertFalse(isAssetPath("/.env"), "a hidden file at the top");
+        assertFalse(isAssetPath("/static/app css"), "a space");
+        assertFalse(isAssetPath("/static/app%2ecss"), "a percent sign");
+        assertFalse(isAssetPath("/static\\app.css"), "a backslash");
+        assertTrue(isAssetPath("/static/app.v2.css"), "a dot inside a segment is fine");
+        return nil;
+    end;
+end module body.

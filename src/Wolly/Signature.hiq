@@ -1,0 +1,499 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    startsWith,
+    indexOf,
+    toLower,
+    parseNat,
+    constantTimeEqual,
+    equal
+);
+import Standard.Base64 (
+    encode,
+    decode
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.X509 (
+    verifyMessage
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    instantOf
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam
+);
+
+module body Wolly.Signature is
+    constant beginPem: Span[Nat8, Static] := "-----BEGIN PUBLIC KEY-----";
+    constant endPem: Span[Nat8, Static] := "-----END PUBLIC KEY-----";
+
+    function freshSeconds(): Int64 is
+        return 300;
+    end;
+
+    -- The value of the parameter name="..." of a Signature header: at its
+    -- start or after a comma and spaces, up to the next quote.
+    generic [S: Region]
+    function paramOf(header: Span[Nat8, S], name: Span[Nat8, Static]): Option[Span[Nat8, S]] is
+        let size: Index := spanLength(header);
+        var at: Index := 0;
+        while at < size do
+            while (at < size) and ((header[at] = ' ') or (header[at] = ',')) do
+                at := at + 1;
+            end while;
+            let rest: Span[Nat8, S] := substring(header, at, size);
+            let width: Index := spanLength(name);
+            let named: Bool := startsWith(rest, name) and (((width + 1) < spanLength(rest)) and ((rest[width] = '=') and (rest[width + 1] = '"')));
+            var stop: Index := at;
+            while (stop < size) and (header[stop] /= '"') do
+                stop := stop + 1;
+            end while;
+            stop := stop + 1;
+            var close: Index := stop;
+            while (close < size) and (header[close] /= '"') do
+                close := close + 1;
+            end while;
+            if close >= size then
+                return None();
+            end if;
+            if named then
+                return Some(value => substring(header, stop, close));
+            end if;
+            at := close + 1;
+        end while;
+        return None();
+    end;
+
+    -- Whether the space-separated list holds token.
+    generic [L: Region]
+    function listHolds(list: Span[Nat8, L], token: Span[Nat8, Static]): Bool is
+        let size: Index := spanLength(list);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (list[i] = ' ') then
+                if equal(substring(list, start, i), token) then
+                    return true;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [A: Region]
+    function algorithmTaken(algorithm: Span[Nat8, A]): Bool is
+        return (equal(algorithm, "rsa-sha256") or equal(algorithm, "hs2019")) or equal(algorithm, "ed25519");
+    end;
+
+    -- Whether digest holds SHA-256= and the base64 of the SHA-256 of body.
+    generic [H: Region, B: Region]
+    function digestFits(digest: Span[Nat8, H], content: Span[Nat8, B]): Bool is
+        case sha256(content) of
+            when Some(value as sum: String) do
+                let wanted: String := encode(asSpan(&sum));
+                destroyString(sum);
+                var fits: Bool := false;
+                case indexOf(digest, "SHA-256=") of
+                    when Some(value as at: Index) do
+                        var stop: Index := at + 8;
+                        while (stop < spanLength(digest)) and (digest[stop] /= ',') do
+                            stop := stop + 1;
+                        end while;
+                        fits := constantTimeEqual(substring(digest, at + 8, stop), asSpan(&wanted));
+                    when None do
+                        skip;
+                end case;
+                destroyString(wanted);
+                return fits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [S: Region, G: Region, D: Region, H: Region, B: Region, P: Region]
+    function checkParts(signature: Span[Nat8, S], signing: Span[Nat8, G], date: Span[Nat8, D], digest: Span[Nat8, H],
+                        content: Span[Nat8, B], publicDer: Span[Nat8, P], now: Int64): SignatureCheck is
+        if spanLength(signature) = 0 then
+            return NotSigned();
+        end if;
+        case paramOf(signature, "algorithm") of
+            when Some(value as algorithm: Span[Nat8, S]) do
+                if not algorithmTaken(algorithm) then
+                    return Malformed();
+                end if;
+            when None do
+                skip;
+        end case;
+        case paramOf(signature, "headers") of
+            when Some(value as headers: Span[Nat8, S]) do
+                let covered: Bool := (listHolds(headers, "(request-target)") and listHolds(headers, "host")) and listHolds(headers, "date");
+                if (not covered) or ((spanLength(content) > 0) and (not listHolds(headers, "digest"))) then
+                    return Malformed();
+                end if;
+            when None do
+                return Malformed();
+        end case;
+        case httpDate(date) of
+            when Some(value as sent: Int64) do
+                if ((sent - now) > freshSeconds()) or ((now - sent) > freshSeconds()) then
+                    return Stale();
+                end if;
+            when None do
+                return Stale();
+        end case;
+        if (spanLength(content) > 0) and (not digestFits(digest, content)) then
+            return DigestMismatch();
+        end if;
+        case paramOf(signature, "keyId") of
+            when Some(value as keyId: Span[Nat8, S]) do
+                case paramOf(signature, "signature") of
+                    when Some(value as encoded: Span[Nat8, S]) do
+                        case decode(encoded) of
+                            when Some(value as raw: String) do
+                                let fits: Bool := verifyMessage(publicDer, signing, asSpan(&raw));
+                                destroyString(raw);
+                                if fits then
+                                    return Verified(keyId => fromSpan(keyId));
+                                else
+                                    return Forged();
+                                end if;
+                            when None do
+                                return Malformed();
+                        end case;
+                    when None do
+                        return Malformed();
+                end case;
+            when None do
+                return Malformed();
+        end case;
+    end;
+
+    -- The CGI name of a header: CONTENT_TYPE and CONTENT_LENGTH as they
+    -- are, every other one HTTP_ and the name in capitals, - as _.
+    generic [N: Region]
+    function cgiName(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        if not (equal(name, "content-type") or equal(name, "content-length")) then
+            writeString(&!out, "HTTP_");
+        end if;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            if byte = '-' then
+                writeByte(&!out, '_');
+            else
+                if (byte >= 'a') and (byte <= 'z') then
+                    writeByte(&!out, byte - 32);
+                else
+                    writeByte(&!out, byte);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The value of the request's parameter name, or the empty string.
+    generic [R: Region]
+    function paramText(request: &[Request, R], name: Span[Nat8, Static]): String is
+        case requestParam(request, name) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- One line of the signing string for the header name, written to out;
+    -- false when the request has no such header.
+    generic [R: Region, N: Region, B: Region]
+    function signingLine(request: &[Request, R], name: Span[Nat8, N], out: &![StringBuilder, B]): Bool is
+        writeString(&~out, name);
+        writeString(&~out, ": ");
+        if equal(name, "(request-target)") then
+            let verb: String := paramText(request, "REQUEST_METHOD");
+            let target: String := paramText(request, "REQUEST_URI");
+            let lower: String := toLower(asSpan(&verb));
+            writeString(&~out, asSpan(&lower));
+            writeByte(&~out, ' ');
+            writeString(&~out, asSpan(&target));
+            let found: Bool := (length(&verb) > 0) and (length(&target) > 0);
+            destroyString(lower);
+            destroyString(verb);
+            destroyString(target);
+            return found;
+        else
+            let variable: String := cgiName(name);
+            case requestParam(request, asSpan(&variable)) of
+                when Some(value as text: String) do
+                    destroyString(variable);
+                    writeString(&~out, asSpan(&text));
+                    destroyString(text);
+                    return true;
+                when None do
+                    destroyString(variable);
+                    return false;
+            end case;
+        end if;
+    end;
+
+    -- The signing string of the headers named in list, or None when the
+    -- request lacks one of them.
+    generic [R: Region, L: Region]
+    function signingString(request: &[Request, R], list: Span[Nat8, L]): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        var complete: Bool := true;
+        var first: Bool := true;
+        let size: Index := spanLength(list);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (list[i] = ' ') then
+                if i > start then
+                    if not first then
+                        writeByte(&!out, '\n');
+                    end if;
+                    first := false;
+                    if not signingLine(request, substring(list, start, i), &!out) then
+                        complete := false;
+                    end if;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        let signing: String := finalize(out);
+        if complete then
+            return Some(value => signing);
+        else
+            destroyString(signing);
+            return None();
+        end if;
+    end;
+
+    generic [R: Region]
+    function signatureKeyId(request: &[Request, R]): Option[String] is
+        case requestParam(request, "HTTP_SIGNATURE") of
+            when Some(value as header: String) do
+                let found: Option[String] := keyIdIn(asSpan(&header));
+                destroyString(header);
+                return found;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [S: Region]
+    function keyIdIn(header: Span[Nat8, S]): Option[String] is
+        case paramOf(header, "keyId") of
+            when Some(value as keyId: Span[Nat8, S]) do
+                return Some(value => fromSpan(keyId));
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, B: Region, P: Region]
+    function verifySignature(request: &[Request, R], content: Span[Nat8, B], publicDer: Span[Nat8, P], now: Int64): SignatureCheck is
+        let header: String := paramText(request, "HTTP_SIGNATURE");
+        let date: String := paramText(request, "HTTP_DATE");
+        let digest: String := paramText(request, "HTTP_DIGEST");
+        let named: Option[String] := headersIn(asSpan(&header));
+        var signing: String := fromSpan("");
+        var complete: Bool := true;
+        case named of
+            when Some(value as list: String) do
+                case signingString(request, asSpan(&list)) of
+                    when Some(value as made: String) do
+                        destroyString(signing);
+                        signing := made;
+                    when None do
+                        complete := false;
+                end case;
+                destroyString(list);
+            when None do
+                skip;
+        end case;
+        var verdict: SignatureCheck := Malformed();
+        if complete then
+            destroyCheck(verdict);
+            verdict := checkParts(asSpan(&header), asSpan(&signing), asSpan(&date), asSpan(&digest), content, publicDer, now);
+        end if;
+        destroyString(signing);
+        destroyString(header);
+        destroyString(date);
+        destroyString(digest);
+        return verdict;
+    end;
+
+    generic [S: Region]
+    function headersIn(header: Span[Nat8, S]): Option[String] is
+        case paramOf(header, "headers") of
+            when Some(value as list: Span[Nat8, S]) do
+                return Some(value => fromSpan(list));
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The number of the two digits of date at at, 0 for none.
+    generic [D: Region]
+    function digitsAt(date: Span[Nat8, D], at: Index, count: Index): Nat64 is
+        case parseNat(substring(date, at, at + count)) of
+            when Some(value as number: Nat64) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The month of a name of three letters, 0 for none.
+    generic [M: Region]
+    function monthOf(name: Span[Nat8, M]): Nat64 is
+        let names: Span[Nat8, Static] := "JanFebMarAprMayJunJulAugSepOctNovDec";
+        var m: Index := 0;
+        while m < 12 do
+            if equal(substring(names, m * 3, (m * 3) + 3), name) then
+                case toNat64(m + 1) of
+                    when Some(value as month: Nat64) do
+                        return month;
+                    when None do
+                        return 0;
+                end case;
+            end if;
+            m := m + 1;
+        end while;
+        return 0;
+    end;
+
+    generic [D: Region]
+    function httpDate(date: Span[Nat8, D]): Option[Int64] is
+        -- Sun, 06 Nov 1994 08:49:37 GMT: 29 bytes, every separator in its place.
+        if spanLength(date) /= 29 then
+            return None();
+        end if;
+        let shape: Bool := ((date[3] = ',') and (date[4] = ' ')) and (((date[7] = ' ') and (date[11] = ' ')) and (date[16] = ' '));
+        let clock: Bool := ((date[19] = ':') and (date[22] = ':')) and equal(substring(date, 25, 29), " GMT");
+        if not (shape and clock) then
+            return None();
+        end if;
+        let year: Nat64 := digitsAt(date, 12, 4);
+        let month: Nat64 := monthOf(substring(date, 8, 11));
+        let day: Nat64 := digitsAt(date, 5, 2);
+        let hour: Nat64 := digitsAt(date, 17, 2);
+        let minute: Nat64 := digitsAt(date, 20, 2);
+        let second: Nat64 := digitsAt(date, 23, 2);
+        case toInt32(year) of
+            when Some(value as y: Int32) do
+                case toNat8(month) of
+                    when Some(value as mo: Nat8) do
+                        case toNat8(day) of
+                            when Some(value as d: Nat8) do
+                                case toNat8(hour) of
+                                    when Some(value as h: Nat8) do
+                                        case toNat8(minute) of
+                                            when Some(value as mi: Nat8) do
+                                                case toNat8(second) of
+                                                    when Some(value as s: Nat8) do
+                                                        let civil: Civil := Civil(year => y, month => mo, day => d, hour => h, minute => mi, second => s, nanos => 0);
+                                                        case instantOf(civil, 0) of
+                                                            when Some(value as at: Instant) do
+                                                                return Some(value => at.seconds);
+                                                            when None do
+                                                                return None();
+                                                        end case;
+                                                    when None do
+                                                        return None();
+                                                end case;
+                                            when None do
+                                                return None();
+                                        end case;
+                                    when None do
+                                        return None();
+                                end case;
+                            when None do
+                                return None();
+                        end case;
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [P: Region]
+    function derOfPem(pem: Span[Nat8, P]): Option[String] is
+        case indexOf(pem, beginPem) of
+            when Some(value as opening: Index) do
+                case indexOf(pem, endPem) of
+                    when Some(value as finish: Index) do
+                        let after: Index := opening + spanLength(beginPem);
+                        if finish <= after then
+                            return None();
+                        end if;
+                        var bare: StringBuilder := makeStringBuilder();
+                        var i: Index := after;
+                        while i < finish do
+                            let byte: Nat8 := pem[i];
+                            if ((byte /= 10) and (byte /= 13)) and (byte /= ' ') then
+                                writeByte(&!bare, byte);
+                            end if;
+                            i := i + 1;
+                        end while;
+                        let text: String := finalize(bare);
+                        let der: Option[String] := decode(asSpan(&text));
+                        destroyString(text);
+                        return der;
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    function destroyCheck(check: SignatureCheck): Unit is
+        case check of
+            when Verified(keyId: String) do
+                destroyString(keyId);
+            when NotSigned do
+                skip;
+            when Malformed do
+                skip;
+            when Stale do
+                skip;
+            when DigestMismatch do
+                skip;
+            when Forged do
+                skip;
+        end case;
+        return nil;
+    end;
+end module body.

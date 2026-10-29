@@ -1,0 +1,127 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    removeLast,
+    length as bufferLength
+);
+import Standard.Text (
+    equal
+);
+import Standard.About (
+    fullVersionWith,
+    info
+);
+
+module body Wolly.Version is
+    function release(): Span[Nat8, Static] is
+        return "0.2.0";
+    end;
+
+    function notice(): Span[Nat8, Static] is
+        return "2026 Heiko Zimmermann";
+    end;
+
+    function longName(): Span[Nat8, Static] is
+        return "Wolly: Web-ready, OpenBSD-first, Linear, Lean, Yours";
+    end;
+
+    function isVersionWord(word: Span[Nat8, Static]): Bool is
+        return (equal(word, "version") or equal(word, "-V")) or equal(word, "--version");
+    end;
+
+    function versionAsked(): Bool is
+        if argumentCount() /= 2 then
+            return false;
+        end if;
+        return isVersionWord(nthArgument(1));
+    end;
+
+    function fullVersionAsked(): Bool is
+        if argumentCount() /= 3 then
+            return false;
+        end if;
+        return isVersionWord(nthArgument(1)) and equal(nthArgument(2), "--full");
+    end;
+
+    function infoAsked(): Bool is
+        if argumentCount() /= 2 then
+            return false;
+        end if;
+        return equal(nthArgument(1), "info");
+    end;
+
+    generic [P: Region]
+    function printVersion(program: Span[Nat8, P]): Unit is
+        print(program);
+        print(" ");
+        print(release());
+        print(", Copyright (C) ");
+        printLn(notice());
+        return nil;
+    end;
+
+    generic [V: Region]
+    function library(name: Span[Nat8, Static], version: Span[Nat8, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, name);
+        writeByte(&!out, ' ');
+        writeString(&!out, version);
+        return finalize(out);
+    end;
+
+    function destroyLibraries(libraries: Buffer[String]): Unit is
+        var rest: Buffer[String] := libraries;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function answerAbout(program: Span[Nat8, Static], libraries: &[Buffer[String], R]): Bool is
+        if versionAsked() then
+            printVersion(program);
+            return true;
+        end if;
+        if fullVersionAsked() then
+            let text: String := fullVersionWith(release(), notice(), libraries);
+            print(asSpan(&text));
+            destroyString(text);
+            return true;
+        end if;
+        if infoAsked() then
+            let text: String := info("", longName(), program, release(), "");
+            print(asSpan(&text));
+            destroyString(text);
+            return true;
+        end if;
+        return false;
+    end;
+
+    function answerAboutBare(program: Span[Nat8, Static]): Bool is
+        let none: Buffer[String] := allocateEmpty();
+        let answered: Bool := answerAbout(program, &none);
+        destroyEmpty(none);
+        return answered;
+    end;
+end module body.

@@ -1,0 +1,527 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Elements of GF(256) are carried as Index from 0 to 255, so that no
+-- arithmetic on Nat8 can trap.  A polynomial is a buffer of its
+-- coefficients, the constant first.  The tables of logarithms and powers
+-- are made for each call of rsParity and rsCorrect, 767 steps, small
+-- beside the work on a block.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    storeNth,
+    removeLast,
+    destroyFree
+);
+
+module body Wolly.BuntiRs is
+    constant blockMost: Index := 255;
+    constant fieldPolynomial: Index := 285;
+
+    -- The powers of 2 from 2^0 to 2^509 and the logarithm of each element
+    -- but 0 (whose entry is never read).
+    record Tables: Linear is
+        powers: Buffer[Index];
+        logs: Buffer[Index];
+    end;
+
+    function mostBlockBytes(): Index is
+        return blockMost;
+    end;
+
+    function gfMultiply(a: Index, b: Index): Index is
+        var x: Index := a;
+        var y: Index := b;
+        var product: Index := 0;
+        while y > 0 do
+            if bitwiseAnd(y, (1 : Index)) = 1 then
+                product := bitwiseXor(product, x);
+            end if;
+            x := x * 2;
+            if x > 255 then
+                x := bitwiseXor(x, fieldPolynomial);
+            end if;
+            y := y / 2;
+        end while;
+        return product;
+    end;
+
+    function makeTables(): Tables is
+        var powers: Buffer[Index] := initialize(510, (0 : Index));
+        var logs: Buffer[Index] := initialize(256, (0 : Index));
+        var x: Index := 1;
+        var i: Index := 0;
+        while i < 255 do
+            storeNth(&!powers, i, x);
+            storeNth(&!powers, i + 255, x);
+            storeNth(&!logs, x, i);
+            x := x * 2;
+            if x > 255 then
+                x := bitwiseXor(x, fieldPolynomial);
+            end if;
+            i := i + 1;
+        end while;
+        return Tables(powers => powers, logs => logs);
+    end;
+
+    function destroyTables(tables: Tables): Unit is
+        let { powers as p: Buffer[Index], logs as l: Buffer[Index] } := tables;
+        destroyFree(p);
+        destroyFree(l);
+        return nil;
+    end;
+
+    generic [T: Region]
+    function mul(tables: &[Tables, T], a: Index, b: Index): Index is
+        if (a = 0) or (b = 0) then
+            return 0;
+        end if;
+        return nth(&(tables->powers), nth(&(tables->logs), a) + nth(&(tables->logs), b));
+    end;
+
+    -- The logarithm of a, a not 0.
+    generic [T: Region]
+    function logOf(tables: &[Tables, T], a: Index): Index is
+        return nth(&(tables->logs), a);
+    end;
+
+    -- a / b, b not 0.
+    generic [T: Region]
+    function divide(tables: &[Tables, T], a: Index, b: Index): Index is
+        if a = 0 then
+            return 0;
+        end if;
+        return nth(&(tables->powers), (nth(&(tables->logs), a) + 255) - nth(&(tables->logs), b));
+    end;
+
+    -- 2^e for e from 0 on.
+    generic [T: Region]
+    function power(tables: &[Tables, T], e: Index): Index is
+        return nth(&(tables->powers), e - ((e / 255) * 255));
+    end;
+
+    -- The value of the polynomial at x, by Horner.
+    generic [T: Region, P: Region]
+    function evaluate(tables: &[Tables, T], poly: &[Buffer[Index], P], x: Index): Index is
+        var value: Index := 0;
+        var i: Index := length(poly);
+        while i > 0 do
+            i := i - 1;
+            value := bitwiseXor(mul(tables, value, x), nth(poly, i));
+        end while;
+        return value;
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as number: Index) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The generator polynomial (x - 2^0) ... (x - 2^(parity - 1)), the
+    -- constant first.
+    generic [T: Region]
+    function generator(tables: &[Tables, T], parity: Index): Buffer[Index] is
+        var g: Buffer[Index] := initialize(parity + 1, (0 : Index));
+        storeNth(&!g, 0, (1 : Index));
+        var degree: Index := 0;
+        while degree < parity do
+            let root: Index := power(tables, degree);
+            var i: Index := degree + 1;
+            while i > 0 do
+                let shifted: Index := nth(&g, i - 1);
+                let kept: Index := mul(tables, nth(&g, i), root);
+                storeNth(&!g, i, bitwiseXor(shifted, kept));
+                i := i - 1;
+            end while;
+            let lowest: Index := mul(tables, nth(&g, 0), root);
+            storeNth(&!g, 0, lowest);
+            degree := degree + 1;
+        end while;
+        return g;
+    end;
+
+    -- The tables and the generator of one parity, made once for all the
+    -- blocks of a code: the generator as it is and as logarithms (0 where
+    -- the coefficient is 0, which the encoder tests first).
+    record RsCoder: Linear is
+        tables: Tables;
+        parity: Index;
+        g: Buffer[Index];
+        gLogs: Buffer[Index];
+        invariant (parity >= 1) and (parity <= 255);
+        invariant length(&g) = (parity + 1);
+        invariant length(&gLogs) = (parity + 1);
+    end;
+
+    function makeRsCoder(parity: Index): RsCoder is
+        let tables: Tables := makeTables();
+        let g: Buffer[Index] := generator(&tables, parity);
+        var gLogs: Buffer[Index] := initialize(parity + 1, (0 : Index));
+        var k: Index := 0;
+        while k <= parity do
+            let c: Index := nth(&g, k);
+            if c /= 0 then
+                storeNth(&!gLogs, k, logOf(&tables, c));
+            end if;
+            k := k + 1;
+        end while;
+        return RsCoder(tables => tables, parity => parity, g => g, gLogs => gLogs);
+    end;
+
+    function destroyRsCoder(coder: RsCoder): Unit is
+        let { tables as t: Tables, parity as p: Index, g as g: Buffer[Index], gLogs as l: Buffer[Index] } := coder;
+        destroyTables(t);
+        destroyFree(g);
+        destroyFree(l);
+        return nil;
+    end;
+
+    generic [C: Region]
+    function rsCoderParity(coder: &[RsCoder, C]): Index is
+        return coder->parity;
+    end;
+
+    -- remainder[k] is the coefficient of x^(parity - 1 - k); for each data
+    -- byte the logarithm of its factor once, then one lookup a term.
+    generic [C: Region, R: Region]
+    function rsParityWith(coder: &[RsCoder, C], data: &[Buffer[Nat8], R], first: Index, count: Index): Buffer[Nat8] is
+        let parity: Index := coder->parity;
+        let tables: &[Tables, C] := &(coder->tables);
+        let powers: &[Buffer[Index], C] := &(tables->powers);
+        let logs: &[Buffer[Index], C] := &(tables->logs);
+        let g: &[Buffer[Index], C] := &(coder->g);
+        let gLogs: &[Buffer[Index], C] := &(coder->gLogs);
+        var remainder: Buffer[Index] := initialize(parity, (0 : Index));
+        var i: Index := 0;
+        while i < count do
+            let factor: Index := bitwiseXor(wide(nth(data, first + i)), nth(&remainder, 0));
+            if factor = 0 then
+                var k: Index := 0;
+                while (k + 1) < parity do
+                    let next: Index := nth(&remainder, k + 1);
+                    storeNth(&!remainder, k, next);
+                    k := k + 1;
+                end while;
+                storeNth(&!remainder, parity - 1, (0 : Index));
+            else
+                let lf: Index := nth(logs, factor);
+                var k: Index := 0;
+                while (k + 1) < parity do
+                    let at: Index := (parity - 1) - k;
+                    var term: Index := 0;
+                    if nth(g, at) /= 0 then
+                        term := nth(powers, lf + nth(gLogs, at));
+                    end if;
+                    let moved: Index := bitwiseXor(nth(&remainder, k + 1), term);
+                    storeNth(&!remainder, k, moved);
+                    k := k + 1;
+                end while;
+                var last: Index := 0;
+                if nth(g, 0) /= 0 then
+                    last := nth(powers, lf + nth(gLogs, 0));
+                end if;
+                storeNth(&!remainder, parity - 1, last);
+            end if;
+            i := i + 1;
+        end while;
+        var out: Buffer[Nat8] := allocateEmpty();
+        var j: Index := 0;
+        while j < parity do
+            insertBack(&!out, narrow(nth(&remainder, j)));
+            j := j + 1;
+        end while;
+        destroyFree(remainder);
+        return out;
+    end;
+
+    generic [R: Region]
+    function rsParity(data: &[Buffer[Nat8], R], first: Index, count: Index, parity: Index): Buffer[Nat8] is
+        let coder: RsCoder := makeRsCoder(parity);
+        let out: Buffer[Nat8] := rsParityWith(&coder, data, first, count);
+        destroyRsCoder(coder);
+        return out;
+    end;
+
+    -- The syndromes of block: its polynomial at 2^0 to 2^(parity - 1).
+    generic [T: Region, B: Region]
+    function syndromes(tables: &[Tables, T], block: &![Buffer[Nat8], B], parity: Index): Buffer[Index] is
+        let n: Index := lengthOf(&~block);
+        var s: Buffer[Index] := initialize(parity, (0 : Index));
+        var i: Index := 0;
+        let powers: &[Buffer[Index], T] := &(tables->powers);
+        let logs: &[Buffer[Index], T] := &(tables->logs);
+        -- The bytes as numbers once, not once a root.
+        var bytes: Buffer[Index] := initialize(n, (0 : Index));
+        var b: Index := 0;
+        while b < n do
+            storeNth(&!bytes, b, wide(nthOf(&~block, b)));
+            b := b + 1;
+        end while;
+        while i < parity do
+            -- value times 2^i is 2^(log value + i): one lookup, i <= 253.
+            var value: Index := 0;
+            var j: Index := 0;
+            while j < n do
+                var shifted: Index := 0;
+                if value /= 0 then
+                    shifted := nth(powers, nth(logs, value) + i);
+                end if;
+                value := bitwiseXor(shifted, nth(&bytes, j));
+                j := j + 1;
+            end while;
+            storeNth(&!s, i, value);
+            i := i + 1;
+        end while;
+        destroyFree(bytes);
+        return s;
+    end;
+
+    generic [B: Region]
+    function lengthOf(block: &![Buffer[Nat8], B]): Index is
+        return lengthMut(&~block);
+    end;
+
+    generic [B: Region]
+    function nthOf(block: &![Buffer[Nat8], B], i: Index): Nat8 is
+        return nthMut(&~block, i);
+    end;
+
+    generic [S: Region]
+    function allZero(s: &[Buffer[Index], S]): Bool is
+        var i: Index := 0;
+        while i < length(s) do
+            if nth(s, i) /= 0 then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [P: Region]
+    function copyOf(poly: &[Buffer[Index], P]): Buffer[Index] is
+        var out: Buffer[Index] := allocateEmpty();
+        var i: Index := 0;
+        while i < length(poly) do
+            insertBack(&!out, nth(poly, i));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- c - factor x^shift b, in place, c made long enough.
+    generic [T: Region, C: Region, B: Region]
+    function subtractShifted(tables: &[Tables, T], c: &![Buffer[Index], C], b: &[Buffer[Index], B], factor: Index, shift: Index): Unit is
+        while lengthMut(&~c) < (length(b) + shift) do
+            insertBack(&~c, (0 : Index));
+        end while;
+        var i: Index := 0;
+        while i < length(b) do
+            let at: Index := i + shift;
+            let sum: Index := bitwiseXor(nthMut(&~c, at), mul(tables, factor, nth(b, i)));
+            storeNth(&~c, at, sum);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The error locator of the syndromes by Berlekamp-Massey, with its
+    -- number of errors L as the last element.
+    generic [T: Region, S: Region]
+    function locator(tables: &[Tables, T], s: &[Buffer[Index], S]): Buffer[Index] is
+        var c: Buffer[Index] := initialize(1, (1 : Index));
+        var b: Buffer[Index] := initialize(1, (1 : Index));
+        var errors: Index := 0;
+        var m: Index := 1;
+        var last: Index := 1;
+        var n: Index := 0;
+        while n < length(s) do
+            var d: Index := nth(s, n);
+            var i: Index := 1;
+            while i <= errors do
+                if i < length(&c) then
+                    d := bitwiseXor(d, mul(tables, nth(&c, i), nth(s, n - i)));
+                end if;
+                i := i + 1;
+            end while;
+            if d = 0 then
+                m := m + 1;
+            else
+                let factor: Index := divide(tables, d, last);
+                if (errors * 2) <= n then
+                    let before: Buffer[Index] := copyOf(&c);
+                    subtractShifted(tables, &!c, &b, factor, m);
+                    errors := (n + 1) - errors;
+                    destroyFree(b);
+                    b := before;
+                    last := d;
+                    m := (1 : Index);
+                else
+                    subtractShifted(tables, &!c, &b, factor, m);
+                    m := m + 1;
+                end if;
+            end if;
+            n := n + 1;
+        end while;
+        destroyFree(b);
+        insertBack(&!c, errors);
+        return c;
+    end;
+
+    -- The block as it was, from the bytes changed: positions and the
+    -- values to put back.
+    generic [B: Region, P: Region, V: Region]
+    function undo(block: &![Buffer[Nat8], B], positions: &[Buffer[Index], P], values: &[Buffer[Nat8], V]): Unit is
+        var i: Index := 0;
+        while i < length(positions) do
+            storeNth(&~block, nth(positions, i), nth(values, i));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The bytes of block that the error locator lambda of errors errors
+    -- and the syndromes s name, corrected (Chien, Forney); block as it was
+    -- and None when they do not all fit.
+    generic [T: Region, R: Region, S: Region, L: Region]
+    function apply(tables: &[Tables, T], block: &![Buffer[Nat8], R], parity: Index, s: &[Buffer[Index], S],
+                   lambda: &[Buffer[Index], L], errors: Index): Option[Index] is
+        let n: Index := lengthOf(&~block);
+        -- omega = s lambda mod x^parity
+        var omega: Buffer[Index] := initialize(parity, (0 : Index));
+        var k: Index := 0;
+        while k < parity do
+            var value: Index := 0;
+            var i: Index := 0;
+            while i <= k do
+                if (k - i) < length(lambda) then
+                    value := bitwiseXor(value, mul(tables, nth(s, i), nth(lambda, k - i)));
+                end if;
+                i := i + 1;
+            end while;
+            storeNth(&!omega, k, value);
+            k := k + 1;
+        end while;
+        -- the formal derivative of lambda: its terms of odd power
+        var derivative: Buffer[Index] := initialize(length(lambda), (0 : Index));
+        var d: Index := 1;
+        while d < length(lambda) do
+            if bitwiseAnd(d, (1 : Index)) = 1 then
+                storeNth(&!derivative, d - 1, nth(lambda, d));
+            end if;
+            d := d + 1;
+        end while;
+        var positions: Buffer[Index] := allocateEmpty();
+        var olds: Buffer[Nat8] := allocateEmpty();
+        var broken: Bool := false;
+        var j: Index := 0;
+        while (j < n) and (not broken) do
+            -- The byte j stands for X = 2^(n - 1 - j); lambda has a root at
+            -- the inverse of X when it is wrong.
+            let exponent: Index := (n - 1) - j;
+            let inverse: Index := power(tables, (255 : Index) - exponent);
+            if evaluate(tables, lambda, inverse) = 0 then
+                let denominator: Index := evaluate(tables, &derivative, inverse);
+                if denominator = 0 then
+                    broken := true;
+                else
+                    let magnitude: Index := mul(tables, power(tables, exponent), divide(tables, evaluate(tables, &omega, inverse), denominator));
+                    let old: Nat8 := nthOf(&~block, j);
+                    insertBack(&!positions, j);
+                    insertBack(&!olds, old);
+                    storeNth(&~block, j, narrow(bitwiseXor(wide(old), magnitude)));
+                end if;
+            end if;
+            j := j + 1;
+        end while;
+        -- A locator of errors roots, each a place of the block, and Forney's
+        -- values give a word whose syndromes are 0: no check again.
+        let found: Index := length(&positions);
+        let whole: Bool := (not broken) and (found = errors);
+        if not whole then
+            undo(&~block, &positions, &olds);
+        end if;
+        destroyFree(positions);
+        destroyFree(olds);
+        destroyFree(derivative);
+        destroyFree(omega);
+        if whole then
+            return Some(value => found);
+        end if;
+        return None();
+    end;
+
+    generic [T: Region, R: Region, S: Region]
+    function fromSyndromes(tables: &[Tables, T], block: &![Buffer[Nat8], R], parity: Index, s: &[Buffer[Index], S]): Option[Index] is
+        var lambda: Buffer[Index] := locator(tables, s);
+        let errors: Index := removeLast(&!lambda);
+        while length(&lambda) < (errors + 1) do
+            insertBack(&!lambda, (0 : Index));
+        end while;
+        -- More errors than parity / 2 leave a locator with fewer roots in the
+        -- block than errors (measured), which apply refuses.
+        var result: Option[Index] := None();
+        if errors > 0 then
+            result := apply(tables, &~block, parity, s, &lambda, errors);
+        end if;
+        destroyFree(lambda);
+        return result;
+    end;
+
+    generic [T: Region, R: Region]
+    function correctWith(tables: &[Tables, T], block: &![Buffer[Nat8], R], parity: Index): Option[Index] is
+        let s: Buffer[Index] := syndromes(tables, &~block, parity);
+        var result: Option[Index] := None();
+        if allZero(&s) then
+            result := Some(value => (0 : Index));
+        else
+            result := fromSyndromes(tables, &~block, parity, &s);
+        end if;
+        destroyFree(s);
+        return result;
+    end;
+
+    generic [R: Region]
+    function rsCorrect(block: &![Buffer[Nat8], R], parity: Index): Option[Index] is
+        let n: Index := lengthOf(&~block);
+        if (n > blockMost) or (n <= parity) then
+            return None();
+        end if;
+        let tables: Tables := makeTables();
+        let result: Option[Index] := correctWith(&tables, &~block, parity);
+        destroyTables(tables);
+        return result;
+    end;
+
+    generic [C: Region, R: Region]
+    function rsCorrectWith(coder: &[RsCoder, C], block: &![Buffer[Nat8], R]): Option[Index] is
+        let n: Index := lengthOf(&~block);
+        let parity: Index := coder->parity;
+        if (n > blockMost) or (n <= parity) then
+            return None();
+        end if;
+        return correctWith(&(coder->tables), &~block, parity);
+    end;
+end module body.

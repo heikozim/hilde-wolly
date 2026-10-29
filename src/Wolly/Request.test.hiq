@@ -1,0 +1,188 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Request (
+    requestMethod,
+    requestPath,
+    query,
+    cookie,
+    formValue,
+    queryValue
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Request.Test is
+
+    generic [R: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, Static]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    -- A request as Hiawatha would send it for uri, with a Cookie header.
+    function fakeRequest(verb: Span[Nat8, Static], uri: Span[Nat8, Static], queryString: Span[Nat8, Static],
+                     cookies: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", verb);
+        addPair(&!params, "REQUEST_URI", uri);
+        addPair(&!params, "QUERY_STRING", queryString);
+        if spanLength(cookies) > 0 then
+            addPair(&!params, "HTTP_COOKIE", cookies);
+        end if;
+        let block: String := finalize(params);
+        let made: Request := makeRequest(block, fromNothing());
+        return made;
+    end;
+
+    -- A POST with content and, when contentType is not empty, a Content-Type.
+    function post(contentType: Span[Nat8, Static], content: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", "POST");
+        addPair(&!params, "REQUEST_URI", "/form");
+        if spanLength(contentType) > 0 then
+            addPair(&!params, "CONTENT_TYPE", contentType);
+        end if;
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(content));
+    end;
+
+    function testForm(): Unit is
+        let r1: Request := post("application/x-www-form-urlencoded", "name=ann&password=a+b%26c&csrf=00");
+        gives(formValue(&r1, "name"), "ann", "a field");
+        gives(formValue(&r1, "password"), "a b&c", "a field decoded");
+        none(formValue(&r1, "other"), "a field that is not there");
+        none(query(&r1, "name"), "a field of the body is no query parameter");
+        destroyRequest(r1);
+        let r2: Request := post("Application/X-WWW-Form-Urlencoded; charset=UTF-8", "name=bob");
+        gives(formValue(&r2, "name"), "bob", "the type in another case, with a parameter");
+        destroyRequest(r2);
+        let r3: Request := post("application/json", "name=eve");
+        none(formValue(&r3, "name"), "a body that is no form");
+        destroyRequest(r3);
+        let r4: Request := post("", "name=eve");
+        none(formValue(&r4, "name"), "a body without a type");
+        destroyRequest(r4);
+        let r5: Request := post("application/x-www-form-urlencodedX", "name=eve");
+        none(formValue(&r5, "name"), "a longer type is another type");
+        destroyRequest(r5);
+        return nil;
+    end;
+
+    function fromNothing(): String is
+        var empty: StringBuilder := makeStringBuilder();
+        return finalize(empty);
+    end;
+
+    function gives(found: Option[String], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as text: String) do
+                let same: Bool := equal(asSpan(&text), wanted);
+                if not same then
+                    printLn(asSpan(&text));
+                end if;
+                destroyString(text);
+                assertTrue(same, message);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function none(found: Option[String], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as text: String) do
+                printLn(asSpan(&text));
+                destroyString(text);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function testQueryValue(): Unit is
+        gives(queryValue("a=1&b=2", "b"), "2", "the second pair");
+        gives(queryValue("a=1&b=2", "a"), "1", "the first pair");
+        gives(queryValue("a=1&a=2", "a"), "1", "the first of two");
+        gives(queryValue("q=hello+there", "q"), "hello there", "a plus is a space");
+        gives(queryValue("q=1%2B1", "q"), "1+1", "an escaped plus stays a plus");
+        gives(queryValue("q=%41%62", "q"), "Ab", "two escaped bytes");
+        gives(queryValue("flag&x=1", "flag"), "", "a name without an equals sign");
+        gives(queryValue("x=", "x"), "", "an empty value");
+        gives(queryValue("x=a=b", "x"), "a=b", "an equals sign inside the value");
+        none(queryValue("a=1&b=2", "c"), "absent");
+        none(queryValue("", "a"), "an empty query");
+        none(queryValue("ab=1", "a"), "a longer name is another name");
+        none(queryValue("&&", "a"), "only separators");
+        none(queryValue("a=1&&b=2", ""), "an empty name is no name");
+        return nil;
+    end;
+
+    function testPath(): Unit is
+        let r1: Request := fakeRequest("GET", "/a/b?x=1", "x=1", "");
+        gives(requestPath(&r1), "/a/b", "the query is cut off");
+        gives(requestMethod(&r1), "GET", "the method");
+        gives(query(&r1, "x"), "1", "a query parameter");
+        destroyRequest(r1);
+        let r2: Request := fakeRequest("GET", "/a%2Fb", "", "");
+        gives(requestPath(&r2), "/a%2Fb", "the path stays encoded");
+        destroyRequest(r2);
+        let r3: Request := fakeRequest("GET", "a/b", "", "");
+        none(requestPath(&r3), "a path without a leading slash");
+        destroyRequest(r3);
+        let r4: Request := fakeRequest("GET", "", "", "");
+        none(requestPath(&r4), "an empty path");
+        destroyRequest(r4);
+        return nil;
+    end;
+
+    function testCookie(): Unit is
+        let r1: Request := fakeRequest("GET", "/", "", "theme=dark; visits=7");
+        gives(cookie(&r1, "visits"), "7", "a cookie of two");
+        none(cookie(&r1, "session"), "a cookie that is not there");
+        destroyRequest(r1);
+        let r2: Request := fakeRequest("GET", "/", "", "");
+        none(cookie(&r2, "visits"), "no Cookie header");
+        destroyRequest(r2);
+        let r3: Request := fakeRequest("GET", "/", "", "visits=a b");
+        none(cookie(&r3, "visits"), "a value that is no cookie value");
+        destroyRequest(r3);
+        return nil;
+    end;
+end module body.

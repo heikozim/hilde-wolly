@@ -1,0 +1,960 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    destroyEmpty,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    nthRef,
+    storeNth,
+    insertBack,
+    removeLast
+);
+import Standard.Text (
+    equal
+);
+import Standard.Template (
+    displayIndex
+);
+import Standard.Html (
+    Policy,
+    sanitize
+);
+import Standard.Json (
+    Json,
+    JsonKind,
+    JsonNull,
+    JsonBoolean,
+    JsonNumber,
+    JsonString,
+    JsonArray,
+    JsonObject,
+    JsonError,
+    readJson,
+    destroyJson,
+    kindAt,
+    stringAt,
+    integerAt,
+    boolAt,
+    countAt,
+    nameAt
+);
+import Wolly.Markdown (
+    markdownToHtml
+);
+
+module body Wolly.ViewData is
+    -- What a node holds, as a number: kindOf gives it as a ViewKind.
+    constant textCode: Nat8 := 1;
+    constant integerCode: Nat8 := 2;
+    constant boolCode: Nat8 := 3;
+    constant listCode: Nat8 := 4;
+    constant mapCode: Nat8 := 5;
+    constant missingCode: Nat8 := 6;
+    constant htmlCode: Nat8 := 7;
+
+    -- One node.  text and key are positions in texts; first, last and next
+    -- are node numbers, and 0 stands for none there, since the root is
+    -- never held by another node.
+    record Node: Free is
+        code: Nat8;
+        number: Int64;
+        text: Index;
+        key: Index;
+        keyed: Bool;
+        first: Index;
+        last: Index;
+        next: Index;
+        count: Index;
+    end;
+
+    record ViewData: Linear is
+        nodes: Buffer[Node];
+        texts: Buffer[String];
+        invariant length(&nodes) >= 1;
+    end;
+
+    function leaf(code: Nat8, number: Int64, text: Index): Node is
+        let zero: Index := 0;
+        return Node(code => code, number => number, text => text, key => zero, keyed => false, first => zero,
+            last => zero, next => zero, count => zero);
+    end;
+
+    function rootNode(): Index is
+        return 0;
+    end;
+
+    function makeWith(root: Node, texts: Buffer[String]): ViewData is
+        var nodes: Buffer[Node] := allocateEmpty();
+        insertBack(&!nodes, root);
+        return ViewData(nodes => nodes, texts => texts);
+    end;
+
+    function makeMapData(): ViewData is
+        let texts: Buffer[String] := allocateEmpty();
+        return makeWith(leaf(mapCode, 0, 0), texts);
+    end;
+
+    function makeListData(): ViewData is
+        let texts: Buffer[String] := allocateEmpty();
+        return makeWith(leaf(listCode, 0, 0), texts);
+    end;
+
+    generic [T: Region]
+    function makeTextData(text: Span[Nat8, T]): ViewData is
+        var texts: Buffer[String] := allocateEmpty();
+        insertBack(&!texts, fromSpan(text));
+        return makeWith(leaf(textCode, 0, 0), texts);
+    end;
+
+    function makeIntegerData(value: Int64): ViewData is
+        let texts: Buffer[String] := allocateEmpty();
+        return makeWith(leaf(integerCode, value, 0), texts);
+    end;
+
+    function makeBoolData(value: Bool): ViewData is
+        let texts: Buffer[String] := allocateEmpty();
+        var number: Int64 := 0;
+        if value then
+            number := 1;
+        end if;
+        return makeWith(leaf(boolCode, number, 0), texts);
+    end;
+
+    function makeMissingData(): ViewData is
+        let texts: Buffer[String] := allocateEmpty();
+        return makeWith(leaf(missingCode, 0, 0), texts);
+    end;
+
+    generic [T: Region]
+    function makeSanitizedHtmlData(html: Span[Nat8, T], policy: Policy): ViewData is
+        var texts: Buffer[String] := allocateEmpty();
+        insertBack(&!texts, sanitize(html, policy));
+        return makeWith(leaf(htmlCode, 0, 0), texts);
+    end;
+
+    generic [T: Region]
+    function makeMarkdownData(markdown: Span[Nat8, T]): ViewData is
+        var texts: Buffer[String] := allocateEmpty();
+        insertBack(&!texts, markdownToHtml(markdown));
+        return makeWith(leaf(htmlCode, 0, 0), texts);
+    end;
+
+    function destroyViewData(data: ViewData): Unit is
+        let { nodes: Buffer[Node], texts: Buffer[String] } := data;
+        destroyFree(nodes);
+        var rest: Buffer[String] := texts;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function nodeCount(data: &[ViewData, R]): Index is
+        return length(&(data->nodes));
+    end;
+
+    generic [R: Region]
+    function isNode(data: &[ViewData, R], node: Index): Bool is
+        return node < nodeCount(data);
+    end;
+
+    generic [R: Region]
+    function nodeAt(data: &[ViewData, R], node: Index): Node is
+        return nth(&(data->nodes), node);
+    end;
+
+    -- The code of node, 0 when there is no such node.
+    generic [R: Region]
+    function codeOf(data: &[ViewData, R], node: Index): Nat8 is
+        if node < nodeCount(data) then
+            let found: Node := nodeAt(data, node);
+            return found.code;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region]
+    function kindOf(data: &[ViewData, R], node: Index): ViewKind is
+        let code: Nat8 := codeOf(data, node);
+        if code = textCode then
+            return ViewText();
+        else if code = integerCode then
+            return ViewInteger();
+        else if code = boolCode then
+            return ViewBool();
+        else if code = listCode then
+            return ViewList();
+        else if code = mapCode then
+            return ViewMap();
+        else if code = htmlCode then
+            return ViewHtml();
+        end if;
+        return ViewMissing();
+    end;
+
+    generic [R: Region]
+    function isMap(data: &[ViewData, R], node: Index): Bool is
+        return codeOf(data, node) = mapCode;
+    end;
+
+    generic [R: Region]
+    function isList(data: &[ViewData, R], node: Index): Bool is
+        return codeOf(data, node) = listCode;
+    end;
+
+    generic [R: Region]
+    function isTextual(data: &[ViewData, R], node: Index): Bool is
+        let code: Nat8 := codeOf(data, node);
+        return (code = textCode) or (code = htmlCode);
+    end;
+
+    generic [R: Region]
+    function isInteger(data: &[ViewData, R], node: Index): Bool is
+        return codeOf(data, node) = integerCode;
+    end;
+
+    generic [R: Region]
+    function isBool(data: &[ViewData, R], node: Index): Bool is
+        return codeOf(data, node) = boolCode;
+    end;
+
+    generic [R: Region]
+    function isMissing(data: &[ViewData, R], node: Index): Bool is
+        return codeOf(data, node) = missingCode;
+    end;
+
+    generic [R: Region]
+    function isHtml(data: &[ViewData, R], node: Index): Bool is
+        return codeOf(data, node) = htmlCode;
+    end;
+
+    generic [R: Region]
+    function isMember(data: &[ViewData, R], node: Index): Bool is
+        if node < nodeCount(data) then
+            let found: Node := nodeAt(data, node);
+            return found.keyed;
+        end if;
+        return false;
+    end;
+
+    ---
+    --- Building, through a write reference: each use of a slot of the
+    --- document is a function of its own that the callers hand a reborrow.
+    ---
+
+    generic [R: Region]
+    function countMut(data: &![ViewData, R]): Index is
+        return lengthMut(&!(data->nodes));
+    end;
+
+    generic [R: Region]
+    function nodeMut(data: &![ViewData, R], at: Index): Node is
+        return nthMut(&!(data->nodes), at);
+    end;
+
+    generic [R: Region]
+    function storeNode(data: &![ViewData, R], at: Index, node: Node): Unit is
+        storeNth(&!(data->nodes), at, node);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushNode(data: &![ViewData, R], node: Node): Unit is
+        insertBack(&!(data->nodes), node);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function textCountMut(data: &![ViewData, R]): Index is
+        return lengthMut(&!(data->texts));
+    end;
+
+    generic [R: Region]
+    function pushText(data: &![ViewData, R], text: String): Unit is
+        insertBack(&!(data->texts), text);
+        return nil;
+    end;
+
+    -- Keeps text and gives its position.
+    generic [R: Region]
+    function storeText(data: &![ViewData, R], text: String): Index is
+        let at: Index := textCountMut(&~data);
+        pushText(&~data, text);
+        return at;
+    end;
+
+    generic [R: Region, K: Region]
+    function textEqualsMut(data: &![ViewData, R], at: Index, key: Span[Nat8, K]): Bool is
+        return equal(asSpan(nthRef(&(data->texts), at)), key);
+    end;
+
+    -- Stops the programme unless node is of the kind code: the duty of the
+    -- caller that the contracts cannot state.
+    generic [R: Region]
+    function requireCode(data: &![ViewData, R], node: Index, code: Nat8): Unit is
+        if codeAtMut(&~data, node) /= code then
+            if code = mapCode then
+                abort("Wolly.ViewData: a put into a node that is no map");
+            end if;
+            abort("Wolly.ViewData: an add to a node that is no list");
+        end if;
+        return nil;
+    end;
+
+    -- The node added as the last one held by parent.
+    generic [R: Region]
+    function appendNode(data: &![ViewData, R], parent: Index, node: Node): Index is
+        if not node.keyed then
+            requireCode(&~data, parent, listCode);
+        end if;
+        let at: Index := countMut(&~data);
+        pushNode(&~data, node);
+        var holder: Node := nodeMut(&~data, parent);
+        if holder.count = 0 then
+            holder.first := at;
+        else
+            var last: Node := nodeMut(&~data, holder.last);
+            last.next := at;
+            storeNode(&~data, holder.last, last);
+        end if;
+        holder.last := at;
+        holder.count := holder.count + 1;
+        storeNode(&~data, parent, holder);
+        return at;
+    end;
+
+    generic [R: Region, K: Region]
+    function findMemberMut(data: &![ViewData, R], map: Index, key: Span[Nat8, K]): Option[Index] is
+        let holder: Node := nodeMut(&~data, map);
+        var at: Index := holder.first;
+        var left: Index := holder.count;
+        while left > 0 do
+            let member: Node := nodeMut(&~data, at);
+            if textEqualsMut(&~data, member.key, key) then
+                return Some(value => at);
+            end if;
+            at := member.next;
+            left := left - 1;
+        end while;
+        return None();
+    end;
+
+    -- node put into map under key, which the map does not hold yet.
+    generic [R: Region, K: Region]
+    function addKeyed(data: &![ViewData, R], map: Index, key: Span[Nat8, K], node: Node): Index is
+        var member: Node := node;
+        member.key := storeText(&~data, fromSpan(key));
+        member.keyed := true;
+        return appendNode(&~data, map, member);
+    end;
+
+    -- A value without text put into map under key.
+    generic [R: Region, K: Region]
+    function putLeaf(data: &![ViewData, R], map: Index, key: Span[Nat8, K], node: Node): Index is
+        requireCode(&~data, map, mapCode);
+        case findMemberMut(&~data, map, key) of
+            when Some(value as existing: Index) do
+                return existing;
+            when None do
+                return addKeyed(&~data, map, key, node);
+        end case;
+    end;
+
+    -- A value with text put into map under key; text is given back when
+    -- the map holds the key already.
+    generic [R: Region, K: Region]
+    function putTextual(data: &![ViewData, R], map: Index, key: Span[Nat8, K], code: Nat8, text: String): Index is
+        requireCode(&~data, map, mapCode);
+        case findMemberMut(&~data, map, key) of
+            when Some(value as existing: Index) do
+                destroyString(text);
+                return existing;
+            when None do
+                let at: Index := storeText(&~data, text);
+                return addKeyed(&~data, map, key, leaf(code, 0, at));
+        end case;
+    end;
+
+    function truthNumber(value: Bool): Int64 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region, K: Region, T: Region]
+    function putText(data: &![ViewData, R], map: Index, key: Span[Nat8, K], text: Span[Nat8, T]): Index is
+        return putTextual(&~data, map, key, textCode, fromSpan(text));
+    end;
+
+    generic [R: Region, K: Region]
+    function putInteger(data: &![ViewData, R], map: Index, key: Span[Nat8, K], value: Int64): Index is
+        return putLeaf(&~data, map, key, leaf(integerCode, value, 0));
+    end;
+
+    generic [R: Region, K: Region]
+    function putBool(data: &![ViewData, R], map: Index, key: Span[Nat8, K], value: Bool): Index is
+        return putLeaf(&~data, map, key, leaf(boolCode, truthNumber(value), 0));
+    end;
+
+    generic [R: Region, K: Region]
+    function putMissing(data: &![ViewData, R], map: Index, key: Span[Nat8, K]): Index is
+        return putLeaf(&~data, map, key, leaf(missingCode, 0, 0));
+    end;
+
+    generic [R: Region, K: Region]
+    function putList(data: &![ViewData, R], map: Index, key: Span[Nat8, K]): Index is
+        return putLeaf(&~data, map, key, leaf(listCode, 0, 0));
+    end;
+
+    generic [R: Region, K: Region]
+    function putMap(data: &![ViewData, R], map: Index, key: Span[Nat8, K]): Index is
+        return putLeaf(&~data, map, key, leaf(mapCode, 0, 0));
+    end;
+
+    generic [R: Region, K: Region, T: Region]
+    function putSanitizedHtml(data: &![ViewData, R], map: Index, key: Span[Nat8, K], html: Span[Nat8, T],
+        policy: Policy): Index is
+        return putTextual(&~data, map, key, htmlCode, sanitize(html, policy));
+    end;
+
+    generic [R: Region, K: Region, T: Region]
+    function putMarkdown(data: &![ViewData, R], map: Index, key: Span[Nat8, K], markdown: Span[Nat8, T]): Index is
+        return putTextual(&~data, map, key, htmlCode, markdownToHtml(markdown));
+    end;
+
+    generic [R: Region]
+    function addTextual(data: &![ViewData, R], list: Index, code: Nat8, text: String): Index is
+        let at: Index := storeText(&~data, text);
+        return appendNode(&~data, list, leaf(code, 0, at));
+    end;
+
+    generic [R: Region, T: Region]
+    function addText(data: &![ViewData, R], list: Index, text: Span[Nat8, T]): Index is
+        return addTextual(&~data, list, textCode, fromSpan(text));
+    end;
+
+    generic [R: Region]
+    function addInteger(data: &![ViewData, R], list: Index, value: Int64): Index is
+        return appendNode(&~data, list, leaf(integerCode, value, 0));
+    end;
+
+    generic [R: Region]
+    function addBool(data: &![ViewData, R], list: Index, value: Bool): Index is
+        return appendNode(&~data, list, leaf(boolCode, truthNumber(value), 0));
+    end;
+
+    generic [R: Region]
+    function addMissing(data: &![ViewData, R], list: Index): Index is
+        return appendNode(&~data, list, leaf(missingCode, 0, 0));
+    end;
+
+    generic [R: Region]
+    function addList(data: &![ViewData, R], list: Index): Index is
+        return appendNode(&~data, list, leaf(listCode, 0, 0));
+    end;
+
+    generic [R: Region]
+    function addMap(data: &![ViewData, R], list: Index): Index is
+        return appendNode(&~data, list, leaf(mapCode, 0, 0));
+    end;
+
+    generic [R: Region, T: Region]
+    function addSanitizedHtml(data: &![ViewData, R], list: Index, html: Span[Nat8, T], policy: Policy): Index is
+        return addTextual(&~data, list, htmlCode, sanitize(html, policy));
+    end;
+
+    generic [R: Region, T: Region]
+    function addMarkdown(data: &![ViewData, R], list: Index, markdown: Span[Nat8, T]): Index is
+        return addTextual(&~data, list, htmlCode, markdownToHtml(markdown));
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    generic [R: Region]
+    function textAt(data: &[ViewData, R], at: Index): Span[Nat8, R] is
+        return asSpan(nthRef(&(data->texts), at));
+    end;
+
+    generic [R: Region]
+    function textOf(data: &[ViewData, R], node: Index): Span[Nat8, R] is
+        if not isTextual(data, node) then
+            abort("Wolly.ViewData: the text of a node that holds none");
+        end if;
+        let found: Node := nodeAt(data, node);
+        return textAt(data, found.text);
+    end;
+
+    generic [R: Region]
+    function integerOf(data: &[ViewData, R], node: Index): Int64 is
+        if not isInteger(data, node) then
+            abort("Wolly.ViewData: the number of a node that holds none");
+        end if;
+        let found: Node := nodeAt(data, node);
+        return found.number;
+    end;
+
+    generic [R: Region]
+    function boolOf(data: &[ViewData, R], node: Index): Bool is
+        if not isBool(data, node) then
+            abort("Wolly.ViewData: the truth value of a node that holds none");
+        end if;
+        let found: Node := nodeAt(data, node);
+        return found.number = 1;
+    end;
+
+    generic [R: Region]
+    function childCount(data: &[ViewData, R], node: Index): Index is
+        let found: Node := nodeAt(data, node);
+        return found.count;
+    end;
+
+    generic [R: Region]
+    function firstChild(data: &[ViewData, R], node: Index): Option[Index] is
+        let holder: Node := nodeAt(data, node);
+        if holder.count = 0 then
+            return None();
+        end if;
+        return Some(value => holder.first);
+    end;
+
+    generic [R: Region]
+    function nextSibling(data: &[ViewData, R], node: Index): Option[Index] is
+        let here: Node := nodeAt(data, node);
+        let next: Index := here.next;
+        if next = 0 then
+            return None();
+        end if;
+        return Some(value => next);
+    end;
+
+    generic [R: Region]
+    function keyOf(data: &[ViewData, R], node: Index): Span[Nat8, R] is
+        if not isMember(data, node) then
+            abort("Wolly.ViewData: the key of a node that is in no map");
+        end if;
+        let found: Node := nodeAt(data, node);
+        return textAt(data, found.key);
+    end;
+
+    generic [R: Region, K: Region]
+    function memberNamed(data: &[ViewData, R], map: Index, key: Span[Nat8, K]): Option[Index] is
+        if not isMap(data, map) then
+            return None();
+        end if;
+        let holder: Node := nodeAt(data, map);
+        var at: Index := holder.first;
+        var left: Index := holder.count;
+        while left > 0 do
+            let member: Node := nodeAt(data, at);
+            if equal(textAt(data, member.key), key) then
+                return Some(value => at);
+            end if;
+            at := member.next;
+            left := left - 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region]
+    function elementAt(data: &[ViewData, R], list: Index, position: Index): Option[Index] is
+        if not isList(data, list) then
+            return None();
+        end if;
+        let holder: Node := nodeAt(data, list);
+        if position >= holder.count then
+            return None();
+        end if;
+        var at: Index := holder.first;
+        var step: Index := 0;
+        while step < position do
+            let passed: Node := nodeAt(data, at);
+            at := passed.next;
+            step := step + 1;
+        end while;
+        return Some(value => at);
+    end;
+
+    ---
+    --- Copies
+    ---
+
+    -- A copy of the node of source alone, without what it holds, its key
+    -- not set.
+    generic [R: Region, S: Region]
+    function copyLeaf(data: &![ViewData, R], source: &[ViewData, S], node: Index): Node is
+        let original: Node := nodeAt(source, node);
+        if (original.code = textCode) or (original.code = htmlCode) then
+            let at: Index := storeText(&~data, fromSpan(textOf(source, node)));
+            return leaf(original.code, 0, at);
+        end if;
+        return leaf(original.code, original.number, 0);
+    end;
+
+    -- What the node copy of data holds: copies of what node of source
+    -- holds, in order, and so on down.  The nodes still to fill wait in
+    -- two lists, so that a deep document does not make a deep recursion.
+    generic [R: Region, S: Region]
+    function copyChildren(data: &![ViewData, R], copy: Index, source: &[ViewData, S], node: Index): Unit is
+        var sources: Buffer[Index] := allocateEmpty();
+        var copies: Buffer[Index] := allocateEmpty();
+        insertBack(&!sources, node);
+        insertBack(&!copies, copy);
+        var at: Index := 0;
+        while at < length(&sources) do
+            let origin: Index := nth(&sources, at);
+            let into: Index := nth(&copies, at);
+            var child: Option[Index] := firstChild(source, origin);
+            var walking: Bool := true;
+            while walking do
+                case child of
+                    when Some(value as c: Index) do
+                        var made: Node := copyLeaf(&~data, source, c);
+                        if isMember(source, c) then
+                            made.key := storeText(&~data, fromSpan(keyOf(source, c)));
+                            made.keyed := true;
+                        end if;
+                        let placed: Index := appendNode(&~data, into, made);
+                        insertBack(&!sources, c);
+                        insertBack(&!copies, placed);
+                        child := nextSibling(source, c);
+                    when None do
+                        walking := false;
+                end case;
+            end while;
+            at := at + 1;
+        end while;
+        destroyFree(sources);
+        destroyFree(copies);
+        return nil;
+    end;
+
+    generic [R: Region, K: Region, S: Region]
+    function putCopy(data: &![ViewData, R], map: Index, key: Span[Nat8, K], source: &[ViewData, S], node: Index): Index is
+        requireCode(&~data, map, mapCode);
+        case findMemberMut(&~data, map, key) of
+            when Some(value as existing: Index) do
+                return existing;
+            when None do
+                let made: Node := copyLeaf(&~data, source, node);
+                let copy: Index := addKeyed(&~data, map, key, made);
+                copyChildren(&~data, copy, source, node);
+                return copy;
+        end case;
+    end;
+
+    generic [S: Region]
+    function copyData(source: &[ViewData, S], node: Index): ViewData is
+        let texts: Buffer[String] := allocateEmpty();
+        var data: ViewData := makeWith(leaf(missingCode, 0, 0), texts);
+        let made: Node := copyLeaf(&!data, source, node);
+        storeNode(&!data, 0, made);
+        copyChildren(&!data, 0, source, node);
+        return data;
+    end;
+
+    generic [R: Region, S: Region]
+    function addCopy(data: &![ViewData, R], list: Index, source: &[ViewData, S], node: Index): Index is
+        let made: Node := copyLeaf(&~data, source, node);
+        let copy: Index := appendNode(&~data, list, made);
+        copyChildren(&~data, copy, source, node);
+        return copy;
+    end;
+
+    ---
+    --- JSON
+    ---
+
+    -- The pointer of the member named name of the object at pointer: ~ and
+    -- / in the name written ~0 and ~1, as RFC 6901 asks.
+    generic [P: Region, N: Region]
+    function memberPointer(pointer: Span[Nat8, P], name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, pointer);
+        writeByte(&!out, '/');
+        var i: Index := 0;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            if byte = '~' then
+                writeString(&!out, "~0");
+            else if byte = '/' then
+                writeString(&!out, "~1");
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function elementPointer(pointer: Span[Nat8, P], position: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, pointer);
+        writeByte(&!out, '/');
+        let digits: String := displayIndex(position);
+        writeString(&!out, asSpan(&digits));
+        destroyString(digits);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function refusedAt(what: Span[Nat8, Static], pointer: Span[Nat8, P]): Either[String, Unit] is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, what);
+        writeString(&!out, " at ");
+        writeString(&!out, pointer);
+        return Left(left => finalize(out));
+    end;
+
+    -- The value at pointer of document, made a node held by holder: under
+    -- name when holder is a map, at the end when it is a list; the nodes
+    -- it holds follow.  Recursion as deep as the JSON, which
+    -- Standard.Json keeps within its mostDepth.
+    generic [J: Region, P: Region, R: Region, N: Region]
+    function readInto(document: &[Json, J], pointer: Span[Nat8, P], data: &![ViewData, R], holder: Index,
+        name: Span[Nat8, N]): Either[String, Unit] is
+        let inMap: Bool := codeAtMut(&~data, holder) = mapCode;
+        case kindAt(document, pointer) of
+            when Some(value as kind: JsonKind) do
+                case kind of
+                    when JsonNull do
+                        if inMap then
+                            let made: Index := putMissing(&~data, holder, name);
+                        else
+                            let made: Index := addMissing(&~data, holder);
+                        end if;
+                    when JsonBoolean do
+                        var truth: Bool := false;
+                        case boolAt(document, pointer) of
+                            when Some(value as b: Bool) do
+                                truth := b;
+                            when None do
+                                skip;
+                        end case;
+                        if inMap then
+                            let made: Index := putBool(&~data, holder, name, truth);
+                        else
+                            let made: Index := addBool(&~data, holder, truth);
+                        end if;
+                    when JsonNumber do
+                        case integerAt(document, pointer) of
+                            when Some(value as number: Int64) do
+                                if inMap then
+                                    let made: Index := putInteger(&~data, holder, name, number);
+                                else
+                                    let made: Index := addInteger(&~data, holder, number);
+                                end if;
+                            when None do
+                                return refusedAt("a number that is no whole number within Int64", pointer);
+                        end case;
+                    when JsonString do
+                        case stringAt(document, pointer) of
+                            when Some(value as text: String) do
+                                if inMap then
+                                    let made: Index := putTextual(&~data, holder, name, textCode, text);
+                                else
+                                    let made: Index := addTextual(&~data, holder, textCode, text);
+                                end if;
+                            when None do
+                                return refusedAt("a string that cannot be read", pointer);
+                        end case;
+                    when JsonArray do
+                        var list: Index := 0;
+                        if inMap then
+                            list := putList(&~data, holder, name);
+                        else
+                            list := addList(&~data, holder);
+                        end if;
+                        let filled: Either[String, Unit] := readArray(document, pointer, &~data, list);
+                        case filled of
+                            when Left(left as message: String) do
+                                return Left(left => message);
+                            when Right(right as done: Unit) do
+                                skip;
+                        end case;
+                    when JsonObject do
+                        var map: Index := 0;
+                        if inMap then
+                            map := putMap(&~data, holder, name);
+                        else
+                            map := addMap(&~data, holder);
+                        end if;
+                        let filled: Either[String, Unit] := readObject(document, pointer, &~data, map);
+                        case filled of
+                            when Left(left as message: String) do
+                                return Left(left => message);
+                            when Right(right as done: Unit) do
+                                skip;
+                        end case;
+                end case;
+            when None do
+                return refusedAt("no value", pointer);
+        end case;
+        return Right(right => nil);
+    end;
+
+    generic [R: Region]
+    function codeAtMut(data: &![ViewData, R], node: Index): Nat8 is
+        let found: Node := nodeMut(&~data, node);
+        return found.code;
+    end;
+
+    generic [J: Region, P: Region, R: Region]
+    function readArray(document: &[Json, J], pointer: Span[Nat8, P], data: &![ViewData, R], list: Index): Either[String, Unit] is
+        var count: Index := 0;
+        case countAt(document, pointer) of
+            when Some(value as n: Index) do
+                count := n;
+            when None do
+                skip;
+        end case;
+        var i: Index := 0;
+        while i < count do
+            let at: String := elementPointer(pointer, i);
+            let read: Either[String, Unit] := readInto(document, asSpan(&at), &~data, list, "");
+            destroyString(at);
+            case read of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as done: Unit) do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return Right(right => nil);
+    end;
+
+    generic [J: Region, P: Region, R: Region]
+    function readObject(document: &[Json, J], pointer: Span[Nat8, P], data: &![ViewData, R], map: Index): Either[String, Unit] is
+        var count: Index := 0;
+        case countAt(document, pointer) of
+            when Some(value as n: Index) do
+                count := n;
+            when None do
+                skip;
+        end case;
+        var i: Index := 0;
+        while i < count do
+            case nameAt(document, pointer, i) of
+                when Some(value as name: String) do
+                    let at: String := memberPointer(pointer, asSpan(&name));
+                    let read: Either[String, Unit] := readInto(document, asSpan(&at), &~data, map, asSpan(&name));
+                    destroyString(at);
+                    destroyString(name);
+                    case read of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as done: Unit) do
+                            skip;
+                    end case;
+                when None do
+                    return refusedAt("a member without a name", pointer);
+            end case;
+            i := i + 1;
+        end while;
+        return Right(right => nil);
+    end;
+
+    -- The document a JSON value at the top makes: a map or a list to fill,
+    -- or the one value it is.  A wrapper list holds a single value while it
+    -- is read, and its one element becomes the root.
+    generic [T: Region]
+    function readViewJson(text: Span[Nat8, T]): Either[String, ViewData] is
+        case readJson(text) of
+            when Left(left as refused: JsonError) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "no JSON: refused at byte ");
+                let offset: String := displayIndex(refused.offset);
+                writeString(&!out, asSpan(&offset));
+                destroyString(offset);
+                return Left(left => finalize(out));
+            when Right(right as document: Json) do
+                var result: Either[String, ViewData] := readTop(&document);
+                destroyJson(document);
+                return result;
+        end case;
+    end;
+
+    generic [J: Region]
+    function readTop(document: &[Json, J]): Either[String, ViewData] is
+        case kindAt(document, "") of
+            when Some(value as kind: JsonKind) do
+                case kind of
+                    when JsonObject do
+                        var data: ViewData := makeMapData();
+                        let filled: Either[String, Unit] := readObject(document, "", &!data, 0);
+                        return finished(data, filled);
+                    when JsonArray do
+                        var data: ViewData := makeListData();
+                        let filled: Either[String, Unit] := readArray(document, "", &!data, 0);
+                        return finished(data, filled);
+                    when JsonNull do
+                        return Right(right => makeMissingData());
+                    when JsonBoolean do
+                        var truth: Bool := false;
+                        case boolAt(document, "") of
+                            when Some(value as b: Bool) do
+                                truth := b;
+                            when None do
+                                skip;
+                        end case;
+                        return Right(right => makeBoolData(truth));
+                    when JsonNumber do
+                        case integerAt(document, "") of
+                            when Some(value as number: Int64) do
+                                return Right(right => makeIntegerData(number));
+                            when None do
+                                return Left(left => fromSpan("a number that is no whole number within Int64 at the top"));
+                        end case;
+                    when JsonString do
+                        case stringAt(document, "") of
+                            when Some(value as s: String) do
+                                let data: ViewData := makeTextData(asSpan(&s));
+                                destroyString(s);
+                                return Right(right => data);
+                            when None do
+                                return Left(left => fromSpan("a string that cannot be read at the top"));
+                        end case;
+                end case;
+            when None do
+                return Left(left => fromSpan("no value at the top"));
+        end case;
+    end;
+
+    function finished(data: ViewData, filled: Either[String, Unit]): Either[String, ViewData] is
+        case filled of
+            when Left(left as message: String) do
+                destroyViewData(data);
+                return Left(left => message);
+            when Right(right as done: Unit) do
+                return Right(right => data);
+        end case;
+    end;
+end module body.

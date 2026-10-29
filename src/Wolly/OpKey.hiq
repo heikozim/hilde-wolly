@@ -1,0 +1,1284 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- No cryptography of its own: keys of ML-DSA-44 are read, made and used by
+-- Standard.X509, composite keys by Standard.CompositeSig, hashes and random
+-- bytes come from Standard.Libcrypto.
+-- What is here is the encoding: the PKCS 8 form of a seed, PEM, the JSON of
+-- headers, keys and vault values.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    insert,
+    remove,
+    removeLast,
+    nthRef,
+    length as bufferLength,
+    lengthMut,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    indexOf,
+    indexOfByte,
+    equal,
+    startsWith,
+    bytesToHex,
+    toUpper
+);
+import Standard.Base64 (
+    encode,
+    decode
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonKind,
+    JsonWriter,
+    readJson,
+    destroyJson,
+    stringAt,
+    integerAt,
+    kindAt,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeString as writeJsonString,
+    writeInteger,
+    finishJson
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha256
+);
+import Standard.Jws (
+    base64UrlEncode,
+    base64UrlDecode,
+    jwkOfPublicKey
+);
+import Standard.X509 (
+    PrivateKey,
+    KeyKind,
+    EcP256,
+    EcP384,
+    EcP521,
+    Ed25519Key,
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    privateKeyFromPem,
+    publicKeyDer,
+    publicKeyKind,
+    signMessage,
+    verifyMessage,
+    destroyPrivateKey
+);
+import Standard.CompositeSig (
+    CompositeKey,
+    keypairFromSeeds,
+    publicKeyOf,
+    openSshLabel,
+    sign as compositeSign,
+    verify as compositeVerify,
+    destroyCompositeKey
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    Damaged,
+    CryptoFailed,
+    getSecret,
+    setSecret,
+    deleteSecret,
+    secretNames
+);
+
+module body Wolly.OpKey is
+    -- The bytes of the PKCS 8 form of a key of ML-DSA-44 that holds only its
+    -- seed, before the seed: a sequence, version 0, the algorithm
+    -- 2.16.840.1.101.3.4.3.17, an octet string with the seed as [0].
+    constant seedLength: Index := 32;
+    -- The seed of a composite key: the seed of its ML-DSA-44 half, then the
+    -- seed of its Ed25519 half.
+    constant compositeSeedLength: Index := 64;
+    constant mostTokenBytes: Index := 16384;
+
+    function algorithmOf(family: KeyFamily): Span[Nat8, Static] is
+        case family of
+            when MlDsa do
+                return "ML-DSA-44";
+            when Composite do
+                return "ML-DSA-44-Ed25519";
+        end case;
+    end;
+
+    generic [A: Region]
+    function familyOf(alg: Span[Nat8, A]): Option[KeyFamily] is
+        if equal(alg, "ML-DSA-44") then
+            return Some(value => MlDsa());
+        end if;
+        if equal(alg, "ML-DSA-44-Ed25519") then
+            return Some(value => Composite());
+        end if;
+        let none: Option[KeyFamily] := None();
+        return none;
+    end;
+
+    -- Whether a and b are one family.
+    function sameFamily(a: KeyFamily, b: KeyFamily): Bool is
+        case a of
+            when MlDsa do
+                case b of
+                    when MlDsa do
+                        return true;
+                    when Composite do
+                        return false;
+                end case;
+            when Composite do
+                case b of
+                    when MlDsa do
+                        return false;
+                    when Composite do
+                        return true;
+                end case;
+        end case;
+    end;
+
+    -- The PEM text of der under label, 64 characters a line.
+    generic [D: Region]
+    function pemOf(der: Span[Nat8, D], label: Span[Nat8, Static]): String is
+        let text: String := encode(der);
+        var pem: StringBuilder := makeStringBuilder();
+        writeString(&!pem, "-----BEGIN ");
+        writeString(&!pem, label);
+        writeString(&!pem, "-----\n");
+        borrow t: &[String, T] := &text do
+            let s: Span[Nat8, T] := asSpan(t);
+            var j: Index := 0;
+            var column: Index := 0;
+            while j < spanLength(s) do
+                writeByte(&!pem, s[j]);
+                j := j + 1;
+                column := column + 1;
+                if (column = 64) and (j < spanLength(s)) then
+                    writeByte(&!pem, 10);
+                    column := 0;
+                end if;
+            end while;
+        end borrow;
+        destroyString(text);
+        writeString(&!pem, "\n-----END ");
+        writeString(&!pem, label);
+        writeString(&!pem, "-----\n");
+        return finalize(pem);
+    end;
+
+    -- The PKCS 8 DER of the key of ML-DSA-44 with seed.
+    generic [S: Region]
+    function seedDer(seed: Span[Nat8, S]): String is
+        var der: StringBuilder := makeStringBuilder();
+        writeByte(&!der, 48);
+        writeByte(&!der, 52);
+        writeByte(&!der, 2);
+        writeByte(&!der, 1);
+        writeByte(&!der, 0);
+        writeByte(&!der, 48);
+        writeByte(&!der, 11);
+        writeByte(&!der, 6);
+        writeByte(&!der, 9);
+        writeByte(&!der, 96);
+        writeByte(&!der, 134);
+        writeByte(&!der, 72);
+        writeByte(&!der, 1);
+        writeByte(&!der, 101);
+        writeByte(&!der, 3);
+        writeByte(&!der, 4);
+        writeByte(&!der, 3);
+        writeByte(&!der, 17);
+        writeByte(&!der, 4);
+        writeByte(&!der, 34);
+        writeByte(&!der, 128);
+        writeByte(&!der, 32);
+        writeString(&!der, seed);
+        return finalize(der);
+    end;
+
+    -- The private key of family with secret, through PEM.
+    generic [S: Region]
+    function privateOf(family: KeyFamily, secret: Span[Nat8, S]): Option[PrivateKey] is
+        case family of
+            when MlDsa do
+                if spanLength(secret) /= seedLength then
+                    let none: Option[PrivateKey] := None();
+                    return none;
+                end if;
+                let der: String := seedDer(secret);
+                let pem: String := pemOf(asSpan(&der), "PRIVATE KEY");
+                destroyString(der);
+                let key: Option[PrivateKey] := privateKeyFromPem(asSpan(&pem));
+                destroyString(pem);
+                return key;
+            when Composite do
+                -- A composite key has no form of Standard.X509.
+                let none: Option[PrivateKey] := None();
+                return none;
+        end case;
+    end;
+
+    -- Whether kind is the kind family must have.
+    function kindFits(family: KeyFamily, kind: KeyKind): Bool is
+        case family of
+            when MlDsa do
+                case kind of
+                    when MlDsa44 do
+                        return true;
+                    when EcP256 | EcP384 | EcP521 | Ed25519Key | Rsa2048 | Rsa3072 | Rsa4096 | MlDsa65 | MlDsa87 do
+                        return false;
+                end case;
+            when Composite do
+                return false;
+        end case;
+    end;
+
+    -- The canonical JWK of the public key publicDer, when its kind fits
+    -- family.
+    generic [P: Region]
+    function canonicalJwk(family: KeyFamily, publicDer: Span[Nat8, P]): Option[String] is
+        case publicKeyKind(publicDer) of
+            when Some(value as kind: KeyKind) do
+                if not kindFits(family, kind) then
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+        case jwkOfPublicKey(publicDer) of
+            when Some(value as jwk: String) do
+                return Some(value => jwk);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The base64url of the SHA-256 of text.
+    generic [T: Region]
+    function digestText(text: Span[Nat8, T]): Option[String] is
+        case sha256(text) of
+            when Some(value as sum: String) do
+                let encoded: String := base64UrlEncode(asSpan(&sum));
+                destroyString(sum);
+                return Some(value => encoded);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [S: Region]
+    function makeRingKey(family: KeyFamily, secret: Span[Nat8, S], created: Int64, retired: Int64): Option[RingKey] is
+        case family of
+            when MlDsa do
+                return makeMlDsaKey(secret, created, retired);
+            when Composite do
+                return makeCompositeKey(secret, created, retired);
+        end case;
+    end;
+
+    -- The canonical JWK of the composite public key raw, as RFC 7638 hashes
+    -- it: the members alg, kty and pub in this order, no blanks.  pub is
+    -- base64url, which needs no escape in a JSON string.
+    generic [P: Region]
+    function compositeCanonicalJwk(raw: Span[Nat8, P]): String is
+        let pub: String := base64UrlEncode(raw);
+        var jwk: StringBuilder := makeStringBuilder();
+        writeString(&!jwk, "{\"alg\":\"ML-DSA-44-Ed25519\",\"kty\":\"AKP\",\"pub\":\"");
+        writeString(&!jwk, asSpan(&pub));
+        writeString(&!jwk, "\"}");
+        destroyString(pub);
+        return finalize(jwk);
+    end;
+
+    -- The ring key of the composite from its seed of 64 bytes.
+    generic [S: Region]
+    function makeCompositeKey(secret: Span[Nat8, S], created: Int64, retired: Int64): Option[RingKey]
+        requires (created > 0) and (retired >= 0) is
+        if spanLength(secret) /= compositeSeedLength then
+            let none: Option[RingKey] := None();
+            return none;
+        end if;
+        case keypairFromSeeds(substring(secret, 0, seedLength), substring(secret, seedLength, compositeSeedLength)) of
+            when Some(value as key: CompositeKey) do
+                let raw: String := publicKeyOf(&key);
+                let jwk: String := compositeCanonicalJwk(asSpan(&raw));
+                let kid: Option[String] := digestText(asSpan(&jwk));
+                destroyString(jwk);
+                case kid of
+                    when Some(value as thumbprint: String) do
+                        return Some(value => RingKey(family => Composite(), secret => fromSpan(secret),
+                            created => created, retired => retired, kid => thumbprint, publicKey => raw,
+                            material => CompositeMaterial(compositeKey => key)));
+                    when None do
+                        destroyString(raw);
+                        destroyCompositeKey(key);
+                        let none: Option[RingKey] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[RingKey] := None();
+                return none;
+        end case;
+    end;
+
+    -- The ring key of ML-DSA-44 from its seed of 32 bytes.
+    generic [S: Region]
+    function makeMlDsaKey(secret: Span[Nat8, S], created: Int64, retired: Int64): Option[RingKey]
+        requires (created > 0) and (retired >= 0) is
+        let family: KeyFamily := MlDsa();
+        case privateOf(family, secret) of
+            when Some(value as key: PrivateKey) do
+                let der: Option[String] := publicKeyDer(&key);
+                case der of
+                    when Some(value as publicDer: String) do
+                        case canonicalJwk(family, asSpan(&publicDer)) of
+                            when Some(value as jwk: String) do
+                                let kid: Option[String] := digestText(asSpan(&jwk));
+                                destroyString(jwk);
+                                case kid of
+                                    when Some(value as thumbprint: String) do
+                                        return Some(value => RingKey(family => family, secret => fromSpan(secret),
+                                            created => created, retired => retired, kid => thumbprint,
+                                            publicKey => publicDer, material => MlDsaMaterial(privateKey => key)));
+                                    when None do
+                                        destroyString(publicDer);
+                                        destroyPrivateKey(key);
+                                        let none: Option[RingKey] := None();
+                                        return none;
+                                end case;
+                            when None do
+                                destroyString(publicDer);
+                                destroyPrivateKey(key);
+                                let none: Option[RingKey] := None();
+                                return none;
+                        end case;
+                    when None do
+                        destroyPrivateKey(key);
+                        let none: Option[RingKey] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[RingKey] := None();
+                return none;
+        end case;
+    end;
+
+    -- The length of the seed of a key of family.
+    function seedLengthOf(family: KeyFamily): Index is
+        case family of
+            when MlDsa do
+                return seedLength;
+            when Composite do
+                return compositeSeedLength;
+        end case;
+    end;
+
+    function newRingKey(family: KeyFamily, now: Int64): Option[RingKey] is
+        case randomBytes(seedLengthOf(family)) of
+            when Some(value as seed: String) do
+                let made: Option[RingKey] := makeRingKey(family, asSpan(&seed), now, 0);
+                destroyString(seed);
+                return made;
+            when None do
+                let none: Option[RingKey] := None();
+                return none;
+        end case;
+    end;
+
+    function destroyMaterial(material: KeyMaterial): Unit is
+        case material of
+            when MlDsaMaterial(privateKey as key: PrivateKey) do
+                destroyPrivateKey(key);
+            when CompositeMaterial(compositeKey as key: CompositeKey) do
+                destroyCompositeKey(key);
+        end case;
+        return nil;
+    end;
+
+    function destroyRingKey(key: RingKey): Unit is
+        let { family: KeyFamily, secret: String, created: Int64, retired: Int64, kid: String, publicKey: String,
+            material: KeyMaterial } := key;
+        destroyMaterial(material);
+        destroyString(secret);
+        destroyString(kid);
+        destroyString(publicKey);
+        return nil;
+    end;
+
+    -- The finished text of writer; a writer of this module always closes
+    -- what it opened, so the text is there.
+    function finishedJson(writer: JsonWriter): String is
+        case finishJson(writer) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromSpan("{}");
+        end case;
+    end;
+
+    generic [K: Region]
+    function keyEntry(key: &[RingKey, K]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "alg");
+        writeJsonString(&!writer, algorithmOf(key->family));
+        let secret: String := base64UrlEncode(asSpan(&(key->secret)));
+        writeName(&!writer, "seed");
+        writeJsonString(&!writer, asSpan(&secret));
+        destroyString(secret);
+        writeName(&!writer, "created");
+        writeInteger(&!writer, key->created);
+        if key->retired /= 0 then
+            writeName(&!writer, "retired");
+            writeInteger(&!writer, key->retired);
+        end if;
+        endObject(&!writer);
+        let text: String := finishedJson(writer);
+        if length(&text) = 0 then
+            destroyString(text);
+            return fromSpan("{}");
+        end if;
+        return text;
+    end;
+
+    generic [T: Region]
+    function readKeyEntry(entry: Span[Nat8, T]): Option[RingKey] is
+        case readJson(entry) of
+            when Right(right as document: Json) do
+                let made: Option[RingKey] := keyOfDocument(&document);
+                destroyJson(document);
+                return made;
+            when Left(left as error: JsonError) do
+                let none: Option[RingKey] := None();
+                return none;
+        end case;
+    end;
+
+    -- The ring key the vault value document describes.
+    generic [D: Region]
+    function keyOfDocument(document: &[Json, D]): Option[RingKey] is
+        let alg: Option[String] := stringAt(document, "/alg");
+        case alg of
+            when Some(value as name: String) do
+                let family: Option[KeyFamily] := familyOf(asSpan(&name));
+                destroyString(name);
+                case family of
+                    when Some(value as f: KeyFamily) do
+                        let created: Option[Int64] := integerAt(document, "/created");
+                        let retiredAt: Option[Int64] := integerAt(document, "/retired");
+                        var retired: Int64 := 0;
+                        case retiredAt of
+                            when Some(value as r: Int64) do
+                                retired := r;
+                            when None do
+                                skip;
+                        end case;
+                        case created of
+                            when Some(value as c: Int64) do
+                                if (c <= 0) or (retired < 0) then
+                                    let none: Option[RingKey] := None();
+                                    return none;
+                                end if;
+                                return secretKey(document, f, c, retired);
+                            when None do
+                                let none: Option[RingKey] := None();
+                                return none;
+                        end case;
+                    when None do
+                        let none: Option[RingKey] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[RingKey] := None();
+                return none;
+        end case;
+    end;
+
+    -- The JSON pointer of the secret of a key of family in its vault value.
+    function secretPointer(family: KeyFamily): Span[Nat8, Static] is
+        case family of
+            when MlDsa do
+                return "/seed";
+            when Composite do
+                return "/seed";
+        end case;
+    end;
+
+    -- The ring key of family made from the seed member of document.
+    generic [D: Region]
+    function secretKey(document: &[Json, D], family: KeyFamily, created: Int64, retired: Int64): Option[RingKey]
+        requires (created > 0) and (retired >= 0) is
+        let member: Option[String] := stringAt(document, secretPointer(family));
+        case member of
+            when Some(value as text: String) do
+                let raw: Option[String] := base64UrlDecode(asSpan(&text));
+                destroyString(text);
+                case raw of
+                    when Some(value as secret: String) do
+                        let made: Option[RingKey] := makeRingKey(family, asSpan(&secret), created, retired);
+                        destroyString(secret);
+                        return made;
+                    when None do
+                        let none: Option[RingKey] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[RingKey] := None();
+                return none;
+        end case;
+    end;
+
+    generic [P: Region, K: Region]
+    function entryName(prefix: Span[Nat8, P], kid: Span[Nat8, K]): String is
+        var name: StringBuilder := makeStringBuilder();
+        writeString(&!name, prefix);
+        case sha256(kid) of
+            when Some(value as sum: String) do
+                let hex: String := bytesToHex(substring(asSpan(&sum), 0, 8));
+                destroyString(sum);
+                let upper: String := toUpper(asSpan(&hex));
+                destroyString(hex);
+                writeString(&!name, asSpan(&upper));
+                destroyString(upper);
+            when None do
+                -- No digest: a name that no key can have, so that nothing is
+                -- overwritten.
+                writeString(&!name, "XXXXXXXXXXXXXXXX");
+        end case;
+        return finalize(name);
+    end;
+
+    -- The header of a token signed with key.
+    generic [K: Region, T: Region]
+    function headerOf(key: &[RingKey, K], typ: Span[Nat8, T]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "alg");
+        writeJsonString(&!writer, algorithmOf(key->family));
+        writeName(&!writer, "kid");
+        writeJsonString(&!writer, asSpan(&(key->kid)));
+        if spanLength(typ) > 0 then
+            writeName(&!writer, "typ");
+            writeJsonString(&!writer, typ);
+        end if;
+        endObject(&!writer);
+        return finishedJson(writer);
+    end;
+
+    generic [K: Region, T: Region, P: Region]
+    function signToken(key: &[RingKey, K], typ: Span[Nat8, T], payload: Span[Nat8, P]): Option[String] is
+        let header: String := headerOf(key, typ);
+        let h: String := base64UrlEncode(asSpan(&header));
+        destroyString(header);
+        let p: String := base64UrlEncode(payload);
+        var input: StringBuilder := makeStringBuilder();
+        writeString(&!input, asSpan(&h));
+        writeByte(&!input, 46);
+        writeString(&!input, asSpan(&p));
+        destroyString(h);
+        destroyString(p);
+        let signing: String := finalize(input);
+        let signature: Option[String] := signWith(key, asSpan(&signing));
+        case signature of
+            when Some(value as raw: String) do
+                let s: String := base64UrlEncode(asSpan(&raw));
+                destroyString(raw);
+                var token: StringBuilder := makeStringBuilder();
+                writeString(&!token, asSpan(&signing));
+                writeByte(&!token, 46);
+                writeString(&!token, asSpan(&s));
+                destroyString(s);
+                destroyString(signing);
+                return Some(value => finalize(token));
+            when None do
+                destroyString(signing);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The signature of message under key: ML-DSA-44 alone, or the two halves
+    -- of the composite over the message representative of its label.
+    generic [K: Region, M: Region]
+    function signWith(key: &[RingKey, K], message: Span[Nat8, M]): Option[String] is
+        case &(key->material) of
+            when MlDsaMaterial(privateKey as p: &[PrivateKey, K]) do
+                return signMessage(p, message);
+            when CompositeMaterial(compositeKey as c: &[CompositeKey, K]) do
+                return compositeSign(c, openSshLabel(), message, "");
+        end case;
+    end;
+
+    generic [K: Region]
+    function publicJwk(key: &[RingKey, K]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "kty");
+        writeJsonString(&!writer, "AKP");
+        writeName(&!writer, "alg");
+        writeJsonString(&!writer, algorithmOf(key->family));
+        writeName(&!writer, "kid");
+        writeJsonString(&!writer, asSpan(&(key->kid)));
+        writeName(&!writer, "use");
+        writeJsonString(&!writer, "sig");
+        case key->family of
+            when Composite do
+                let pub: String := base64UrlEncode(asSpan(&(key->publicKey)));
+                writeName(&!writer, "pub");
+                writeJsonString(&!writer, asSpan(&pub));
+                destroyString(pub);
+                endObject(&!writer);
+                return finishedJson(writer);
+            when MlDsa do
+                skip;
+        end case;
+        case jwkOfPublicKey(asSpan(&(key->publicKey))) of
+            when Some(value as jwk: String) do
+                case readJson(asSpan(&jwk)) of
+                    when Right(right as document: Json) do
+                        copyMember(&!writer, &document, "pub");
+                        destroyJson(document);
+                    when Left(left as error: JsonError) do
+                        skip;
+                end case;
+                destroyString(jwk);
+            when None do
+                skip;
+        end case;
+        endObject(&!writer);
+        return finishedJson(writer);
+    end;
+
+    -- Writes the string member name of document, when it is there.
+    generic [W: Region, D: Region]
+    function copyMember(writer: &![JsonWriter, W], document: &[Json, D], name: Span[Nat8, Static]): Unit is
+        var pointer: StringBuilder := makeStringBuilder();
+        writeByte(&!pointer, 47);
+        writeString(&!pointer, name);
+        let path: String := finalize(pointer);
+        let value: Option[String] := stringAt(document, asSpan(&path));
+        destroyString(path);
+        case value of
+            when Some(value as text: String) do
+                writeName(&~writer, name);
+                writeJsonString(&~writer, asSpan(&text));
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function activeKey(ring: &[Buffer[RingKey], R], family: KeyFamily): Option[Index] is
+        var i: Index := bufferLength(ring);
+        while i > 0 do
+            i := i - 1;
+            let key: &[RingKey, R] := nthRef(ring, i);
+            if (key->retired = 0) and sameFamily(key->family, family) then
+                return Some(value => i);
+            end if;
+        end while;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function hasFamily(ring: &[Buffer[RingKey], R], family: KeyFamily): Bool is
+        var i: Index := 0;
+        while i < bufferLength(ring) do
+            let key: &[RingKey, R] := nthRef(ring, i);
+            if sameFamily(key->family, family) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region]
+    function isDue(ring: &[Buffer[RingKey], R], family: KeyFamily, now: Int64, every: Int64): Bool is
+        case activeKey(ring, family) of
+            when Some(value as i: Index) do
+                let key: &[RingKey, R] := nthRef(ring, i);
+                return now >= (key->created + every);
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The key at i of ring with retired set to now.
+    generic [R: Region]
+    function retireAt(ring: &![Buffer[RingKey], R], i: Index, now: Int64): Unit is
+        let old: RingKey := remove(&~ring, i);
+        let { family: KeyFamily, secret: String, created: Int64, retired: Int64, kid: String, publicKey: String,
+            material: KeyMaterial } := old;
+        insert(&~ring, i, RingKey(family => family, secret => secret, created => created, retired => now, kid => kid,
+            publicKey => publicKey, material => material));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function rotate(ring: &![Buffer[RingKey], R], family: KeyFamily, now: Int64): Option[String] is
+        case newRingKey(family, now) of
+            when Some(value as fresh: RingKey) do
+                var i: Index := 0;
+                while i < lengthMut(&~ring) do
+                    let retired: Int64 := retiredOf(&~ring, i);
+                    let same: Bool := familyAt(&~ring, i, family);
+                    if (retired = 0) and same then
+                        retireAt(&~ring, i, now);
+                    end if;
+                    i := i + 1;
+                end while;
+                let kid: String := kidCopy(&fresh);
+                var at: Index := lengthMut(&~ring);
+                while (at > 0) and (createdOf(&~ring, at - 1) > now) do
+                    at := at - 1;
+                end while;
+                insert(&~ring, at, fresh);
+                return Some(value => kid);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region]
+    function kidCopy(key: &[RingKey, K]): String is
+        return fromSpan(asSpan(&(key->kid)));
+    end;
+
+    generic [K: Region]
+    function createdOfKey(key: &[RingKey, K]): Int64 is
+        return key->created;
+    end;
+
+    generic [R: Region]
+    function retiredOf(ring: &![Buffer[RingKey], R], i: Index): Int64 is
+        let view: &[Buffer[RingKey], R] := ring: &[Buffer[RingKey], R];
+        let key: &[RingKey, R] := nthRef(view, i);
+        return key->retired;
+    end;
+
+    generic [R: Region]
+    function createdOf(ring: &![Buffer[RingKey], R], i: Index): Int64 is
+        let view: &[Buffer[RingKey], R] := ring: &[Buffer[RingKey], R];
+        let key: &[RingKey, R] := nthRef(view, i);
+        return key->created;
+    end;
+
+    generic [R: Region]
+    function familyAt(ring: &![Buffer[RingKey], R], i: Index, family: KeyFamily): Bool is
+        let view: &[Buffer[RingKey], R] := ring: &[Buffer[RingKey], R];
+        let key: &[RingKey, R] := nthRef(view, i);
+        return sameFamily(key->family, family);
+    end;
+
+    generic [R: Region]
+    function prune(ring: &![Buffer[RingKey], R], now: Int64, keep: Int64): Buffer[String] is
+        var gone: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < lengthMut(&~ring) do
+            let retired: Int64 := retiredOf(&~ring, i);
+            if (retired /= 0) and (now > (retired + keep)) then
+                let old: RingKey := remove(&~ring, i);
+                let { family: KeyFamily, secret: String, created: Int64, retired as at: Int64, kid: String, publicKey: String,
+                    material: KeyMaterial } := old;
+                destroyMaterial(material);
+                destroyString(secret);
+                destroyString(publicKey);
+                insertBack(&!gone, kid);
+            else
+                i := i + 1;
+            end if;
+        end while;
+        return gone;
+    end;
+
+    generic [R: Region]
+    function keySet(ring: &[Buffer[RingKey], R]): String is
+        -- The positions of the keys, sorted by kid with an insertion sort:
+        -- a ring holds a handful of keys.
+        var order: Buffer[Index] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(ring) do
+            var at: Index := bufferLength(&order);
+            while (at > 0) and kidBefore(ring, i, positionAt(&order, at - 1)) do
+                at := at - 1;
+            end while;
+            insert(&!order, at, i);
+            i := i + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{\"keys\":[");
+        var j: Index := 0;
+        while j < bufferLength(&order) do
+            if j > 0 then
+                writeByte(&!out, 44);
+            end if;
+            let key: &[RingKey, R] := nthRef(ring, positionAt(&order, j));
+            let jwk: String := publicJwk(key);
+            writeString(&!out, asSpan(&jwk));
+            destroyString(jwk);
+            j := j + 1;
+        end while;
+        writeString(&!out, "]}");
+        destroyPositions(order);
+        return finalize(out);
+    end;
+
+    generic [O: Region]
+    function positionAt(order: &[Buffer[Index], O], i: Index): Index is
+        let p: &[Index, O] := nthRef(order, i);
+        return !p;
+    end;
+
+    function destroyPositions(order: Buffer[Index]): Unit is
+        var o: Buffer[Index] := order;
+        while bufferLength(&o) > 0 do
+            let p: Index := removeLast(&!o);
+        end while;
+        destroyEmpty(o);
+        return nil;
+    end;
+
+    -- Whether the kid of the key at a sorts before the kid of the key at b.
+    generic [R: Region]
+    function kidBefore(ring: &[Buffer[RingKey], R], a: Index, b: Index): Bool is
+        let ka: &[RingKey, R] := nthRef(ring, a);
+        let kb: &[RingKey, R] := nthRef(ring, b);
+        let x: Span[Nat8, R] := asSpan(&(ka->kid));
+        let y: Span[Nat8, R] := asSpan(&(kb->kid));
+        var i: Index := 0;
+        while (i < spanLength(x)) and (i < spanLength(y)) do
+            if x[i] /= y[i] then
+                return x[i] < y[i];
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(x) < spanLength(y);
+    end;
+
+    function destroyRing(ring: Buffer[RingKey]): Unit is
+        var r: Buffer[RingKey] := ring;
+        while bufferLength(&r) > 0 do
+            destroyRingKey(removeLast(&!r));
+        end while;
+        destroyEmpty(r);
+        return nil;
+    end;
+
+    function destroyVerified(verified: Verified): Unit is
+        let { typ: String, payload: String } := verified;
+        destroyString(typ);
+        destroyString(payload);
+        return nil;
+    end;
+
+    generic [T: Region, R: Region]
+    function verify(token: Span[Nat8, T], ring: &[Buffer[RingKey], R]): Option[Verified] is
+        if spanLength(token) > mostTokenBytes then
+            let none: Option[Verified] := None();
+            return none;
+        end if;
+        case indexOfByte(token, 46) of
+            when Some(value as first: Index) do
+                let rest: Span[Nat8, T] := substring(token, first + 1, spanLength(token));
+                case indexOfByte(rest, 46) of
+                    when Some(value as second: Index) do
+                        let headerPart: Span[Nat8, T] := substring(token, 0, first);
+                        let signing: Span[Nat8, T] := substring(token, 0, (first + 1) + second);
+                        let payloadPart: Span[Nat8, T] := substring(rest, 0, second);
+                        let signaturePart: Span[Nat8, T] := substring(rest, second + 1, spanLength(rest));
+                        case indexOfByte(signaturePart, 46) of
+                            when Some(value as third: Index) do
+                                let none: Option[Verified] := None();
+                                return none;
+                            when None do
+                                skip;
+                        end case;
+                        return checkParts(headerPart, signing, payloadPart, signaturePart, ring);
+                    when None do
+                        let none: Option[Verified] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Verified] := None();
+                return none;
+        end case;
+    end;
+
+    -- The members a header may not have: they would let the token name its
+    -- own key or change how it is read.
+    generic [D: Region]
+    function forbiddenHeader(document: &[Json, D]): Bool is
+        let crit: Bool := hasMember(document, "/crit");
+        let jwk: Bool := hasMember(document, "/jwk");
+        let jku: Bool := hasMember(document, "/jku");
+        let x5u: Bool := hasMember(document, "/x5u");
+        let x5c: Bool := hasMember(document, "/x5c");
+        let b64: Bool := hasMember(document, "/b64");
+        return crit or jwk or jku or x5u or x5c or b64;
+    end;
+
+    generic [D: Region]
+    function hasMember(document: &[Json, D], pointer: Span[Nat8, Static]): Bool is
+        case kindAt(document, pointer) of
+            when Some(value as kind: JsonKind) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [H: Region, S: Region, P: Region, G: Region, R: Region]
+    function checkParts(headerPart: Span[Nat8, H], signing: Span[Nat8, S], payloadPart: Span[Nat8, P],
+        signaturePart: Span[Nat8, G], ring: &[Buffer[RingKey], R]): Option[Verified] is
+        let rawHeader: Option[String] := base64UrlDecode(headerPart);
+        case rawHeader of
+            when Some(value as header: String) do
+                let parsed: Either[JsonError, Json] := readJson(asSpan(&header));
+                destroyString(header);
+                case parsed of
+                    when Right(right as document: Json) do
+                        let result: Option[Verified] := checkHeader(&document, signing, payloadPart, signaturePart, ring);
+                        destroyJson(document);
+                        return result;
+                    when Left(left as error: JsonError) do
+                        let none: Option[Verified] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Verified] := None();
+                return none;
+        end case;
+    end;
+
+    generic [D: Region, S: Region, P: Region, G: Region, R: Region]
+    function checkHeader(document: &[Json, D], signing: Span[Nat8, S], payloadPart: Span[Nat8, P],
+        signaturePart: Span[Nat8, G], ring: &[Buffer[RingKey], R]): Option[Verified] is
+        if forbiddenHeader(document) then
+            let none: Option[Verified] := None();
+            return none;
+        end if;
+        let alg: Option[String] := stringAt(document, "/alg");
+        let kid: Option[String] := stringAt(document, "/kid");
+        let typ: Option[String] := stringAt(document, "/typ");
+        var typText: String := fromSpan("");
+        case typ of
+            when Some(value as t: String) do
+                destroyString(typText);
+                typText := t;
+            when None do
+                skip;
+        end case;
+        case alg of
+            when Some(value as a: String) do
+                case kid of
+                    when Some(value as k: String) do
+                        let found: Option[Index] := keyOf(ring, asSpan(&a), asSpan(&k));
+                        destroyString(a);
+                        destroyString(k);
+                        case found of
+                            when Some(value as i: Index) do
+                                let key: &[RingKey, R] := nthRef(ring, i);
+                                let signature: Option[String] := base64UrlDecode(signaturePart);
+                                let payload: Option[String] := base64UrlDecode(payloadPart);
+                                case signature of
+                                    when Some(value as raw: String) do
+                                        let holds: Bool := holdsUnder(key, signing, asSpan(&raw));
+                                        destroyString(raw);
+                                        case payload of
+                                            when Some(value as content: String) do
+                                                if holds then
+                                                    return Some(value => Verified(typ => typText, payload => content));
+                                                end if;
+                                                destroyString(content);
+                                                destroyString(typText);
+                                                let none: Option[Verified] := None();
+                                                return none;
+                                            when None do
+                                                destroyString(typText);
+                                                let none: Option[Verified] := None();
+                                                return none;
+                                        end case;
+                                    when None do
+                                        case payload of
+                                            when Some(value as content: String) do
+                                                destroyString(content);
+                                            when None do
+                                                skip;
+                                        end case;
+                                        destroyString(typText);
+                                        let none: Option[Verified] := None();
+                                        return none;
+                                end case;
+                            when None do
+                                destroyString(typText);
+                                let none: Option[Verified] := None();
+                                return none;
+                        end case;
+                    when None do
+                        destroyString(a);
+                        destroyString(typText);
+                        let none: Option[Verified] := None();
+                        return none;
+                end case;
+            when None do
+                case kid of
+                    when Some(value as k: String) do
+                        destroyString(k);
+                    when None do
+                        skip;
+                end case;
+                destroyString(typText);
+                let none: Option[Verified] := None();
+                return none;
+        end case;
+    end;
+
+    -- Whether signature holds over signing under key: ML-DSA-44 through its
+    -- DER key, the composite through its raw key, both halves.
+    generic [K: Region, S: Region, G: Region]
+    function holdsUnder(key: &[RingKey, K], signing: Span[Nat8, S], signature: Span[Nat8, G]): Bool is
+        case key->family of
+            when MlDsa do
+                return verifyMessage(asSpan(&(key->publicKey)), signing, signature);
+            when Composite do
+                return compositeVerify(asSpan(&(key->publicKey)), openSshLabel(), signing, "", signature);
+        end case;
+    end;
+
+    -- The position of the key of ring with kid whose algorithm is alg.
+    generic [R: Region, A: Region, K: Region]
+    function keyOf(ring: &[Buffer[RingKey], R], alg: Span[Nat8, A], kid: Span[Nat8, K]): Option[Index] is
+        case familyOf(alg) of
+            when Some(value as family: KeyFamily) do
+                var i: Index := 0;
+                while i < bufferLength(ring) do
+                    let key: &[RingKey, R] := nthRef(ring, i);
+                    if sameFamily(key->family, family) and equal(asSpan(&(key->kid)), kid) then
+                        return Some(value => i);
+                    end if;
+                    i := i + 1;
+                end while;
+                let none: Option[Index] := None();
+                return none;
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    generic [V: Region, P: Region]
+    function loadRing(vault: &[Vault, V], prefix: Span[Nat8, P]): Either[VaultError, Buffer[RingKey]] is
+        case secretNames(vault) of
+            when Right(right as names: Buffer[String]) do
+                var ring: Buffer[RingKey] := allocateEmpty();
+                var names2: Buffer[String] := names;
+                var failed: Bool := false;
+                var failure: VaultError := Damaged();
+                while bufferLength(&names2) > 0 do
+                    let name: String := removeLast(&!names2);
+                    if (not failed) and startsWith(asSpan(&name), prefix) then
+                        case getSecret(vault, asSpan(&name)) of
+                            when Right(right as value: String) do
+                                -- A key of another algorithm, such as RS256 of
+                                -- an older provider, is left in the vault and
+                                -- out of the ring.
+                                if not isForeign(asSpan(&value)) then
+                                    case readKeyEntry(asSpan(&value)) of
+                                        when Some(value as key: RingKey) do
+                                            let made: Int64 := createdOfKey(&key);
+                                            var at: Index := bufferLength(&ring);
+                                            while (at > 0) and (createdIn(&ring, at - 1) > made) do
+                                                at := at - 1;
+                                            end while;
+                                            insert(&!ring, at, key);
+                                        when None do
+                                            failed := true;
+                                            failure := Damaged();
+                                    end case;
+                                end if;
+                                destroyString(value);
+                            when Left(left as error: VaultError) do
+                                failed := true;
+                                failure := error;
+                        end case;
+                    end if;
+                    destroyString(name);
+                end while;
+                destroyEmpty(names2);
+                if failed then
+                    destroyRing(ring);
+                    return Left(left => failure);
+                end if;
+                return Right(right => ring);
+            when Left(left as error: VaultError) do
+                return Left(left => error);
+        end case;
+    end;
+
+    -- Whether the vault value entry is a key of an algorithm this module
+    -- does not take: JSON with an alg that names no family.
+    generic [E: Region]
+    function isForeign(entry: Span[Nat8, E]): Bool is
+        case readJson(entry) of
+            when Right(right as document: Json) do
+                let alg: Option[String] := stringAt(&document, "/alg");
+                destroyJson(document);
+                case alg of
+                    when Some(value as name: String) do
+                        let family: Option[KeyFamily] := familyOf(asSpan(&name));
+                        destroyString(name);
+                        case family of
+                            when Some(value as f: KeyFamily) do
+                                return false;
+                            when None do
+                                return true;
+                        end case;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: JsonError) do
+                return false;
+        end case;
+    end;
+
+    -- Whether the secret name of vault holds a foreign key.
+    generic [V: Region, N: Region]
+    function foreignIn(vault: &![Vault, V], name: Span[Nat8, N]): Bool is
+        let view: &[Vault, V] := vault: &[Vault, V];
+        case getSecret(view, name) of
+            when Right(right as value: String) do
+                let foreign: Bool := isForeign(asSpan(&value));
+                destroyString(value);
+                return foreign;
+            when Left(left as error: VaultError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function createdIn(ring: &[Buffer[RingKey], R], i: Index): Int64 is
+        let key: &[RingKey, R] := nthRef(ring, i);
+        return key->created;
+    end;
+
+    generic [V: Region, P: Region, R: Region]
+    function saveRing(vault: &![Vault, V], prefix: Span[Nat8, P], ring: &[Buffer[RingKey], R]): Either[VaultError, Unit] is
+        var keep: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(ring) do
+            let key: &[RingKey, R] := nthRef(ring, i);
+            let name: String := entryName(prefix, asSpan(&(key->kid)));
+            let entry: String := keyEntry(key);
+            let stored: Either[VaultError, Unit] := setSecret(&~vault, asSpan(&name), asSpan(&entry));
+            destroyString(entry);
+            insertBack(&!keep, name);
+            case stored of
+                when Left(left as error: VaultError) do
+                    destroyNames(keep);
+                    return Left(left => error);
+                when Right(right as done: Unit) do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        let listed: Either[VaultError, Buffer[String]] := namesOf(&~vault);
+        case listed of
+            when Right(right as names: Buffer[String]) do
+                var all: Buffer[String] := names;
+                var problem: Option[VaultError] := None();
+                while bufferLength(&all) > 0 do
+                    let name: String := removeLast(&!all);
+                    -- A foreign key stays, so that an older provider can be
+                    -- started again on the same vault.
+                    if (startsWith(asSpan(&name), prefix) and (not listedIn(&keep, asSpan(&name))))
+                        and (not foreignIn(&~vault, asSpan(&name))) then
+                        case deleteSecret(&~vault, asSpan(&name)) of
+                            when Left(left as error: VaultError) do
+                                problem := Some(value => error);
+                            when Right(right as gone: Bool) do
+                                skip;
+                        end case;
+                    end if;
+                    destroyString(name);
+                end while;
+                destroyEmpty(all);
+                destroyNames(keep);
+                case problem of
+                    when Some(value as error: VaultError) do
+                        return Left(left => error);
+                    when None do
+                        return Right(right => nil);
+                end case;
+            when Left(left as error: VaultError) do
+                destroyNames(keep);
+                return Left(left => error);
+        end case;
+    end;
+
+    generic [V: Region]
+    function namesOf(vault: &![Vault, V]): Either[VaultError, Buffer[String]] is
+        let view: &[Vault, V] := vault: &[Vault, V];
+        return secretNames(view);
+    end;
+
+    generic [B: Region, N: Region]
+    function listedIn(names: &[Buffer[String], B], name: Span[Nat8, N]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(names) do
+            if equal(asSpan(nthRef(names, i)), name) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    function destroyNames(names: Buffer[String]): Unit is
+        var n: Buffer[String] := names;
+        while bufferLength(&n) > 0 do
+            destroyString(removeLast(&!n));
+        end while;
+        destroyEmpty(n);
+        return nil;
+    end;
+end module body.

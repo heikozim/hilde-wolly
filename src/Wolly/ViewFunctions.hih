@@ -1,0 +1,329 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The functions Go html/template pages commonly call, for Wolly.View:
+fifteen general helpers, eight chart helpers, the
+builtins of Go's templates that converted pages
+use (
+eq, ne, lt, le, gt, ge, index, slice, len), and two that the
+application sets up: t over a Standard.I18n catalog and asset over
+Wolly.Asset.
+
+Each is a function of Wolly.View: it takes its arguments as a list and
+gives its result as the root of a ViewData, or a Left with what was
+wrong, which the render reports with the template's line.  Each gives
+what its Go counterpart gives, byte for byte, with these exceptions:
+upper and lower use the full case mappings of Standard.Unicode (Go maps
+the German sharp s to itself, this to SS) and refuse text that is not
+UTF-8 (Go replaces the bad bytes); safeHTML cleans with Standard.Html
+under lucyPolicy, the elements and attributes of the Go allowlist that
+Standard.Html offers; add, subtract, multiply and mulPrice refuse a
+result outside Int64 where Go's int wraps; barHeight gives the text Go
+prints for the number, not the number.
+
+A number Go formats with %.1f, %.2f or as a float64 prints (%v) is
+formatted from its exact binary value, as Go's strconv does:
+formatFixed and formatShortest.
+
+addStandardFunctions gives an engine every function but t and asset;
+those need the application's catalog and directory.  An application
+writes, for example:
+
+    function translation(call: ViewData): Either[String, ViewData] is
+        return translateWith(messages(), keyOfText, call);
+    end;
+
+    function versioned(call: ViewData): Either[String, ViewData] is
+        return assetWith("/srv/www/static", call);
+    end;
+
+and adds them as t and asset.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Html (
+    Policy
+);
+import Standard.I18n (
+    Catalog
+);
+import Wolly.ViewData (
+    ViewData
+);
+import Wolly.View (
+    ViewEngine
+);
+
+module Wolly.ViewFunctions is
+    """
+    Every function of the module but t and asset, under its Go name.
+    No contract: the engine tells no count of its functions.
+    """
+    generic [R: Region]
+    function addStandardFunctions(engine: &![ViewEngine, R]): Unit;
+
+    """
+    The elements and attributes of the Go view's sanitize allowlist that
+    Standard.Html can keep, without rel added to links.  It aborts should
+    Standard.Html refuse the list, which is fixed: a mistake of the
+    programme, not of a template.
+    No contract: a Policy has nothing to ask.
+    """
+    function lucyPolicy(): Policy;
+
+    """
+    value as Go prints a float64 with %v: the shortest digits that read
+    back as the same value, in the form %g chooses; never empty.  The
+    digits themselves are the algorithm, not a contract.
+    """
+    function formatShortest(value: Float64): String
+        ensures length(&result) > 0;
+
+    """
+    value as Go formats it with %.Nf, N being decimals: rounded from its
+    exact binary value, a tie to the even digit.  The digits are the
+    algorithm, not a contract.
+    """
+    function formatFixed(value: Float64, decimals: Index): String
+        requires decimals <= 20;
+
+    """
+    The general helper functions, each under its Go name.
+
+    No contract: it is taken as a function of the engine, and its result
+    is a document whose kind depends on the arguments.
+    """
+    function hasPrefix(call: ViewData): Either[String, ViewData];
+
+    """
+    upper, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function upper(call: ViewData): Either[String, ViewData];
+
+    """
+    lower, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function lower(call: ViewData): Either[String, ViewData];
+
+    """
+    joinStrings, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function joinStrings(call: ViewData): Either[String, ViewData];
+
+    """
+    add, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function add(call: ViewData): Either[String, ViewData];
+
+    """
+    subtract, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function subtract(call: ViewData): Either[String, ViewData];
+
+    """
+    multiply, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function multiply(call: ViewData): Either[String, ViewData];
+
+    """
+    setting, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function setting(call: ViewData): Either[String, ViewData];
+
+    """
+    safeHTML, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function safeHTML(call: ViewData): Either[String, ViewData];
+
+    """
+    formatSize, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function formatSize(call: ViewData): Either[String, ViewData];
+
+    """
+    mulPrice, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function mulPrice(call: ViewData): Either[String, ViewData];
+
+    """
+    centToEur, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function centToEur(call: ViewData): Either[String, ViewData];
+
+    """
+    formatDate, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function formatDate(call: ViewData): Either[String, ViewData];
+
+    """
+    formatPrice, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function formatPrice(call: ViewData): Either[String, ViewData];
+
+    """
+    selectOptions, the Go template function of that name, as hasPrefix.
+
+    No contract: as for hasPrefix.
+    """
+    function selectOptions(call: ViewData): Either[String, ViewData];
+
+    """
+    The chart helper functions, each under its Go name.
+
+    No contract: it is taken as a function of the engine, and its result
+    is a document whose kind depends on the arguments.
+    """
+    function readableNumber(call: ViewData): Either[String, ViewData];
+
+    """
+    barHeight of the Go chart FuncMap, as readableNumber.
+    No contract: as for readableNumber.
+    """
+    function barHeight(call: ViewData): Either[String, ViewData];
+
+    """
+    formatDay of the Go chart FuncMap, as readableNumber.
+    No contract: as for readableNumber.
+    """
+    function formatDay(call: ViewData): Either[String, ViewData];
+
+    """
+    formatFullDate of the Go chart FuncMap, as readableNumber.
+    No contract: as for readableNumber.
+    """
+    function formatFullDate(call: ViewData): Either[String, ViewData];
+
+    """
+    isWeekend of the Go chart FuncMap, as readableNumber.
+    No contract: as for readableNumber.
+    """
+    function isWeekend(call: ViewData): Either[String, ViewData];
+
+    """
+    prevDate of the Go chart FuncMap, as readableNumber.
+    No contract: as for readableNumber.
+    """
+    function prevDate(call: ViewData): Either[String, ViewData];
+
+    """
+    nextDate of the Go chart FuncMap, as readableNumber.
+    No contract: as for readableNumber.
+    """
+    function nextDate(call: ViewData): Either[String, ViewData];
+
+    """
+    formatHour of the Go chart FuncMap, as readableNumber.
+    No contract: as for readableNumber.
+    """
+    function formatHour(call: ViewData): Either[String, ViewData];
+
+    """
+    The builtins of Go's templates.  index gives for a key a map does not
+    hold the zero value of the kind its first value has, as Go gives the
+    zero value of a typed map's values; a missing value for an empty map.
+    No contract: it is taken as a function of the engine, and its result
+    is a document whose kind depends on the arguments.
+    """
+    function eq(call: ViewData): Either[String, ViewData];
+
+    """
+    ne of Go's templates, as eq.
+    No contract: as for eq.
+    """
+    function ne(call: ViewData): Either[String, ViewData];
+
+    """
+    lt of Go's templates, as eq.
+    No contract: as for eq.
+    """
+    function lt(call: ViewData): Either[String, ViewData];
+
+    """
+    le of Go's templates, as eq.
+    No contract: as for eq.
+    """
+    function le(call: ViewData): Either[String, ViewData];
+
+    """
+    gt of Go's templates, as eq.
+    No contract: as for eq.
+    """
+    function gt(call: ViewData): Either[String, ViewData];
+
+    """
+    ge of Go's templates, as eq.
+    No contract: as for eq.
+    """
+    function ge(call: ViewData): Either[String, ViewData];
+
+    """
+    index of Go's templates, as eq.
+    No contract: as for eq.
+    """
+    function index(call: ViewData): Either[String, ViewData];
+
+    """
+    slice of Go's templates, as eq.
+    No contract: as for eq.
+    """
+    function slice(call: ViewData): Either[String, ViewData];
+
+    """
+    len of Go's templates, as eq.
+    No contract: as for eq.
+    """
+    function len(call: ViewData): Either[String, ViewData];
+
+    """
+    The Go view's t: the text of the key, the second argument, in the language of
+    the first, with the further arguments put in as {1}, {2} and so on
+    (at most nine).  A key keyOf does not know gives the key itself, as
+    the Go view's catalog does.  For an application's function t.
+    No contract: as for hasPrefix.
+    """
+    generic [K: Free]
+    function translateWith(catalog: Catalog[K], keyOf: Fn[String, Option[K]], call: ViewData): Either[String, ViewData];
+
+    """
+    The Go view's Asset: the path with the query of Wolly.Asset.assetVersion when
+    the file under root has one, else the path as it is.  For an
+    application's function asset.  It reads and hashes the file at every
+    call: an application that renders often keeps the versions itself and
+    gives its own asset.
+    No contract: it reads a file.
+    """
+    generic [T: Region]
+    function assetWith(root: Span[Nat8, T], call: ViewData): Either[String, ViewData];
+end module.

@@ -1,0 +1,481 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromLiteral,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    contains,
+    countOf,
+    substring,
+    equal
+);
+import Standard.Task (
+    sleepFor
+);
+import Standard.File (
+    FileDescriptor,
+    createNewFile,
+    writeAll,
+    syncFile,
+    closeFile,
+    createDirectory,
+    removeFileIfThere
+);
+import Standard.HttpClient (
+    Limits,
+    defaultLimits
+);
+import Standard.X509 (
+    PrivateKey,
+    Certificate,
+    privateKeyFromPem,
+    destroyPrivateKey,
+    certificateFromPem,
+    destroyCertificate,
+    validUntil,
+    isDnsNameList,
+    certificateRequest
+);
+import Standard.Acme (
+    AcmeError,
+    destroyAcmeError,
+    Account,
+    openAccount,
+    closeAccount,
+    keyAuthorization,
+    Order,
+    destroyOrder,
+    newOrder,
+    fetchOrder,
+    Challenge,
+    destroyChallenge,
+    challengeOf,
+    respond,
+    authorizationStatus,
+    finalizeOrder,
+    downloadCertificate
+);
+
+module body Wolly.Acme is
+    constant namesMost: Index := 20;
+    constant tokenMost: Index := 128;
+    constant thirtyDays: Int64 := 2592000;
+    constant polls: Nat32 := 60;
+    constant pollMillis: Nat32 := 1000;
+
+    function mostNames(): Index is
+        return namesMost;
+    end;
+
+    function renewalSeconds(): Int64 is
+        return thirtyDays;
+    end;
+
+    generic [C: Region]
+    function needsRenewal(certPem: Span[Nat8, C], at: Int64, before: Int64): Bool is
+        case certificateFromPem(certPem) of
+            when Some(value as cert: Certificate) do
+                let ends: Option[Int64] := validUntil(&cert);
+                destroyCertificate(cert);
+                case ends of
+                    when Some(value as finish: Int64) do
+                        return (finish - at) < before;
+                    when None do
+                        return true;
+                end case;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- Fields of an order, through a reference: the order is linear.
+    generic [O: Region]
+    function statusIs(order: &[Order, O], wanted: Span[Nat8, Static]): Bool is
+        return equal(asSpan(&(order->status)), wanted);
+    end;
+
+    generic [O: Region]
+    function urlOf(order: &[Order, O]): String is
+        return fromSpan(asSpan(&(order->url)));
+    end;
+
+    generic [O: Region]
+    function authorizationsOf(order: &[Order, O]): String is
+        return fromSpan(asSpan(&(order->authorizations)));
+    end;
+
+    generic [O: Region]
+    function certificateUrlOf(order: &[Order, O]): String is
+        return fromSpan(asSpan(&(order->certificateUrl)));
+    end;
+
+    function isTokenByte(byte: Nat8): Bool is
+        let letter: Bool := ((byte >= 65) and (byte <= 90)) or ((byte >= 97) and (byte <= 122));
+        let digit: Bool := (byte >= 48) and (byte <= 57);
+        return (letter or digit) or ((byte = 45) or (byte = 95));
+    end;
+
+    generic [T: Region]
+    function isToken(token: Span[Nat8, T]): Bool is
+        let size: Index := spanLength(token);
+        if (size = 0) or (size > tokenMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if not isTokenByte(token[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [N: Region]
+    function usableNames(names: Span[Nat8, N]): Bool is
+        if not isDnsNameList(names) then
+            return false;
+        end if;
+        if spanLength(names) = 0 then
+            return false;
+        end if;
+        if contains(names, "*") then
+            return false;
+        end if;
+        return (countOf(names, ",") + 1) <= namesMost;
+    end;
+
+    generic [W: Region, T: Region]
+    function challengePath(webroot: Span[Nat8, W], token: Span[Nat8, T]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, webroot);
+        writeString(&!builder, "/.well-known/acme-challenge/");
+        writeString(&!builder, token);
+        return finalize(builder);
+    end;
+
+    -- The words of a failed step: the step, the kind and the detail of the
+    -- server.
+    function reason(step: Span[Nat8, Static], error: AcmeError): String is
+        let { kind: String, detail: String } := error;
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, step);
+        writeString(&!builder, ": ");
+        writeString(&!builder, asSpan(&kind));
+        writeString(&!builder, " ");
+        writeString(&!builder, asSpan(&detail));
+        destroyString(kind);
+        destroyString(detail);
+        return finalize(builder);
+    end;
+
+    function failedWith(step: Span[Nat8, Static], error: AcmeError): Either[String, Unit] is
+        let result: Either[String, Unit] := Left(left => reason(step, error));
+        return result;
+    end;
+
+    function failedStep(words: Span[Nat8, Static]): Either[String, Unit] is
+        let result: Either[String, Unit] := Left(left => fromLiteral(words));
+        return result;
+    end;
+
+    function succeeded(): Either[String, Unit] is
+        let result: Either[String, Unit] := Right(right => nil);
+        return result;
+    end;
+
+    function limitsFor(privateCa: Bool): Limits is
+        let base: Limits := defaultLimits();
+        return Limits(connectMillis => base.connectMillis, totalMillis => base.totalMillis, maximumBytes => base.maximumBytes, publicOnly => not privateCa);
+    end;
+
+    -- Writes the answer of a challenge into the file at path, which is made
+    -- new.  The directories under the webroot are made when they are not
+    -- there.
+    generic [W: Region, P: Region, B: Region]
+    function putAnswer(webroot: Span[Nat8, W], path: Span[Nat8, P], answer: Span[Nat8, B]): Bool is
+        var wellKnown: StringBuilder := makeStringBuilder();
+        writeString(&!wellKnown, webroot);
+        writeString(&!wellKnown, "/.well-known");
+        let dir1: String := finalize(wellKnown);
+        let made1: Bool := createDirectory(asSpan(&dir1));
+        var challenges: StringBuilder := makeStringBuilder();
+        writeString(&!challenges, asSpan(&dir1));
+        writeString(&!challenges, "/acme-challenge");
+        destroyString(dir1);
+        let dir2: String := finalize(challenges);
+        let made2: Bool := createDirectory(asSpan(&dir2));
+        destroyString(dir2);
+        let removed: Bool := removeFileIfThere(path);
+        case createNewFile(path, #o644) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, answer);
+                let synced: Bool := syncFile(&!file);
+                let closed: Bool := closeFile(file);
+                return (written and synced) and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Waits for the authorization at url to become valid.
+    generic [R: Region, U: Region]
+    function awaitAuthorization(account: &![Account, R], url: Span[Nat8, U]): Either[String, Unit] is
+        var tries: Nat32 := 0;
+        while tries < polls do
+            case authorizationStatus(&~account, url) of
+                when Left(left as error: AcmeError) do
+                    return failedWith("authorization", error);
+                when Right(right as status: String) do
+                    let valid: Bool := equal(asSpan(&status), "valid");
+                    let invalid: Bool := equal(asSpan(&status), "invalid");
+                    destroyString(status);
+                    if valid then
+                        return succeeded();
+                    end if;
+                    if invalid then
+                        return failedStep("authorization: the server found the challenge invalid");
+                    end if;
+            end case;
+            sleepFor(pollMillis);
+            tries := tries + 1;
+        end while;
+        return failedStep("authorization: no verdict in time");
+    end;
+
+    -- Tells the server to look when the answer is in place, and waits.
+    generic [R: Region, U: Region, C: Region]
+    function respondWhenPut(account: &![Account, R], put: Bool, authorizationUrl: Span[Nat8, U],
+                            challenge: &[Challenge, C]): Either[String, Unit] is
+        if not put then
+            return failedStep("challenge: the answer could not be written under the webroot");
+        end if;
+        case respond(&~account, asSpan(&(challenge->url))) of
+            when Left(left as error: AcmeError) do
+                return failedWith("respond", error);
+            when Right(right as ignored: Unit) do
+                return awaitAuthorization(&~account, authorizationUrl);
+        end case;
+    end;
+
+    generic [R: Region, W: Region, U: Region, C: Region]
+    function answerAndAwait(account: &![Account, R], webroot: Span[Nat8, W], authorizationUrl: Span[Nat8, U],
+                            challenge: &[Challenge, C]): Either[String, Unit] is
+        if not isToken(asSpan(&(challenge->token))) then
+            return failedStep("challenge: the token is no token");
+        end if;
+        let answer: String := keyAuthorization(&~account, asSpan(&(challenge->token)));
+        let path: String := challengePath(webroot, asSpan(&(challenge->token)));
+        let put: Bool := putAnswer(webroot, asSpan(&path), asSpan(&answer));
+        destroyString(answer);
+        let outcome: Either[String, Unit] := respondWhenPut(&~account, put, authorizationUrl, challenge);
+        let removed: Bool := removeFileIfThere(asSpan(&path));
+        destroyString(path);
+        return outcome;
+    end;
+
+    generic [R: Region, W: Region, U: Region]
+    function proveOne(account: &![Account, R], webroot: Span[Nat8, W], authorizationUrl: Span[Nat8, U]): Either[String, Unit] is
+        -- A server may reuse an authorization it has found valid (RFC 8555,
+        -- 7.4.1): its challenge cannot be answered again.
+        case authorizationStatus(&~account, authorizationUrl) of
+            when Left(left as error: AcmeError) do
+                return failedWith("authorization", error);
+            when Right(right as status: String) do
+                let reused: Bool := equal(asSpan(&status), "valid");
+                destroyString(status);
+                if reused then
+                    return succeeded();
+                end if;
+        end case;
+        case challengeOf(&~account, authorizationUrl, "http-01") of
+            when Left(left as error: AcmeError) do
+                return failedWith("challenge", error);
+            when Right(right as challenge: Challenge) do
+                let outcome: Either[String, Unit] := answerAndAwait(&~account, webroot, authorizationUrl, &challenge);
+                destroyChallenge(challenge);
+                return outcome;
+        end case;
+    end;
+
+    -- Proves every authorization of the list, URLs separated by spaces.
+    generic [R: Region, W: Region, L: Region]
+    function proveAll(account: &![Account, R], webroot: Span[Nat8, W], urls: Span[Nat8, L]): Either[String, Unit] is
+        let size: Index := spanLength(urls);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (urls[i] = 32) then
+                if i > start then
+                    let result: Either[String, Unit] := proveOne(&~account, webroot, substring(urls, start, i));
+                    case result of
+                        when Left(left as words: String) do
+                            let failed: Either[String, Unit] := Left(left => words);
+                            return failed;
+                        when Right(right as ignored: Unit) do
+                            skip;
+                    end case;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return succeeded();
+    end;
+
+    -- The order at url when it has the status wanted.
+    generic [R: Region, U: Region]
+    function awaitOrder(account: &![Account, R], url: Span[Nat8, U], wanted: Span[Nat8, Static]): Either[String, Order] is
+        var tries: Nat32 := 0;
+        while tries < polls do
+            case fetchOrder(&~account, url) of
+                when Left(left as error: AcmeError) do
+                    let failed: Either[String, Order] := Left(left => reason("order", error));
+                    return failed;
+                when Right(right as order: Order) do
+                    let hit: Bool := statusIs(&order, wanted);
+                    let invalid: Bool := statusIs(&order, "invalid");
+                    if hit then
+                        let found: Either[String, Order] := Right(right => order);
+                        return found;
+                    else
+                        destroyOrder(order);
+                        if invalid then
+                            let failed: Either[String, Order] := Left(left => fromLiteral("order: the server found the order invalid"));
+                            return failed;
+                        end if;
+                    end if;
+            end case;
+            sleepFor(pollMillis);
+            tries := tries + 1;
+        end while;
+        let late: Either[String, Order] := Left(left => fromLiteral("order: not in the status wanted in time"));
+        return late;
+    end;
+
+    generic [R: Region, O: Region, Q: Region]
+    function finishOrder(account: &![Account, R], order: &[Order, O], csr: Span[Nat8, Q]): Either[String, String] is
+        case finalizeOrder(&~account, order, csr) of
+            when Left(left as error: AcmeError) do
+                let failed: Either[String, String] := Left(left => reason("finalize", error));
+                return failed;
+            when Right(right as done: Order) do
+                let doneUrl: String := urlOf(&done);
+                destroyOrder(done);
+                case awaitOrder(&~account, asSpan(&doneUrl), "valid") of
+                    when Left(left as words: String) do
+                        destroyString(doneUrl);
+                        let failed: Either[String, String] := Left(left => words);
+                        return failed;
+                    when Right(right as valid: Order) do
+                        destroyString(doneUrl);
+                        let certificateUrl: String := certificateUrlOf(&valid);
+                        destroyOrder(valid);
+                        case downloadCertificate(&~account, asSpan(&certificateUrl)) of
+                            when Left(left as error: AcmeError) do
+                                destroyString(certificateUrl);
+                                let failed: Either[String, String] := Left(left => reason("download", error));
+                                return failed;
+                            when Right(right as chain: String) do
+                                destroyString(certificateUrl);
+                                let got: Either[String, String] := Right(right => chain);
+                                return got;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The order proved, finalized with a request for the key, downloaded.
+    generic [R: Region, N: Region, W: Region, K: Region]
+    function runOrder(account: &![Account, R], names: Span[Nat8, N], webroot: Span[Nat8, W], domainKeyPem: Span[Nat8, K]): Either[String, String] is
+        case newOrder(&~account, names) of
+            when Left(left as error: AcmeError) do
+                let failed: Either[String, String] := Left(left => reason("new order", error));
+                return failed;
+            when Right(right as order: Order) do
+                let authorizations: String := authorizationsOf(&order);
+                let proved: Either[String, Unit] := proveAll(&~account, webroot, asSpan(&authorizations));
+                destroyString(authorizations);
+                case proved of
+                    when Left(left as words: String) do
+                        destroyOrder(order);
+                        let failed: Either[String, String] := Left(left => words);
+                        return failed;
+                    when Right(right as ignored: Unit) do
+                        let orderUrl: String := urlOf(&order);
+                        let readiness: Either[String, Order] := awaitOrder(&~account, asSpan(&orderUrl), "ready");
+                        destroyString(orderUrl);
+                        case readiness of
+                            when Left(left as words: String) do
+                                destroyOrder(order);
+                                let failed: Either[String, String] := Left(left => words);
+                                return failed;
+                            when Right(right as ready: Order) do
+                                destroyOrder(ready);
+                                case privateKeyFromPem(domainKeyPem) of
+                                    when None do
+                                        destroyOrder(order);
+                                        let failed: Either[String, String] := Left(left => fromLiteral("domain key: no key in the PEM"));
+                                        return failed;
+                                    when Some(value as key: PrivateKey) do
+                                        let request: Option[String] := certificateRequest(&key, "", names);
+                                        destroyPrivateKey(key);
+                                        case request of
+                                            when None do
+                                                destroyOrder(order);
+                                                let failed: Either[String, String] := Left(left => fromLiteral("request: libcrypto made none"));
+                                                return failed;
+                                            when Some(value as csr: String) do
+                                                let outcome: Either[String, String] := finishOrder(&~account, &order, asSpan(&csr));
+                                                destroyString(csr);
+                                                destroyOrder(order);
+                                                return outcome;
+                                        end case;
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, F: Region, A: Region, C: Region, N: Region, W: Region, K: Region]
+    function obtainHttp01(directoryUrl: Span[Nat8, D], caFile: Span[Nat8, F], accountKeyPem: Span[Nat8, A],
+                          contact: Span[Nat8, C], names: Span[Nat8, N], webroot: Span[Nat8, W],
+                          domainKeyPem: Span[Nat8, K], privateCa: Bool): Either[String, String] is
+        if ((not usableNames(names)) or (spanLength(webroot) = 0)) or (spanLength(directoryUrl) = 0) then
+            let refused: Either[String, String] := Left(left => fromLiteral("arguments: names, webroot or directory unusable"));
+            return refused;
+        end if;
+        case privateKeyFromPem(accountKeyPem) of
+            when None do
+                let failed: Either[String, String] := Left(left => fromLiteral("account key: no key in the PEM"));
+                return failed;
+            when Some(value as key: PrivateKey) do
+                case openAccount(directoryUrl, key, contact, caFile, limitsFor(privateCa)) of
+                    when Left(left as error: AcmeError) do
+                        let failed: Either[String, String] := Left(left => reason("account", error));
+                        return failed;
+                    when Right(right as opened: Account) do
+                        var account: Account := opened;
+                        let outcome: Either[String, String] := runOrder(&!account, names, webroot, domainKeyPem);
+                        let back: PrivateKey := closeAccount(account);
+                        destroyPrivateKey(back);
+                        return outcome;
+                end case;
+        end case;
+    end;
+end module body.

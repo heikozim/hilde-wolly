@@ -1,0 +1,99 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Measured values of an application -- requests, logins, errors, the size of
+a queue -- kept in its SQLite database and read back as a series of
+buckets for a chart (Wolly.Svg).
+
+A sample is a name, a time in seconds since 1970 and a value of 0 or more.
+A series is the samples of one name from a start, cut into buckets of
+step seconds each, at most mostBuckets of them; a bucket is the sum or the
+largest of its samples, 0 when it has none.  Old samples are pruned by the
+caller (pruneMetrics), as the audit log is.
+
+SQLite and not a column store: the number of samples of one application
+is small for SQLite (an index over name and time answers a series).
+"""
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Metrics is
+    """
+    How a bucket is made of its samples.
+    """
+    union Fold: Free is
+        """
+        The sum: counts, such as requests.
+        """
+        case Total;
+        """
+        The largest: levels, such as the length of a queue.
+        """
+        case Highest;
+    end;
+
+    """
+    The most buckets of a series: 1000.
+    """
+    function mostBuckets(): Index
+        ensures result = 1000;
+
+    """
+    Whether name may name a metric: 1 to 64 bytes of a to z, 0 to 9, dot,
+    hyphen and underscore.
+    No contract: a walk over name; false is the answer for a bad one.
+    """
+    generic [N: Region]
+    function isMetricName(name: Span[Nat8, N]): Bool;
+
+    """
+    Makes the table of samples and its index, if they are not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareMetrics(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Keeps the sample.  Right false, and nothing kept, when name is no metric
+    name, value is below 0 or at below 0.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function recordMetric(db: &![Database[Writing], R], name: Span[Nat8, N], at: Int64, value: Int64): Either[DbError, Bool];
+
+    """
+    The series of name: buckets buckets of step seconds from since, the
+    first from since to since + step.  Samples outside are left out.  An
+    empty buffer for a name that is no metric name, a step below 1 or above
+    366 days, a since below 0 or no buckets; buckets above mostBuckets are cut to it.
+    No contract: the answer is the work of the database.
+    """
+    generic [Q: Free, R: Region, N: Region]
+    function series(db: &![Database[Q], R], name: Span[Nat8, N], since: Int64, step: Int64, buckets: Index,
+                    fold: Fold): Either[DbError, Buffer[Int64]];
+
+    """
+    The value of the latest sample of name, or None.
+    No contract: the answer is the work of the database.
+    """
+    generic [Q: Free, R: Region, N: Region]
+    function latestMetric(db: &![Database[Q], R], name: Span[Nat8, N]): Either[DbError, Option[Int64]];
+
+    """
+    Removes the samples from before the time before; Right the number
+    removed.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function pruneMetrics(db: &![Database[Writing], R], before: Int64): Either[DbError, Nat64];
+end module.

@@ -1,0 +1,259 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan
+);
+import Standard.Text (
+    trim,
+    substring,
+    indexOfByte,
+    parseNat
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    isIpv6,
+    isPrivateOrReserved,
+    ipToString,
+    inSubnet
+);
+
+module body Wolly.Net is
+    constant hostnameMost: Index := 253;
+    constant labelMost: Index := 63;
+    constant width4: Index := 32;
+    constant width6: Index := 128;
+
+    -- A dotted quad with a group that has a leading zero is no address
+    -- here: some parsers read 010 as octal, so two programmes would not
+    -- agree on whom it names.  Standard.Ip takes it as decimal.
+    generic [T: Region]
+    function parseStrict(text: Span[Nat8, T]): Option[IpAddress] is
+        case indexOfByte(text, ':') of
+            when Some(value as colon: Index) do
+                return parseIp(text);
+            when None do
+                var i: Index := 0;
+                while i < spanLength(text) do
+                    let groupStart: Bool := (i = 0) or (text[i - 1] = 46);
+                    let hasNext: Bool := (i + 1) < spanLength(text);
+                    if (text[i] = 48) and groupStart then
+                        if hasNext then
+                            if text[i + 1] /= 46 then
+                                return None();
+                            end if;
+                        end if;
+                    end if;
+                    i := i + 1;
+                end while;
+                return parseIp(text);
+        end case;
+    end;
+
+    function mostHostnameBytes(): Index is
+        return hostnameMost;
+    end;
+
+    function isLabelByte(byte: Nat8): Bool is
+        let letter: Bool := ((byte >= 65) and (byte <= 90)) or ((byte >= 97) and (byte <= 122));
+        let digit: Bool := (byte >= 48) and (byte <= 57);
+        return (letter or digit) or (byte = 45);
+    end;
+
+    generic [T: Region]
+    function validHostname(text: Span[Nat8, T]): Bool is
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > hostnameMost) then
+            return false;
+        end if;
+        var labelStart: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (text[i] = 46) then
+                let length: Index := i - labelStart;
+                if (length = 0) or (length > labelMost) then
+                    return false;
+                end if;
+                if (text[labelStart] = 45) or (text[i - 1] = 45) then
+                    return false;
+                end if;
+                labelStart := i + 1;
+            else
+                if not isLabelByte(text[i]) then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Region]
+    function isPublicAddress(text: Span[Nat8, T]): Bool is
+        case parseStrict(text) of
+            when Some(value as address: IpAddress) do
+                return not isPrivateOrReserved(address);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The bits of an entry "address/bits" or of a bare address: its own
+    -- width.  None when the bits are no number or exceed the width.
+    generic [E: Region]
+    function bitsOf(entry: Span[Nat8, E], address: IpAddress): Option[Index] is
+        var width: Index := width4;
+        if isIpv6(address) then
+            width := width6;
+        end if;
+        case indexOfByte(entry, '/') of
+            when None do
+                return Some(value => width);
+            when Some(value as slash: Index) do
+                case parseNat(substring(entry, slash + 1, spanLength(entry))) of
+                    when None do
+                        return None();
+                    when Some(value as bits: Nat64) do
+                        case toIndex(bits) of
+                            when None do
+                                return None();
+                            when Some(value as narrowed: Index) do
+                                if narrowed > width then
+                                    return None();
+                                end if;
+                                return Some(value => narrowed);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The address part of an entry: before the slash, or all of it.
+    generic [E: Region]
+    function addressPart(entry: Span[Nat8, E]): Span[Nat8, E] is
+        case indexOfByte(entry, '/') of
+            when Some(value as slash: Index) do
+                return substring(entry, 0, slash);
+            when None do
+                return entry;
+        end case;
+    end;
+
+    -- Whether one entry of the list is well formed and not a default route.
+    generic [E: Region]
+    function validEntry(entry: Span[Nat8, E]): Bool is
+        case parseStrict(addressPart(entry)) of
+            when None do
+                return false;
+            when Some(value as address: IpAddress) do
+                case bitsOf(entry, address) of
+                    when None do
+                        return false;
+                    when Some(value as bits: Index) do
+                        return bits > 0;
+                end case;
+        end case;
+    end;
+
+    generic [T: Region]
+    function validTrustedProxies(trusted: Span[Nat8, T]): Bool is
+        let size: Index := spanLength(trusted);
+        if spanLength(trim(trusted)) = 0 then
+            return size = 0;
+        end if;
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (trusted[i] = 44) then
+                if not validEntry(trim(substring(trusted, start, i))) then
+                    return false;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether address is in one of the entries of a valid list.
+    generic [T: Region]
+    function isTrusted(address: IpAddress, trusted: Span[Nat8, T]): Bool is
+        let size: Index := spanLength(trusted);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (trusted[i] = 44) then
+                let entry: Span[Nat8, T] := trim(substring(trusted, start, i));
+                case parseStrict(addressPart(entry)) of
+                    when Some(value as net: IpAddress) do
+                        case bitsOf(entry, net) of
+                            when Some(value as bits: Index) do
+                                if inSubnet(address, net, bits) then
+                                    return true;
+                                end if;
+                            when None do
+                                skip;
+                        end case;
+                    when None do
+                        skip;
+                end case;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The peer as the answer: canonical when it is an address.
+    generic [P: Region]
+    function peerText(peer: Span[Nat8, P]): String is
+        case parseStrict(peer) of
+            when Some(value as address: IpAddress) do
+                return ipToString(address);
+            when None do
+                return fromSpan(peer);
+        end case;
+    end;
+
+    generic [P: Region, F: Region, T: Region]
+    function clientAddress(peer: Span[Nat8, P], forwarded: Span[Nat8, F], trusted: Span[Nat8, T]): String is
+        if (spanLength(trim(trusted)) = 0) or (not validTrustedProxies(trusted)) then
+            return peerText(peer);
+        end if;
+        case parseStrict(peer) of
+            when None do
+                return peerText(peer);
+            when Some(value as peerAddress: IpAddress) do
+                if not isTrusted(peerAddress, trusted) then
+                    return peerText(peer);
+                end if;
+                -- The forwarded addresses from the right.
+                var stop: Index := spanLength(forwarded);
+                var more: Bool := stop > 0;
+                while more do
+                    var start: Index := stop;
+                    while (start > 0) and (forwarded[start - 1] /= 44) do
+                        start := start - 1;
+                    end while;
+                    case parseStrict(trim(substring(forwarded, start, stop))) of
+                        when None do
+                            return peerText(peer);
+                        when Some(value as hop: IpAddress) do
+                            if not isTrusted(hop, trusted) then
+                                return ipToString(hop);
+                            end if;
+                    end case;
+                    if start = 0 then
+                        more := false;
+                    else
+                        stop := start - 1;
+                    end if;
+                end while;
+                return peerText(peer);
+        end case;
+    end;
+end module body.

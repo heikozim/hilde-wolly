@@ -1,0 +1,125 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The rules for a password after NIST SP 800-63B-4: a length and a list,
+nothing else.
+
+A password is taken as text: it must be UTF-8, and it is brought to NFKC
+before anything else, before it is counted, compared and hashed, so that
+the same password typed on two keyboards is the same password.  Spaces
+and every character of Unicode are allowed; there is no rule of
+character classes and no forced change.
+
+The length is counted in characters (code points of the NFKC form): at
+least 15 when the password is the only factor, at least 8 when the user
+has a second factor; at most mostCharacters, and at most mostBytes bytes,
+so that a request cannot make the server hash a megabyte.
+
+A password is refused when it is on a list of passwords known from
+breaches or as common, one a line in a file the application names,
+compared without regard to ASCII case; and when it holds the user name.
+A list that cannot be read refuses every password: an unchecked password
+is not taken as a checked one.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Passphrase is
+    """
+    What the rules say of a password.
+    """
+    union PassphraseCheck: Free is
+        """
+        The password may be used.
+        """
+        case PassphraseFits;
+        """
+        Fewer characters than fewestCharacters asks.
+        """
+        case TooShort;
+        """
+        More than mostCharacters characters or mostBytes bytes.
+        """
+        case TooLong;
+        """
+        Not UTF-8.
+        """
+        case NotText;
+        """
+        On the list of known passwords.
+        """
+        case Listed;
+        """
+        The user name is in it.
+        """
+        case HoldsName;
+        """
+        The list could not be read; nothing was checked.
+        """
+        case ListUnreadable;
+    end;
+
+    """
+    The fewest characters of a password: 15 when it is the only factor, 8
+    when the user has a second one.
+    """
+    function fewestCharacters(secondFactor: Bool): Index
+        ensures result >= 8;
+
+    """
+    The most characters of a password: 256, four times the 64 the
+    guideline asks to allow at least.
+    """
+    function mostCharacters(): Index
+        ensures result = 256;
+
+    """
+    The most bytes of a password, before and after NFKC: 1024.
+    """
+    function mostBytes(): Index
+        ensures result = 1024;
+
+    """
+    password in NFKC, the form that is counted, compared and hashed.  None
+    when it is not UTF-8 or longer than mostBytes, before or after.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [P: Region]
+    function normalizedPassword(password: Span[Nat8, P]): Option[String];
+
+    """
+    The characters of a password in NFKC, as normalizedPassword gives it.
+    """
+    generic [P: Region]
+    function characterCount(normalized: Span[Nat8, P]): Index
+        ensures result <= spanLength(normalized);
+
+    """
+    The verdict of the rules on password for the user name, with or
+    without a second factor, against the list in the file at listPath.
+    The first check that fails is the answer, in this order: UTF-8, too
+    short, too long, the list readable, on the list, the name in it.
+    No contract: the outcome is the result of I/O, the reading of the list.
+    """
+    generic [P: Region, N: Region, L: Region]
+    function checkPassphrase(password: Span[Nat8, P], name: Span[Nat8, N], secondFactor: Bool,
+                             listPath: Span[Nat8, L]): PassphraseCheck;
+
+    """
+    Whether check is PassphraseFits.
+    No contract: a test of one case, which a clause would only restate.
+    """
+    function isFit(check: PassphraseCheck): Bool;
+
+    """
+    A short English sentence for a verdict, for a form or a command line.
+    """
+    function describeCheck(check: PassphraseCheck): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+end module.

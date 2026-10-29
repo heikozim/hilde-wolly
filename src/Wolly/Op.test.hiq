@@ -1,0 +1,1071 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The provider end to end without a network: Wolly.Rambo, a client of the
+-- provider, starts a sign-in; the requests a browser and a client would
+-- send are made as FastCGI requests; the answers are read as a browser and
+-- a client read them.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    nthRef,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    contains,
+    indexOf,
+    indexOfByte,
+    substring,
+    parseNat
+);
+import Standard.Base64 (
+    encode
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Http (
+    headerCount,
+    nthHeaderName,
+    nthHeaderValue
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Standard.Log (
+    Log,
+    logToNothing,
+    closeLog
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Account (
+    Account,
+    AccountProblem,
+    destroyAccount,
+    prepareAccounts,
+    createAccount
+);
+import Wolly.OpKey (
+    RingKey,
+    MlDsa,
+    Verified,
+    rotate,
+    keySet,
+    verify,
+    destroyRing,
+    destroyVerified
+);
+import Wolly.OpUrl (
+    queryEscape
+);
+import Wolly.OpClient (
+    OpClient,
+    ClientProblem,
+    Limits,
+    ClientKind,
+    WebClient,
+    NativeClient,
+    ServiceClient,
+    prepareClients,
+    addClient,
+    destroyClient,
+    destroyProblem
+);
+import Wolly.OpStore (
+    RequestProblem,
+    prepareStore
+);
+import Wolly.OpBase (
+    OpSettings,
+    makeSettings,
+    destroySettings
+);
+import Wolly.OpGrant (
+    tokenEndpoint
+);
+import Wolly.Op (
+    Handover,
+    FinishProblem,
+    Pending,
+    destroyHandover,
+    destroyPending,
+    discoveryEndpoint,
+    jwksEndpoint,
+    authorizeEndpoint,
+    logoutEndpoint,
+    finish,
+    pending
+);
+import Wolly.Rambo (
+    RamboConfig,
+    RamboStart,
+    RamboTokens,
+    RamboError,
+    makeRamboConfig,
+    destroyRamboConfig,
+    beginLogin,
+    destroyStart,
+    readTokens,
+    destroyTokens,
+    destroyRamboError,
+    idTokenProblem
+);
+
+module body Wolly.Op.Test is
+    constant issuer: Span[Nat8, Static] := "https://auth.example.com";
+    constant callback: Span[Nat8, Static] := "https://lucy.example.com/cb";
+    constant ip: Span[Nat8, Static] := "192.0.2.7";
+
+    function nowSeconds(): Int64 is
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                abort("the clock is out of range");
+        end case;
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var all: Buffer[String] := strings;
+        while bufferLength(&all) > 0 do
+            destroyString(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    -- One pair of a FastCGI parameter block, when value is not empty.
+    generic [B: Region, V: Region]
+    function pair(block: &![StringBuilder, B], name: Span[Nat8, Static], value: Span[Nat8, V]): Unit is
+        if spanLength(value) = 0 then
+            return nil;
+        end if;
+        case makePair(name, value) of
+            when Some(value as encoded: String) do
+                writeString(&~block, asSpan(&encoded));
+                destroyString(encoded);
+            when None do
+                abort("a pair is not encoded");
+        end case;
+        return nil;
+    end;
+
+    -- A request as Hiawatha hands it over.
+    generic [U: Region, Q: Region, C: Region, B: Region, A: Region]
+    function requestOf(verb: Span[Nat8, Static], uri: Span[Nat8, U], query: Span[Nat8, Q], cookie: Span[Nat8, C],
+        content: Span[Nat8, B], authorization: Span[Nat8, A]): Request is
+        var block: StringBuilder := makeStringBuilder();
+        pair(&!block, "REQUEST_METHOD", verb);
+        pair(&!block, "REQUEST_URI", uri);
+        pair(&!block, "QUERY_STRING", query);
+        pair(&!block, "HTTP_COOKIE", cookie);
+        pair(&!block, "HTTP_AUTHORIZATION", authorization);
+        pair(&!block, "HTTP_USER_AGENT", "test browser");
+        pair(&!block, "REMOTE_ADDR", ip);
+        if spanLength(content) > 0 then
+            pair(&!block, "CONTENT_TYPE", "application/x-www-form-urlencoded");
+        end if;
+        return makeRequest(finalize(block), fromSpan(content));
+    end;
+
+    generic [O: Region]
+    function statusOf(output: Span[Nat8, O]): Int64 is
+        if not startsWith(output, "Status: ") then
+            return 0;
+        end if;
+        case parseNat(substring(output, 8, 11)) of
+            when Some(value as n: Nat64) do
+                case toInt64(n) of
+                    when Some(value as status: Int64) do
+                        return status;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [O: Region]
+    function headOf(output: Span[Nat8, O]): Span[Nat8, O] is
+        case indexOf(output, "\r\n\r\n") of
+            when Some(value as stop: Index) do
+                return substring(output, 0, stop + 2);
+            when None do
+                return output;
+        end case;
+    end;
+
+    generic [O: Region]
+    function contentOf(output: Span[Nat8, O]): Span[Nat8, O] is
+        case indexOf(output, "\r\n\r\n") of
+            when Some(value as stop: Index) do
+                return substring(output, stop + 4, spanLength(output));
+            when None do
+                return substring(output, 0, 0);
+        end case;
+    end;
+
+    -- The value of the nth header called name of CGI output, empty when
+    -- there is none.
+    generic [O: Region]
+    function header(output: Span[Nat8, O], name: Span[Nat8, Static], nth: Index): String is
+        let head: Span[Nat8, O] := headOf(output);
+        var seen: Index := 0;
+        var i: Index := 0;
+        while i < headerCount(head) do
+            case nthHeaderName(head, i) of
+                when Some(value as found: String) do
+                    let fits: Bool := equal(asSpan(&found), name);
+                    destroyString(found);
+                    if fits then
+                        if seen = nth then
+                            case nthHeaderValue(head, i) of
+                                when Some(value as v: String) do
+                                    return v;
+                                when None do
+                                    return fromSpan("");
+                            end case;
+                        end if;
+                        seen := seen + 1;
+                    end if;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return fromSpan("");
+    end;
+
+    -- name=value of a Set-Cookie header, without its attributes.
+    generic [S: Region]
+    function cookiePair(setCookie: Span[Nat8, S]): String is
+        case indexOfByte(setCookie, ';') of
+            when Some(value as semicolon: Index) do
+                return fromSpan(substring(setCookie, 0, semicolon));
+            when None do
+                return fromSpan(setCookie);
+        end case;
+    end;
+
+    -- The value of the query parameter name of url, as it stands.
+    generic [U: Region]
+    function parameter(url: Span[Nat8, U], name: Span[Nat8, Static]): String is
+        var key: StringBuilder := makeStringBuilder();
+        writeString(&!key, name);
+        writeByte(&!key, '=');
+        let wanted: String := finalize(key);
+        var found: String := fromSpan("");
+        var i: Index := 0;
+        while i < spanLength(url) do
+            let c: Nat8 := url[i];
+            if (c = '?') or (c = '&') then
+                let rest: Span[Nat8, U] := substring(url, i + 1, spanLength(url));
+                if startsWith(rest, asSpan(&wanted)) then
+                    let first: Index := length(&wanted);
+                    var stop: Index := first;
+                    while (stop < spanLength(rest)) and (rest[stop] /= '&') do
+                        stop := stop + 1;
+                    end while;
+                    destroyString(found);
+                    found := fromSpan(substring(rest, first, stop));
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(wanted);
+        return found;
+    end;
+
+    -- The text after the first question mark of url.
+    generic [U: Region]
+    function queryOf(url: Span[Nat8, U]): Span[Nat8, U] is
+        case indexOfByte(url, '?') of
+            when Some(value as at: Index) do
+                return substring(url, at + 1, spanLength(url));
+            when None do
+                return substring(url, 0, 0);
+        end case;
+    end;
+
+    -- The world of a test: the database, the settings, the keys, the
+    -- account and the secret of the web client.
+    record World: Linear is
+        db: Database[Writing];
+        settings: OpSettings;
+        ring: Buffer[RingKey];
+        subject: String;
+        secret: String;
+        log: Log;
+    end;
+
+    function isNone(error: Option[DbError]): Bool is
+        case error of
+            when Some(value as e: DbError) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [A: Region]
+    function idOfAccount(account: &[Account, A]): String is
+        return fromSpan(asSpan(&(account->id)));
+    end;
+
+    function makeWorld(): World is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                assertTrue(isNone(prepareAccounts(&!db)), "accounts");
+                assertTrue(isNone(prepareClients(&!db)), "clients");
+                assertTrue(isNone(prepareStore(&!db)), "store");
+                let now: Int64 := nowSeconds();
+                var subject: String := fromSpan("");
+                case createAccount(&!db, "Alice@Example.com", "Alice", now) of
+                    when Right(right as made: Either[AccountProblem, Account]) do
+                        case made of
+                            when Right(right as account: Account) do
+                                destroyString(subject);
+                                subject := idOfAccount(&account);
+                                destroyAccount(account);
+                            when Left(left as problem: AccountProblem) do
+                                assertTrue(false, "an account is made");
+                        end case;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "an account is stored");
+                end case;
+                case makeSettings(issuer, "RAMBO", "__Host-rambo", false, 7200, 43200) of
+                    when Some(value as settings: OpSettings) do
+                        let session: Limits := Limits(idle => 7200, max => 43200, refresh => 7200);
+                        let secret: String := added(&!db, "lucy", WebClient(), callback, session, now);
+                        let native: String := added(&!db, "native-app", NativeClient(), "http://127.0.0.1/callback", session, now);
+                        destroyString(native);
+                        let bot: String := added(&!db, "ops-bot", ServiceClient(), "", session, now);
+                        destroyString(bot);
+                        var ring: Buffer[RingKey] := allocateEmpty();
+                        case rotate(&!ring, MlDsa(), now) of
+                            when Some(value as kid: String) do
+                                destroyString(kid);
+                            when None do
+                                assertTrue(false, "a key is made");
+                        end case;
+                        return World(db => db, settings => settings, ring => ring, subject => subject, secret => secret,
+                            log => logToNothing());
+                    when None do
+                        destroyString(subject);
+                        closeDatabase(db);
+                        abort("the settings do not hold");
+                end case;
+            when Left(left as error: DbError) do
+                abort("no test database");
+        end case;
+    end;
+
+    -- Adds a client and gives its secret.
+    generic [R: Region, U: Region]
+    function added(db: &![Database[Writing], R], id: Span[Nat8, Static], kind: ClientKind, redirect: Span[Nat8, U],
+        session: Limits, now: Int64): String is
+        var redirects: Buffer[String] := allocateEmpty();
+        var logouts: Buffer[String] := allocateEmpty();
+        if spanLength(redirect) > 0 then
+            insertBack(&!redirects, fromSpan(redirect));
+        end if;
+        case kind of
+            when WebClient do
+                insertBack(&!logouts, fromSpan("https://lucy.example.com/"));
+            when NativeClient | ServiceClient do
+                skip;
+        end case;
+        let client: OpClient := OpClient(id => fromSpan(id), name => fromSpan(id), kind => kind, secretHash => fromSpan(""),
+            redirectUris => redirects, logoutUris => logouts, audience => allocateEmpty(),
+            limits => Limits(idle => 0, max => 0, refresh => 0), disabled => false, initiateLoginUri => fromSpan(""),
+            logo => fromSpan(""), idTokenAlg => fromSpan(""), signAlg => fromSpan(""), laxAuth => false, created => 0, updated => 0);
+        let result: Either[DbError, Either[ClientProblem, String]] := addClient(&~db, &client, session, false, now);
+        destroyClient(client);
+        case result of
+            when Right(right as made: Either[ClientProblem, String]) do
+                case made of
+                    when Right(right as secret: String) do
+                        return secret;
+                    when Left(left as problem: ClientProblem) do
+                        destroyProblem(problem);
+                        abort("a client is refused");
+                end case;
+            when Left(left as error: DbError) do
+                abort("a client is not stored");
+        end case;
+    end;
+
+    function testDiscovery(): Unit is
+        var { db: Database[Writing], settings: OpSettings, ring: Buffer[RingKey], subject: String, secret: String,
+            log: Log } := makeWorld();
+        let output: String := discoveryEndpoint(&!db, &settings);
+        assertTrue(statusOf(asSpan(&output)) = 200, "discovery answers 200");
+        let want: Span[Nat8, Static] := "{\"authorization_endpoint\":\"https://auth.example.com/authorize\",\"authorization_response_iss_parameter_supported\":true,\"claims_parameter_supported\":false,\"claims_supported\":[\"iss\",\"sub\",\"aud\",\"exp\",\"iat\",\"auth_time\",\"nonce\",\"sid\",\"amr\",\"azp\",\"email\",\"name\",\"roles\"],\"code_challenge_methods_supported\":[\"S256\"],\"end_session_endpoint\":\"https://auth.example.com/logout\",\"grant_types_supported\":[\"authorization_code\",\"refresh_token\",\"client_credentials\"],\"id_token_signing_alg_values_supported\":[\"ML-DSA-44\",\"ML-DSA-44-Ed25519\"],\"issuer\":\"https://auth.example.com\",\"jwks_uri\":\"https://auth.example.com/jwks\",\"prompt_values_supported\":[\"none\",\"login\"],\"request_parameter_supported\":false,\"request_uri_parameter_supported\":false,\"response_modes_supported\":[\"query\"],\"response_types_supported\":[\"code\"],\"scopes_supported\":[\"openid\",\"email\",\"profile\"],\"subject_types_supported\":[\"public\"],\"token_endpoint\":\"https://auth.example.com/token\",\"token_endpoint_auth_methods_supported\":[\"client_secret_basic\",\"client_secret_post\",\"none\"]}";
+        assertTrue(equal(contentOf(asSpan(&output)), want), "the document is Go's byte for byte");
+        let cache: String := header(asSpan(&output), "Cache-Control", 0);
+        assertTrue(equal(asSpan(&cache), "public, max-age=300"), "cached for five minutes");
+        destroyString(cache);
+        destroyString(output);
+        let keys: String := jwksEndpoint(&ring);
+        let kind: String := header(asSpan(&keys), "Content-Type", 0);
+        assertTrue(equal(asSpan(&kind), "application/jwk-set+json"), "the key set has its own type");
+        assertTrue(startsWith(contentOf(asSpan(&keys)), "{\"keys\":[{\"kty\":\"AKP\""), "the key set lists the key");
+        destroyString(kind);
+        destroyString(keys);
+        closeDatabase(db);
+        destroySettings(settings);
+        destroyRing(ring);
+        destroyString(subject);
+        destroyString(secret);
+        let closed: Bool := closeLog(log);
+        return nil;
+    end;
+
+    generic [S: Region]
+    function urlOf(start: &[RamboStart, S]): Span[Nat8, S] is
+        return asSpan(&(start->url));
+    end;
+
+    generic [S: Region]
+    function stateOf(start: &[RamboStart, S]): Span[Nat8, S] is
+        return asSpan(&(start->state));
+    end;
+
+    generic [S: Region]
+    function nonceOf(start: &[RamboStart, S]): Span[Nat8, S] is
+        return asSpan(&(start->nonce));
+    end;
+
+    generic [S: Region]
+    function verifierOf(start: &[RamboStart, S]): Span[Nat8, S] is
+        return asSpan(&(start->verifier));
+    end;
+
+    generic [T: Region]
+    function idTokenOf(tokens: &[RamboTokens, T]): Span[Nat8, T] is
+        return asSpan(&(tokens->idToken));
+    end;
+
+    generic [T: Region]
+    function refreshOf(tokens: &[RamboTokens, T]): Span[Nat8, T] is
+        return asSpan(&(tokens->refreshToken));
+    end;
+
+    generic [T: Region]
+    function accessOf(tokens: &[RamboTokens, T]): Span[Nat8, T] is
+        return asSpan(&(tokens->accessToken));
+    end;
+
+    generic [W: Region]
+    function clientNameOf(waiting: &[Pending, W]): Span[Nat8, W] is
+        return asSpan(&(waiting->clientName));
+    end;
+
+    generic [V: Region]
+    function typOfVerified(found: &[Verified, V]): Span[Nat8, V] is
+        return asSpan(&(found->typ));
+    end;
+
+    generic [H: Region]
+    function locationOf(handover: &[Handover, H]): Span[Nat8, H] is
+        return asSpan(&(handover->location));
+    end;
+
+    generic [H: Region]
+    function firstCookie(handover: &[Handover, H]): String is
+        let cookies: &[Buffer[String], H] := &(handover->cookies);
+        if bufferLength(cookies) = 0 then
+            return fromSpan("");
+        end if;
+        return cookiePair(asSpan(nthRef(cookies, 0)));
+    end;
+
+    -- The Authorization header of client id with secret.
+    generic [S: Region]
+    function basicFor(id: Span[Nat8, Static], secret: Span[Nat8, S]): String is
+        var raw: StringBuilder := makeStringBuilder();
+        writeString(&!raw, id);
+        writeByte(&!raw, ':');
+        writeString(&!raw, secret);
+        let joined: String := finalize(raw);
+        let encoded: String := encode(asSpan(&joined));
+        destroyString(joined);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "Basic ");
+        writeString(&!out, asSpan(&encoded));
+        destroyString(encoded);
+        return finalize(out);
+    end;
+
+    -- The form of a code redemption.
+    generic [C: Region, V: Region]
+    function codeForm(code: Span[Nat8, C], verifier: Span[Nat8, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "grant_type=authorization_code&code=");
+        let c: String := queryEscape(code);
+        writeString(&!out, asSpan(&c));
+        destroyString(c);
+        writeString(&!out, "&redirect_uri=");
+        let r: String := queryEscape(callback);
+        writeString(&!out, asSpan(&r));
+        destroyString(r);
+        writeString(&!out, "&code_verifier=");
+        writeString(&!out, verifier);
+        return finalize(out);
+    end;
+
+    generic [T: Region]
+    function refreshForm(given: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "grant_type=refresh_token&refresh_token=");
+        let t: String := queryEscape(given);
+        writeString(&!out, asSpan(&t));
+        destroyString(t);
+        return finalize(out);
+    end;
+
+    generic [O: Region]
+    function tokensOf(output: Span[Nat8, O]): Option[RamboTokens] is
+        case readTokens(200, contentOf(output)) of
+            when Right(right as tokens: RamboTokens) do
+                return Some(value => tokens);
+            when Left(left as error: RamboError) do
+                destroyRamboError(error);
+                let none: Option[RamboTokens] := None();
+                return none;
+        end case;
+    end;
+
+    -- The answer of the token endpoint to the form content of lucy.
+    generic [R: Region, S: Region, K: Region, L: Region, C: Region, B: Region]
+    function askToken(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K], log: &![Log, L],
+        content: Span[Nat8, C], authorization: Span[Nat8, B], now: Int64): String is
+        let request: Request := requestOf("POST", "/token", "", "", content, authorization);
+        let output: String := tokenEndpoint(&request, &~db, settings, ring, &~log, ip, now);
+        destroyRequest(request);
+        return output;
+    end;
+
+    function testSignIn(): Unit is
+        var { db: Database[Writing], settings: OpSettings, ring: Buffer[RingKey], subject: String, secret: String,
+            log: Log } := makeWorld();
+        let now: Int64 := nowSeconds();
+        case makeRamboConfig(issuer, "lucy", asSpan(&secret), callback, "/etc/ssl/certs/ca-certificates.crt") of
+            when Some(value as config: RamboConfig) do
+                case beginLogin(&config, -1, false) of
+                    when Some(value as start: RamboStart) do
+                        signInWith(&!db, &settings, &ring, &!log, asSpan(&subject), asSpan(&secret), &config, &start, now);
+                        destroyStart(start);
+                    when None do
+                        assertTrue(false, "a sign-in starts");
+                end case;
+                destroyRamboConfig(config);
+            when None do
+                assertTrue(false, "the client is configured");
+        end case;
+        closeDatabase(db);
+        destroySettings(settings);
+        destroyRing(ring);
+        destroyString(subject);
+        destroyString(secret);
+        let closed: Bool := closeLog(log);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, K: Region, L: Region, U: Region, X: Region, C: Region, T: Region]
+    function signInWith(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K],
+        log: &![Log, L], subject: Span[Nat8, U], secret: Span[Nat8, X], config: &[RamboConfig, C],
+        start: &[RamboStart, T], now: Int64): Unit is
+        let query: Span[Nat8, T] := queryOf(urlOf(start));
+        -- A browser that comes from the client's site sends no cookie: the
+        -- endpoint answers with the page that tries once more.
+        let first: Request := requestOf("GET", "/authorize", query, "", "", "");
+        let bounced: String := authorizeEndpoint(&first, &~db, settings, &~log, ip, now);
+        destroyRequest(first);
+        assertTrue(statusOf(asSpan(&bounced)) = 200, "the first arrival is bounced");
+        assertTrue(contains(contentOf(asSpan(&bounced)), "_rs=1"), "the page goes to the request with _rs");
+        let csp: String := header(asSpan(&bounced), "Content-Security-Policy", 0);
+        assertTrue(equal(asSpan(&csp), "default-src 'none'"), "the page allows nothing");
+        destroyString(csp);
+        destroyString(bounced);
+        var again: StringBuilder := makeStringBuilder();
+        writeString(&!again, query);
+        writeString(&!again, "&_rs=1");
+        let second: String := finalize(again);
+        let back: Request := requestOf("GET", "/authorize", asSpan(&second), "", "", "");
+        destroyString(second);
+        let toLogin: String := authorizeEndpoint(&back, &~db, settings, &~log, ip, now);
+        destroyRequest(back);
+        assertTrue(statusOf(asSpan(&toLogin)) = 302, "then the browser goes to the login page");
+        let location: String := header(asSpan(&toLogin), "Location", 0);
+        assertTrue(startsWith(asSpan(&location), "/login?req="), "with the request");
+        let flowHeader: String := header(asSpan(&toLogin), "Set-Cookie", 0);
+        assertTrue(startsWith(asSpan(&flowHeader), "__Host-rambo-flow="), "and the flow cookie");
+        assertTrue(contains(asSpan(&flowHeader), "; Max-Age=600; HttpOnly; Secure; SameSite=Strict"), "of ten minutes");
+        let flow: String := cookiePair(asSpan(&flowHeader));
+        destroyString(flowHeader);
+        destroyString(toLogin);
+        let reqId: String := parameter(asSpan(&location), "req");
+        destroyString(location);
+        -- The login page reads the request with the flow cookie, and not
+        -- without it.
+        let page: Request := requestOf("GET", "/login", "", asSpan(&flow), "", "");
+        case pending(&page, &~db, settings, asSpan(&reqId), now) of
+            when Right(right as found: Either[RequestProblem, Pending]) do
+                case found of
+                    when Right(right as waiting: Pending) do
+                        assertTrue(equal(clientNameOf(&waiting), "lucy"), "the login page names the client");
+                        destroyPending(waiting);
+                    when Left(left as problem: RequestProblem) do
+                        assertTrue(false, "the request waits for this browser");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the request is read");
+        end case;
+        destroyRequest(page);
+        let stranger: Request := requestOf("GET", "/login", "", "", "", "");
+        case pending(&stranger, &~db, settings, asSpan(&reqId), now) of
+            when Right(right as found: Either[RequestProblem, Pending]) do
+                case found of
+                    when Right(right as waiting: Pending) do
+                        assertTrue(false, "another browser does not get the request");
+                        destroyPending(waiting);
+                    when Left(left as problem: RequestProblem) do
+                        skip;
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the request is read for the stranger");
+        end case;
+        destroyRequest(stranger);
+        -- The page checked the person and finishes.
+        let done: Request := requestOf("POST", "/login", "", asSpan(&flow), "", "");
+        let finished: Either[DbError, Either[FinishProblem, Handover]] := finish(&done, &~db, settings, &~log,
+            asSpan(&reqId), subject, "pwd otp mfa", ip, now);
+        destroyRequest(done);
+        destroyString(flow);
+        destroyString(reqId);
+        case finished of
+            when Right(right as result: Either[FinishProblem, Handover]) do
+                case result of
+                    when Right(right as handover: Handover) do
+                        afterFinish(&~db, settings, ring, &~log, secret, config, start, &handover, now);
+                        destroyHandover(handover);
+                    when Left(left as problem: FinishProblem) do
+                        assertTrue(false, "the login is handed over");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the login is finished");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, K: Region, L: Region, X: Region, C: Region, T: Region, H: Region]
+    function afterFinish(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K],
+        log: &![Log, L], secret: Span[Nat8, X], config: &[RamboConfig, C], start: &[RamboStart, T],
+        handover: &[Handover, H], now: Int64): Unit is
+        let location: Span[Nat8, H] := locationOf(handover);
+        assertTrue(startsWith(location, "https://lucy.example.com/cb?code="), "the browser goes back with a code");
+        let state: String := parameter(location, "state");
+        assertTrue(equal(asSpan(&state), stateOf(start)), "and the client's state");
+        destroyString(state);
+        let iss: String := parameter(location, "iss");
+        assertTrue(equal(asSpan(&iss), "https%3A%2F%2Fauth.example.com"), "and the issuer");
+        destroyString(iss);
+        let session: String := firstCookie(handover);
+        assertTrue(startsWith(asSpan(&session), "__Host-rambo="), "the session cookie is set");
+        destroyString(session);
+        let code: String := parameter(location, "code");
+        let form: String := codeForm(asSpan(&code), verifierOf(start));
+        let basic: String := basicFor("lucy", secret);
+        let answer: String := askToken(&~db, settings, ring, &~log, asSpan(&form), asSpan(&basic), now);
+        assertTrue(statusOf(asSpan(&answer)) = 200, "the code is redeemed");
+        let noStore: String := header(asSpan(&answer), "Cache-Control", 0);
+        assertTrue(equal(asSpan(&noStore), "no-store"), "the answer is not stored");
+        destroyString(noStore);
+        case tokensOf(asSpan(&answer)) of
+            when Some(value as tokens: RamboTokens) do
+                let keys: String := keySet(ring);
+                case idTokenProblem(config, idTokenOf(&tokens), asSpan(&keys), nonceOf(start), -1, now) of
+                    when Some(value as problem: String) do
+                        printLn(asSpan(&problem));
+                        assertTrue(false, "Wolly.Rambo takes the ID token");
+                        destroyString(problem);
+                    when None do
+                        skip;
+                end case;
+                case verify(accessOf(&tokens), ring) of
+                    when Some(value as found: Verified) do
+                        assertTrue(equal(typOfVerified(&found), "at+jwt"), "the access token is at+jwt");
+                        destroyVerified(found);
+                    when None do
+                        assertTrue(false, "the access token verifies");
+                end case;
+                destroyString(keys);
+                rotation(&~db, settings, ring, &~log, asSpan(&basic), refreshOf(&tokens), now);
+                destroyTokens(tokens);
+            when None do
+                printLn(asSpan(&answer));
+                assertTrue(false, "the answer holds tokens");
+        end case;
+        -- The code again: refused, and the family it made is revoked.
+        let replay: String := askToken(&~db, settings, ring, &~log, asSpan(&form), asSpan(&basic), now);
+        assertTrue(statusOf(asSpan(&replay)) = 400, "a code is redeemed once");
+        assertTrue(contains(contentOf(asSpan(&replay)), "invalid_grant"), "as invalid_grant");
+        destroyString(replay);
+        destroyString(form);
+        destroyString(code);
+        destroyString(answer);
+        destroyString(basic);
+        return nil;
+    end;
+
+    -- A refresh token is rotated once; the spent one revokes the family.
+    generic [R: Region, S: Region, K: Region, L: Region, B: Region, T: Region]
+    function rotation(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K], log: &![Log, L],
+        basic: Span[Nat8, B], first: Span[Nat8, T], now: Int64): Unit is
+        let form: String := refreshForm(first);
+        let renewed: String := askToken(&~db, settings, ring, &~log, asSpan(&form), basic, now);
+        if statusOf(asSpan(&renewed)) /= 200 then
+            printLn(asSpan(&renewed));
+        end if;
+        assertTrue(statusOf(asSpan(&renewed)) = 200, "a refresh token is rotated");
+        case tokensOf(asSpan(&renewed)) of
+            when Some(value as tokens: RamboTokens) do
+                let reused: String := askToken(&~db, settings, ring, &~log, asSpan(&form), basic, now);
+                assertTrue(statusOf(asSpan(&reused)) = 400, "a spent refresh token is refused");
+                destroyString(reused);
+                let next: String := refreshForm(refreshOf(&tokens));
+                let revoked: String := askToken(&~db, settings, ring, &~log, asSpan(&next), basic, now);
+                assertTrue(statusOf(asSpan(&revoked)) = 400, "and its family with it");
+                destroyString(revoked);
+                destroyString(next);
+                destroyTokens(tokens);
+            when None do
+                assertTrue(false, "the rotation gives tokens");
+        end case;
+        destroyString(renewed);
+        destroyString(form);
+        let wrong: String := askToken(&~db, settings, ring, &~log, "grant_type=client_credentials", basic, now);
+        assertTrue(statusOf(asSpan(&wrong)) = 400, "a web client may not use client credentials");
+        assertTrue(contains(contentOf(asSpan(&wrong)), "unauthorized_client"), "as unauthorized_client");
+        destroyString(wrong);
+        let bad: String := basicForBad();
+        let refused: String := askToken(&~db, settings, ring, &~log, "grant_type=client_credentials", asSpan(&bad), now);
+        assertTrue(statusOf(asSpan(&refused)) = 401, "a wrong secret is refused");
+        let challenge: String := header(asSpan(&refused), "WWW-Authenticate", 0);
+        assertTrue(equal(asSpan(&challenge), "Basic realm=\"rambo\""), "with the challenge of Basic");
+        destroyString(challenge);
+        destroyString(refused);
+        destroyString(bad);
+        return nil;
+    end;
+
+    function basicForBad(): String is
+        return basicFor("lucy", "WRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWR");
+    end;
+
+    -- What a sign-in left: the session cookie, as name=value, and the
+    -- tokens of the client.
+    record SignedIn: Linear is
+        cookie: String;
+        idToken: String;
+        refresh: String;
+    end;
+
+    function destroySignedIn(signed: SignedIn): Unit is
+        let { cookie: String, idToken: String, refresh: String } := signed;
+        destroyString(cookie);
+        destroyString(idToken);
+        destroyString(refresh);
+        return nil;
+    end;
+
+    function nothingSigned(): SignedIn is
+        return SignedIn(cookie => fromSpan(""), idToken => fromSpan(""), refresh => fromSpan(""));
+    end;
+
+    -- A sign-in of subject at client through the endpoints, the browser
+    -- sending the cookie it holds: the code is redeemed with authorization
+    -- and form, which is extra for the form of the token request.
+    generic [R: Region, S: Region, K: Region, L: Region, U: Region, C: Region, B: Region, H: Region, D: Region]
+    function signIn(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K], log: &![Log, L],
+        subject: Span[Nat8, U], config: &[RamboConfig, C], redirect: Span[Nat8, D], authorization: Span[Nat8, B],
+        extra: Span[Nat8, Static], cookie: Span[Nat8, H], now: Int64): SignedIn is
+        case beginLogin(config, -1, false) of
+            when Some(value as start: RamboStart) do
+                var query: StringBuilder := makeStringBuilder();
+                writeString(&!query, queryOf(urlOf(&start)));
+                writeString(&!query, "&_rs=1");
+                let q: String := finalize(query);
+                let first: Request := requestOf("GET", "/authorize", asSpan(&q), cookie, "", "");
+                destroyString(q);
+                let toLogin: String := authorizeEndpoint(&first, &~db, settings, &~log, ip, now);
+                destroyRequest(first);
+                let location: String := header(asSpan(&toLogin), "Location", 0);
+                let flowHeader: String := header(asSpan(&toLogin), "Set-Cookie", 0);
+                destroyString(toLogin);
+                let flow: String := cookiePair(asSpan(&flowHeader));
+                destroyString(flowHeader);
+                let reqId: String := parameter(asSpan(&location), "req");
+                destroyString(location);
+                let done: Request := requestOf("POST", "/login", "", asSpan(&flow), "", "");
+                let finished: Either[DbError, Either[FinishProblem, Handover]] := finish(&done, &~db, settings, &~log,
+                    asSpan(&reqId), subject, "pwd otp mfa", ip, now);
+                destroyRequest(done);
+                destroyString(flow);
+                destroyString(reqId);
+                case finished of
+                    when Right(right as result: Either[FinishProblem, Handover]) do
+                        case result of
+                            when Right(right as handover: Handover) do
+                                let session: String := firstCookie(&handover);
+                                let code: String := parameter(locationOf(&handover), "code");
+                                destroyHandover(handover);
+                                var form: StringBuilder := makeStringBuilder();
+                                writeString(&!form, "grant_type=authorization_code&code=");
+                                let c: String := queryEscape(asSpan(&code));
+                                writeString(&!form, asSpan(&c));
+                                destroyString(c);
+                                destroyString(code);
+                                writeString(&!form, "&redirect_uri=");
+                                let r: String := queryEscape(redirect);
+                                writeString(&!form, asSpan(&r));
+                                destroyString(r);
+                                writeString(&!form, "&code_verifier=");
+                                writeString(&!form, verifierOf(&start));
+                                writeString(&!form, extra);
+                                let content: String := finalize(form);
+                                let answer: String := askToken(&~db, settings, ring, &~log, asSpan(&content), authorization, now);
+                                destroyString(content);
+                                destroyStart(start);
+                                case tokensOf(asSpan(&answer)) of
+                                    when Some(value as tokens: RamboTokens) do
+                                        destroyString(answer);
+                                        let signed: SignedIn := SignedIn(cookie => session, idToken => fromSpan(idTokenOf(&tokens)),
+                                            refresh => fromSpan(refreshOf(&tokens)));
+                                        destroyTokens(tokens);
+                                        return signed;
+                                    when None do
+                                        printLn(asSpan(&answer));
+                                        destroyString(answer);
+                                        destroyString(session);
+                                        assertTrue(false, "the sign-in gives tokens");
+                                        return nothingSigned();
+                                end case;
+                            when Left(left as problem: FinishProblem) do
+                                destroyStart(start);
+                                assertTrue(false, "the sign-in is handed over");
+                                return nothingSigned();
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyStart(start);
+                        assertTrue(false, "the sign-in is finished");
+                        return nothingSigned();
+                end case;
+            when None do
+                assertTrue(false, "a sign-in starts");
+                return nothingSigned();
+        end case;
+    end;
+
+    generic [G: Region]
+    function cookieOf(signed: &[SignedIn, G]): Span[Nat8, G] is
+        return asSpan(&(signed->cookie));
+    end;
+
+    generic [G: Region]
+    function idOf(signed: &[SignedIn, G]): Span[Nat8, G] is
+        return asSpan(&(signed->idToken));
+    end;
+
+    generic [G: Region]
+    function refreshTokenOf(signed: &[SignedIn, G]): Span[Nat8, G] is
+        return asSpan(&(signed->refresh));
+    end;
+
+    function testLogout(): Unit is
+        var { db: Database[Writing], settings: OpSettings, ring: Buffer[RingKey], subject: String, secret: String,
+            log: Log } := makeWorld();
+        let now: Int64 := nowSeconds();
+        case makeRamboConfig(issuer, "lucy", asSpan(&secret), callback, "/etc/ssl/certs/ca-certificates.crt") of
+            when Some(value as config: RamboConfig) do
+                let basic: String := basicFor("lucy", asSpan(&secret));
+                let signed: SignedIn := signIn(&!db, &settings, &ring, &!log, asSpan(&subject), &config, callback, asSpan(&basic), "", "", now);
+                -- A logout the client starts, with the ID token as hint.
+                var query: StringBuilder := makeStringBuilder();
+                writeString(&!query, "id_token_hint=");
+                writeString(&!query, idOf(&signed));
+                writeString(&!query, "&post_logout_redirect_uri=https%3A%2F%2Flucy.example.com%2F&state=after");
+                let q: String := finalize(query);
+                let out: Request := requestOf("GET", "/logout", asSpan(&q), cookieOf(&signed), "", "");
+                destroyString(q);
+                let answer: String := logoutEndpoint(&out, &!db, &settings, &ring, &!log, now);
+                destroyRequest(out);
+                assertTrue(statusOf(asSpan(&answer)) = 302, "the logout redirects");
+                let location: String := header(asSpan(&answer), "Location", 0);
+                assertTrue(equal(asSpan(&location), "https://lucy.example.com/?state=after"), "to the registered page with state");
+                destroyString(location);
+                let gone: String := header(asSpan(&answer), "Set-Cookie", 0);
+                assertTrue(startsWith(asSpan(&gone), "__Host-rambo=; Path=/; Max-Age=0"), "and removes the session cookie");
+                destroyString(gone);
+                destroyString(answer);
+                -- The session ended, and the refresh token with it.
+                let form: String := refreshForm(refreshTokenOf(&signed));
+                let refused: String := askToken(&!db, &settings, &ring, &!log, asSpan(&form), asSpan(&basic), now);
+                assertTrue(statusOf(asSpan(&refused)) = 400, "the refresh token of the ended session is refused");
+                destroyString(refused);
+                destroyString(form);
+                destroySignedIn(signed);
+                -- Without a hint the browser is asked.
+                let plain: Request := requestOf("GET", "/logout", "", "", "", "");
+                let asked: String := logoutEndpoint(&plain, &!db, &settings, &ring, &!log, now);
+                destroyRequest(plain);
+                let where: String := header(asSpan(&asked), "Location", 0);
+                assertTrue(equal(asSpan(&where), "/login/logout"), "a logout without hint goes to the question");
+                destroyString(where);
+                destroyString(asked);
+                -- A hint that is no token goes there as well.
+                let bogus: Request := requestOf("GET", "/logout", "id_token_hint=a.b.c", "", "", "");
+                let refusedHint: String := logoutEndpoint(&bogus, &!db, &settings, &ring, &!log, now);
+                destroyRequest(bogus);
+                let place: String := header(asSpan(&refusedHint), "Location", 0);
+                assertTrue(equal(asSpan(&place), "/login/logout"), "a hint that does not verify asks too");
+                destroyString(place);
+                destroyString(refusedHint);
+                destroyString(basic);
+                destroyRamboConfig(config);
+            when None do
+                assertTrue(false, "the client is configured");
+        end case;
+        closeDatabase(db);
+        destroySettings(settings);
+        destroyRing(ring);
+        destroyString(subject);
+        destroyString(secret);
+        let closed: Bool := closeLog(log);
+        return nil;
+    end;
+
+    function testOtherClients(): Unit is
+        var { db: Database[Writing], settings: OpSettings, ring: Buffer[RingKey], subject: String, secret: String,
+            log: Log } := makeWorld();
+        let now: Int64 := nowSeconds();
+        -- A native client: a loopback redirect on any port, a code challenge and no
+        -- secret.
+        case makeRamboConfig(issuer, "native-app", "", "http://127.0.0.1:53111/callback", "/none") of
+            when Some(value as config: RamboConfig) do
+                let signed: SignedIn := signIn(&!db, &settings, &ring, &!log, asSpan(&subject), &config, "http://127.0.0.1:53111/callback", "", "&client_id=native-app",
+                    "", now);
+                assertTrue(spanLength(refreshTokenOf(&signed)) > 0, "a native client signs in without a secret");
+                destroySignedIn(signed);
+                destroyRamboConfig(config);
+            when None do
+                assertTrue(false, "the native client is configured");
+        end case;
+        -- A service client asks for a token about itself.
+        let session: Limits := Limits(idle => 7200, max => 43200, refresh => 7200);
+        let botSecret: String := added(&!db, "relay-bot", ServiceClient(), "", session, now);
+        let botBasic: String := basicFor("relay-bot", asSpan(&botSecret));
+        let machine: String := askToken(&!db, &settings, &ring, &!log, "grant_type=client_credentials", asSpan(&botBasic), now);
+        assertTrue(statusOf(asSpan(&machine)) = 200, "a service client gets a token");
+        assertTrue(contains(contentOf(asSpan(&machine)), "\"token_type\":\"Bearer\",\"expires_in\":600}"), "an access token alone");
+        destroyString(machine);
+        let code: String := askToken(&!db, &settings, &ring, &!log, "grant_type=authorization_code&code=x", asSpan(&botBasic), now);
+        assertTrue(contains(contentOf(asSpan(&code)), "unauthorized_client"), "a service client may not redeem a code");
+        destroyString(code);
+        destroyString(botBasic);
+        destroyString(botSecret);
+        -- Without a session prompt=none is answered at once.
+        case makeRamboConfig(issuer, "lucy", asSpan(&secret), callback, "/none") of
+            when Some(value as config: RamboConfig) do
+                case beginLogin(&config, -1, true) of
+                    when Some(value as start: RamboStart) do
+                        var query: StringBuilder := makeStringBuilder();
+                        writeString(&!query, queryOf(urlOf(&start)));
+                        writeString(&!query, "&_rs=1");
+                        let q: String := finalize(query);
+                        let silent: Request := requestOf("GET", "/authorize", asSpan(&q), "", "", "");
+                        destroyString(q);
+                        let answer: String := authorizeEndpoint(&silent, &!db, &settings, &!log, ip, now);
+                        destroyRequest(silent);
+                        let location: String := header(asSpan(&answer), "Location", 0);
+                        let error: String := parameter(asSpan(&location), "error");
+                        assertTrue(equal(asSpan(&error), "login_required"), "prompt=none without a session is login_required");
+                        destroyString(error);
+                        destroyString(location);
+                        destroyString(answer);
+                        destroyStart(start);
+                    when None do
+                        assertTrue(false, "a silent sign-in starts");
+                end case;
+                destroyRamboConfig(config);
+            when None do
+                assertTrue(false, "lucy is configured");
+        end case;
+        -- An unknown client and a request without a nonce.
+        let unknown: Request := requestOf("GET", "/authorize", "client_id=nobody&redirect_uri=https%3A%2F%2Fx.example%2F", "", "", "");
+        let page: String := authorizeEndpoint(&unknown, &!db, &settings, &!log, ip, now);
+        destroyRequest(unknown);
+        assertTrue(statusOf(asSpan(&page)) = 400, "an unknown client is answered here");
+        assertTrue(equal(contentOf(asSpan(&page)), "RAMBO: unknown client\n"), "with a fixed text");
+        destroyString(page);
+        let noNonce: Request := requestOf("GET", "/authorize",
+            "client_id=lucy&redirect_uri=https%3A%2F%2Flucy.example.com%2Fcb&response_type=code&scope=openid&state=s1&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256",
+            "", "", "");
+        let missing: String := authorizeEndpoint(&noNonce, &!db, &settings, &!log, ip, now);
+        destroyRequest(noNonce);
+        let back: String := header(asSpan(&missing), "Location", 0);
+        assertTrue(startsWith(asSpan(&back), "https://lucy.example.com/cb?error=invalid_request&error_description=nonce+is+required"),
+            "a request without a nonce goes back with invalid_request");
+        destroyString(back);
+        destroyString(missing);
+        closeDatabase(db);
+        destroySettings(settings);
+        destroyRing(ring);
+        destroyString(subject);
+        destroyString(secret);
+        let closed: Bool := closeLog(log);
+        return nil;
+    end;
+end module body.

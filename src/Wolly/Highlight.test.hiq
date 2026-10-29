@@ -1,0 +1,222 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each case is held against what Ted Unangst's synlight writes for the
+-- same file name and code: its Go, unchanged (go 1.27.2, linux/arm64),
+-- HighlightString with HTML.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Wolly.Highlight (
+    Language,
+    CLanguage,
+    Diff,
+    GoLanguage,
+    HtmlLanguage,
+    JavaScript,
+    Lua,
+    Python,
+    Rust,
+    SqlLanguage,
+    mostHighlightBytes,
+    languageOf,
+    highlight,
+    escapeCode
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Highlight.Test is
+
+    -- Whether code as the file name would be shown is wanted, the way
+    -- synlight picks the lexer: by the extension, or escaped only.
+    generic [C: Region]
+    function lighted(name: Span[Nat8, Static], code: Span[Nat8, C], wanted: Span[Nat8, Static]): Bool is
+        case languageOf(name) of
+            when Some(value as language: Language) do
+                let out: String := highlight(code, language);
+                let same: Bool := equal(asSpan(&out), wanted);
+                destroyString(out);
+                return same;
+            when None do
+                let out: String := escapeCode(code);
+                let same: Bool := equal(asSpan(&out), wanted);
+                destroyString(out);
+                return same;
+        end case;
+    end;
+
+    -- The number of the language of name, 0 for none.
+    function numberOf(name: Span[Nat8, Static]): Nat8 is
+        case languageOf(name) of
+            when Some(value as language: Language) do
+                case language of
+                    when CLanguage do
+                        return 1;
+                    when Diff do
+                        return 2;
+                    when GoLanguage do
+                        return 3;
+                    when HtmlLanguage do
+                        return 4;
+                    when JavaScript do
+                        return 5;
+                    when Lua do
+                        return 6;
+                    when Python do
+                        return 7;
+                    when Rust do
+                        return 8;
+                    when SqlLanguage do
+                        return 9;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(numberOf("a.c") = 1, "c");
+        assertTrue(numberOf("a.h") = 1, "h is C");
+        assertTrue(numberOf("fix.patch") = 2, "patch is a diff");
+        assertTrue(numberOf("x.diff") = 2, "diff");
+        assertTrue(numberOf("main.go") = 3, "go");
+        assertTrue(numberOf("feed.xml") = 4, "xml is HTML");
+        assertTrue(numberOf("page.html") = 4, "html");
+        assertTrue(numberOf("app.js") = 5, "js");
+        assertTrue(numberOf("init.lua") = 6, "lua");
+        assertTrue(numberOf("x.py") = 7, "py");
+        assertTrue(numberOf("x.python") = 7, "python is Python");
+        assertTrue(numberOf("x.rs") = 8, "rs");
+        assertTrue(numberOf("x.rust") = 8, "rust is Rust");
+        assertTrue(numberOf("schema.sql") = 9, "sql");
+        assertTrue(numberOf("a.b.go") = 3, "the last dot counts");
+        assertTrue(numberOf("go") = 3, "a name without a dot is its own extension, as in synlight");
+        assertTrue(numberOf("Makefile") = 0, "a name of no language");
+        assertTrue(numberOf("x.GO") = 0, "the extension is case-sensitive");
+        assertTrue(numberOf("x.") = 0, "an empty extension");
+        return nil;
+    end;
+
+    -- func and a space 13107 times, 65535 bytes, and tail.
+    function funcs(tail: Span[Nat8, Static]): String is
+        var big: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 13107 do
+            writeString(&!big, "func ");
+            i := i + 1;
+        end while;
+        writeString(&!big, tail);
+        return finalize(big);
+    end;
+
+    generic [T: Region]
+    function hasSpan(text: Span[Nat8, T]): Bool is
+        var i: Index := 0;
+        while (i + 5) <= spanLength(text) do
+            if (((text[i] = '<') and (text[i + 1] = 's')) and ((text[i + 2] = 'p') and (text[i + 3] = 'a'))) and (text[i + 4] = 'n') then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    function testLimit(): Unit is
+        assertTrue(mostHighlightBytes() = 65536, "64 KiB are lexed at most");
+        let over: String := funcs("xx");
+        let escaped: String := highlight(asSpan(&over), GoLanguage());
+        assertTrue(not hasSpan(asSpan(&escaped)), "65537 bytes are escaped, not lexed");
+        destroyString(escaped);
+        destroyString(over);
+        let fits: String := funcs("x");
+        let lexed: String := highlight(asSpan(&fits), GoLanguage());
+        assertTrue(hasSpan(asSpan(&lexed)), "the control: 65536 bytes are lexed");
+        destroyString(lexed);
+        destroyString(fits);
+        return nil;
+    end;
+
+    function testCase1(): Unit is
+        assertTrue(lighted("x.c", "#include <stdio.h>\nint main(void) { if (a < b && c) return 'x'; /* note */ }\n", "<span class=bi>#include &lt;stdio.h&gt;</span>\n<span class=tp>int</span> main<span class=st>(</span><span class=tp>void</span><span class=st>)</span> <span class=st>{</span> <span class=kw>if</span> <span class=kw>(</span>a <span class=op>&lt;</span> b &amp;&amp; c<span class=kw>)</span> <span class=kw>return</span> <span class=nm>&#39;x&#39;</span>; <span class=cm>/* note */</span> <span class=st>}</span>\n"), "synlight's output for x.c");
+        return nil;
+    end;
+
+    function testCase2(): Unit is
+        assertTrue(lighted("x.diff", "diff a b\n@@ -1 +1 @@\n-old line\n+new <line>\n same\n", "<span class=kw>diff a b</span>\n<span class=bi>@@ -1 +1 @@</span>\n<span class=dl>-old line</span>\n<span class=al>+new &lt;line&gt;</span>\n same\n"), "synlight's output for x.diff");
+        return nil;
+    end;
+
+    function testCase3(): Unit is
+        assertTrue(lighted("x.go", "func main() { x := 42; return \"hi\" } // c\n", "<span class=kw>func</span> main<span class=st>(</span><span class=st>)</span> <span class=st>{</span> x <span class=op>:=</span> <span class=nm>42</span>; <span class=kw>return</span> <span class=st>&#34;hi&#34;</span> <span class=st>}</span> <span class=cm>// c</span>\n"), "synlight's output for x.go");
+        return nil;
+    end;
+
+    function testCase4(): Unit is
+        assertTrue(lighted("x.h", "((([[{{}}]])))\n", "<span class=st>(</span><span class=kw>(</span><span class=cm>(</span><span class=bi>[</span><span class=st>[</span><span class=kw>{</span><span class=cm>{</span><span class=cm>}</span><span class=kw>}</span><span class=st>]</span><span class=bi>]</span><span class=cm>)</span><span class=kw>)</span><span class=st>)</span>\n"), "synlight's output for x.h");
+        return nil;
+    end;
+
+    function testCase5(): Unit is
+        assertTrue(lighted("x.html", "<p class=\"a\">hi & {{ .Name }}</p>\n", "<span class=bi>&lt;p</span><span class=kw> class</span>=<span class=st>&#34;a&#34;</span><span class=bi>&gt;</span>hi &amp; <span class=cm>{{ .Name }}</span><span class=bi>&lt;/p</span><span class=bi>&gt;</span>\n"), "synlight's output for x.html");
+        return nil;
+    end;
+
+    function testCase6(): Unit is
+        assertTrue(lighted("x.js", "function f(a) { return console.log('it''s', [1]); }\n", "<span class=kw>function</span> f<span class=st>(</span>a<span class=st>)</span> <span class=st>{</span> <span class=kw>return</span> <span class=bi>console.log</span><span class=kw>(</span><span class=st>&#39;it&#39;</span><span class=st>&#39;s&#39;</span><span class=op>,</span> <span class=cm>[</span><span class=nm>1</span><span class=cm>]</span><span class=kw>)</span>; <span class=st>}</span>\n"), "synlight's output for x.js");
+        return nil;
+    end;
+
+    function testCase7(): Unit is
+        assertTrue(lighted("x.lua", "local t = [[long\nstring]] -- c\nprint(string.format(\"%d\", 1))\n", "<span class=kw>local</span> t <span class=op>=</span> <span class=st>[[long\nstring]]</span> <span class=cm>-- c</span>\n<span class=bi>print</span><span class=st>(</span><span class=bi>string.format</span><span class=kw>(</span><span class=st>&#34;%d&#34;</span><span class=op>,</span> <span class=nm>1</span><span class=kw>)</span><span class=st>)</span>\n"), "synlight's output for x.lua");
+        return nil;
+    end;
+
+    function testCase8(): Unit is
+        assertTrue(lighted("x.py", "def f(x):\n    return None if x is 0x1F else 'a' # c\n", "<span class=kw>def</span> f<span class=op>(</span>x<span class=op>):</span>\n    <span class=kw>return</span> <span class=bi>None</span> <span class=kw>if</span> x <span class=kw>is</span> <span class=nm>0x1F</span> <span class=kw>else</span> <span class=st>&#39;a&#39;</span> <span class=cm># c</span>\n"), "synlight's output for x.py");
+        return nil;
+    end;
+
+    function testCase9(): Unit is
+        assertTrue(lighted("x.rs", "use std::io;\nfn main() { let mut s = String::new(); println!(\"{}\", s); }\n", "<span class=bi>use std::io;</span>\n<span class=kw>fn</span> main<span class=st>(</span><span class=st>)</span> <span class=st>{</span> <span class=kw>let</span> <span class=tp>mut</span> s <span class=op>=</span> <span class=tp>String</span><span class=op>::</span><span class=bi>new</span><span class=kw>(</span><span class=kw>)</span>; <span class=bi>println!</span><span class=kw>(</span><span class=st>&#34;{}&#34;</span><span class=op>,</span> s<span class=kw>)</span>; <span class=st>}</span>\n"), "synlight's output for x.rs");
+        return nil;
+    end;
+
+    function testCase10(): Unit is
+        assertTrue(lighted("x.sql", "CREATE TABLE t (id INTEGER PRIMARY KEY, n text); select 'it''s' from t\n", "<span class=kw>CREATE</span> <span class=bi>TABLE</span> t (id <span class=bi>INTEGER</span> <span class=bi>PRIMARY</span> <span class=bi>KEY</span>, n <span class=bi>text</span>); <span class=kw>select</span> <span class=st>&#39;it&#39;&#39;s&#39;</span> <span class=kw>from</span> t\n"), "synlight's output for x.sql");
+        return nil;
+    end;
+
+    function testCase11(): Unit is
+        assertTrue(lighted("x.txt", "<b>plain</b>\n", "&lt;b&gt;plain&lt;/b&gt;\n"), "synlight's output for x.txt");
+        return nil;
+    end;
+
+    function testCase12(): Unit is
+        var input: StringBuilder := makeStringBuilder();
+        writeString(&!input, "<a/><b x=\"1\"/>");
+        writeByte(&!input, 0);
+        writeString(&!input, "\n");
+        let code: String := finalize(input);
+        assertTrue(lighted("x.xml", asSpan(&code), "<span class=bi>&lt;a/</span><span class=bi>&gt;</span><span class=bi>&lt;b</span><span class=kw> x</span>=<span class=st>&#34;1&#34;</span><span class=bi>/&gt;</span>�\n"), "synlight's output for x.xml, with a NUL");
+        destroyString(code);
+        return nil;
+    end;
+end module body.

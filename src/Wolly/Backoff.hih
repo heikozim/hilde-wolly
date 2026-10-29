@@ -1,0 +1,106 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Growing delays after failed attempts, per key, kept in the database so that
+they hold across requests and processes: a key that failed too often waits
+before its next attempt, and the wait doubles with each further failure.
+
+There is no lock: a lock would hand whoever guesses a way to shut the owner
+out, while a delay only makes guessing slow.  The caller asks backoffWait
+before it checks a credential and refuses the attempt, unchecked, while the
+wait is above zero; it calls backoffFail after a failed check and
+backoffReset after one that held.
+
+The delay after n failures is nothing while n is below free, then base
+seconds, doubled with each further failure, and at most max seconds.  A key
+whose last failure lies more than forget seconds back starts again from
+nothing.
+"""
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Backoff is
+    """
+    How a key is slowed down: free failures cost nothing, then base seconds
+    doubling up to max; forget seconds after its last failure a key is new.
+    """
+    record BackoffRule: Free is
+        free: Int64;
+        base: Int64;
+        max: Int64;
+        forget: Int64;
+    end;
+
+    """
+    The rule of 3 free failures, 1 second, at most 15 minutes, forgotten
+    after a day.
+    """
+    function defaultRule(): BackoffRule
+        ensures (((result.free = 3) and (result.base = 1)) and (result.max = 900)) and (result.forget = 86400);
+
+    """
+    The seconds a key waits after failures failures under rule.
+    """
+    function delayAfter(rule: BackoffRule, failures: Int64): Int64
+        requires (rule.base > 0) and (rule.max >= rule.base)
+        ensures (result >= 0) and (result <= rule.max);
+
+    """
+    Makes the table wolly_backoff, when it is not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareBackoff(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    The seconds key must wait at now before its next attempt; 0 means at
+    once.  A key forgotten under rule goes.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region]
+    function backoffWait(db: &![Database[Writing], R], key: Span[Nat8, K], rule: BackoffRule,
+        now: Int64): Either[DbError, Int64]
+        requires now > 0;
+
+    """
+    Counts a failed attempt of key at now.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region]
+    function backoffFail(db: &![Database[Writing], R], key: Span[Nat8, K], rule: BackoffRule,
+        now: Int64): Option[DbError]
+        requires now > 0;
+
+    """
+    The failures of key on record at now, 0 for a key not known or
+    forgotten under rule.  It changes nothing, so a caller can scale another
+    cost by it.
+    No ensures: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, K: Region]
+    function backoffFailures(db: &![Database[M], R], key: Span[Nat8, K], rule: BackoffRule,
+        now: Int64): Either[DbError, Int64]
+        requires now > 0;
+
+    """
+    Forgets key, after an attempt that held.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region]
+    function backoffReset(db: &![Database[Writing], R], key: Span[Nat8, K]): Option[DbError];
+
+    """
+    Removes the keys forgotten under rule at now.  The rows removed.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function pruneBackoff(db: &![Database[Writing], R], rule: BackoffRule, now: Int64): Either[DbError, Int64]
+        requires now > 0;
+end module.

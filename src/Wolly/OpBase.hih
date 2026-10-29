@@ -1,0 +1,252 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+What the endpoints of an OpenID provider share: its settings, the form of
+a request, the session cookie and the login flow cookie, the answers it
+gives (an error page, a redirect, JSON), the audit line, and the session a
+browser holds.
+
+The cookies are named by the settings: cookieName for the session and
+cookieName-flow for the flow of a login request, both Secure, HttpOnly,
+SameSite=Strict and Path=/ with no Domain, so that a name with the prefix of host
+cookies is taken by a browser only from this very host.
+
+The people who sign in are the accounts of Wolly.Account: a subject is an
+account ID, and an account that is locked holds no session.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.OpClient (
+    Limits
+);
+import Wolly.OpUrl (
+    QueryPair
+);
+import Wolly.OpStore (
+    OpSession
+);
+import Wolly.OpKey (
+    KeyFamily
+);
+
+module Wolly.OpBase is
+    """
+    The settings of a provider.  name stands in its error pages; the times
+    are seconds.
+    """
+    record OpSettings: Linear is
+        issuer: String;
+        name: String;
+        cookieName: String;
+        allowHttp: Bool;
+        session: Limits;
+        accessTtl: Int64;
+        idTokenTtl: Int64;
+        codeTtl: Int64;
+        requestTtl: Int64;
+        keyRotation: Int64;
+        leeway: Int64;
+        loginPath: String;
+        logoutPath: String;
+        defaultFamily: KeyFamily;
+    end;
+
+    """
+    The settings of a provider at issuer, scheme://host without a path, a
+    query, a fragment or a slash at its end, https unless allowHttp; name
+    and cookieName as given; idle and max the limits of a session, 0 <
+    idle <= max, the life of a refresh token idle.  Tokens live 600
+    seconds, codes 60, login requests 600; a key is replaced after 90 days;
+    120 seconds of leeway.  The login page is /login, its logout question
+    /login/logout.  A client that names no algorithm is signed with
+    ML-DSA-44.  None when issuer or the limits do not hold.
+    No contract: an Option read from text.
+    """
+    generic [I: Region, N: Region, C: Region]
+    function makeSettings(issuer: Span[Nat8, I], name: Span[Nat8, N], cookieName: Span[Nat8, C], allowHttp: Bool,
+        idle: Int64, max: Int64): Option[OpSettings];
+
+    """
+    settings with family as the one a client that names no algorithm is
+    signed with.
+    No contract: the settings are a linear record that a condition cannot read without taking it.
+    """
+    function withDefaultFamily(settings: OpSettings, family: KeyFamily): OpSettings;
+
+    """
+    Frees settings.
+    No contract: it only frees.
+    """
+    function destroySettings(settings: OpSettings): Unit;
+
+    """
+    How long a retired key stays published: the longest life of a token it
+    signed and the leeway.
+    """
+    generic [S: Region]
+    function keyKeep(settings: &[OpSettings, S]): Int64
+        ensures result > 0;
+
+    """
+    The most bytes of the body of a request to an endpoint: 16 KiB.
+    """
+    function mostFormBytes(): Index
+        ensures result = 16384;
+
+    """
+    The pairs of the form of request: those of its body when it is a form
+    (application/x-www-form-urlencoded) and the method is POST, then those
+    of its query.  None when the body is larger than mostFormBytes or a
+    part does not decode.
+    No contract: an Option read from the request.
+    """
+    generic [R: Region]
+    function formOf(request: &[Request, R]): Option[Buffer[QueryPair]];
+
+    """
+    The pairs of the body alone, as formOf reads it; empty for a request
+    that is no POST of a form.
+    No contract: an Option read from text.
+    """
+    generic [R: Region]
+    function bodyOf(request: &[Request, R]): Option[Buffer[QueryPair]];
+
+    """
+    The first value of name in pairs, empty when there is none.
+    No contract: its length follows the input.
+    """
+    generic [P: Region, N: Region]
+    function valueOf(pairs: &[Buffer[QueryPair], P], name: Span[Nat8, N]): String;
+
+    """
+    Whether pairs has name.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [P: Region, N: Region]
+    function hasValue(pairs: &[Buffer[QueryPair], P], name: Span[Nat8, N]): Bool;
+
+    """
+    Whether request is a POST.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isPost(request: &[Request, R]): Bool;
+
+    """
+    The value of the cookie name of request, empty when it has none.
+    No contract: its length follows the input.
+    """
+    generic [R: Region, N: Region]
+    function cookieOf(request: &[Request, R], name: Span[Nat8, N]): String;
+
+    """
+    The name of the flow cookie: cookieName and -flow.
+    """
+    generic [S: Region]
+    function flowCookieName(settings: &[OpSettings, S]): String
+        ensures length(&result) > 5;
+
+    """
+    The Set-Cookie value that sets the cookie name to value for maxAge
+    seconds, or for the browser session when maxAge is 0, or removes it
+    when maxAge is below 0.
+    """
+    generic [N: Region, V: Region]
+    function cookieHeader(name: Span[Nat8, N], value: Span[Nat8, V], maxAge: Int64): String
+        ensures length(&result) > 0;
+
+    """
+    The CGI output of the error page of settings: status 400, plain text,
+    the name of the provider, a colon and message.  Nothing of the request
+    is echoed.
+    """
+    generic [S: Region]
+    function errorPage(settings: &[OpSettings, S], message: Span[Nat8, Static]): String
+        ensures length(&result) > 0;
+
+    """
+    The CGI output of a redirect to location with status, no caching, and
+    the Set-Cookie values of cookies.
+    """
+    generic [L: Region, C: Region]
+    function redirectTo(status: Nat16, location: Span[Nat8, L], cookies: &[Buffer[String], C]): String
+        requires (status >= 300) and (status <= 399)
+        ensures length(&result) > 0;
+
+    """
+    The CGI output of JSON body with status and contentType, and Cache-Control
+    cacheControl when it is not empty.
+    """
+    generic [B: Region, C: Region]
+    function jsonOutput(status: Nat16, contentType: Span[Nat8, Static], content: Span[Nat8, B],
+        cacheControl: Span[Nat8, C]): String
+        requires (status >= 100) and (status <= 599)
+        ensures length(&result) > 0;
+
+    """
+    What a token says of a person: e-mail address and display name.
+    """
+    record Subject: Linear is
+        email: String;
+        name: String;
+    end;
+
+    """
+    Frees subject.
+    No contract: it only frees.
+    """
+    function destroySubject(subject: Subject): Unit;
+
+    """
+    The subject id when it is an account that is not locked.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, I: Region]
+    function activeSubject(db: &![Database[Writing], R], id: Span[Nat8, I]): Either[DbError, Option[Subject]];
+
+    """
+    The live session of the session cookie of request at now, whose subject
+    is active.  Right None otherwise.
+    """
+    generic [Q: Region, R: Region, S: Region]
+    function cookieSession(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        now: Int64): Either[DbError, Option[OpSession]]
+        requires now > 0;
+
+    """
+    Writes an audit line to log: the message audit, event, and client,
+    subject, sid, reason, result and addr when they are not empty.
+    No contract: it writes a line and gives nothing back.
+    """
+    generic [L: Region, C: Region, U: Region, I: Region, E: Region, A: Region]
+    function audit(log: &![Log, L], event: Span[Nat8, Static], client: Span[Nat8, C], subject: Span[Nat8, U],
+        sid: Span[Nat8, I], reason: Span[Nat8, E], result: Span[Nat8, Static], addr: Span[Nat8, A]): Unit;
+
+    """
+    The minimal HTML escape of text: and sign, less and greater than,
+    double and single quote.
+    """
+    generic [T: Region]
+    function htmlEscape(text: Span[Nat8, T]): String
+        ensures length(&result) >= spanLength(text);
+end module.

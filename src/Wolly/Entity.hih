@@ -1,0 +1,255 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Things whose fields are defined at run time, in SQLite: entity, attribute,
+value (EAV), with the fields typed and checked.  An administrator defines
+the fields of a kind (an article has a title, a text of at most 200
+bytes, required and unique); the application then stores and finds the
+values of each entity of that kind without a new build.
+
+Hilde takes only constant SQL, checked when the programme is compiled
+(Standard.Database), so a table of its own for each kind, made at run time,
+is not possible.  The tables here are fixed: the fields, the entities, one
+row for each value, the unique values and the audit.  What an application
+knows when it is built belongs into tables of its own, with @query and the
+migrations of Standard.Database.
+
+The names of a kind and a field are an allowlist, never what a request
+says: a to z first, then a to z, 0 to 9 and underscore, 1 to 31 bytes, and
+none of the names the columns of a table of its own would have (id, kind,
+version, created_at, created_by, updated_at, updated_by).  A kind has at
+most mostFields fields.  A text value is UTF-8 of at most the length of
+its field in bytes, at most mostLength.  A unique value is held by one
+entity of the kind at most, which a table with that key enforces, not a
+look before the write.  Every change is one transaction and leaves a line
+in the audit: who, when, what, which kind, entity and field, but never the
+value, which may be personal.
+
+Built on Standard.Database with SQLite as the backend; the SQL
+keeps to what Postgres also takes, apart from what a Postgres driver
+must translate: ? for $1, STRICT, the rowid key and a value of type ANY.
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Entity is
+    """
+    The type of the values of a field.
+    """
+    union ValueType: Free is
+        case TextValue;
+        case IntegerValue;
+    end;
+
+    """
+    What became of a change.  Only Stored changed anything.
+    """
+    union Change: Free is
+        """
+        Stored, and the audit says so.
+        """
+        case Stored;
+        """
+        No entity has this number.
+        """
+        case NoEntity;
+        """
+        The kind of the entity has no such field.
+        """
+        case UnknownField;
+        """
+        The field holds values of the other type.
+        """
+        case WrongType;
+        """
+        A text longer than its field allows.
+        """
+        case EntityTooLong;
+        """
+        A text that is not well-formed UTF-8.
+        """
+        case NotUtf8;
+        """
+        Another entity of the kind holds this value of a unique field.
+        """
+        case Taken;
+        """
+        The value of a required field cannot be cleared.
+        """
+        case Required;
+        """
+        The actor is no name of Wolly.Role.isName.
+        """
+        case BadActor;
+    end;
+
+    """
+    The most fields a kind may have: 64.
+    """
+    function mostFields(): Int64
+        ensures result = 64;
+
+    """
+    The most bytes a text field may allow: 65536.
+    """
+    function mostLength(): Int64
+        ensures result = 65536;
+
+    """
+    The most entities a search gives: 1000.
+    """
+    function mostFound(): Int64
+        ensures result = 1000;
+
+    """
+    Whether name may name a kind or a field.
+    No contract: a walk over name, more than O(1) to state.
+    """
+    generic [N: Region]
+    function isFieldName(name: Span[Nat8, N]): Bool;
+
+    """
+    Makes the tables and their indexes, if they are not there.  None when
+    all exist afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareEntities(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Defines field of kind.  Right true when the field is there afterwards
+    with this shape, also when it was before.  Right false, and nothing
+    stored, when kind, field or actor is no name, maxLength is not 1 to
+    mostLength (it counts for text only, and an integer field takes 1),
+    kind has mostFields fields already, or the field is there with another
+    shape: a field is never changed, only dropped and defined anew.  A new
+    required field leaves the entities there before incomplete
+    (missingField).
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function defineField(db: &![Database[Writing], R], kind: Span[Nat8, K], field: Span[Nat8, F], valueType: ValueType,
+                         required: Bool, unique: Bool, maxLength: Int64, actor: Span[Nat8, A], now: Int64): Either[DbError, Bool];
+
+    """
+    Drops field of kind and every value of it.  Right true when there was
+    such a field; Right false when there was none or actor is no name.
+    Destructive: a confirmation in two steps is the handler's.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region, F: Region, A: Region]
+    function dropField(db: &![Database[Writing], R], kind: Span[Nat8, K], field: Span[Nat8, F], actor: Span[Nat8, A],
+                       now: Int64): Either[DbError, Bool];
+
+    """
+    A new entity of kind, without values.  Right Some with its number; Right
+    None when kind has no field or actor is no name.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region, A: Region]
+    function createEntity(db: &![Database[Writing], R], kind: Span[Nat8, K], actor: Span[Nat8, A],
+                          now: Int64): Either[DbError, Option[Int64]];
+
+    """
+    Sets field of entity to the text value.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, F: Region, V: Region, A: Region]
+    function setText(db: &![Database[Writing], R], entity: Int64, field: Span[Nat8, F], value: Span[Nat8, V],
+                     actor: Span[Nat8, A], now: Int64): Either[DbError, Change];
+
+    """
+    Sets field of entity to the integer value.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, F: Region, A: Region]
+    function setInteger(db: &![Database[Writing], R], entity: Int64, field: Span[Nat8, F], value: Int64,
+                        actor: Span[Nat8, A], now: Int64): Either[DbError, Change];
+
+    """
+    Clears field of entity.  Stored also when it had no value.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, F: Region, A: Region]
+    function clearValue(db: &![Database[Writing], R], entity: Int64, field: Span[Nat8, F], actor: Span[Nat8, A],
+                        now: Int64): Either[DbError, Change];
+
+    """
+    Deletes entity and its values.  Right true when there was one; Right
+    false when there was none or actor is no name.  Destructive: the
+    confirmation in two steps is the handler's.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, A: Region]
+    function deleteEntity(db: &![Database[Writing], R], entity: Int64, actor: Span[Nat8, A],
+                          now: Int64): Either[DbError, Bool];
+
+    """
+    The text of field of entity, None when it has none.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, F: Region]
+    function textOf(db: &![Database[M], R], entity: Int64, field: Span[Nat8, F]): Either[DbError, Option[String]];
+
+    """
+    The integer of field of entity, None when it has none.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, F: Region]
+    function integerField(db: &![Database[M], R], entity: Int64, field: Span[Nat8, F]): Either[DbError, Option[Int64]];
+
+    """
+    The kind of entity, None when there is no such entity.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region]
+    function kindOf(db: &![Database[M], R], entity: Int64): Either[DbError, Option[String]];
+
+    """
+    The first required field of the kind of entity, after the order of the
+    names, that entity has no value of; None when it has them all or there
+    is no such entity.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region]
+    function missingField(db: &![Database[M], R], entity: Int64): Either[DbError, Option[String]];
+
+    """
+    The entities of kind whose field has the text value, ascending, at most
+    mostFound.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, K: Region, F: Region, V: Region]
+    function findText(db: &![Database[M], R], kind: Span[Nat8, K], field: Span[Nat8, F],
+                      value: Span[Nat8, V]): Either[DbError, Buffer[Int64]];
+
+    """
+    The entities of kind whose field has the integer value, ascending, at
+    most mostFound.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, K: Region, F: Region]
+    function findInteger(db: &![Database[M], R], kind: Span[Nat8, K], field: Span[Nat8, F],
+                         value: Int64): Either[DbError, Buffer[Int64]];
+
+    """
+    The number of lines of the audit, of all kinds: for a test and for an
+    administrator who checks that a change was written down.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region]
+    function auditCount(db: &![Database[M], R]): Either[DbError, Int64];
+end module.

@@ -1,0 +1,76 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A Wolly application as a FastCGI responder behind a web server such as
+Hiawatha, on a Unix domain socket.
+
+serve is the whole life of the process: it listens on the socket with mode
+0660, so that the web server reaches it through a shared group and nobody
+else does, serves with Standard.FcgiServer until SIGTERM or SIGINT, lets
+the requests in flight finish, and removes the socket.  The loop, its
+limits and its tasks are Standard.FcgiServer's; Wolly adds no second loop.
+
+The socket path is the operator's: whatever is there is removed before
+listening, as a socket left by an earlier run would be.
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer,
+    length
+);
+import Standard.FcgiServer (
+    Limits,
+    Request,
+    Turn,
+    Served
+);
+
+module Wolly.Server is
+    """
+    How serve ended.
+    """
+    union Outcome: Free is
+        """
+        A signal asked for the end, and the requests in flight are done.
+        The number is the connections that were accepted.
+        """
+        case Stopped is
+            accepted: Index;
+        """
+        The socket could not be made: the directory is missing or not
+        writable, or the path is too long for a Unix socket.
+        """
+        case NoSocket;
+        """
+        SIGTERM and SIGINT could not be watched, or the task runtime could
+        not be set up; nothing was served.
+        """
+        case NotStarted;
+    end;
+
+    """
+    Serves handler on the Unix socket at socketPath with limits until a
+    signal ends it.
+    No contract: what comes back is the result of I/O.
+    """
+    generic [S: Region]
+    function serve(socketPath: Span[Nat8, S], handler: Fn[Request, String], limits: Limits): Outcome;
+
+    """
+    As serve, for a handler that keeps a state between requests, as
+    Standard.FcgiServer.serveUnixWith has it: each task of the loop has
+    one of states alone, and every state is back in states when serve
+    returns, for the caller to close.  states must not be empty.  No
+    ensures: what comes back is the result of I/O.
+    """
+    generic [T: Type, S: Region, B: Region]
+    function serveWith(socketPath: Span[Nat8, S], states: &![Buffer[T], B], handler: Fn[Turn[T], Served[T]],
+        limits: Limits): Outcome
+        requires length(&states) > 0;
+end module.

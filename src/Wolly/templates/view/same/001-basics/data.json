@@ -1,0 +1,13 @@
+{
+ "title": "Tom & Jerry's <Page>",
+ "user": "Ann \"A\" O'Neil",
+ "admin": true,
+ "count": 3,
+ "items": [
+  {"name": "apple", "price": 3, "note": null},
+  {"name": "pear <x>", "price": 12, "note": "ripe & sweet"}
+ ],
+ "empty": [],
+ "motto": "  keep going  ",
+ "missing": null
+}

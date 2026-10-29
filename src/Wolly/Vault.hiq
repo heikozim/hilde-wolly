@@ -1,0 +1,596 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    destroyWiped,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    substring,
+    indexOfByte,
+    bytesToHex,
+    hexToBytes
+);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    statusOf,
+    openRead,
+    readAll,
+    createNewFile,
+    writeAll,
+    syncFile,
+    closeFile,
+    renameFile,
+    removeFileIfThere
+);
+import Wolly.Secret (
+    readKey
+);
+import Standard.Vault (
+    VaultError,
+    Damaged,
+    Vault,
+    createPepper,
+    createKey,
+    openVault,
+    closeVault,
+    setSecret as setStandardSecret,
+    getSecret as getStandardSecret
+);
+import Wolly.Seal (
+    sealValue,
+    openValue
+);
+
+module body Wolly.Vault is
+    constant secretMost: Index := 4096;
+    constant nameMost: Index := 64;
+    constant purpose: Span[Nat8, Static] := "wolly-vault";
+
+    function mostSecretBytes(): Index is
+        return secretMost;
+    end;
+
+    generic [N: Region]
+    function isSecretName(name: Span[Nat8, N]): Bool is
+        let size: Index := spanLength(name);
+        if (size = 0) or (size > nameMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := name[i];
+            let upper: Bool := (byte >= 65) and (byte <= 90);
+            let digit: Bool := (byte >= 48) and (byte <= 57);
+            if not ((upper or digit) or (byte = 95)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The name of a line NAME=SEALED, or the whole line when it has no =.
+    generic [L: Region]
+    function nameOf(line: Span[Nat8, L]): Span[Nat8, L] is
+        case indexOfByte(line, '=') of
+            when Some(value as at: Index) do
+                return substring(line, 0, at);
+            when None do
+                return line;
+        end case;
+    end;
+
+    generic [L: Region]
+    function sealedOf(line: Span[Nat8, L]): Span[Nat8, L] is
+        case indexOfByte(line, '=') of
+            when Some(value as at: Index) do
+                return substring(line, at + 1, spanLength(line));
+            when None do
+                return substring(line, 0, 0);
+        end case;
+    end;
+
+    -- The vault as text: empty when there is none, None when it cannot be
+    -- read.
+    generic [V: Region]
+    function readVault(vaultPath: Span[Nat8, V]): Option[String] is
+        case statusOf(vaultPath) of
+            when FileMissing do
+                return Some(value => fromSpan(substring("", 0, 0)));
+            when FileUnreadable do
+                return None();
+            when FileFound(status as found: FileStatus) do
+                case openRead(vaultPath) of
+                    when Some(value as opened: FileDescriptor) do
+                        var file: FileDescriptor := opened;
+                        let content: Option[String] := readAll(&!file);
+                        let closed: Bool := closeFile(file);
+                        return content;
+                    when None do
+                        return None();
+                end case;
+        end case;
+    end;
+
+    -- Writes text to the vault: a new file beside it, mode 0600, synced,
+    -- renamed over it.
+    generic [V: Region, T: Region]
+    function writeVault(vaultPath: Span[Nat8, V], text: Span[Nat8, T]): Bool is
+        var temp: StringBuilder := makeStringBuilder();
+        writeString(&!temp, vaultPath);
+        writeString(&!temp, ".new");
+        let tempPath: String := finalize(temp);
+        let cleared: Bool := removeFileIfThere(asSpan(&tempPath));
+        var done: Bool := false;
+        case createNewFile(asSpan(&tempPath), #o600) of
+            when Some(value as made: FileDescriptor) do
+                var file: FileDescriptor := made;
+                let written: Bool := writeAll(&!file, text);
+                let synced: Bool := syncFile(&!file);
+                let closed: Bool := closeFile(file);
+                if (written and synced) and closed then
+                    done := renameFile(asSpan(&tempPath), vaultPath);
+                end if;
+            when None do
+                skip;
+        end case;
+        if not done then
+            let removed: Bool := removeFileIfThere(asSpan(&tempPath));
+        end if;
+        destroyString(tempPath);
+        return done;
+    end;
+
+    -- The sealed value of name in the vault text, in hex; empty when the
+    -- vault has no line for name.
+    generic [T: Region, N: Region]
+    function findSealed(text: Span[Nat8, T], name: Span[Nat8, N]): Span[Nat8, T] is
+        let size: Index := spanLength(text);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (text[i] = 10) then
+                let line: Span[Nat8, T] := substring(text, start, i);
+                if (spanLength(line) > 0) and equal(nameOf(line), name) then
+                    return sealedOf(line);
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return substring(text, 0, 0);
+    end;
+
+    generic [K: Region, H: Region, N: Region]
+    function openSealed(key: Span[Nat8, K], hex: Span[Nat8, H], name: Span[Nat8, N]): Option[String] is
+        if spanLength(hex) = 0 then
+            return None();
+        end if;
+        case hexToBytes(hex) of
+            when Some(value as sealed: String) do
+                let plain: Option[String] := openValue(key, purpose, asSpan(&sealed), name);
+                destroyString(sealed);
+                return plain;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [V: Region, K: Region, N: Region]
+    function getSecret(vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], name: Span[Nat8, N]): Option[String] is
+        case readKey(keyPath) of
+            when None do
+                return None();
+            when Some(value as key: String) do
+                case readVault(vaultPath) of
+                    when None do
+                        destroyString(key);
+                        return None();
+                    when Some(value as text: String) do
+                        let plain: Option[String] := openSealed(asSpan(&key), findSealed(asSpan(&text), name), name);
+                        destroyString(text);
+                        destroyString(key);
+                        return plain;
+                end case;
+        end case;
+    end;
+
+    -- The vault text with the line of name as line, in its place or at the
+    -- end; without it when line is empty.
+    generic [T: Region, N: Region, L: Region]
+    function withLine(text: Span[Nat8, T], name: Span[Nat8, N], line: Span[Nat8, L]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var replaced: Bool := false;
+        let size: Index := spanLength(text);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (text[i] = 10) then
+                let old: Span[Nat8, T] := substring(text, start, i);
+                if spanLength(old) > 0 then
+                    if equal(nameOf(old), name) then
+                        if (spanLength(line) > 0) and (not replaced) then
+                            writeString(&!out, line);
+                            writeByte(&!out, 10);
+                        end if;
+                        replaced := true;
+                    else
+                        writeString(&!out, old);
+                        writeByte(&!out, 10);
+                    end if;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        if (not replaced) and (spanLength(line) > 0) then
+            writeString(&!out, line);
+            writeByte(&!out, 10);
+        end if;
+        return finalize(out);
+    end;
+
+    -- NAME=HEX of value sealed under key.
+    generic [K: Region, N: Region, S: Region]
+    function sealedLine(key: Span[Nat8, K], name: Span[Nat8, N], value: Span[Nat8, S]): Option[String] is
+        case sealValue(key, purpose, value, name) of
+            when Some(value as sealed: String) do
+                let hex: String := bytesToHex(asSpan(&sealed));
+                destroyString(sealed);
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, name);
+                writeByte(&!out, '=');
+                writeString(&!out, asSpan(&hex));
+                destroyString(hex);
+                return Some(value => finalize(out));
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [V: Region, K: Region, N: Region, S: Region]
+    function setSecret(vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], name: Span[Nat8, N], value: Span[Nat8, S]): Bool is
+        if ((not isSecretName(name)) or (spanLength(value) = 0)) or (spanLength(value) > secretMost) then
+            return false;
+        end if;
+        case readKey(keyPath) of
+            when None do
+                return false;
+            when Some(value as key: String) do
+                let made: Option[String] := sealedLine(asSpan(&key), name, value);
+                destroyString(key);
+                case made of
+                    when None do
+                        return false;
+                    when Some(value as line: String) do
+                        case readVault(vaultPath) of
+                            when None do
+                                destroyString(line);
+                                return false;
+                            when Some(value as text: String) do
+                                let next: String := withLine(asSpan(&text), name, asSpan(&line));
+                                destroyString(text);
+                                destroyString(line);
+                                let written: Bool := writeVault(vaultPath, asSpan(&next));
+                                destroyString(next);
+                                return written;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [V: Region, N: Region]
+    function deleteSecret(vaultPath: Span[Nat8, V], name: Span[Nat8, N]): Bool is
+        if not isSecretName(name) then
+            return false;
+        end if;
+        case readVault(vaultPath) of
+            when None do
+                return false;
+            when Some(value as text: String) do
+                let there: Bool := spanLength(findSealed(asSpan(&text), name)) > 0;
+                let next: String := withLine(asSpan(&text), name, "");
+                destroyString(text);
+                var written: Bool := false;
+                if there then
+                    written := writeVault(vaultPath, asSpan(&next));
+                end if;
+                destroyString(next);
+                return written;
+        end case;
+    end;
+
+    -- The names of the lines of text, one a line.
+    generic [T: Region]
+    function namesIn(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(text);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (text[i] = 10) then
+                let line: Span[Nat8, T] := substring(text, start, i);
+                if spanLength(line) > 0 then
+                    writeString(&!out, nameOf(line));
+                    writeByte(&!out, 10);
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [V: Region]
+    function secretNames(vaultPath: Span[Nat8, V]): String is
+        case readVault(vaultPath) of
+            when Some(value as text: String) do
+                let names: String := namesIn(asSpan(&text));
+                destroyString(text);
+                return names;
+            when None do
+                return fromSpan(substring("", 0, 0));
+        end case;
+    end;
+
+    -- Every line of text opened under one key and sealed under the other;
+    -- None when one does not open.
+    generic [T: Region, O: Region, N: Region]
+    function resealed(text: Span[Nat8, T], oldKey: Span[Nat8, O], newKey: Span[Nat8, N]): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        var good: Bool := true;
+        let size: Index := spanLength(text);
+        var start: Index := 0;
+        var i: Index := 0;
+        while (i <= size) and good do
+            if (i = size) or (text[i] = 10) then
+                let line: Span[Nat8, T] := substring(text, start, i);
+                if spanLength(line) > 0 then
+                    case openSealed(oldKey, sealedOf(line), nameOf(line)) of
+                        when Some(value as plain: String) do
+                            case sealedLine(newKey, nameOf(line), asSpan(&plain)) of
+                                when Some(value as fresh: String) do
+                                    writeString(&!out, asSpan(&fresh));
+                                    writeByte(&!out, 10);
+                                    destroyString(fresh);
+                                when None do
+                                    good := false;
+                            end case;
+                            destroyString(plain);
+                        when None do
+                            good := false;
+                    end case;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        let made: String := finalize(out);
+        if good then
+            return Some(value => made);
+        else
+            destroyString(made);
+            return None();
+        end if;
+    end;
+
+    generic [V: Region, O: Region, N: Region]
+    function rotateVault(vaultPath: Span[Nat8, V], oldKeyPath: Span[Nat8, O], newKeyPath: Span[Nat8, N]): Bool is
+        case readKey(oldKeyPath) of
+            when None do
+                return false;
+            when Some(value as oldKey: String) do
+                case readKey(newKeyPath) of
+                    when None do
+                        destroyString(oldKey);
+                        return false;
+                    when Some(value as newKey: String) do
+                        var done: Bool := false;
+                        if not equal(asSpan(&oldKey), asSpan(&newKey)) then
+                            case readVault(vaultPath) of
+                                when Some(value as text: String) do
+                                    case resealed(asSpan(&text), asSpan(&oldKey), asSpan(&newKey)) of
+                                        when Some(value as next: String) do
+                                            done := writeVault(vaultPath, asSpan(&next));
+                                            destroyString(next);
+                                        when None do
+                                            skip;
+                                    end case;
+                                    destroyString(text);
+                                when None do
+                                    skip;
+                            end case;
+                        end if;
+                        destroyString(oldKey);
+                        destroyString(newKey);
+                        return done;
+                end case;
+        end case;
+    end;
+
+    function destroyConversion(conversion: Conversion): Unit is
+        let { converted as count: Index, refused as names: String } := conversion;
+        destroyString(names);
+        return nil;
+    end;
+
+    -- Whether a name can be carried into Standard.Vault as it is: its first byte is no digit.
+    generic [N: Region]
+    function carried(name: Span[Nat8, N]): Bool is
+        return (spanLength(name) > 0) and ((name[0] < '0') or (name[0] > '9'));
+    end;
+
+    -- The end of the line of names that starts at start: the index of its newline, or the end of names.
+    generic [L: Region]
+    function lineEnd(names: Span[Nat8, L], start: Index): Index is
+        var at: Index := start;
+        while (at < spanLength(names)) and (names[at] /= '\n') do
+            at := at + 1;
+        end while;
+        return at;
+    end;
+
+    -- Whether every secret of names that can be carried opens under the old key.
+    generic [V: Region, K: Region, L: Region]
+    function allOpen(vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], names: Span[Nat8, L]): Bool is
+        var start: Index := 0;
+        while start < spanLength(names) do
+            let stop: Index := lineEnd(names, start);
+            let name: Span[Nat8, L] := substring(names, start, stop);
+            if carried(name) then
+                case getSecret(vaultPath, keyPath, name) of
+                    when Some(value as old: String) do
+                        destroyWiped(old);
+                    when None do
+                        return false;
+                end case;
+            end if;
+            start := stop + 1;
+        end while;
+        return true;
+    end;
+
+    -- The pepper when it is not there yet; Right when a file is at its place afterwards.
+    generic [P: Region]
+    function pepperThere(pepperPath: Span[Nat8, P]): Either[VaultError, Unit] is
+        case statusOf(pepperPath) of
+            when FileMissing do
+                return createPepper(pepperPath);
+            when FileUnreadable do
+                return createPepper(pepperPath);
+            when FileFound(status as found: FileStatus) do
+                let there: Either[VaultError, Unit] := Right(right => nil);
+                return there;
+        end case;
+    end;
+
+    -- The vault of Standard.Vault, with its key line made when opening it finds none.
+    generic [E: Region, P: Region, N: Region]
+    function newVault(envPath: Span[Nat8, E], pepperPath: Span[Nat8, P], keyName: Span[Nat8, N]): Either[VaultError, Vault] is
+        case openVault(envPath, pepperPath, keyName) of
+            when Right(right as opened: Vault) do
+                return Right(right => opened);
+            when Left(left as missing: VaultError) do
+                case createKey(envPath, pepperPath, keyName) of
+                    when Left(left as error: VaultError) do
+                        return Left(left => error);
+                    when Right(right as made: Unit) do
+                        return openVault(envPath, pepperPath, keyName);
+                end case;
+        end case;
+    end;
+
+    -- One secret carried over: set under name, read back and compared.
+    generic [R: Region, N: Region, T: Region]
+    function carryOne(vault: &![Vault, R], name: Span[Nat8, N], value: Span[Nat8, T]): Option[VaultError] is
+        case setStandardSecret(&~vault, name, value) of
+            when Left(left as error: VaultError) do
+                return Some(value => error);
+            when Right(right as set: Unit) do
+                skip;
+        end case;
+        case getStandardSecret(&vault, name) of
+            when Left(left as error: VaultError) do
+                return Some(value => error);
+            when Right(right as back: String) do
+                let alike: Bool := equal(asSpan(&back), value);
+                destroyWiped(back);
+                if alike then
+                    return None();
+                end if;
+                return Some(value => Damaged());
+        end case;
+    end;
+
+    -- Every name of names carried into vault, or the first failure; the names refused written into refused.
+    generic [R: Region, B: Region, V: Region, K: Region, L: Region]
+    function carryAll(vault: &![Vault, R], vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], names: Span[Nat8, L],
+                      refused: &![StringBuilder, B]): Either[VaultError, Index] is
+        var count: Index := 0;
+        var start: Index := 0;
+        while start < spanLength(names) do
+            let stop: Index := lineEnd(names, start);
+            let name: Span[Nat8, L] := substring(names, start, stop);
+            if carried(name) then
+                case getSecret(vaultPath, keyPath, name) of
+                    when Some(value as old: String) do
+                        let failed: Option[VaultError] := carryOne(&~vault, name, asSpan(&old));
+                        destroyWiped(old);
+                        case failed of
+                            when Some(value as error: VaultError) do
+                                return Left(left => error);
+                            when None do
+                                count := count + 1;
+                        end case;
+                    when None do
+                        return Left(left => Damaged());
+                end case;
+            else
+                writeString(&~refused, name);
+                writeByte(&~refused, '\n');
+            end if;
+            start := stop + 1;
+        end while;
+        return Right(right => count);
+    end;
+
+    generic [V: Region, K: Region, E: Region, P: Region, L: Region, N: Region]
+    function convertNames(vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], envPath: Span[Nat8, E],
+                          pepperPath: Span[Nat8, P], keyName: Span[Nat8, N], names: Span[Nat8, L]): Either[VaultError, Conversion] is
+        if not allOpen(vaultPath, keyPath, names) then
+            return Left(left => Damaged());
+        end if;
+        case pepperThere(pepperPath) of
+            when Left(left as error: VaultError) do
+                return Left(left => error);
+            when Right(right as there: Unit) do
+                skip;
+        end case;
+        case newVault(envPath, pepperPath, keyName) of
+            when Left(left as error: VaultError) do
+                return Left(left => error);
+            when Right(right as opened: Vault) do
+                var vault: Vault := opened;
+                var refused: StringBuilder := makeStringBuilder();
+                let carriedOver: Either[VaultError, Index] := carryAll(&!vault, vaultPath, keyPath, names, &!refused);
+                closeVault(vault);
+                let refusedNames: String := finalize(refused);
+                case carriedOver of
+                    when Left(left as error: VaultError) do
+                        destroyString(refusedNames);
+                        return Left(left => error);
+                    when Right(right as count: Index) do
+                        return Right(right => Conversion(converted => count, refused => refusedNames));
+                end case;
+        end case;
+    end;
+
+    generic [V: Region, K: Region, E: Region, P: Region, N: Region]
+    function convertVault(vaultPath: Span[Nat8, V], keyPath: Span[Nat8, K], envPath: Span[Nat8, E],
+                          pepperPath: Span[Nat8, P], keyName: Span[Nat8, N]): Either[VaultError, Conversion] is
+        let names: String := secretNames(vaultPath);
+        let result: Either[VaultError, Conversion] := convertNames(vaultPath, keyPath, envPath, pepperPath, keyName, asSpan(&names));
+        destroyString(names);
+        return result;
+    end;
+end module body.

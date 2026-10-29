@@ -1,0 +1,116 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The URI is taken apart again: the base64 decoded, the PNG decoded, its
+-- side measured.  "hello" is 5 bytes, version 1 at level medium: 21
+-- modules, 4 light ones around, 4 pixels each, so 116 pixels.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    startsWith,
+    substring
+);
+import Standard.Base64 (
+    decode
+);
+import Standard.Png (
+    Image,
+    PngError,
+    decodePng,
+    imageWidth,
+    imageHeight,
+    destroyImage
+);
+import Wolly.Qr (
+    moduleScale,
+    qrDataUri
+);
+
+module body Wolly.Qr.Test is
+    constant prefixBytes: Index := 22;
+
+    -- The side in pixels of the image in uri, 0 when it is none.
+    generic [U: Region]
+    function sideOf(uri: Span[Nat8, U]): Index is
+        case decode(substring(uri, prefixBytes, spanLength(uri))) of
+            when Some(value as png: String) do
+                let decoded: Either[PngError, Image] := decodePng(asSpan(&png), 1000000);
+                destroyString(png);
+                case decoded of
+                    when Right(right as image: Image) do
+                        var side: Index := 0;
+                        if imageWidth(&image) = imageHeight(&image) then
+                            side := imageWidth(&image);
+                        end if;
+                        destroyImage(image);
+                        return side;
+                    when Left(left as error: PngError) do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- count bytes of a.
+    function letters(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!out, 'a');
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function testHello(): Unit is
+        assertTrue(moduleScale() = 4, "4 pixels a module");
+        case qrDataUri("hello") of
+            when Some(value as uri: String) do
+                assertTrue(startsWith(asSpan(&uri), "data:image/png;base64,iVBORw0KGgo"), "a data URI of a PNG");
+                assertTrue(sideOf(asSpan(&uri)) = 116, "21 modules and 8 of quiet zone, 4 pixels each");
+                destroyString(uri);
+            when None do
+                assertTrue(false, "hello has a code");
+        end case;
+        return nil;
+    end;
+
+    function testLongest(): Unit is
+        let most: String := letters(2331);
+        case qrDataUri(asSpan(&most)) of
+            when Some(value as uri: String) do
+                assertTrue(sideOf(asSpan(&uri)) = 740, "2331 bytes fill version 40: 177 modules and 8, 4 pixels each");
+                destroyString(uri);
+            when None do
+                assertTrue(false, "2331 bytes fit at level medium");
+        end case;
+        destroyString(most);
+        let over: String := letters(2332);
+        case qrDataUri(asSpan(&over)) of
+            when Some(value as uri: String) do
+                destroyString(uri);
+                assertTrue(false, "2332 bytes do not fit");
+            when None do
+                assertTrue(true, "2332 bytes do not fit");
+        end case;
+        destroyString(over);
+        return nil;
+    end;
+end module body.

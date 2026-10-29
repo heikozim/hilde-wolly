@@ -1,0 +1,111 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The answer of a handler as CGI output: a Status line, a Content-Type line,
+header lines such as Set-Cookie, an empty line and the body.
+
+Standard.FcgiServer.cgiResponse writes the first two lines and the body; a
+Response adds the headers between them.  A header whose name is no token or
+whose value holds a byte outside printable ASCII and tab is refused, never
+escaped: CR and LF in a value would end the header block and let the value
+write headers of its own.  A response with a refused header is not sent as
+it was meant: finish turns it into a 500 without any of its headers or its
+body, so a handler that ignores the Bool of addHeader still fails closed.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Cookie (
+    CookieOptions
+);
+
+module Wolly.Response is
+    """
+    An answer being built.  Linear: finish gives back its CGI output.
+    """
+    type Response: Linear;
+
+    """
+    A response with this status and content type.  The content type is a
+    literal of the programme, never a value from the request.  The status
+    is one of HTTP's, from 100 to 599.
+    """
+    function makeResponse(status: Nat16, contentType: Span[Nat8, Static]): Response
+        requires (status >= 100) and (status <= 599);
+
+    """
+    The response with the header name: value added, or with the header
+    refused: name no token, name Status or Content-Type, which the
+    response writes itself, or value with a byte outside printable ASCII
+    and tab.  A refused header makes finish answer 500; wasRefused tells.
+    No contract: whether the header was refused is a walk over name and
+    value, more than a constant cost.
+    """
+    generic [N: Region, V: Region]
+    function addHeader(response: Response, name: Span[Nat8, N], value: Span[Nat8, V]): Response;
+
+    """
+    The decimal digits of value, without a sign or leading zeros.
+    """
+    function decimalText(value: Int64): String
+        requires value >= 0
+        ensures length(&result) >= 1;
+
+    """
+    The response with the header name and the decimal digits of value, as
+    Retry-After takes them; refused as addHeader refuses a name.  No
+    ensures, for the reason addHeader gives.
+    """
+    generic [N: Region]
+    function addNumberHeader(response: Response, name: Span[Nat8, N], value: Int64): Response
+        requires value >= 0;
+
+    """
+    The response with a Set-Cookie header for name, value and path, made
+    by Standard.Cookie.setCookie.  Refused as there.
+    No contract: whether it was refused costs more than O(1), as for
+    addHeader.
+    """
+    generic [N: Region, V: Region, P: Region]
+    function addCookie(response: Response, name: Span[Nat8, N], value: Span[Nat8, V], path: Span[Nat8, P],
+                       options: CookieOptions): Response;
+
+    """
+    Whether a header of response was refused.
+    No contract: it reads one field and has nothing to promise beyond it.
+    """
+    generic [R: Region]
+    function wasRefused(response: &[Response, R]): Bool;
+
+    """
+    The CGI output of response with content as its body.  A response with a refused
+    header gives a 500 with a short text body instead.
+    """
+    generic [B: Region]
+    function finish(response: Response, content: Span[Nat8, B]): String
+        ensures length(&result) > 0;
+
+    """
+    The finished CGI output with the header name: value added before its
+    empty line, for a step that runs after the handler.  A header of that
+    name that is there already, in any case, stays and nothing is added.
+    A name or value that addHeader would refuse, and an output without an
+    empty line, give a 500 instead, as finish does for a refused header.
+    """
+    generic [N: Region, V: Region]
+    function withHeader(output: String, name: Span[Nat8, N], value: Span[Nat8, V]): String
+        ensures length(&result) > 0;
+
+    """
+    Whether value may stand in a header line: printable ASCII and tab, no
+    CR, no LF, no other control byte.
+    No contract: the answer is a walk over value.
+    """
+    generic [V: Region]
+    function isHeaderValue(value: Span[Nat8, V]): Bool;
+end module.

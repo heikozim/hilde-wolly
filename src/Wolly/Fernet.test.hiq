@@ -1,0 +1,131 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length,
+    nthByte,
+    storeNth
+);
+import Standard.Text (
+    equal
+);
+import Wolly.Fernet (
+    overheadBytes,
+    readFernetKey,
+    newFernetKey,
+    sealFernet,
+    openFernet
+);
+
+module body Wolly.Fernet.Test is
+    -- 48 bytes 0 to 47 in URL Base64 with padding.
+    constant key: Span[Nat8, Static] := "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v";
+    constant other: Span[Nat8, Static] := "AQECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v";
+
+    function sealed(value: Span[Nat8, Static], now: Int64): String is
+        case sealFernet(key, value, now) of
+            when Some(value as token: String) do
+                return token;
+            when None do
+                abort("nothing was sealed");
+        end case;
+    end;
+
+    function testRoundTrip(): Unit is
+        let token: String := sealed("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", 1700000000);
+        assertTrue(length(&token) = (32 + overheadBytes()), "the token is the value and the overhead");
+        assertTrue(nthByte(&token, 0) = 204, "the version is 0xCC");
+        assertTrue(nthByte(&token, 8) = 0, "the time ends in byte 8: 1700000000 is 0x6553F100");
+        assertTrue(nthByte(&token, 7) = 241, "byte 7 of the time");
+        assertTrue(nthByte(&token, 5) = 101, "byte 5 of the time");
+        case openFernet(key, asSpan(&token)) of
+            when Some(value as plain: String) do
+                assertTrue(equal(asSpan(&plain), "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"), "the value comes back");
+                destroyString(plain);
+            when None do
+                assertTrue(false, "the token opens");
+        end case;
+        case openFernet(other, asSpan(&token)) of
+            when Some(value as plain: String) do
+                assertTrue(false, "another key opens nothing");
+                destroyString(plain);
+            when None do
+                skip;
+        end case;
+        destroyString(token);
+        return nil;
+    end;
+
+    function testChanged(): Unit is
+        var token: String := sealed("secret", 1);
+        let mid: Index := 20;
+        let was: Nat8 := nthByte(&token, mid);
+        storeNth(&!token, mid, was + 1);
+        case openFernet(key, asSpan(&token)) of
+            when Some(value as plain: String) do
+                assertTrue(false, "a changed nonce is refused");
+                destroyString(plain);
+            when None do
+                skip;
+        end case;
+        storeNth(&!token, mid, was);
+        storeNth(&!token, 0, 128);
+        case openFernet(key, asSpan(&token)) of
+            when Some(value as plain: String) do
+                assertTrue(false, "another version is refused");
+                destroyString(plain);
+            when None do
+                skip;
+        end case;
+        destroyString(token);
+        case openFernet(key, "short") of
+            when Some(value as plain: String) do
+                assertTrue(false, "a short token is refused");
+                destroyString(plain);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function testKeys(): Unit is
+        case readFernetKey(key) of
+            when Some(value as raw: String) do
+                assertTrue(length(&raw) = 48, "a key is 48 bytes");
+                destroyString(raw);
+            when None do
+                assertTrue(false, "the key is read");
+        end case;
+        case readFernetKey("AAEC") of
+            when Some(value as raw: String) do
+                assertTrue(false, "3 bytes are no key");
+                destroyString(raw);
+            when None do
+                skip;
+        end case;
+        case newFernetKey() of
+            when Some(value as made: String) do
+                assertTrue(length(&made) = 64, "a new key is 64 characters");
+                case readFernetKey(asSpan(&made)) of
+                    when Some(value as raw: String) do
+                        destroyString(raw);
+                    when None do
+                        assertTrue(false, "a new key is read");
+                end case;
+                destroyString(made);
+            when None do
+                assertTrue(false, "a key is made");
+        end case;
+        return nil;
+    end;
+end module body.

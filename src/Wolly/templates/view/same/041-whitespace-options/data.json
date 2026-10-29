@@ -1,0 +1,40 @@
+{
+ "title": "a tale-of two (cities)",
+ "name": "Ada & <Bob>",
+ "word": "hello world",
+ "sentence": "The quick brown fox jumps over the lazy dog",
+ "n": 7,
+ "m": -7,
+ "items": [
+  "a",
+  "b<",
+  "c"
+ ],
+ "pairs": [
+  [
+   "x",
+   1
+  ],
+  [
+   "y",
+   2
+  ]
+ ],
+ "users": [
+  {
+   "name": "Ann",
+   "active": true
+  },
+  {
+   "name": "Ben",
+   "active": false
+  },
+  {
+   "name": "Cy",
+   "active": true
+  }
+ ],
+ "author": {
+  "name": "Eve"
+ }
+}

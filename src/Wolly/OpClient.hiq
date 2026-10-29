@@ -1,0 +1,1039 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database: every statement is a constant and
+-- every value is bound.  The columns of op_clients are those of an earlier
+-- provider written in Go, in the order its schema has them, so that one
+-- database serves both.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    nthRef,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    trim,
+    indexOf,
+    indexOfByte,
+    startsWith,
+    equal
+);
+import Standard.Base64 (
+    encode,
+    decode
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Values,
+    noValues,
+    withInt64,
+    withText,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    isUniqueViolation
+);
+import Wolly.OpRandom (
+    randomToken,
+    tokenHash,
+    tokenMatches
+);
+import Wolly.OpUrl (
+    UrlParts,
+    QueryPair,
+    destroyUrlParts,
+    parseUrl,
+    destroyPairs,
+    withQuery
+);
+
+module body Wolly.OpClient is
+    constant makeClients: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS op_clients (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, secret_hash TEXT NOT NULL DEFAULT '', redirect_uris TEXT NOT NULL DEFAULT '', logout_uris TEXT NOT NULL DEFAULT '', audience TEXT NOT NULL DEFAULT '', idle_seconds INTEGER NOT NULL DEFAULT 0, max_seconds INTEGER NOT NULL DEFAULT 0, refresh_seconds INTEGER NOT NULL DEFAULT 0, disabled INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, initiate_login_uri TEXT NOT NULL DEFAULT '', logo TEXT NOT NULL DEFAULT '', id_token_alg TEXT NOT NULL DEFAULT '', lax_auth INTEGER NOT NULL DEFAULT 0, sign_alg TEXT NOT NULL DEFAULT '')";
+    constant selectClient: Span[Nat8, Static] := "SELECT id, name, kind, secret_hash, redirect_uris, logout_uris, audience, idle_seconds, max_seconds, refresh_seconds, disabled, initiate_login_uri, logo, id_token_alg, lax_auth, created_at, updated_at, sign_alg FROM op_clients WHERE id = ?";
+    constant selectClients: Span[Nat8, Static] := "SELECT id, name, kind, secret_hash, redirect_uris, logout_uris, audience, idle_seconds, max_seconds, refresh_seconds, disabled, initiate_login_uri, logo, id_token_alg, lax_auth, created_at, updated_at, sign_alg FROM op_clients ORDER BY id";
+    constant insertClient: Span[Nat8, Static] := "INSERT INTO op_clients (id, name, kind, secret_hash, redirect_uris, logout_uris, audience, idle_seconds, max_seconds, refresh_seconds, initiate_login_uri, logo, id_token_alg, lax_auth, created_at, updated_at, sign_alg) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    constant updateSecret: Span[Nat8, Static] := "UPDATE op_clients SET secret_hash = ?, updated_at = ? WHERE id = ?";
+    constant updateLimits: Span[Nat8, Static] := "UPDATE op_clients SET idle_seconds = ?, max_seconds = ?, refresh_seconds = ?, updated_at = ? WHERE id = ?";
+    constant updateStart: Span[Nat8, Static] := "UPDATE op_clients SET initiate_login_uri = ?, updated_at = ? WHERE id = ?";
+    constant updateLogo: Span[Nat8, Static] := "UPDATE op_clients SET logo = ?, updated_at = ? WHERE id = ?";
+    constant updateAlg: Span[Nat8, Static] := "UPDATE op_clients SET id_token_alg = ?, updated_at = ? WHERE id = ?";
+    constant updateSignAlg: Span[Nat8, Static] := "UPDATE op_clients SET sign_alg = ?, updated_at = ? WHERE id = ?";
+    constant updateLax: Span[Nat8, Static] := "UPDATE op_clients SET lax_auth = ?, updated_at = ? WHERE id = ?";
+    constant updateDisabled: Span[Nat8, Static] := "UPDATE op_clients SET disabled = ?, updated_at = ? WHERE id = ?";
+    constant updateName: Span[Nat8, Static] := "UPDATE op_clients SET name = ?, updated_at = ? WHERE id = ?";
+    constant countRsa: Span[Nat8, Static] := "SELECT COUNT(*) FROM op_clients WHERE id_token_alg = 'RS256' AND disabled = 0";
+
+    constant mostNameBytes: Index := 100;
+    constant mostUriBytes: Index := 512;
+    constant mostLogo: Index := 49152;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var all: Buffer[String] := strings;
+        while bufferLength(&all) > 0 do
+            destroyString(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    function destroyClient(client: OpClient): Unit is
+        let { id: String, name: String, kind: ClientKind, secretHash: String, redirectUris: Buffer[String],
+            logoutUris: Buffer[String], audience: Buffer[String], limits: Limits, disabled: Bool,
+            initiateLoginUri: String, logo: String, idTokenAlg: String, signAlg: String, laxAuth: Bool,
+            created: Int64, updated: Int64 } := client;
+        destroyString(signAlg);
+        destroyString(id);
+        destroyString(name);
+        destroyString(secretHash);
+        destroyStrings(redirectUris);
+        destroyStrings(logoutUris);
+        destroyStrings(audience);
+        destroyString(initiateLoginUri);
+        destroyString(logo);
+        destroyString(idTokenAlg);
+        return nil;
+    end;
+
+    function destroyClients(clients: Buffer[OpClient]): Unit is
+        var all: Buffer[OpClient] := clients;
+        while bufferLength(&all) > 0 do
+            destroyClient(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    function refused(reason: Span[Nat8, Static]): ClientProblem is
+        return ClientRefused(reason => fromSpan(reason));
+    end;
+
+    -- A refusal whose reason is prefix, the value in double quotes and
+    -- suffix.
+    generic [V: Region]
+    function refusedWith(prefix: Span[Nat8, Static], value: Span[Nat8, V], suffix: Span[Nat8, Static]): ClientProblem is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, prefix);
+        writeByte(&!out, '"');
+        writeString(&!out, value);
+        writeByte(&!out, '"');
+        writeString(&!out, suffix);
+        return ClientRefused(reason => finalize(out));
+    end;
+
+    generic [P: Region]
+    function describeProblem(problem: &[ClientProblem, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        case problem of
+            when ClientRefused(reason: &[String, P]) do
+                writeString(&!out, "invalid client definition: ");
+                writeString(&!out, asSpan(reason));
+            when LimitTooLong(reason: &[String, P]) do
+                writeString(&!out, "client limit longer than the provider's: ");
+                writeString(&!out, asSpan(reason));
+            when ClientExists do
+                writeString(&!out, "invalid client definition: the client exists");
+            when NoClient do
+                writeString(&!out, "no such client");
+        end case;
+        return finalize(out);
+    end;
+
+    function destroyProblem(problem: ClientProblem): Unit is
+        case problem of
+            when ClientRefused(reason: String) do
+                destroyString(reason);
+            when LimitTooLong(reason: String) do
+                destroyString(reason);
+            when ClientExists do
+                skip;
+            when NoClient do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function kindName(kind: ClientKind): Span[Nat8, Static] is
+        case kind of
+            when WebClient do
+                return "web";
+            when NativeClient do
+                return "native";
+            when ServiceClient do
+                return "service";
+        end case;
+    end;
+
+    generic [T: Region]
+    function kindOf(text: Span[Nat8, T]): Option[ClientKind] is
+        if equal(text, "web") then
+            return Some(value => WebClient());
+        end if;
+        if equal(text, "native") then
+            return Some(value => NativeClient());
+        end if;
+        if equal(text, "service") then
+            return Some(value => ServiceClient());
+        end if;
+        let none: Option[ClientKind] := None();
+        return none;
+    end;
+
+    function isNative(kind: ClientKind): Bool is
+        case kind of
+            when NativeClient do
+                return true;
+            when WebClient do
+                return false;
+            when ServiceClient do
+                return false;
+        end case;
+    end;
+
+    function isService(kind: ClientKind): Bool is
+        case kind of
+            when ServiceClient do
+                return true;
+            when WebClient do
+                return false;
+            when NativeClient do
+                return false;
+        end case;
+    end;
+
+    function isWeb(kind: ClientKind): Bool is
+        case kind of
+            when WebClient do
+                return true;
+            when NativeClient do
+                return false;
+            when ServiceClient do
+                return false;
+        end case;
+    end;
+
+    generic [T: Region]
+    function isClientId(text: Span[Nat8, T]): Bool is
+        if (spanLength(text) < 2) or (spanLength(text) > 40) then
+            return false;
+        end if;
+        if (text[0] < 'a') or (text[0] > 'z') then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < spanLength(text) do
+            let c: Nat8 := text[i];
+            let fits: Bool := ((c >= 'a') and (c <= 'z')) or ((c >= '0') and (c <= '9')) or (c = '-');
+            if not fits then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function mostLogoBytes(): Index is
+        return 49152;
+    end;
+
+    -- The type of a picture by its first bytes, as Go's content sniffing
+    -- names the types png, jpeg, gif and webp; empty for anything else.
+    generic [B: Region]
+    function pictureType(bytes: Span[Nat8, B]): Span[Nat8, Static] is
+        let n: Index := spanLength(bytes);
+        if (n >= 8) and ((bytes[0] = 137) and (bytes[1] = 'P') and (bytes[2] = 'N') and (bytes[3] = 'G')) and
+            ((bytes[4] = 13) and (bytes[5] = 10) and (bytes[6] = 26) and (bytes[7] = 10)) then
+            return "image/png";
+        end if;
+        if (n >= 3) and ((bytes[0] = 255) and (bytes[1] = 216) and (bytes[2] = 255)) then
+            return "image/jpeg";
+        end if;
+        if (n >= 6) and startsWith(bytes, "GIF8") and (((bytes[4] = '7') or (bytes[4] = '9')) and (bytes[5] = 'a')) then
+            return "image/gif";
+        end if;
+        if (n >= 14) and startsWith(bytes, "RIFF") and equal(substring(bytes, 8, 14), "WEBPVP") then
+            return "image/webp";
+        end if;
+        return "";
+    end;
+
+    generic [B: Region]
+    function logoDataUri(bytes: Span[Nat8, B]): Either[ClientProblem, String] is
+        if (spanLength(bytes) = 0) or (spanLength(bytes) > mostLogo) then
+            return Left(left => refused("logo must be 1-49152 bytes"));
+        end if;
+        let kind: Span[Nat8, Static] := pictureType(bytes);
+        if spanLength(kind) = 0 then
+            return Left(left => refused("logo is no png, jpeg, gif or webp"));
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "data:");
+        writeString(&!out, kind);
+        writeString(&!out, ";base64,");
+        let text: String := encode(bytes);
+        writeString(&!out, asSpan(&text));
+        destroyString(text);
+        return Right(right => finalize(out));
+    end;
+
+    -- Whether logo is the data URI logoDataUri makes of the picture in it.
+    generic [L: Region]
+    function logoFits(logo: Span[Nat8, L]): Bool is
+        if not startsWith(logo, "data:") then
+            return false;
+        end if;
+        case indexOf(logo, ";base64,") of
+            when Some(value as at: Index) do
+                case decode(substring(logo, at + 8, spanLength(logo))) of
+                    when Some(value as bytes: String) do
+                        let made: Either[ClientProblem, String] := logoDataUri(asSpan(&bytes));
+                        destroyString(bytes);
+                        case made of
+                            when Right(right as uri: String) do
+                                let same: Bool := equal(asSpan(&uri), logo);
+                                destroyString(uri);
+                                return same;
+                            when Left(left as problem: ClientProblem) do
+                                destroyProblem(problem);
+                                return false;
+                        end case;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function shorter(client: Int64, session: Int64): Int64 is
+        if (client > 0) and (client < session) then
+            return client;
+        end if;
+        return session;
+    end;
+
+    function effectiveLimits(client: Limits, session: Limits): Limits is
+        return Limits(idle => shorter(client.idle, session.idle), max => shorter(client.max, session.max),
+            refresh => shorter(client.refresh, session.refresh));
+    end;
+
+    function limitsProblem(limits: Limits, session: Limits): Option[ClientProblem] is
+        if (limits.idle < 0) or (limits.max < 0) or (limits.refresh < 0) then
+            return Some(value => refused("a limit is negative"));
+        end if;
+        if limits.idle > session.idle then
+            return Some(value => LimitTooLong(reason => fromSpan("idle")));
+        end if;
+        if limits.max > session.max then
+            return Some(value => LimitTooLong(reason => fromSpan("max")));
+        end if;
+        if limits.refresh > session.refresh then
+            return Some(value => LimitTooLong(reason => fromSpan("refresh")));
+        end if;
+        let none: Option[ClientProblem] := None();
+        return none;
+    end;
+
+    generic [H: Region]
+    function isLoopback(host: Span[Nat8, H]): Bool is
+        return equal(host, "127.0.0.1") or equal(host, "::1");
+    end;
+
+    -- Whether uri may be a redirect, logout or start URI of a client of kind.
+    generic [U: Region]
+    function uriAllowed(kind: ClientKind, uri: Span[Nat8, U], allowHttp: Bool): Bool is
+        if spanLength(uri) > mostUriBytes then
+            return false;
+        end if;
+        case parseUrl(uri) of
+            when Some(value as parts: UrlParts) do
+                let allowed: Bool := partsAllowed(kind, &parts, allowHttp);
+                destroyUrlParts(parts);
+                return allowed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [P: Region]
+    function partsAllowed(kind: ClientKind, parts: &[UrlParts, P], allowHttp: Bool): Bool is
+        if parts->hasUser then
+            return false;
+        end if;
+        if parts->hasFragment and (length(&(parts->fragment)) > 0) then
+            return false;
+        end if;
+        let scheme: Span[Nat8, P] := asSpan(&(parts->scheme));
+        let hasHost: Bool := parts->hasAuthority and (length(&(parts->host)) > 0);
+        if equal(scheme, "https") and hasHost then
+            return true;
+        end if;
+        if equal(scheme, "http") and hasHost and allowHttp then
+            return true;
+        end if;
+        if isNative(kind) and equal(scheme, "http") and isLoopback(asSpan(&(parts->host))) then
+            return true;
+        end if;
+        if isNative(kind) and (not parts->hasAuthority) then
+            case indexOfByte(scheme, '.') of
+                when Some(value as dot: Index) do
+                    return startsWith(asSpan(&(parts->path)), "/");
+                when None do
+                    return false;
+            end case;
+        end if;
+        return false;
+    end;
+
+    -- Whether name is 1 to 100 bytes after trimming and holds no control byte.
+    generic [N: Region]
+    function nameFits(name: Span[Nat8, N]): Bool is
+        let trimmed: Span[Nat8, N] := trim(name);
+        if (spanLength(trimmed) = 0) or (spanLength(trimmed) > mostNameBytes) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(trimmed) do
+            if (trimmed[i] < 32) or (trimmed[i] = 127) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [C: Region]
+    function clientProblem(client: &[OpClient, C], session: Limits, allowHttp: Bool): Option[ClientProblem] is
+        if not isClientId(asSpan(&(client->id))) then
+            return Some(value => refusedWith("id ", asSpan(&(client->id)), " (lowercase letters, digits, dashes, 2-40)"));
+        end if;
+        if not nameFits(asSpan(&(client->name))) then
+            return Some(value => refused("name must be 1-100 bytes"));
+        end if;
+        let kind: ClientKind := client->kind;
+        let redirects: &[Buffer[String], C] := &(client->redirectUris);
+        let logouts: &[Buffer[String], C] := &(client->logoutUris);
+        if isService(kind) then
+            if (bufferLength(redirects) > 0) or (bufferLength(logouts) > 0) then
+                return Some(value => refused("a service client has no redirect URIs"));
+            end if;
+        else if bufferLength(redirects) = 0 then
+            return Some(value => refusedWith("a ", kindName(kind), " client needs a redirect URI"));
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(redirects) do
+            let uri: Span[Nat8, C] := asSpan(nthRef(redirects, i));
+            if not uriAllowed(kind, uri, allowHttp) then
+                return Some(value => refusedWith("redirect ", uri, " not allowed for this client"));
+            end if;
+            i := i + 1;
+        end while;
+        var j: Index := 0;
+        while j < bufferLength(logouts) do
+            let uri: Span[Nat8, C] := asSpan(nthRef(logouts, j));
+            if not uriAllowed(kind, uri, allowHttp) then
+                return Some(value => refusedWith("redirect ", uri, " not allowed for this client"));
+            end if;
+            j := j + 1;
+        end while;
+        let start: Span[Nat8, C] := asSpan(&(client->initiateLoginUri));
+        if spanLength(start) > 0 then
+            if isService(kind) then
+                return Some(value => refused("a service client has no start page"));
+            end if;
+            if not uriAllowed(WebClient(), start, allowHttp) then
+                return Some(value => refusedWith("redirect ", start, " not allowed for this client"));
+            end if;
+        end if;
+        let logo: Span[Nat8, C] := asSpan(&(client->logo));
+        if (spanLength(logo) > 0) and (not logoFits(logo)) then
+            return Some(value => refused("logo is not a plain picture"));
+        end if;
+        let alg: Span[Nat8, C] := asSpan(&(client->idTokenAlg));
+        if (spanLength(alg) > 0) and (not equal(alg, "RS256")) then
+            return Some(value => refusedWith("signing algorithm ", alg, " (empty for ML-DSA-44, or the mark RS256)"));
+        end if;
+        if not isSignAlg(asSpan(&(client->signAlg))) then
+            return Some(value => refusedWith("signing algorithm ", asSpan(&(client->signAlg)),
+                " (ML-DSA-44, ML-DSA-44-Ed25519, or empty for the provider's)"));
+        end if;
+        if client->laxAuth and (not isWeb(kind)) then
+            return Some(value => refused("only a web client can be lax about PKCE and the nonce"));
+        end if;
+        let audience: &[Buffer[String], C] := &(client->audience);
+        var k: Index := 0;
+        while k < bufferLength(audience) do
+            let a: Span[Nat8, C] := asSpan(nthRef(audience, k));
+            if not isClientId(a) then
+                return Some(value => refusedWith("audience ", a, ""));
+            end if;
+            k := k + 1;
+        end while;
+        return limitsProblem(client->limits, session);
+    end;
+
+    generic [R: Region]
+    function prepareClients(db: &![Database[Writing], R]): Option[DbError] is
+        case execute(&~db, makeClients, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as done: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+        end case;
+    end;
+
+    -- The lines of text, one a URI.
+    generic [T: Region]
+    function linesOf(text: Span[Nat8, T]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        if spanLength(text) = 0 then
+            return out;
+        end if;
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(text) do
+            if (i = spanLength(text)) or (text[i] = 10) then
+                insertBack(&!out, fromSpan(substring(text, start, i)));
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The lines joined by LF.
+    generic [B: Region]
+    function joined(lines: &[Buffer[String], B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < bufferLength(lines) do
+            if i > 0 then
+                writeByte(&!out, 10);
+            end if;
+            writeString(&!out, asSpan(nthRef(lines, i)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function flag(value: Bool): Int64 is
+        return if value then (1 : Int64) else (0 : Int64);
+    end;
+
+    generic [C: Region]
+    function clientAt(cursor: &[Cursor, C]): OpClient is
+        var kind: ClientKind := WebClient();
+        case kindOf(columnText(cursor, 2)) of
+            when Some(value as k: ClientKind) do
+                kind := k;
+            when None do
+                -- A kind this code does not know is taken as a service:
+                -- it then may neither sign in a person nor redirect.
+                kind := ServiceClient();
+        end case;
+        return OpClient(id => fromSpan(columnText(cursor, 0)), name => fromSpan(columnText(cursor, 1)), kind => kind,
+            secretHash => fromSpan(columnText(cursor, 3)), redirectUris => linesOf(columnText(cursor, 4)),
+            logoutUris => linesOf(columnText(cursor, 5)), audience => linesOf(columnText(cursor, 6)),
+            limits => Limits(idle => columnInt64(cursor, 7), max => columnInt64(cursor, 8), refresh => columnInt64(cursor, 9)),
+            disabled => columnInt64(cursor, 10) /= 0, initiateLoginUri => fromSpan(columnText(cursor, 11)),
+            logo => fromSpan(columnText(cursor, 12)), idTokenAlg => fromSpan(columnText(cursor, 13)),
+            signAlg => fromSpan(columnText(cursor, 17)), laxAuth => columnInt64(cursor, 14) /= 0,
+            created => columnInt64(cursor, 15), updated => columnInt64(cursor, 16));
+    end;
+
+    generic [M: Free, R: Region, I: Region]
+    function getClient(db: &![Database[M], R], id: Span[Nat8, I]): Either[DbError, Option[OpClient]] is
+        if not isClientId(id) then
+            let none: Option[OpClient] := None();
+            return Right(right => none);
+        end if;
+        var cursor: Cursor := start(&~db, selectClient, withText(noValues(), id));
+        var found: Option[OpClient] := None();
+        if advance(&!cursor) then
+            let made: OpClient := clientAt(&cursor);
+            dropClient(found);
+            found := Some(value => made);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropClient(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    function dropClient(client: Option[OpClient]): Unit is
+        case client of
+            when Some(value as c: OpClient) do
+                destroyClient(c);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function listClients(db: &![Database[M], R]): Either[DbError, Buffer[OpClient]] is
+        var cursor: Cursor := start(&~db, selectClients, noValues());
+        var all: Buffer[OpClient] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!all, clientAt(&cursor));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyClients(all);
+                return Left(left => error);
+            when None do
+                return Right(right => all);
+        end case;
+    end;
+
+    generic [R: Region, C: Region]
+    function addClient(db: &![Database[Writing], R], client: &[OpClient, C], session: Limits, allowHttp: Bool,
+        now: Int64): Either[DbError, Either[ClientProblem, String]] is
+        case clientProblem(client, session, allowHttp) of
+            when Some(value as problem: ClientProblem) do
+                return Right(right => Left(left => problem));
+            when None do
+                skip;
+        end case;
+        var secret: String := fromSpan("");
+        var hash: String := fromSpan("");
+        if not isNative(client->kind) then
+            case randomToken() of
+                when Some(value as token: String) do
+                    destroyString(hash);
+                    hash := tokenHash(asSpan(&token));
+                    destroyString(secret);
+                    secret := token;
+                when None do
+                    destroyString(secret);
+                    destroyString(hash);
+                    return Right(right => Left(left => refused("no random bytes for a secret")));
+            end case;
+        end if;
+        let redirects: String := joined(&(client->redirectUris));
+        let logouts: String := joined(&(client->logoutUris));
+        let audience: String := joined(&(client->audience));
+        let limits: Limits := client->limits;
+        let values: Values := withText(withInt64(withInt64(withInt64(withText(withText(withText(withInt64(withInt64(withInt64(
+            withText(withText(withText(withText(withText(withText(withText(noValues(), asSpan(&(client->id))),
+                trim(asSpan(&(client->name)))), kindName(client->kind)), asSpan(&hash)), asSpan(&redirects)),
+                asSpan(&logouts)), asSpan(&audience)), limits.idle), limits.max), limits.refresh),
+            asSpan(&(client->initiateLoginUri))), asSpan(&(client->logo))), asSpan(&(client->idTokenAlg))),
+            flag(client->laxAuth)), now), now), asSpan(&(client->signAlg)));
+        let stored: Either[DbError, Nat64] := execute(&~db, insertClient, values);
+        destroyString(redirects);
+        destroyString(logouts);
+        destroyString(audience);
+        destroyString(hash);
+        case stored of
+            when Left(left as error: DbError) do
+                destroyString(secret);
+                if isUniqueViolation(error) then
+                    return Right(right => Left(left => ClientExists()));
+                end if;
+                return Left(left => error);
+            when Right(right as rows: Nat64) do
+                return Right(right => Right(right => secret));
+        end case;
+    end;
+
+    generic [R: Region, I: Region, S: Region]
+    function authenticateClient(db: &![Database[Writing], R], id: Span[Nat8, I], secret: Span[Nat8, S],
+        secretGiven: Bool): Either[DbError, Option[OpClient]] is
+        case getClient(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[OpClient]) do
+                case found of
+                    when Some(value as client: OpClient) do
+                        let passes: Bool := mayUseToken(&client, secret, secretGiven);
+                        if passes then
+                            return Right(right => Some(value => client));
+                        end if;
+                        destroyClient(client);
+                        let none: Option[OpClient] := None();
+                        return Right(right => none);
+                    when None do
+                        let none: Option[OpClient] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    generic [C: Region, S: Region]
+    function mayUseToken(client: &[OpClient, C], secret: Span[Nat8, S], secretGiven: Bool): Bool is
+        if client->disabled then
+            return false;
+        end if;
+        if isNative(client->kind) then
+            return not secretGiven;
+        end if;
+        return tokenMatches(secret, asSpan(&(client->secretHash)));
+    end;
+
+    generic [C: Region]
+    function nativeClient(client: &[OpClient, C]): Bool is
+        return isNative(client->kind);
+    end;
+
+    -- Whether one row was changed: Right None, else NoClient.
+    function changed(result: Either[DbError, Nat64]): Either[DbError, Option[ClientProblem]] is
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as rows: Nat64) do
+                if rows = 1 then
+                    let none: Option[ClientProblem] := None();
+                    return Right(right => none);
+                end if;
+                return Right(right => Some(value => NoClient()));
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function rotateSecret(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Either[DbError, Either[ClientProblem, String]] is
+        case getClient(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[OpClient]) do
+                case found of
+                    when Some(value as client: OpClient) do
+                        let native: Bool := nativeClient(&client);
+                        destroyClient(client);
+                        if native then
+                            return Right(right => Left(left => refused("a native client has no secret")));
+                        end if;
+                    when None do
+                        return Right(right => Left(left => NoClient()));
+                end case;
+        end case;
+        case randomToken() of
+            when Some(value as token: String) do
+                let hash: String := tokenHash(asSpan(&token));
+                let result: Either[DbError, Option[ClientProblem]] := changed(execute(&~db, updateSecret,
+                    withText(withInt64(withText(noValues(), asSpan(&hash)), now), id)));
+                destroyString(hash);
+                case result of
+                    when Left(left as error: DbError) do
+                        destroyString(token);
+                        return Left(left => error);
+                    when Right(right as problem: Option[ClientProblem]) do
+                        case problem of
+                            when Some(value as p: ClientProblem) do
+                                destroyString(token);
+                                return Right(right => Left(left => p));
+                            when None do
+                                return Right(right => Right(right => token));
+                        end case;
+                end case;
+            when None do
+                return Right(right => Left(left => refused("no random bytes for a secret")));
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function setLimits(db: &![Database[Writing], R], id: Span[Nat8, I], limits: Limits, session: Limits,
+        now: Int64): Either[DbError, Option[ClientProblem]] is
+        case limitsProblem(limits, session) of
+            when Some(value as problem: ClientProblem) do
+                return Right(right => Some(value => problem));
+            when None do
+                return changed(execute(&~db, updateLimits, withText(withInt64(withInt64(withInt64(withInt64(noValues(),
+                    limits.idle), limits.max), limits.refresh), now), id)));
+        end case;
+    end;
+
+    -- The client id with one field changed by change, checked as a whole:
+    -- Right None when it holds, else why not.
+    generic [R: Region, I: Region]
+    function checkedChange(db: &![Database[Writing], R], id: Span[Nat8, I], field: Index, text: String, flagValue: Bool,
+        session: Limits, allowHttp: Bool): Either[DbError, Option[ClientProblem]] is
+        case getClient(&~db, id) of
+            when Left(left as error: DbError) do
+                destroyString(text);
+                return Left(left => error);
+            when Right(right as found: Option[OpClient]) do
+                case found of
+                    when Some(value as client: OpClient) do
+                        let changedClient: OpClient := withField(client, field, text, flagValue);
+                        let problem: Option[ClientProblem] := clientProblem(&changedClient, session, allowHttp);
+                        destroyClient(changedClient);
+                        return Right(right => problem);
+                    when None do
+                        destroyString(text);
+                        return Right(right => Some(value => NoClient()));
+                end case;
+        end case;
+    end;
+
+    -- client with field 0 (start page), 1 (logo), 2 (algorithm mark), 4
+    -- (signing algorithm) set to text, or field 3 (laxAuth) set to flagValue.
+    function withField(client: OpClient, field: Index, text: String, flagValue: Bool): OpClient is
+        let { id: String, name: String, kind: ClientKind, secretHash: String, redirectUris: Buffer[String],
+            logoutUris: Buffer[String], audience: Buffer[String], limits: Limits, disabled: Bool,
+            initiateLoginUri: String, logo: String, idTokenAlg: String, signAlg: String, laxAuth: Bool,
+            created: Int64, updated: Int64 } := client;
+        var start: String := initiateLoginUri;
+        var picture: String := logo;
+        var alg: String := idTokenAlg;
+        var sign: String := signAlg;
+        var lax: Bool := laxAuth;
+        if field = 0 then
+            destroyString(start);
+            start := text;
+        else if field = 1 then
+            destroyString(picture);
+            picture := text;
+        else if field = 2 then
+            destroyString(alg);
+            alg := text;
+        else if field = 4 then
+            destroyString(sign);
+            sign := text;
+        else
+            destroyString(text);
+            lax := flagValue;
+        end if;
+        return OpClient(id => id, name => name, kind => kind, secretHash => secretHash, redirectUris => redirectUris,
+            logoutUris => logoutUris, audience => audience, limits => limits, disabled => disabled,
+            initiateLoginUri => start, logo => picture, idTokenAlg => alg, signAlg => sign, laxAuth => lax,
+            created => created, updated => updated);
+    end;
+
+    -- Whether alg may stand in the column sign_alg: empty for the provider's
+    -- algorithm, or the name of one it signs with.
+    generic [A: Region]
+    function isSignAlg(alg: Span[Nat8, A]): Bool is
+        return ((spanLength(alg) = 0) or equal(alg, "ML-DSA-44")) or equal(alg, "ML-DSA-44-Ed25519");
+    end;
+
+    -- The change of one field after checkedChange.
+    generic [R: Region, I: Region, V: Region]
+    function textChange(db: &![Database[Writing], R], id: Span[Nat8, I], field: Index, value: Span[Nat8, V],
+        sql: Span[Nat8, Static], session: Limits, allowHttp: Bool,
+        now: Int64): Either[DbError, Option[ClientProblem]] is
+        case checkedChange(&~db, id, field, fromSpan(value), false, session, allowHttp) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as problem: Option[ClientProblem]) do
+                case problem of
+                    when Some(value as p: ClientProblem) do
+                        return Right(right => Some(value => p));
+                    when None do
+                        return changed(execute(&~db, sql, withText(withInt64(withText(noValues(), value), now), id)));
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, I: Region, U: Region]
+    function setStartUrl(db: &![Database[Writing], R], id: Span[Nat8, I], uri: Span[Nat8, U], session: Limits,
+        allowHttp: Bool, now: Int64): Either[DbError, Option[ClientProblem]] is
+        return textChange(&~db, id, 0, uri, updateStart, session, allowHttp, now);
+    end;
+
+    generic [R: Region, I: Region, L: Region]
+    function setLogo(db: &![Database[Writing], R], id: Span[Nat8, I], logo: Span[Nat8, L], session: Limits,
+        allowHttp: Bool, now: Int64): Either[DbError, Option[ClientProblem]] is
+        return textChange(&~db, id, 1, logo, updateLogo, session, allowHttp, now);
+    end;
+
+    generic [R: Region, I: Region, A: Region]
+    function setIdTokenAlg(db: &![Database[Writing], R], id: Span[Nat8, I], alg: Span[Nat8, A], session: Limits,
+        allowHttp: Bool, now: Int64): Either[DbError, Option[ClientProblem]] is
+        if spanLength(alg) > 0 then
+            return Right(right => Some(value => refusedWith("signing algorithm ", alg, ": every token is ML-DSA-44")));
+        end if;
+        return textChange(&~db, id, 2, alg, updateAlg, session, allowHttp, now);
+    end;
+
+    generic [R: Region, I: Region, A: Region]
+    function setSignAlg(db: &![Database[Writing], R], id: Span[Nat8, I], alg: Span[Nat8, A], session: Limits,
+        allowHttp: Bool, now: Int64): Either[DbError, Option[ClientProblem]] is
+        return textChange(&~db, id, 4, alg, updateSignAlg, session, allowHttp, now);
+    end;
+
+    generic [R: Region, I: Region]
+    function setLaxAuth(db: &![Database[Writing], R], id: Span[Nat8, I], lax: Bool, session: Limits, allowHttp: Bool,
+        now: Int64): Either[DbError, Option[ClientProblem]] is
+        case checkedChange(&~db, id, 3, fromSpan(""), lax, session, allowHttp) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as problem: Option[ClientProblem]) do
+                case problem of
+                    when Some(value as p: ClientProblem) do
+                        return Right(right => Some(value => p));
+                    when None do
+                        return changed(execute(&~db, updateLax, withText(withInt64(withInt64(noValues(), flag(lax)), now), id)));
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function setDisabled(db: &![Database[Writing], R], id: Span[Nat8, I], disabled: Bool,
+        now: Int64): Either[DbError, Option[ClientProblem]] is
+        return changed(execute(&~db, updateDisabled, withText(withInt64(withInt64(noValues(), flag(disabled)), now), id)));
+    end;
+
+    generic [R: Region, I: Region, N: Region]
+    function setClientName(db: &![Database[Writing], R], id: Span[Nat8, I], name: Span[Nat8, N],
+        now: Int64): Either[DbError, Option[ClientProblem]] is
+        if not nameFits(name) then
+            return Right(right => Some(value => refused("name must be 1-100 bytes without a control character")));
+        end if;
+        if not isClientId(id) then
+            return Right(right => Some(value => NoClient()));
+        end if;
+        return changed(execute(&~db, updateName, withText(withInt64(withText(noValues(), trim(name)), now), id)));
+    end;
+
+    generic [M: Free, R: Region]
+    function rsaClients(db: &![Database[M], R]): Either[DbError, Int64] is
+        var cursor: Cursor := start(&~db, countRsa, noValues());
+        var n: Int64 := 0;
+        if advance(&!cursor) then
+            n := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => n);
+        end case;
+    end;
+
+    generic [B: Region, U: Region]
+    function listedIn(uris: &[Buffer[String], B], uri: Span[Nat8, U]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(uris) do
+            if equal(asSpan(nthRef(uris, i)), uri) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [C: Region, U: Region]
+    function redirectAllowed(client: &[OpClient, C], uri: Span[Nat8, U]): Bool is
+        if listedIn(&(client->redirectUris), uri) then
+            return true;
+        end if;
+        if not isNative(client->kind) then
+            return false;
+        end if;
+        case parseUrl(uri) of
+            when Some(value as got: UrlParts) do
+                let fits: Bool := anyLoopbackFits(&(client->redirectUris), &got);
+                destroyUrlParts(got);
+                return fits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether got is a loopback http URI that one of the registered URIs
+    -- without a port fits.
+    generic [B: Region, G: Region]
+    function anyLoopbackFits(registered: &[Buffer[String], B], got: &[UrlParts, G]): Bool is
+        if not (equal(asSpan(&(got->scheme)), "http") and isLoopback(asSpan(&(got->host)))) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(registered) do
+            case parseUrl(asSpan(nthRef(registered, i))) of
+                when Some(value as reg: UrlParts) do
+                    let fits: Bool := loopbackFits(&reg, got);
+                    destroyUrlParts(reg);
+                    if fits then
+                        return true;
+                    end if;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Whether the registered loopback URI reg without a port fits got.
+    generic [E: Region, G: Region]
+    function loopbackFits(reg: &[UrlParts, E], got: &[UrlParts, G]): Bool is
+        return equal(asSpan(&(reg->scheme)), "http") and (length(&(reg->port)) = 0) and
+            equal(asSpan(&(reg->host)), asSpan(&(got->host))) and equal(asSpan(&(reg->path)), asSpan(&(got->path))) and
+            equal(asSpan(&(reg->query)), asSpan(&(got->query)));
+    end;
+
+    generic [C: Region, U: Region]
+    function logoutAllowed(client: &[OpClient, C], uri: Span[Nat8, U]): Bool is
+        return listedIn(&(client->logoutUris), uri);
+    end;
+
+    generic [C: Region]
+    function isListed(client: &[OpClient, C]): Bool is
+        return (not client->disabled) and (not isService(client->kind)) and (length(&(client->initiateLoginUri)) > 0);
+    end;
+
+    generic [C: Region, I: Region]
+    function startUrl(client: &[OpClient, C], issuer: Span[Nat8, I]): String is
+        let start: Span[Nat8, C] := asSpan(&(client->initiateLoginUri));
+        if spanLength(start) = 0 then
+            return fromSpan("");
+        end if;
+        var set: Buffer[QueryPair] := allocateEmpty();
+        insertBack(&!set, QueryPair(name => fromSpan("iss"), value => fromSpan(issuer)));
+        let made: Option[String] := withQuery(start, &set);
+        destroyPairs(set);
+        case made of
+            when Some(value as url: String) do
+                return url;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [C: Region]
+    function audienceOf(client: &[OpClient, C]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        let audience: &[Buffer[String], C] := &(client->audience);
+        if bufferLength(audience) = 0 then
+            insertBack(&!out, fromSpan(asSpan(&(client->id))));
+            return out;
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(audience) do
+            insertBack(&!out, fromSpan(asSpan(nthRef(audience, i))));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+end module body.

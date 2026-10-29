@@ -1,0 +1,77 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The expected values were made with Python's hmac and hashlib: the
+-- HMAC-SHA256 of the value under the HMAC-SHA256 of "wolly-pseudonym"
+-- under the key.  Beside them the two values a wrong pseudonym would
+-- have: the plain SHA-256 and the HMAC under the key itself.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    contains
+);
+import Wolly.Pseudonym (
+    pseudonymDigits,
+    pseudonym
+);
+
+module body Wolly.Pseudonym.Test is
+    constant key: Span[Nat8, Static] := "0123456789abcdef0123456789abcdef";
+
+    function isPseudonym(value: Span[Nat8, Static], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case pseudonym(key, value) of
+            when Some(value as made: String) do
+                assertTrue((length(&made) = pseudonymDigits()) and contains(asSpan(&made), wanted), message);
+                destroyString(made);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function testKnown(): Unit is
+        assertTrue(pseudonymDigits() = 64, "64 hex digits");
+        isPseudonym("10.0.0.1", "d2ff50d60fcb9b523ebb31fd1b789fc987f435e57683030bd5891a25c2aad063", "an address");
+        isPseudonym("10.0.0.2", "400a45714f64b49b6f587e1fcdd546a44cfe254071c2e1d7f2fbc5c55156de3d", "another address, another pseudonym");
+        isPseudonym("", "c9eedc09e80432d32bbc9d6542e15c8367f1f4ef6e791f20392e0e5fa92a3cda", "the empty value has one too");
+        case pseudonym(key, "10.0.0.1") of
+            when Some(value as made: String) do
+                assertFalse(contains(asSpan(&made), "f5047344122f0dee9974ba6761e61c6b8649e1f3968d13a635ebbf7be53a3a0d"), "not the plain SHA-256");
+                assertFalse(contains(asSpan(&made), "d094ec1a13557b71fd948daa21a9db71ba13c8b02eed4d8f4ff24c4f0e00d9bd"), "not the HMAC under the key itself");
+                assertFalse(contains(asSpan(&made), "10.0.0.1"), "not the address");
+                destroyString(made);
+            when None do
+                assertTrue(false, "an address has a pseudonym");
+        end case;
+        return nil;
+    end;
+
+    function testKey(): Unit is
+        case pseudonym("0123456789abcdef0123456789abcde", "10.0.0.1") of
+            when Some(value as made: String) do
+                destroyString(made);
+                assertTrue(false, "a key of 31 bytes makes none");
+            when None do
+                assertTrue(true, "a key of 31 bytes makes none");
+        end case;
+        case pseudonym("", "10.0.0.1") of
+            when Some(value as made: String) do
+                destroyString(made);
+                assertTrue(false, "no key makes none");
+            when None do
+                assertTrue(true, "no key makes none");
+        end case;
+        return nil;
+    end;
+end module body.

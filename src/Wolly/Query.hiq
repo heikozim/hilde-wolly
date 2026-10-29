@@ -1,0 +1,1423 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A query is read in two passes, each linear in its bytes: the bytes into
+-- tokens, the tokens into a list of nodes, each node after the nodes it is
+-- made of.  It runs as one constant statement a node, each value bound:
+-- a term puts the numbers of its lines into a temporary table under the
+-- number of its node, and, or and not make the set of their node from the
+-- sets of theirs with INTERSECT, UNION and EXCEPT.  No SQL text is ever
+-- made: Standard.Database takes a statement only as Span[Nat8, Static].
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    parseInt
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    storeNth,
+    destroyFree
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Values,
+    Cursor,
+    noValues,
+    withText,
+    withInt64,
+    execute,
+    start,
+    advance,
+    columnInt64,
+    finish
+);
+import Wolly.LogStore (
+    isLevel,
+    isSource
+);
+import Wolly.Net (
+    validHostname
+);
+import Wolly.Dialect (
+    pick,
+    onPostgres
+);
+
+module body Wolly.Query is
+    constant queryMost: Index := 1024;
+    constant depthMost: Index := 16;
+    constant nodesMost: Index := 64;
+    constant wordsMost: Index := 16;
+    constant textsMost: Index := 8;
+    constant wordBytesMost: Index := 64;
+    constant hostMost: Index := 253;
+    constant timeMost: Int64 := 9223372036854775807;
+    constant dayLast: Int64 := 86399;
+
+    constant wordToken: Nat8 := 1;
+    constant quotedToken: Nat8 := 2;
+    constant colonToken: Nat8 := 3;
+    constant openToken: Nat8 := 4;
+    constant closeToken: Nat8 := 5;
+    constant fromToken: Nat8 := 6;
+    constant toToken: Nat8 := 7;
+    constant dotsToken: Nat8 := 8;
+    constant endToken: Nat8 := 9;
+
+    constant textNode: Nat8 := 1;
+    constant equalNode: Nat8 := 2;
+    constant prefixNode: Nat8 := 3;
+    constant timeNode: Nat8 := 4;
+    constant idNode: Nat8 := 5;
+    constant andNode: Nat8 := 6;
+    constant orNode: Nat8 := 7;
+    constant notNode: Nat8 := 8;
+
+    constant hostField: Nat8 := 1;
+    constant sourceField: Nat8 := 2;
+    constant levelField: Nat8 := 3;
+    constant timeField: Nat8 := 4;
+    constant idField: Nat8 := 5;
+
+    constant makeSets: Span[Nat8, Static] := "CREATE TEMP TABLE IF NOT EXISTS wolly_query_sets (node INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (node, id)) WITHOUT ROWID";
+    -- The transaction of a search: no lock that keeps a writer waiting.  Not READ ONLY on
+    -- PostgreSQL: that refuses the CREATE TEMP TABLE of makeSetsPg, and a transaction there
+    -- keeps no writer waiting anyway.
+    constant beginReading: Span[Nat8, Static] := "BEGIN DEFERRED";
+    constant beginReadingPg: Span[Nat8, Static] := "BEGIN";
+    constant clearSets: Span[Nat8, Static] := "DELETE FROM temp.wolly_query_sets";
+    constant dropNode: Span[Nat8, Static] := "DELETE FROM temp.wolly_query_sets WHERE node = ?";
+    constant countWindow: Span[Nat8, Static] := "SELECT count(*) FROM wolly_log_lines WHERE at >= ? AND at <= ?";
+    -- Kept with EXPLAIN QUERY PLAN in front, so a test reads the plan of exactly this statement
+    -- (hostTermSql); hostIsSql is it without those 19 bytes.
+    constant hostPlan: Span[Nat8, Static] := "EXPLAIN QUERY PLAN INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND lower(host) = lower(?)";
+    constant sourceIs: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND source = ?";
+    constant levelIs: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND level = ?";
+    constant hostStarts: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND substr(CAST(lower(host) AS BLOB), 1, ?) = CAST(lower(?) AS BLOB)";
+    constant sourceStarts: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND substr(CAST(source AS BLOB), 1, ?) = CAST(? AS BLOB)";
+    constant timeIn: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND at >= ? AND at <= ?";
+    constant idIn: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND id >= ? AND id <= ?";
+    constant textHas: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT DISTINCT ?, l.id FROM hilde_search JOIN wolly_log_lines AS l ON l.id = CAST(hilde_search.key AS INTEGER) WHERE hilde_search MATCH ? AND hilde_search.title = l.host || ' ' || l.source || ' ' || l.level AND l.at >= ? AND l.at <= ?";
+    -- textHas for a window of few lines: FTS5 reads only the hits from the least to the greatest
+    -- rowid of the window's lines in hilde_search (each looked up once in hilde_search_keys), not
+    -- every hit of the store; those bounds hold every line of the window, and the window is checked
+    -- as in textHas.  Kept with EXPLAIN QUERY PLAN in front, as hostPlan (textTermSql).  Its values:
+    -- the node, the phrase, then the low and the high end of the window three times.
+    constant textPlan: Span[Nat8, Static] := "EXPLAIN QUERY PLAN INSERT INTO temp.wolly_query_sets (node, id) SELECT DISTINCT ?, l.id FROM hilde_search JOIN wolly_log_lines AS l ON l.id = CAST(hilde_search.key AS INTEGER) WHERE hilde_search MATCH ? AND hilde_search.rowid >= (SELECT min(k.id) FROM wolly_log_lines AS w JOIN hilde_search_keys AS k ON k.key = CAST(w.id AS TEXT) WHERE w.at >= ? AND w.at <= ?) AND hilde_search.rowid <= (SELECT max(k.id) FROM wolly_log_lines AS w JOIN hilde_search_keys AS k ON k.key = CAST(w.id AS TEXT) WHERE w.at >= ? AND w.at <= ?) AND hilde_search.title = l.host || ' ' || l.source || ' ' || l.level AND l.at >= ? AND l.at <= ?";
+    constant both: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM (SELECT id FROM temp.wolly_query_sets WHERE node = ? INTERSECT SELECT id FROM temp.wolly_query_sets WHERE node = ?)";
+    constant either: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM (SELECT id FROM temp.wolly_query_sets WHERE node = ? UNION SELECT id FROM temp.wolly_query_sets WHERE node = ?)";
+    constant notIn: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, id FROM (SELECT id FROM wolly_log_lines WHERE at >= ? AND at <= ? EXCEPT SELECT id FROM temp.wolly_query_sets WHERE node = ?)";
+    -- An equal term under and, as a filter of the set of the other side: each line of that set
+    -- looked up by its key, instead of a set of every line of the field in the window.
+    constant hostKeeps: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, s.id FROM temp.wolly_query_sets AS s JOIN wolly_log_lines AS l ON l.id = s.id WHERE s.node = ? AND lower(l.host) = lower(?)";
+    constant sourceKeeps: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, s.id FROM temp.wolly_query_sets AS s JOIN wolly_log_lines AS l ON l.id = s.id WHERE s.node = ? AND l.source = ?";
+    constant levelKeeps: Span[Nat8, Static] := "INSERT INTO temp.wolly_query_sets (node, id) SELECT ?, s.id FROM temp.wolly_query_sets AS s JOIN wolly_log_lines AS l ON l.id = s.id WHERE s.node = ? AND l.level = ?";
+    constant hostKeepsPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), s.id FROM pg_temp.wolly_query_sets AS s JOIN wolly_log_lines AS l ON l.id = s.id WHERE s.node = ? AND lower(l.host) = lower(?)";
+    constant sourceKeepsPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), s.id FROM pg_temp.wolly_query_sets AS s JOIN wolly_log_lines AS l ON l.id = s.id WHERE s.node = ? AND l.source = ?";
+    constant levelKeepsPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), s.id FROM pg_temp.wolly_query_sets AS s JOIN wolly_log_lines AS l ON l.id = s.id WHERE s.node = ? AND l.level = ?";
+    constant countNode: Span[Nat8, Static] := "SELECT count(*) FROM temp.wolly_query_sets WHERE node = ?";
+    constant pageNode: Span[Nat8, Static] := "SELECT l.id FROM temp.wolly_query_sets AS q JOIN wolly_log_lines AS l ON l.id = q.id WHERE q.node = ? ORDER BY l.at DESC, l.id DESC LIMIT ? OFFSET ?";
+    -- The statements of PostgreSQL: its temporary schema is pg_temp, the number of a node is cast where
+    -- nothing else gives it a type, a prefix is compared as bytes with convert_to, and the text of a line is
+    -- found in its column line_words (Wolly.LogStore), the phrase read by PostgreSQL itself.
+    constant makeSetsPg: Span[Nat8, Static] := "CREATE TEMP TABLE IF NOT EXISTS wolly_query_sets (node BIGINT NOT NULL, id BIGINT NOT NULL, PRIMARY KEY (node, id))";
+    constant clearSetsPg: Span[Nat8, Static] := "DELETE FROM pg_temp.wolly_query_sets";
+    constant dropNodePg: Span[Nat8, Static] := "DELETE FROM pg_temp.wolly_query_sets WHERE node = ?";
+    constant hostIsPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND lower(host) = lower(?)";
+    constant sourceIsPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND source = ?";
+    constant levelIsPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND level = ?";
+    constant hostStartsPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND substr(convert_to(lower(host), 'UTF8'), 1, CAST(? AS INTEGER)) = convert_to(lower(?), 'UTF8')";
+    constant sourceStartsPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND substr(convert_to(source, 'UTF8'), 1, CAST(? AS INTEGER)) = convert_to(CAST(? AS TEXT), 'UTF8')";
+    constant timeInPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND at >= ? AND at <= ?";
+    constant idInPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM wolly_log_lines WHERE at >= ? AND at <= ? AND id >= ? AND id <= ?";
+    constant textHasPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT DISTINCT CAST(? AS BIGINT), id FROM wolly_log_lines WHERE line_words @@ phraseto_tsquery('wolly'::regconfig, ?) AND at >= ? AND at <= ?";
+    constant bothPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM (SELECT id FROM pg_temp.wolly_query_sets WHERE node = ? INTERSECT SELECT id FROM pg_temp.wolly_query_sets WHERE node = ?) AS found";
+    constant eitherPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM (SELECT id FROM pg_temp.wolly_query_sets WHERE node = ? UNION SELECT id FROM pg_temp.wolly_query_sets WHERE node = ?) AS found";
+    constant notInPg: Span[Nat8, Static] := "INSERT INTO pg_temp.wolly_query_sets (node, id) SELECT CAST(? AS BIGINT), id FROM (SELECT id FROM wolly_log_lines WHERE at >= ? AND at <= ? EXCEPT SELECT id FROM pg_temp.wolly_query_sets WHERE node = ?) AS found";
+    constant countNodePg: Span[Nat8, Static] := "SELECT count(*) FROM pg_temp.wolly_query_sets WHERE node = ?";
+    constant pageNodePg: Span[Nat8, Static] := "SELECT l.id FROM pg_temp.wolly_query_sets AS q JOIN wolly_log_lines AS l ON l.id = q.id WHERE q.node = ? ORDER BY l.at DESC, l.id DESC LIMIT ? OFFSET ?";
+
+    -- A token: its kind, its bytes from start to before stop (for text in
+    -- quotes the bytes inside), and where the next one may begin.
+    record Token: Free is
+        kind: Nat8;
+        start: Index;
+        stop: Index;
+        next: Index;
+    end;
+
+    -- A node: a term with its field, its bytes and its bounds, or an
+    -- operator with the nodes it is made of, which come before it.
+    record Node: Free is
+        kind: Nat8;
+        field: Nat8;
+        first: Index;
+        second: Index;
+        start: Index;
+        stop: Index;
+        low: Int64;
+        high: Int64;
+    end;
+
+    -- The node a part of the query became and the token after it.
+    record Step: Free is
+        node: Index;
+        next: Index;
+    end;
+
+    record TimeValue: Free is
+        seconds: Int64;
+        wholeDay: Bool;
+    end;
+
+    record Window: Free is
+        low: Int64;
+        high: Int64;
+    end;
+
+    function mostQueryBytes(): Index is
+        return queryMost;
+    end;
+
+    function mostQueryDepth(): Index is
+        return depthMost;
+    end;
+
+    function mostQueryNodes(): Index is
+        return nodesMost;
+    end;
+
+    function mostQueryTexts(): Index is
+        return textsMost;
+    end;
+
+    function windowStart(now: Int64, seconds: Int64): Int64 is
+        if seconds >= now then
+            return 0;
+        end if;
+        return now - seconds;
+    end;
+
+    -- The days from the civil calendar after Howard Hinnant's
+    -- days_from_civil, for years from 1970 on.
+    -- Whether the day is in the month is the caller's to check.  Not in the
+    -- interface: the contract tests of hilde test draw no input that meets
+    -- six narrow requires (accepted=0 in 1000 rounds), so the values are
+    -- tested through time ranges in Query.test.hiq.
+    function civilSeconds(year: Int64, month: Int64, day: Int64, hour: Int64, minute: Int64, second: Int64): Int64
+        requires (year >= 1970) and (year <= 9999)
+        requires (month >= 1) and (month <= 12)
+        requires (day >= 1) and (day <= 31)
+        requires (hour >= 0) and (hour <= 23)
+        requires (minute >= 0) and (minute <= 59)
+        requires (second >= 0) and (second <= 59)
+        ensures result >= 0
+    is
+        var y: Int64 := year;
+        var shifted: Int64 := month + 9;
+        if month > 2 then
+            shifted := month - 3;
+        else
+            y := year - 1;
+        end if;
+        let era: Int64 := y / 400;
+        let yearOfEra: Int64 := y - (era * 400);
+        let dayOfYear: Int64 := (((shifted * 153) + 2) / 5) + (day - 1);
+        let dayOfEra: Int64 := (((yearOfEra * 365) + (yearOfEra / 4)) - (yearOfEra / 100)) + dayOfYear;
+        let days: Int64 := ((era * 146097) + dayOfEra) - 719468;
+        return (((days * 86400) + (hour * 3600)) + (minute * 60)) + second;
+    end;
+
+    ---
+    --- Tokens
+    ---
+
+    function isControl(byte: Nat8): Bool is
+        return (byte < 32) or (byte = 127);
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    function isLetter(byte: Nat8): Bool is
+        return ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+    end;
+
+    -- A byte of a word outside quotes: a letter, a digit, a byte of UTF-8
+    -- above ASCII, or one of . _ / @ * - +.
+    function isWordByte(byte: Nat8): Bool is
+        if byte >= 128 then
+            return true;
+        end if;
+        if isDigit(byte) or isLetter(byte) then
+            return true;
+        end if;
+        let marks: Bool := ((byte = '.') or (byte = '_')) or ((byte = '/') or (byte = '@'));
+        return marks or (((byte = '*') or (byte = '-')) or (byte = '+'));
+    end;
+
+    -- Whether two dots begin at at.
+    generic [T: Region]
+    function dotsAt(text: Span[Nat8, T], at: Index): Bool is
+        if (at + 1) >= spanLength(text) then
+            return false;
+        end if;
+        if text[at] /= '.' then
+            return false;
+        end if;
+        return text[at + 1] = '.';
+    end;
+
+    function madeToken(kind: Nat8, begins: Index, stop: Index, next: Index): Either[QueryError, Token] is
+        return Right(right => Token(kind => kind, start => begins, stop => stop, next => next));
+    end;
+
+    function badToken(position: Index, problem: QueryProblem): Either[QueryError, Token] is
+        return Left(left => QueryError(position => position, problem => problem));
+    end;
+
+    -- The token that begins at at, which is no space.
+    generic [T: Region]
+    function tokenAt(text: Span[Nat8, T], at: Index): Either[QueryError, Token] is
+        let size: Index := spanLength(text);
+        let byte: Nat8 := text[at];
+        if byte = '"' then
+            var i: Index := at + 1;
+            while i < size do
+                if text[i] = '"' then
+                    return madeToken(quotedToken, at + 1, i, i + 1);
+                end if;
+                if isControl(text[i]) then
+                    return badToken(i, UnexpectedByte());
+                end if;
+                i := i + 1;
+            end while;
+            return badToken(at, UnclosedQuote());
+        end if;
+        if byte = ':' then
+            return madeToken(colonToken, at, at + 1, at + 1);
+        end if;
+        if byte = '(' then
+            return madeToken(openToken, at, at + 1, at + 1);
+        end if;
+        if byte = ')' then
+            return madeToken(closeToken, at, at + 1, at + 1);
+        end if;
+        if byte = '[' then
+            return madeToken(fromToken, at, at + 1, at + 1);
+        end if;
+        if byte = ']' then
+            return madeToken(toToken, at, at + 1, at + 1);
+        end if;
+        if dotsAt(text, at) then
+            return madeToken(dotsToken, at, at + 2, at + 2);
+        end if;
+        if isWordByte(byte) then
+            var i: Index := at + 1;
+            var going: Bool := true;
+            while going and (i < size) do
+                if isWordByte(text[i]) and (not dotsAt(text, i)) then
+                    i := i + 1;
+                else
+                    going := false;
+                end if;
+            end while;
+            return madeToken(wordToken, at, i, i);
+        end if;
+        return badToken(at, UnexpectedByte());
+    end;
+
+    -- The tokens of text, the last one the end.
+    generic [T: Region]
+    function lex(text: Span[Nat8, T]): Either[QueryError, Buffer[Token]] is
+        var tokens: Buffer[Token] := allocateEmpty();
+        let size: Index := spanLength(text);
+        var problem: Option[QueryError] := None();
+        var going: Bool := true;
+        var i: Index := 0;
+        while going and (i < size) do
+            if (text[i] = ' ') or (text[i] = 9) then
+                i := i + 1;
+            else
+                case tokenAt(text, i) of
+                    when Left(left as error: QueryError) do
+                        problem := Some(value => error);
+                        going := false;
+                    when Right(right as token: Token) do
+                        insertBack(&!tokens, token);
+                        i := token.next;
+                end case;
+            end if;
+        end while;
+        case problem of
+            when Some(value as error: QueryError) do
+                destroyFree(tokens);
+                return Left(left => error);
+            when None do
+                insertBack(&!tokens, Token(kind => endToken, start => size, stop => size, next => size));
+                return Right(right => tokens);
+        end case;
+    end;
+
+    ---
+    --- Nodes
+    ---
+
+    -- Whether the token at at is the word word, in any case; word is
+    -- written in small letters.
+    generic [T: Region, B: Region]
+    function keywordAt(text: Span[Nat8, T], tokens: &[Buffer[Token], B], at: Index, word: Span[Nat8, Static]): Bool is
+        let token: Token := nth(tokens, at);
+        if token.kind /= wordToken then
+            return false;
+        end if;
+        if (token.stop - token.start) /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            var byte: Nat8 := text[token.start + i];
+            if (byte >= 'A') and (byte <= 'Z') then
+                byte := byte + 32;
+            end if;
+            if byte /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Region, B: Region]
+    function fieldOf(text: Span[Nat8, T], tokens: &[Buffer[Token], B], at: Index): Nat8 is
+        if keywordAt(text, tokens, at, "host") then
+            return hostField;
+        end if;
+        if keywordAt(text, tokens, at, "source") then
+            return sourceField;
+        end if;
+        if keywordAt(text, tokens, at, "level") then
+            return levelField;
+        end if;
+        if keywordAt(text, tokens, at, "time") then
+            return timeField;
+        end if;
+        if keywordAt(text, tokens, at, "id") then
+            return idField;
+        end if;
+        return 0;
+    end;
+
+    function failed(position: Index, problem: QueryProblem): Either[QueryError, Step] is
+        return Left(left => QueryError(position => position, problem => problem));
+    end;
+
+    function reached(node: Index, next: Index): Either[QueryError, Step] is
+        return Right(right => Step(node => node, next => next));
+    end;
+
+    function leaf(kind: Nat8, field: Nat8, begins: Index, stop: Index, low: Int64, high: Int64): Node is
+        return Node(kind => kind, field => field, first => 0, second => 0, start => begins, stop => stop, low => low, high => high);
+    end;
+
+    function joint(kind: Nat8, first: Index, second: Index): Node is
+        return Node(kind => kind, field => 0, first => first, second => second, start => 0, stop => 0, low => 0, high => 0);
+    end;
+
+    -- Adds node; Right its number, or TooManyTerms at position.
+    generic [N: Region]
+    function added(nodes: &![Buffer[Node], N], node: Node, position: Index): Either[QueryError, Index] is
+        if lengthMut(&~nodes) >= nodesMost then
+            return Left(left => QueryError(position => position, problem => TooManyTerms()));
+        end if;
+        insertBack(&~nodes, node);
+        return Right(right => lengthMut(&~nodes) - 1);
+    end;
+
+    function stepped(made: Either[QueryError, Index], next: Index): Either[QueryError, Step] is
+        case made of
+            when Left(left as error: QueryError) do
+                return Left(left => error);
+            when Right(right as node: Index) do
+                return reached(node, next);
+        end case;
+    end;
+
+    -- Where an error in the value of token is reported: at its quote when
+    -- it has one.
+    function valuePosition(token: Token): Index is
+        if token.kind = quotedToken then
+            return token.start - 1;
+        end if;
+        return token.start;
+    end;
+
+    -- A byte that ends a word of text in quotes, as Standard.Search has it:
+    -- a space, a control byte or punctuation of ASCII.
+    function isBreak(byte: Nat8): Bool is
+        if byte <= 32 then
+            return true;
+        end if;
+        if byte >= 127 then
+            return byte = 127;
+        end if;
+        return not (isDigit(byte) or isLetter(byte));
+    end;
+
+    -- Text in quotes: 1 to wordsMost words of at most wordBytesMost bytes.
+    generic [T: Region, N: Region]
+    function textTerm(text: Span[Nat8, T], nodes: &![Buffer[Node], N], token: Token, next: Index): Either[QueryError, Step] is
+        var count: Index := 0;
+        var i: Index := token.start;
+        while i < token.stop do
+            if isBreak(text[i]) then
+                i := i + 1;
+            else
+                let first: Index := i;
+                while (i < token.stop) and (not isBreak(text[i])) do
+                    i := i + 1;
+                end while;
+                if (i - first) > wordBytesMost then
+                    return failed(first, TooManyWords());
+                end if;
+                count := count + 1;
+                if count > wordsMost then
+                    return failed(first, TooManyWords());
+                end if;
+            end if;
+        end while;
+        if count = 0 then
+            return failed(token.start - 1, BadValue());
+        end if;
+        var texts: Index := 0;
+        var k: Index := 0;
+        while k < lengthMut(&~nodes) do
+            let other: Node := nthMut(&~nodes, k);
+            if other.kind = textNode then
+                texts := texts + 1;
+            end if;
+            k := k + 1;
+        end while;
+        if texts >= textsMost then
+            return failed(token.start - 1, TooManyTexts());
+        end if;
+        return stepped(added(&~nodes, leaf(textNode, 0, token.start, token.stop, 0, 0), token.start - 1), next);
+    end;
+
+    -- A number of 1 to 18 digits.
+    generic [V: Region]
+    function digitsValue(value: Span[Nat8, V]): Option[Int64] is
+        let size: Index := spanLength(value);
+        if (size = 0) or (size > 18) then
+            return None();
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if not isDigit(value[i]) then
+                return None();
+            end if;
+            i := i + 1;
+        end while;
+        return parseInt(value);
+    end;
+
+    -- The number of count digits at place, which are digits.
+    generic [V: Region]
+    function digitsAt(value: Span[Nat8, V], place: Index, count: Index): Int64 is
+        var number: Int64 := 0;
+        var i: Index := 0;
+        while i < count do
+            case toInt64(value[place + i] - '0') of
+                when Some(value as digit: Int64) do
+                    number := (number * 10) + digit;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return number;
+    end;
+
+    -- Whether value has digits where pattern has 9 and the byte of pattern
+    -- elsewhere.
+    generic [V: Region]
+    function shaped(value: Span[Nat8, V], pattern: Span[Nat8, Static]): Bool is
+        if spanLength(value) /= spanLength(pattern) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(value) do
+            if pattern[i] = '9' then
+                if not isDigit(value[i]) then
+                    return false;
+                end if;
+            else
+                if value[i] /= pattern[i] then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function daysIn(year: Int64, month: Int64): Int64 is
+        if month = 2 then
+            let leap: Bool := ((year - ((year / 4) * 4)) = 0) and (((year - ((year / 100) * 100)) /= 0) or ((year - ((year / 400) * 400)) = 0));
+            if leap then
+                return 29;
+            end if;
+            return 28;
+        end if;
+        if (((month = 4) or (month = 6)) or (month = 9)) or (month = 11) then
+            return 30;
+        end if;
+        return 31;
+    end;
+
+    function someTime(seconds: Int64, wholeDay: Bool): Option[TimeValue] is
+        return Some(value => TimeValue(seconds => seconds, wholeDay => wholeDay));
+    end;
+
+    -- Seconds since 1970, a day YYYY-MM-DD, or YYYY-MM-DDTHH:MM:SS with or
+    -- without a Z; always UTC.
+    generic [V: Region]
+    function timeValue(value: Span[Nat8, V]): Option[TimeValue] is
+        let size: Index := spanLength(value);
+        if (size >= 1) and (size <= 12) then
+            case digitsValue(value) of
+                when Some(value as seconds: Int64) do
+                    return someTime(seconds, false);
+                when None do
+                    skip;
+            end case;
+        end if;
+        let day: Bool := shaped(value, "9999-99-99");
+        let moment: Bool := shaped(value, "9999-99-99T99:99:99") or shaped(value, "9999-99-99T99:99:99Z");
+        if not (day or moment) then
+            return None();
+        end if;
+        let year: Int64 := digitsAt(value, 0, 4);
+        let month: Int64 := digitsAt(value, 5, 2);
+        let date: Int64 := digitsAt(value, 8, 2);
+        var hour: Int64 := 0;
+        var minute: Int64 := 0;
+        var second: Int64 := 0;
+        if moment then
+            hour := digitsAt(value, 11, 2);
+            minute := digitsAt(value, 14, 2);
+            second := digitsAt(value, 17, 2);
+        end if;
+        if (year < 1970) or ((month < 1) or (month > 12)) then
+            return None();
+        end if;
+        if (date < 1) or (date > daysIn(year, month)) then
+            return None();
+        end if;
+        if ((hour > 23) or (minute > 59)) or (second > 59) then
+            return None();
+        end if;
+        return someTime(civilSeconds(year, month, date, hour, minute, second), day);
+    end;
+
+    -- The seconds of an amount like 24h: 1 to 999999 of s, m, h, d or w.
+    generic [V: Region]
+    function spanSeconds(value: Span[Nat8, V]): Option[Int64] is
+        let size: Index := spanLength(value);
+        if (size < 2) or (size > 7) then
+            return None();
+        end if;
+        let unit: Nat8 := value[size - 1];
+        var each: Int64 := 0;
+        if unit = 's' then
+            each := (1 : Int64);
+        else if unit = 'm' then
+            each := (60 : Int64);
+        else if unit = 'h' then
+            each := (3600 : Int64);
+        else if unit = 'd' then
+            each := (86400 : Int64);
+        else if unit = 'w' then
+            each := (604800 : Int64);
+        else
+            return None();
+        end if;
+        case digitsValue(substring(value, 0, size - 1)) of
+            when Some(value as amount: Int64) do
+                if amount < 1 then
+                    return None();
+                end if;
+                return Some(value => amount * each);
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- One end of a range or a single value of time or id; for time the
+    -- upper end takes the whole of a day.
+    generic [T: Region]
+    function boundOf(text: Span[Nat8, T], field: Nat8, token: Token, upper: Bool): Option[Int64] is
+        let value: Span[Nat8, T] := substring(text, token.start, token.stop);
+        if field = idField then
+            return digitsValue(value);
+        end if;
+        case timeValue(value) of
+            when Some(value as time: TimeValue) do
+                if upper and time.wholeDay then
+                    return Some(value => time.seconds + dayLast);
+                end if;
+                return Some(value => time.seconds);
+            when None do
+                return None();
+        end case;
+    end;
+
+    function boundProblem(field: Nat8): QueryProblem is
+        if field = timeField then
+            return BadTime();
+        end if;
+        return BadValue();
+    end;
+
+    function isValue(token: Token): Bool is
+        return (token.kind = wordToken) or (token.kind = quotedToken);
+    end;
+
+    function boundNode(field: Nat8, low: Int64, high: Int64): Node is
+        if field = timeField then
+            return leaf(timeNode, timeField, 0, 0, low, high);
+        end if;
+        return leaf(idNode, idField, 0, 0, low, high);
+    end;
+
+    -- time:value or id:value, the token of the value at at.
+    generic [T: Region, B: Region, N: Region]
+    function pointTerm(text: Span[Nat8, T], tokens: &[Buffer[Token], B], nodes: &![Buffer[Node], N], field: Nat8, at: Index): Either[QueryError, Step] is
+        let token: Token := nth(tokens, at);
+        let fieldName: Token := nth(tokens, at - 2);
+        case boundOf(text, field, token, false) of
+            when None do
+                return failed(valuePosition(token), boundProblem(field));
+            when Some(value as low: Int64) do
+                case boundOf(text, field, token, true) of
+                    when None do
+                        return failed(valuePosition(token), boundProblem(field));
+                    when Some(value as high: Int64) do
+                        return stepped(added(&~nodes, boundNode(field, low, high), fieldName.start), at + 1);
+                end case;
+        end case;
+    end;
+
+    -- field:[a .. b], the bracket at at.
+    generic [T: Region, B: Region, N: Region]
+    function rangeTerm(text: Span[Nat8, T], tokens: &[Buffer[Token], B], nodes: &![Buffer[Node], N], field: Nat8, at: Index): Either[QueryError, Step] is
+        let open: Token := nth(tokens, at);
+        let lower: Token := nth(tokens, at + 1);
+        if not isValue(lower) then
+            return failed(lower.start, BadValue());
+        end if;
+        let dots: Token := nth(tokens, at + 2);
+        if dots.kind /= dotsToken then
+            return failed(dots.start, BadValue());
+        end if;
+        let upper: Token := nth(tokens, at + 3);
+        if not isValue(upper) then
+            return failed(upper.start, BadValue());
+        end if;
+        let close: Token := nth(tokens, at + 4);
+        if close.kind /= toToken then
+            return failed(close.start, BadValue());
+        end if;
+        case boundOf(text, field, lower, false) of
+            when None do
+                return failed(valuePosition(lower), boundProblem(field));
+            when Some(value as low: Int64) do
+                case boundOf(text, field, upper, true) of
+                    when None do
+                        return failed(valuePosition(upper), boundProblem(field));
+                    when Some(value as high: Int64) do
+                        if low > high then
+                            return failed(open.start, BadRange());
+                        end if;
+                        return stepped(added(&~nodes, boundNode(field, low, high), open.start), at + 5);
+                end case;
+        end case;
+    end;
+
+    -- time:last N, the word last at at.
+    generic [T: Region, B: Region, N: Region]
+    function lastTerm(text: Span[Nat8, T], tokens: &[Buffer[Token], B], nodes: &![Buffer[Node], N], at: Index, now: Int64): Either[QueryError, Step] is
+        let amount: Token := nth(tokens, at + 1);
+        let fieldName: Token := nth(tokens, at - 2);
+        if amount.kind /= wordToken then
+            return failed(amount.start, BadTime());
+        end if;
+        case spanSeconds(substring(text, amount.start, amount.stop)) of
+            when None do
+                return failed(amount.start, BadTime());
+            when Some(value as seconds: Int64) do
+                let node: Node := leaf(timeNode, timeField, 0, 0, windowStart(now, seconds), timeMost);
+                return stepped(added(&~nodes, node, fieldName.start), at + 2);
+        end case;
+    end;
+
+    -- Whether value is a value of field.
+    generic [V: Region]
+    function fits(field: Nat8, value: Span[Nat8, V]): Bool is
+        if field = hostField then
+            return validHostname(value);
+        end if;
+        if field = sourceField then
+            return isSource(value);
+        end if;
+        return isLevel(value);
+    end;
+
+    -- Whether prefix may begin a value of field: for a host its bytes are
+    -- those of a host name.
+    generic [V: Region]
+    function fitsPrefix(field: Nat8, prefix: Span[Nat8, V]): Bool is
+        if field = sourceField then
+            return isSource(prefix);
+        end if;
+        if field /= hostField then
+            return false;
+        end if;
+        let size: Index := spanLength(prefix);
+        if (size = 0) or (size > hostMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := prefix[i];
+            if not ((isDigit(byte) or isLetter(byte)) or ((byte = '.') or (byte = '-'))) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- field:value, the field at at.
+    generic [T: Region, B: Region, N: Region]
+    function fieldTerm(text: Span[Nat8, T], tokens: &[Buffer[Token], B], nodes: &![Buffer[Node], N], at: Index, now: Int64): Either[QueryError, Step] is
+        let name: Token := nth(tokens, at);
+        let field: Nat8 := fieldOf(text, tokens, at);
+        if field = 0 then
+            return failed(name.start, UnknownQueryField());
+        end if;
+        let valueAt: Index := at + 2;
+        let value: Token := nth(tokens, valueAt);
+        if (field = timeField) or (field = idField) then
+            if value.kind = fromToken then
+                return rangeTerm(text, tokens, &~nodes, field, valueAt);
+            end if;
+            if (field = timeField) and keywordAt(text, tokens, valueAt, "last") then
+                return lastTerm(text, tokens, &~nodes, valueAt, now);
+            end if;
+            if isValue(value) then
+                return pointTerm(text, tokens, &~nodes, field, valueAt);
+            end if;
+            return failed(value.start, BadValue());
+        end if;
+        if not isValue(value) then
+            return failed(value.start, BadValue());
+        end if;
+        let position: Index := valuePosition(value);
+        if value.kind = wordToken then
+            if text[value.stop - 1] = '*' then
+                let prefix: Span[Nat8, T] := substring(text, value.start, value.stop - 1);
+                if not fitsPrefix(field, prefix) then
+                    return failed(position, BadValue());
+                end if;
+                return stepped(added(&~nodes, leaf(prefixNode, field, value.start, value.stop - 1, 0, 0), name.start), valueAt + 1);
+            end if;
+        end if;
+        if not fits(field, substring(text, value.start, value.stop)) then
+            return failed(position, BadValue());
+        end if;
+        return stepped(added(&~nodes, leaf(equalNode, field, value.start, value.stop, 0, 0), name.start), valueAt + 1);
+    end;
+
+    -- A term, text in quotes or a part in parentheses.
+    generic [T: Region, B: Region, N: Region]
+    function parsePrimary(text: Span[Nat8, T], tokens: &[Buffer[Token], B], nodes: &![Buffer[Node], N], at: Index, depth: Index,
+                          now: Int64): Either[QueryError, Step] is
+        let token: Token := nth(tokens, at);
+        if token.kind = openToken then
+            case parseOr(text, tokens, &~nodes, at + 1, depth + 1, now) of
+                when Left(left as error: QueryError) do
+                    return Left(left => error);
+                when Right(right as inner: Step) do
+                    let after: Token := nth(tokens, inner.next);
+                    if after.kind = closeToken then
+                        return reached(inner.node, inner.next + 1);
+                    end if;
+                    if after.kind = endToken then
+                        return failed(token.start, UnclosedParenthesis());
+                    end if;
+                    return failed(after.start, ExpectedOperator());
+            end case;
+        end if;
+        if token.kind = quotedToken then
+            return textTerm(text, &~nodes, token, at + 1);
+        end if;
+        if token.kind = wordToken then
+            if keywordAt(text, tokens, at, "and") or keywordAt(text, tokens, at, "or") then
+                return failed(token.start, ExpectedTerm());
+            end if;
+            let colon: Token := nth(tokens, at + 1);
+            if colon.kind = colonToken then
+                return fieldTerm(text, tokens, &~nodes, at, now);
+            end if;
+            return failed(token.start, UnquotedWord());
+        end if;
+        return failed(token.start, ExpectedTerm());
+    end;
+
+    -- not, binding closest; each not and each parenthesis one level deeper.
+    generic [T: Region, B: Region, N: Region]
+    function parseUnary(text: Span[Nat8, T], tokens: &[Buffer[Token], B], nodes: &![Buffer[Node], N], at: Index, depth: Index,
+                        now: Int64): Either[QueryError, Step] is
+        let token: Token := nth(tokens, at);
+        if depth > depthMost then
+            return failed(token.start, TooDeep());
+        end if;
+        if keywordAt(text, tokens, at, "not") then
+            case parseUnary(text, tokens, &~nodes, at + 1, depth + 1, now) of
+                when Left(left as error: QueryError) do
+                    return Left(left => error);
+                when Right(right as inner: Step) do
+                    return stepped(added(&~nodes, joint(notNode, inner.node, inner.node), token.start), inner.next);
+            end case;
+        end if;
+        return parsePrimary(text, tokens, &~nodes, at, depth, now);
+    end;
+
+    generic [T: Region, B: Region, N: Region]
+    function parseAnd(text: Span[Nat8, T], tokens: &[Buffer[Token], B], nodes: &![Buffer[Node], N], at: Index, depth: Index,
+                      now: Int64): Either[QueryError, Step] is
+        case parseUnary(text, tokens, &~nodes, at, depth, now) of
+            when Left(left as error: QueryError) do
+                return Left(left => error);
+            when Right(right as head: Step) do
+                var node: Index := head.node;
+                var next: Index := head.next;
+                while keywordAt(text, tokens, next, "and") do
+                    let operator: Token := nth(tokens, next);
+                    let position: Index := operator.start;
+                    case parseUnary(text, tokens, &~nodes, next + 1, depth, now) of
+                        when Left(left as error: QueryError) do
+                            return Left(left => error);
+                        when Right(right as more: Step) do
+                            case added(&~nodes, joint(andNode, node, more.node), position) of
+                                when Left(left as error: QueryError) do
+                                    return Left(left => error);
+                                when Right(right as made: Index) do
+                                    node := made;
+                                    next := more.next;
+                            end case;
+                    end case;
+                end while;
+                return reached(node, next);
+        end case;
+    end;
+
+    generic [T: Region, B: Region, N: Region]
+    function parseOr(text: Span[Nat8, T], tokens: &[Buffer[Token], B], nodes: &![Buffer[Node], N], at: Index, depth: Index,
+                     now: Int64): Either[QueryError, Step] is
+        case parseAnd(text, tokens, &~nodes, at, depth, now) of
+            when Left(left as error: QueryError) do
+                return Left(left => error);
+            when Right(right as head: Step) do
+                var node: Index := head.node;
+                var next: Index := head.next;
+                while keywordAt(text, tokens, next, "or") do
+                    let operator: Token := nth(tokens, next);
+                    let position: Index := operator.start;
+                    case parseAnd(text, tokens, &~nodes, next + 1, depth, now) of
+                        when Left(left as error: QueryError) do
+                            return Left(left => error);
+                        when Right(right as more: Step) do
+                            case added(&~nodes, joint(orNode, node, more.node), position) of
+                                when Left(left as error: QueryError) do
+                                    return Left(left => error);
+                                when Right(right as made: Index) do
+                                    node := made;
+                                    next := more.next;
+                            end case;
+                    end case;
+                end while;
+                return reached(node, next);
+        end case;
+    end;
+
+    -- The nodes of the query, the last one the whole.
+    generic [T: Region]
+    function parsed(text: Span[Nat8, T], now: Int64): Either[QueryError, Buffer[Node]] is
+        if spanLength(text) > queryMost then
+            return Left(left => QueryError(position => queryMost, problem => QueryTooLong()));
+        end if;
+        case lex(text) of
+            when Left(left as error: QueryError) do
+                return Left(left => error);
+            when Right(right as tokens: Buffer[Token]) do
+                let opening: Token := nth(&tokens, 0);
+                if opening.kind = endToken then
+                    destroyFree(tokens);
+                    return Left(left => QueryError(position => 0, problem => NoQuery()));
+                else
+                    var nodes: Buffer[Node] := allocateEmpty();
+                    let outcome: Either[QueryError, Step] := parseOr(text, &tokens, &!nodes, 0, 0, now);
+                    case outcome of
+                        when Left(left as error: QueryError) do
+                            destroyFree(tokens);
+                            destroyFree(nodes);
+                            return Left(left => error);
+                        when Right(right as whole: Step) do
+                            let after: Token := nth(&tokens, whole.next);
+                            destroyFree(tokens);
+                            if after.kind /= endToken then
+                                destroyFree(nodes);
+                                return Left(left => QueryError(position => after.start, problem => ExpectedOperator()));
+                            else
+                                return Right(right => nodes);
+                            end if;
+                    end case;
+                end if;
+        end case;
+    end;
+
+    generic [T: Region]
+    function checkQuery(text: Span[Nat8, T], now: Int64): Option[QueryError] is
+        case parsed(text, now) of
+            when Left(left as error: QueryError) do
+                return Some(value => error);
+            when Right(right as nodes: Buffer[Node]) do
+                destroyFree(nodes);
+                return None();
+        end case;
+    end;
+
+    ---
+    --- Running
+    ---
+
+    -- The time window of the query: the times its outermost and joins
+    -- together.  Leaving the lines outside it out of every set changes no
+    -- result, since the whole is false for them.
+    generic [B: Region]
+    function windowOf(nodes: &[Buffer[Node], B]): Window is
+        let count: Index := length(nodes);
+        var joined: Buffer[Bool] := allocateEmpty();
+        var i: Index := 0;
+        while i < count do
+            insertBack(&!joined, false);
+            i := i + 1;
+        end while;
+        storeNth(&!joined, count - 1, true);
+        var low: Int64 := 0;
+        var high: Int64 := timeMost;
+        var k: Index := count;
+        while k > 0 do
+            let at: Index := k - 1;
+            if nth(&joined, at) then
+                let node: Node := nth(nodes, at);
+                if node.kind = andNode then
+                    storeNth(&!joined, node.first, true);
+                    storeNth(&!joined, node.second, true);
+                end if;
+                if node.kind = timeNode then
+                    if node.low > low then
+                        low := node.low;
+                    end if;
+                    if node.high < high then
+                        high := node.high;
+                    end if;
+                end if;
+            end if;
+            k := k - 1;
+        end while;
+        destroyFree(joined);
+        return Window(low => low, high => high);
+    end;
+
+    function wide(i: Index): Int64 is
+        case toInt64(i) of
+            when Some(value as number: Int64) do
+                return number;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function ran(result: Either[DbError, Nat64]): Option[DbError] is
+        case result of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as changed: Nat64) do
+                return None();
+        end case;
+    end;
+
+    -- The number in the first column of the one row of sql.
+    generic [R: Region]
+    function counted(db: &![Database[Writing], R], sql: Span[Nat8, Static], values: Values): Either[DbError, Int64] is
+        var cursor: Cursor := start(&~db, sql, values);
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => count);
+        end case;
+    end;
+
+    -- The words of text in quotes as one phrase of FTS5 in the column of
+    -- the line: body : "w1 w2".  A word holds only letters, digits and
+    -- bytes above ASCII, so no byte of it is FTS5 syntax.
+    generic [V: Region]
+    function phraseOf(value: Span[Nat8, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "body : \"");
+        var words: Index := 0;
+        var i: Index := 0;
+        let size: Index := spanLength(value);
+        while i < size do
+            if isBreak(value[i]) then
+                i := i + 1;
+            else
+                if words > 0 then
+                    writeByte(&!out, ' ');
+                end if;
+                while (i < size) and (not isBreak(value[i])) do
+                    writeByte(&!out, value[i]);
+                    i := i + 1;
+                end while;
+                words := words + 1;
+            end if;
+        end while;
+        writeByte(&!out, '"');
+        return finalize(out);
+    end;
+
+    -- The child of the and node at that filters its sibling instead of building a set: the second
+    -- when it is an equal term, else the first when it is one, else none (the length of nodes).
+    generic [B: Region]
+    function filterOf(nodes: &[Buffer[Node], B], at: Index): Index is
+        let node: Node := nth(nodes, at);
+        if node.kind /= andNode then
+            return length(nodes);
+        end if;
+        let second: Node := nth(nodes, node.second);
+        if second.kind = equalNode then
+            return node.second;
+        end if;
+        let first: Node := nth(nodes, node.first);
+        if first.kind = equalNode then
+            return node.first;
+        end if;
+        return length(nodes);
+    end;
+
+    -- Whether node at filters the set of its sibling under an and, so that it builds none.
+    generic [B: Region]
+    function isFilter(nodes: &[Buffer[Node], B], at: Index): Bool is
+        var i: Index := at + 1;
+        while i < length(nodes) do
+            if filterOf(nodes, i) = at then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The set of the and node number: the lines of the set of other that the equal term filter
+    -- keeps; the set of other is dropped.
+    generic [R: Region, T: Region]
+    function filtered(db: &![Database[Writing], R], text: Span[Nat8, T], number: Int64, other: Index, filter: Node): Option[DbError] is
+        var sql: Span[Nat8, Static] := pick(&db, levelKeeps, levelKeepsPg);
+        if filter.field = hostField then
+            sql := pick(&db, hostKeeps, hostKeepsPg);
+        else if filter.field = sourceField then
+            sql := pick(&db, sourceKeeps, sourceKeepsPg);
+        end if;
+        let value: Span[Nat8, T] := substring(text, filter.start, filter.stop);
+        case ran(execute(&~db, sql, withText(withInt64(withInt64(noValues(), number), wide(other)), value))) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                let dropNodeSql10: Span[Nat8, Static] := pick(&db, dropNode, dropNodePg);
+                return ran(execute(&~db, dropNodeSql10, withInt64(noValues(), wide(other))));
+        end case;
+    end;
+
+    -- The set of node at, made from the lines in the window from low to
+    -- high, or from the sets of the nodes it is made of, which are dropped.
+    -- narrow: the window holds at most mostRangeLines lines.
+    generic [R: Region, T: Region, B: Region]
+    function runNode(db: &![Database[Writing], R], text: Span[Nat8, T], nodes: &[Buffer[Node], B], at: Index, low: Int64,
+                     high: Int64, narrow: Bool): Option[DbError] is
+        let node: Node := nth(nodes, at);
+        let number: Int64 := wide(at);
+        if node.kind = textNode then
+            if onPostgres(&db) then
+                return ran(execute(&~db, textHasPg, withInt64(withInt64(withText(withInt64(noValues(), number), substring(text, node.start, node.stop)), low), high)));
+            end if;
+            let phrase: String := phraseOf(substring(text, node.start, node.stop));
+            let given: Values := withText(withInt64(noValues(), number), asSpan(&phrase));
+            var result: Option[DbError] := None();
+            if narrow then
+                result := ran(execute(&~db, textWithinSql(), withInt64(withInt64(withInt64(withInt64(withInt64(withInt64(given, low), high), low), high), low), high)));
+            else
+                result := ran(execute(&~db, textHas, withInt64(withInt64(given, low), high)));
+            end if;
+            destroyString(phrase);
+            return result;
+        end if;
+        if node.kind = equalNode then
+            var sql: Span[Nat8, Static] := pick(&db, levelIs, levelIsPg);
+            if node.field = hostField then
+                sql := pick(&db, hostIsSql(), hostIsPg);
+            else if node.field = sourceField then
+                sql := pick(&db, sourceIs, sourceIsPg);
+            end if;
+            let value: Span[Nat8, T] := substring(text, node.start, node.stop);
+            return ran(execute(&~db, sql, withText(withInt64(withInt64(withInt64(noValues(), number), low), high), value)));
+        end if;
+        if node.kind = prefixNode then
+            var sql: Span[Nat8, Static] := pick(&db, sourceStarts, sourceStartsPg);
+            if node.field = hostField then
+                sql := pick(&db, hostStarts, hostStartsPg);
+            end if;
+            let value: Span[Nat8, T] := substring(text, node.start, node.stop);
+            let size: Int64 := wide(node.stop - node.start);
+            return ran(execute(&~db, sql, withText(withInt64(withInt64(withInt64(withInt64(noValues(), number), low), high), size), value)));
+        end if;
+        if (node.kind = timeNode) or (node.kind = idNode) then
+            var sql: Span[Nat8, Static] := pick(&db, idIn, idInPg);
+            if node.kind = timeNode then
+                sql := pick(&db, timeIn, timeInPg);
+            end if;
+            return ran(execute(&~db, sql, withInt64(withInt64(withInt64(withInt64(withInt64(noValues(), number), low), high), node.low), node.high)));
+        end if;
+        if node.kind = notNode then
+            let notInSql7: Span[Nat8, Static] := pick(&db, notIn, notInPg);
+            case ran(execute(&~db, notInSql7, withInt64(withInt64(withInt64(withInt64(noValues(), number), low), high), wide(node.first)))) of
+                when Some(value as error: DbError) do
+                    return Some(value => error);
+                when None do
+                    let dropNodeSql6: Span[Nat8, Static] := pick(&db, dropNode, dropNodePg);
+                    return ran(execute(&~db, dropNodeSql6, withInt64(noValues(), wide(node.first))));
+            end case;
+        end if;
+        let filter: Index := filterOf(nodes, at);
+        if filter < length(nodes) then
+            var other: Index := node.first;
+            if filter = node.first then
+                other := node.second;
+            end if;
+            return filtered(&~db, text, number, other, nth(nodes, filter));
+        end if;
+        var sql: Span[Nat8, Static] := pick(&db, either, eitherPg);
+        if node.kind = andNode then
+            sql := pick(&db, both, bothPg);
+        end if;
+        case ran(execute(&~db, sql, withInt64(withInt64(withInt64(noValues(), number), wide(node.first)), wide(node.second)))) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                let dropNodeSql5: Span[Nat8, Static] := pick(&db, dropNode, dropNodePg);
+                case ran(execute(&~db, dropNodeSql5, withInt64(noValues(), wide(node.first)))) of
+                    when Some(value as error: DbError) do
+                        return Some(value => error);
+                    when None do
+                        let dropNodeSql4: Span[Nat8, Static] := pick(&db, dropNode, dropNodePg);
+                        return ran(execute(&~db, dropNodeSql4, withInt64(noValues(), wide(node.second))));
+                end case;
+        end case;
+    end;
+
+    -- The numbers of at most limit lines of node after offset, newest
+    -- first.
+    generic [R: Region]
+    function page(db: &![Database[Writing], R], node: Int64, limit: Int64, offset: Int64): Either[DbError, Buffer[Int64]] is
+        let pageNodeSql9: Span[Nat8, Static] := pick(&db, pageNode, pageNodePg);
+        var cursor: Cursor := start(&~db, pageNodeSql9, withInt64(withInt64(withInt64(noValues(), node), limit), offset));
+        var keys: Buffer[Int64] := allocateEmpty();
+        while advance(&!cursor) do
+            insertBack(&!keys, columnInt64(&cursor, 0));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyFree(keys);
+                return Left(left => error);
+            when None do
+                return Right(right => keys);
+        end case;
+    end;
+
+    function storageFailure(error: DbError): Either[QueryFailure, QueryResult] is
+        return Left(left => QueryStorage(error => error));
+    end;
+
+    generic [R: Region, T: Region, B: Region]
+    function run(db: &![Database[Writing], R], text: Span[Nat8, T], nodes: &[Buffer[Node], B], window: Window, mostLines: Int64,
+                 limit: Int64, offset: Int64): Either[QueryFailure, QueryResult] is
+        let makeSetsSql1: Span[Nat8, Static] := pick(&db, makeSets, makeSetsPg);
+        case ran(execute(&~db, makeSetsSql1, noValues())) of
+            when Some(value as error: DbError) do
+                return storageFailure(error);
+            when None do
+                skip;
+        end case;
+        let clearSetsSql3: Span[Nat8, Static] := pick(&db, clearSets, clearSetsPg);
+        case ran(execute(&~db, clearSetsSql3, noValues())) of
+            when Some(value as error: DbError) do
+                return storageFailure(error);
+            when None do
+                skip;
+        end case;
+        var narrow: Bool := false;
+        case counted(&~db, countWindow, withInt64(withInt64(noValues(), window.low), window.high)) of
+            when Left(left as error: DbError) do
+                return storageFailure(error);
+            when Right(right as lines: Int64) do
+                if lines > mostLines then
+                    return Left(left => TooManyLines());
+                end if;
+                narrow := lines <= mostRangeLines();
+        end case;
+        var i: Index := 0;
+        while i < length(nodes) do
+            if not isFilter(nodes, i) then
+                case runNode(&~db, text, nodes, i, window.low, window.high, narrow) of
+                    when Some(value as error: DbError) do
+                        return storageFailure(error);
+                    when None do
+                        skip;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        let root: Int64 := wide(length(nodes) - 1);
+        let countNodeSql8: Span[Nat8, Static] := pick(&db, countNode, countNodePg);
+        case counted(&~db, countNodeSql8, withInt64(noValues(), root)) of
+            when Left(left as error: DbError) do
+                return storageFailure(error);
+            when Right(right as total: Int64) do
+                case page(&~db, root, limit, offset) of
+                    when Left(left as error: DbError) do
+                        return storageFailure(error);
+                    when Right(right as keys: Buffer[Int64]) do
+                        let clearSetsSql2: Span[Nat8, Static] := pick(&db, clearSets, clearSetsPg);
+                        case ran(execute(&~db, clearSetsSql2, noValues())) of
+                            when Some(value as error: DbError) do
+                                destroyFree(keys);
+                                return storageFailure(error);
+                            when None do
+                                return Right(right => QueryResult(total => total, keys => keys));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function findByQuery(db: &![Database[Writing], R], text: Span[Nat8, T], now: Int64, mostLines: Int64,
+                         limit: Int64, offset: Int64): Either[QueryFailure, QueryResult] is
+        case parsed(text, now) of
+            when Left(left as error: QueryError) do
+                return Left(left => QueryRefused(reason => error));
+            when Right(right as nodes: Buffer[Node]) do
+                let window: Window := windowOf(&nodes);
+                -- A reading transaction of its own, not Standard.Database's begin: on a writing
+                -- connection of SQLite that is BEGIN IMMEDIATE, which would hold the write lock of the
+                -- store for the whole search and make every writer fail meanwhile.  The
+                -- search writes only its temporary table, which both allow.
+                let beginSql: Span[Nat8, Static] := pick(&db, beginReading, beginReadingPg);
+                case ran(execute(&~db, beginSql, noValues())) of
+                    when Some(value as error: DbError) do
+                        destroyFree(nodes);
+                        return storageFailure(error);
+                    when None do
+                        skip;
+                end case;
+                let outcome: Either[QueryFailure, QueryResult] := run(&~db, text, &nodes, window, mostLines, limit, offset);
+                destroyFree(nodes);
+                case outcome of
+                    when Left(left as failure: QueryFailure) do
+                        -- The failure is the answer; a failed rollback ends the transaction too.
+                        let undone: Option[DbError] := ran(execute(&~db, "ROLLBACK", noValues()));
+                        return Left(left => failure);
+                    when Right(right as found: QueryResult) do
+                        case ran(execute(&~db, "COMMIT", noValues())) of
+                            when Some(value as error: DbError) do
+                                destroyResult(found);
+                                return storageFailure(error);
+                            when None do
+                                return Right(right => found);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function hostTermSql(): Span[Nat8, Static] is
+        return hostPlan;
+    end;
+
+    function textTermSql(): Span[Nat8, Static] is
+        return textPlan;
+    end;
+
+    -- textPlan without its first 19 bytes, "EXPLAIN QUERY PLAN ".
+    function textWithinSql(): Span[Nat8, Static] is
+        return substring(textPlan, 19, spanLength(textPlan));
+    end;
+
+    -- The most lines of a window for which a text term reads the rowids of the window
+    -- (textPlan) rather than every hit (textHas).  Measured with SQLite 3.46.1, 1 000 000
+    -- lines, 100 222 hits, warm: an hour 2.5 against 243.9 ms, a day 55.3 against 266.6 ms,
+    -- 30 days (every line) 1695.8 against 340.9 ms; even at about 180 000 lines.  Cold each
+    -- hit textHas reads is a line fetched from the disk, so the bound stays below that.
+    function mostRangeLines(): Int64 is
+        return 100000;
+    end;
+
+    -- hostPlan without its first 19 bytes, "EXPLAIN QUERY PLAN ".
+    function hostIsSql(): Span[Nat8, Static] is
+        return substring(hostPlan, 19, spanLength(hostPlan));
+    end;
+
+    function destroyResult(result: QueryResult): Unit is
+        let { total: Int64, keys: Buffer[Int64] } := result;
+        destroyFree(keys);
+        return nil;
+    end;
+end module body.

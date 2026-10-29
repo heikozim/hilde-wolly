@@ -1,0 +1,179 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The list is a file of the test's own, written in its working directory
+-- and removed again: one line with capitals, one with CRLF, a last one
+-- without a line feed.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFileIfThere
+);
+import Wolly.Passphrase (
+    PassphraseCheck,
+    PassphraseFits,
+    TooShort,
+    TooLong,
+    NotText,
+    Listed,
+    HoldsName,
+    ListUnreadable,
+    fewestCharacters,
+    mostCharacters,
+    mostBytes,
+    normalizedPassword,
+    characterCount,
+    checkPassphrase,
+    describeCheck
+);
+
+module body Wolly.Passphrase.Test is
+    constant listPath: Span[Nat8, Static] := "passphrase-test-list.txt";
+    constant listText: Span[Nat8, Static] := "PasswordPassword\nqwertyuiopasdfgh\r\ncorrecthorsebatterystaple";
+
+    -- The number of the case of check, so that two verdicts compare.
+    function caseOf(check: PassphraseCheck): Index is
+        case check of
+            when PassphraseFits do
+                return 0;
+            when TooShort do
+                return 1;
+            when TooLong do
+                return 2;
+            when NotText do
+                return 3;
+            when Listed do
+                return 4;
+            when HoldsName do
+                return 5;
+            when ListUnreadable do
+                return 6;
+        end case;
+    end;
+
+    generic [P: Region]
+    function isCase(password: Span[Nat8, P], name: Span[Nat8, Static], second: Bool, wanted: Index,
+                    message: Span[Nat8, Static]): Unit is
+        assertTrue(caseOf(checkPassphrase(password, name, second, listPath)) = wanted, message);
+        return nil;
+    end;
+
+    function written(): Bool is
+        case openWrite(listPath) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let done: Bool := writeAll(&!file, listText);
+                let closed: Bool := closeFile(file);
+                return done and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- count times the bytes of piece.
+    function repeated(piece: Span[Nat8, Static], count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeString(&!out, piece);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function testLengths(): Unit is
+        assertTrue(written(), "the list is written");
+        assertTrue((fewestCharacters(false) = 15) and (fewestCharacters(true) = 8), "15 alone, 8 with a second factor");
+        assertTrue((mostCharacters() = 256) and (mostBytes() = 1024), "256 characters, 1024 bytes");
+        isCase("correct horse battery", "ann", false, 0, "21 characters with spaces fit");
+        isCase("fourteen chars", "ann", false, 1, "14 characters are too short alone");
+        isCase("fourteen chars", "ann", true, 0, "but fit with a second factor");
+        isCase("fifteen chars!!", "ann", false, 0, "15 fit alone");
+        isCase("eight ch", "ann", true, 0, "8 fit with a second factor");
+        isCase("seven c", "ann", true, 1, "7 do not");
+        -- 13 characters of 3 bytes each: counted as 13, not as 39 bytes.
+        isCase("パスワードはとても長いです", "ann", true, 0, "13 Japanese characters fit with a second factor");
+        isCase("パスワードはとても長いです", "ann", false, 1, "and are too short alone, though 39 bytes");
+        let ligatures: String := repeated("ﬁ", 7);
+        isCase(asSpan(&ligatures), "ann", false, 1, "seven ligatures fi are 14 characters in NFKC: too short alone");
+        isCase(asSpan(&ligatures), "ann", true, 0, "but they count as 14, not 7, with a second factor");
+        destroyString(ligatures);
+        let most: String := repeated("a", 256);
+        isCase(asSpan(&most), "ann", false, 0, "256 characters fit");
+        destroyString(most);
+        let over: String := repeated("a", 257);
+        isCase(asSpan(&over), "ann", false, 2, "257 are too long");
+        destroyString(over);
+        let wide: String := repeated("パ", 342);
+        isCase(asSpan(&wide), "ann", false, 2, "1026 bytes are too long");
+        destroyString(wide);
+        let removed: Bool := removeFileIfThere(listPath);
+        return nil;
+    end;
+
+    function testText(): Unit is
+        assertTrue(written(), "the list is written");
+        var raw: StringBuilder := makeStringBuilder();
+        writeString(&!raw, "a valid start, ");
+        writeByte(&!raw, 255);
+        writeString(&!raw, " then no UTF-8");
+        let bad: String := finalize(raw);
+        isCase(asSpan(&bad), "ann", false, 3, "a byte 255 is no UTF-8");
+        destroyString(bad);
+        var parts: StringBuilder := makeStringBuilder();
+        writeByte(&!parts, 'a');
+        writeByte(&!parts, 204);
+        writeByte(&!parts, 136);
+        let decomposed: String := finalize(parts);
+        assertTrue(length(&decomposed) = 3, "a and U+0308 are three bytes");
+        let normal: Option[String] := normalizedPassword(asSpan(&decomposed));
+        destroyString(decomposed);
+        case normal of
+            when Some(value as composed: String) do
+                assertTrue((length(&composed) = 2) and (characterCount(asSpan(&composed)) = 1), "a and a combining diaeresis are one character, ä, in two bytes");
+                destroyString(composed);
+            when None do
+                assertTrue(false, "a and a combining diaeresis normalise");
+        end case;
+        let removed: Bool := removeFileIfThere(listPath);
+        return nil;
+    end;
+
+    function testList(): Unit is
+        assertTrue(written(), "the list is written");
+        isCase("passwordpassword", "ann", false, 4, "a listed password, the list in capitals");
+        isCase("PASSWORDPASSWORD", "ann", false, 4, "in capitals too");
+        isCase("qwertyuiopasdfgh", "ann", false, 4, "a line that ends in CRLF");
+        isCase("correcthorsebatterystaple", "ann", false, 4, "the last line, without a line feed");
+        isCase("passwordpassword!", "ann", false, 0, "the control: one more character is not listed");
+        isCase("this is anns own secret", "ann", false, 5, "the name in it");
+        isCase("this is ANNS own secret", "ann", false, 5, "in capitals too");
+        isCase("this is anns own secret", "bob", false, 0, "the control: another user may");
+        let removed: Bool := removeFileIfThere(listPath);
+        isCase("correct horse battery", "ann", false, 6, "without a readable list nothing fits");
+        assertTrue(spanLength(describeCheck(Listed())) > 0, "a verdict has a sentence");
+        return nil;
+    end;
+end module body.

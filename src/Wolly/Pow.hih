@@ -1,0 +1,126 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A proof of work in front of an expensive step, such as a login that costs
+an Argon2id hash: the browser finds a number, the server checks it before
+the step, and each puzzle counts once.
+
+A puzzle is a signed text and nothing is stored when it is given out: 1, a
+random ID of 16 bytes, the number of leading zero bits asked for, the time
+it ends, the binding (the flow it belongs to) in base64url, and the
+HMAC-SHA256 of these five parts under a key of the server, all joined by
+dots.  An answer is a number n of 1 to 20 digits such that the SHA-256 of
+the puzzle, a colon and n begins with that many zero bits.
+
+A check goes in the order of its cost: the form and the HMAC (in constant
+time), the time, the binding, the difficulty, the hash, and last the entry
+of the ID in the table pow_spent, whose primary key makes a puzzle count
+once.  Only a right answer writes a row.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Pow is
+    """
+    The most zero bits a puzzle may ask for: 32.
+    """
+    function mostBits(): Int64
+        ensures result = 32;
+
+    """
+    The fewest bytes of a key: 32.
+    """
+    function fewestKeyBytes(): Index
+        ensures result = 32;
+
+    """
+    A puzzle given out: its text, its ID, its zero bits and when it ends.
+    """
+    record Puzzle: Linear is
+        token: String;
+        id: String;
+        bits: Int64;
+        expires: Int64;
+    end;
+
+    """
+    Frees puzzle.
+    No contract: it only frees.
+    """
+    function destroyPuzzle(puzzle: Puzzle): Unit;
+
+    """
+    A new puzzle for binding (1 to 256 bytes) of bits zero bits, signed
+    with key, ending ttl seconds after now.  None when the key is shorter
+    than fewestKeyBytes, bits or binding are out of their bounds, or the
+    random source fails.  An Option over the random source, so no ensures.
+    """
+    generic [K: Region, B: Region]
+    function issuePuzzle(key: Span[Nat8, K], binding: Span[Nat8, B], bits: Int64, now: Int64,
+        ttl: Int64): Option[Puzzle]
+        requires (now > 0) and (ttl > 0);
+
+    """
+    What a check found.
+    """
+    union PowCheck: Free is
+        case PowMalformed;
+        case PowForged;
+        case PowExpired;
+        case PowOtherFlow;
+        case PowTooEasy;
+        case PowWrong;
+        case PowReused;
+        case PowSolved;
+    end;
+
+    """
+    The word of check as a log line names it: malformed, forged, expired,
+    other_flow, too_easy, wrong, reused, or empty for a solved puzzle.
+    No contract: a word of a fixed list.
+    """
+    function powReason(check: PowCheck): Span[Nat8, Static];
+
+    """
+    Whether the SHA-256 of token, a colon and nonce begins with bits zero
+    bits.
+    No ensures: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Region, N: Region]
+    function solves(token: Span[Nat8, T], nonce: Span[Nat8, N], bits: Int64): Bool
+        requires (bits >= 0) and (bits <= mostBits());
+
+    """
+    Makes the table pow_spent, when it is not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function preparePow(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Checks token and its answer nonce for binding at now, asking for
+    minBits zero bits at least, and spends the puzzle when it is solved.
+    """
+    generic [R: Region, K: Region, T: Region, N: Region, B: Region]
+    function checkPuzzle(db: &![Database[Writing], R], key: Span[Nat8, K], token: Span[Nat8, T], nonce: Span[Nat8, N],
+        binding: Span[Nat8, B], minBits: Int64, now: Int64): Either[DbError, PowCheck]
+        requires now > 0;
+
+    """
+    Deletes the spent puzzles that ended before now.  The rows deleted.
+    """
+    generic [R: Region]
+    function prunePow(db: &![Database[Writing], R], now: Int64): Either[DbError, Int64]
+        requires now > 0;
+end module.

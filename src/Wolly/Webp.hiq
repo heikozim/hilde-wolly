@@ -1,0 +1,1229 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Wolly.Vp8 (
+    Vp8Picture,
+    readVp8,
+    vp8Width,
+    vp8Height,
+    vp8Pixels,
+    destroyVp8
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    lengthMut,
+    length as bufferLength,
+    nth,
+    storeNth,
+    destroyFree
+);
+
+module body Wolly.Webp is
+    constant sideMost: Index := 16000;
+    constant wordBits: Index := 32;
+    -- One prefix code in the buffer codes from its base: what kind it is
+    -- at 0 (1 one symbol and no bits, 2 a tree), the one symbol at 1, the
+    -- count of codes of length l (1 to 15) at 2 + l, the first code of
+    -- that length at 17 + l, the index of its first symbol at 32 + l, the
+    -- symbols from 48, by length and then by value.
+    constant countAt: Index := 2;
+    constant firstCodeAt: Index := 17;
+    constant firstIndexAt: Index := 32;
+    constant symbolsAt: Index := 48;
+    -- A symbol no code has.
+    constant noSymbol: Index := 100000;
+    -- What a reader answers: read, Broken, too large.
+    constant fine: Index := 0;
+    constant broken: Index := 1;
+    constant tooLarge: Index := 3;
+
+    record WebpPicture: Linear is
+        width: Index;
+        height: Index;
+        pixels: String;
+        alpha: String;
+        invariant (width >= 1) and (width <= 16000);
+        invariant (height >= 1) and (height <= 16000);
+        invariant length(&pixels) = ((width * height) * 3);
+        invariant length(&alpha) = (width * height);
+    end;
+
+    -- Where the bits are read, the least significant first: the byte at
+    -- at, its bit bit, the end of the chunk at stop, and whether a read
+    -- went past it.
+    record Bits: Free is
+        at: Index;
+        bit: Index;
+        stop: Index;
+        overrun: Bool;
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(n: Index): Nat8 is
+        case toNat8(bitwiseAnd(n, (255 : Index))) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The i-th byte of text written as hex digits, two a byte.
+    function hexByte(text: Span[Nat8, Static], i: Index): Index is
+        return (hexDigit(text[i * 2]) * 16) + hexDigit(text[(i * 2) + 1]);
+    end;
+
+    function hexDigit(c: Nat8): Index is
+        let n: Index := wide(c);
+        if n >= 97 then
+            return n - 87;
+        end if;
+        return n - 48;
+    end;
+
+    -- 2 to the n, n at most 32.
+    function power(n: Index): Index is
+        var p: Index := 1;
+        var i: Index := 0;
+        while i < n do
+            p := p * 2;
+            i := i + 1;
+        end while;
+        return p;
+    end;
+
+    -- The little-endian 32 bits at at.
+    generic [D: Region]
+    function long(data: Span[Nat8, D], at: Index): Index is
+        return ((wide(data[at]) + (wide(data[at + 1]) * 256)) + (wide(data[at + 2]) * 65536)) + (wide(data[at + 3]) * 16777216);
+    end;
+
+    -- Whether the four bytes at at are the fourcc c1 c2 c3 c4.
+    generic [D: Region]
+    function isChunk(data: Span[Nat8, D], at: Index, c1: Nat8, c2: Nat8, c3: Nat8, c4: Nat8): Bool is
+        return ((data[at] = c1) and (data[at + 1] = c2)) and ((data[at + 2] = c3) and (data[at + 3] = c4));
+    end;
+
+    -- The next n bits, the first the least significant; 0 past the end.
+    generic [D: Region, B: Region]
+    function readBits(data: Span[Nat8, D], bits: &![Bits, B], n: Index): Index is
+        var v: Index := 0;
+        var i: Index := 0;
+        while i < n do
+            let at: Index := bits->at;
+            if at >= (bits->stop) then
+                bits->overrun := true;
+            else
+                let bit: Index := bits->bit;
+                if bitwiseAnd(wide(data[at]) / power(bit), (1 : Index)) = 1 then
+                    v := v + power(i);
+                end if;
+                if bit = 7 then
+                    bits->bit := (0 : Index);
+                    bits->at := at + 1;
+                else
+                    bits->bit := bit + 1;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return v;
+    end;
+
+    -- A channel of an ARGB pixel: 0 blue, 1 green, 2 red, 3 alpha.
+    function channel(argb: Index, k: Index): Index is
+        return bitwiseAnd(argb / power(k * 8), (255 : Index));
+    end;
+
+    function argbOf(a: Index, r: Index, g: Index, b: Index): Index is
+        return (((a * 16777216) + (r * 65536)) + (g * 256)) + b;
+    end;
+
+    ---
+    --- Prefix codes
+    ---
+
+    -- The code of the lengths in lengths (0 for a symbol not coded),
+    -- appended to codes: canonical, as deflate has it; a code of one
+    -- symbol takes no bits.  broken when no symbol is coded or the code is
+    -- not complete, tooLarge when codes would grow past room.
+    generic [L: Region, C: Region]
+    function buildCode(lengths: &[Buffer[Index], L], alphabet: Index, codes: &![Buffer[Index], C], room: Index): Index is
+        var counts: Buffer[Index] := initialize(16, (0 : Index));
+        var coded: Index := 0;
+        var one: Index := 0;
+        var s: Index := 0;
+        while s < alphabet do
+            let l: Index := nth(lengths, s);
+            if l > 0 then
+                let counted: Index := nth(&counts, l) + 1;
+                storeNth(&!counts, l, counted);
+                coded := coded + 1;
+                one := s;
+            end if;
+            s := s + 1;
+        end while;
+        var result: Index := fine;
+        let base: Index := lengthMut(&~codes);
+        if coded = 0 then
+            result := broken;
+        else
+            if ((base + symbolsAt) + coded) > room then
+                result := tooLarge;
+            end if;
+        end if;
+        if (result = fine) and (coded > 1) then
+            -- Kraft: every code length used up exactly
+            var left: Index := 1;
+            var l: Index := 1;
+            while (result = fine) and (l <= 15) do
+                left := left * 2;
+                if nth(&counts, l) > left then
+                    result := broken;
+                else
+                    left := left - nth(&counts, l);
+                end if;
+                l := l + 1;
+            end while;
+            if (result = fine) and (left /= 0) then
+                result := broken;
+            end if;
+        end if;
+        if result = fine then
+            var k: Index := 0;
+            while k < symbolsAt do
+                insertBack(&~codes, (0 : Index));
+                k := k + 1;
+            end while;
+            if coded = 1 then
+                storeNth(&~codes, base, (1 : Index));
+                storeNth(&~codes, base + 1, one);
+            else
+                storeNth(&~codes, base, (2 : Index));
+                var code: Index := 0;
+                var index: Index := 0;
+                var l: Index := 1;
+                while l <= 15 do
+                    storeNth(&~codes, (base + countAt) + l, nth(&counts, l));
+                    storeNth(&~codes, (base + firstCodeAt) + l, code);
+                    storeNth(&~codes, (base + firstIndexAt) + l, index);
+                    code := (code + nth(&counts, l)) * 2;
+                    index := index + nth(&counts, l);
+                    var t: Index := 0;
+                    while t < alphabet do
+                        if nth(lengths, t) = l then
+                            insertBack(&~codes, t);
+                        end if;
+                        t := t + 1;
+                    end while;
+                    l := l + 1;
+                end while;
+            end if;
+        end if;
+        destroyFree(counts);
+        return result;
+    end;
+
+    -- The next symbol of the code at base; noSymbol for bits no code has.
+    generic [D: Region, B: Region, C: Region]
+    function decodeSymbol(data: Span[Nat8, D], bits: &![Bits, B], codes: &[Buffer[Index], C], base: Index): Index is
+        if nth(codes, base) = 1 then
+            return nth(codes, base + 1);
+        end if;
+        var code: Index := 0;
+        var l: Index := 1;
+        while l <= 15 do
+            code := (code * 2) + readBits(data, &~bits, 1);
+            let first: Index := nth(codes, (base + firstCodeAt) + l);
+            if (code >= first) and ((code - first) < nth(codes, (base + countAt) + l)) then
+                return nth(codes, ((base + symbolsAt) + nth(codes, (base + firstIndexAt) + l)) + (code - first));
+            end if;
+            l := l + 1;
+        end while;
+        return noSymbol;
+    end;
+
+    -- The code lengths of a prefix code of alphabet symbols (RFC 9649
+    -- 3.7.2.1.1 and 3.7.2.1.2): a simple code of one or two symbols, or the
+    -- lengths coded with a code of code lengths and repeats.
+    generic [D: Region, B: Region, L: Region]
+    function codeLengths(data: Span[Nat8, D], bits: &![Bits, B], alphabet: Index, lengths: &![Buffer[Index], L]): Index is
+        if readBits(data, &~bits, 1) = 1 then
+            let count: Index := readBits(data, &~bits, 1) + 1;
+            var firstBits: Index := 1;
+            if readBits(data, &~bits, 1) = 1 then
+                firstBits := (8 : Index);
+            end if;
+            let first: Index := readBits(data, &~bits, firstBits);
+            if first >= alphabet then
+                return broken;
+            end if;
+            storeNth(&~lengths, first, (1 : Index));
+            if count = 2 then
+                let second: Index := readBits(data, &~bits, 8);
+                if second >= alphabet then
+                    return broken;
+                end if;
+                storeNth(&~lengths, second, (1 : Index));
+            end if;
+            return fine;
+        end if;
+        -- the order in which the lengths of the code of code lengths come, in
+        -- hex
+        let order: Span[Nat8, Static] := "111200010203040510060708090a0b0c0d0e0f";
+        var lengthLengths: Buffer[Index] := initialize(19, (0 : Index));
+        let n: Index := readBits(data, &~bits, 4) + 4;
+        var i: Index := 0;
+        while i < n do
+            storeNth(&!lengthLengths, hexByte(order, i), readBits(data, &~bits, 3));
+            i := i + 1;
+        end while;
+        var lengthCode: Buffer[Index] := allocateEmpty();
+        var result: Index := buildCode(&lengthLengths, 19, &!lengthCode, 1000);
+        var most: Index := alphabet;
+        if result = fine then
+            if readBits(data, &~bits, 1) = 1 then
+                let mostBits: Index := (readBits(data, &~bits, 3) * 2) + 2;
+                most := readBits(data, &~bits, mostBits) + 2;
+                if most > alphabet then
+                    result := broken;
+                end if;
+            end if;
+        end if;
+        var symbol: Index := 0;
+        var previous: Index := 8;
+        while ((result = fine) and (symbol < alphabet)) and (most > 0) do
+            most := most - 1;
+            let code: Index := decodeSymbol(data, &~bits, &lengthCode, 0);
+            if code < 16 then
+                storeNth(&~lengths, symbol, code);
+                symbol := symbol + 1;
+                if code /= 0 then
+                    previous := code;
+                end if;
+            else
+                var repeat: Index := 0;
+                var value: Index := 0;
+                if code = 16 then
+                    repeat := readBits(data, &~bits, 2) + 3;
+                    value := previous;
+                end if;
+                if code = 17 then
+                    repeat := readBits(data, &~bits, 3) + 3;
+                end if;
+                if code = 18 then
+                    repeat := readBits(data, &~bits, 7) + 11;
+                end if;
+                if (repeat = 0) or ((symbol + repeat) > alphabet) then
+                    result := broken;
+                else
+                    var r: Index := 0;
+                    while r < repeat do
+                        storeNth(&~lengths, symbol, value);
+                        symbol := symbol + 1;
+                        r := r + 1;
+                    end while;
+                end if;
+            end if;
+        end while;
+        destroyFree(lengthLengths);
+        destroyFree(lengthCode);
+        return result;
+    end;
+
+    -- A prefix code of alphabet symbols read and appended to codes.
+    generic [D: Region, B: Region, C: Region]
+    function readCode(data: Span[Nat8, D], bits: &![Bits, B], alphabet: Index, codes: &![Buffer[Index], C], room: Index): Index is
+        var lengths: Buffer[Index] := initialize(alphabet, (0 : Index));
+        var result: Index := codeLengths(data, &~bits, alphabet, &!lengths);
+        if result = fine then
+            result := buildCode(&lengths, alphabet, &~codes, room);
+        end if;
+        if bits->overrun then
+            result := broken;
+        end if;
+        destroyFree(lengths);
+        return result;
+    end;
+
+    ---
+    --- Entropy-coded images
+    ---
+
+    -- The length or distance of a prefix symbol and its extra bits (RFC
+    -- 9649 3.6.1.1... 5.2.2).
+    generic [D: Region, B: Region]
+    function prefixValue(data: Span[Nat8, D], bits: &![Bits, B], prefix: Index): Index is
+        if prefix < 4 then
+            return prefix + 1;
+        end if;
+        let extra: Index := (prefix - 2) / 2;
+        let offset: Index := (bitwiseAnd(prefix, (1 : Index)) + 2) * power(extra);
+        return (offset + readBits(data, &~bits, extra)) + 1;
+    end;
+
+    -- The distance in pixels of distance code code in an image width
+    -- wide: above 120 the code less 120, else a place near the pixel from
+    -- the table of RFC 9649 5.2.2 (row up, column), at least 1.
+    function planeDistance(code: Index, width: Index): Index is
+        if code > 120 then
+            return code - 120;
+        end if;
+        -- each byte, in hex: the rows up times 16 plus 8 less the columns left
+        let plane: Span[Nat8, Static] := "1807171928062729161a262a38053739151b363a252b48044749141c353b464a242c58454b343c035759131d565a232d444c555b333d68026769121e666a222e545c434d656b323e78017779535d111f646c424e767a212f757b313f636d525e00747c414f1020626e30737d515f40727e616f50717f6070";
+        let v: Index := hexByte(plane, code - 1);
+        let d: Index := (((v / 16) * width) + 8) - bitwiseAnd(v, (15 : Index));
+        if d < 1 then
+            return 1;
+        end if;
+        return d;
+    end;
+
+    -- The pixels of an image of width by height as ARGB into out from at
+    -- (RFC 9649 5): the colour cache, for the main image the entropy image
+    -- of groups of prefix codes, the five codes of each group, the pixels.
+    generic [D: Region, B: Region, O: Region]
+    function imageData(data: Span[Nat8, D], bits: &![Bits, B], width: Index, height: Index, main: Bool,
+                       out: &![Buffer[Index], O], at: Index, room: Index): Index is
+        var cacheBits: Index := 0;
+        if readBits(data, &~bits, 1) = 1 then
+            cacheBits := readBits(data, &~bits, 4);
+            if (cacheBits < 1) or (cacheBits > 11) then
+                return broken;
+            end if;
+        end if;
+        var metaBits: Index := 0;
+        var across: Index := 1;
+        var groups: Index := 1;
+        var result: Index := fine;
+        var entropy: Buffer[Index] := allocateEmpty();
+        if main then
+            if readBits(data, &~bits, 1) = 1 then
+                metaBits := readBits(data, &~bits, 3) + 2;
+                across := ((width + power(metaBits)) - 1) / power(metaBits);
+                let down: Index := ((height + power(metaBits)) - 1) / power(metaBits);
+                destroyFree(entropy);
+                entropy := initialize(across * down, (0 : Index));
+                result := imageData(data, &~bits, across, down, false, &!entropy, 0, room);
+                var i: Index := 0;
+                while (result = fine) and (i < (across * down)) do
+                    let group: Index := bitwiseAnd(nth(&entropy, i) / 256, (65535 : Index)) + 1;
+                    if group > groups then
+                        groups := group;
+                    end if;
+                    i := i + 1;
+                end while;
+            end if;
+        end if;
+        let cacheSize: Index := power(cacheBits);
+        var codes: Buffer[Index] := allocateEmpty();
+        var bases: Buffer[Index] := allocateEmpty();
+        var g: Index := 0;
+        while (result = fine) and (g < groups) do
+            var k: Index := 0;
+            while (result = fine) and (k < 5) do
+                var alphabet: Index := 256;
+                if k = 0 then
+                    alphabet := (280 : Index);
+                    if cacheBits > 0 then
+                        alphabet := alphabet + cacheSize;
+                    end if;
+                end if;
+                if k = 4 then
+                    alphabet := (40 : Index);
+                end if;
+                insertBack(&!bases, lengthMut(&!codes));
+                result := readCode(data, &~bits, alphabet, &!codes, room);
+                k := k + 1;
+            end while;
+            g := g + 1;
+        end while;
+        if result = fine then
+            result := pixelData(data, &~bits, width, height, &codes, &bases, &entropy, metaBits, across, cacheBits, &~out, at);
+        end if;
+        destroyFree(entropy);
+        destroyFree(codes);
+        destroyFree(bases);
+        return result;
+    end;
+
+    -- The colour cache slot of argb: the upper cacheBits bits of the low
+    -- 32 bits of argb times 0x1e35a7bd.
+    function cacheKey(argb: Index, cacheBits: Index): Index is
+        return bitwiseAnd(argb * (506832829 : Index), (4294967295 : Index)) / power(wordBits - cacheBits);
+    end;
+
+    -- The coded pixels: literals, backward references, cache hits.
+    generic [D: Region, B: Region, C: Region, S: Region, E: Region, O: Region]
+    function pixelData(data: Span[Nat8, D], bits: &![Bits, B], width: Index, height: Index, codes: &[Buffer[Index], C],
+                       bases: &[Buffer[Index], S], entropy: &[Buffer[Index], E], metaBits: Index, across: Index,
+                       cacheBits: Index, out: &![Buffer[Index], O], at: Index): Index is
+        let total: Index := width * height;
+        var cache: Buffer[Index] := initialize(power(cacheBits), (0 : Index));
+        var result: Index := fine;
+        var pos: Index := 0;
+        while (result = fine) and (pos < total) do
+            var group: Index := 0;
+            if metaBits > 0 then
+                let y: Index := pos / width;
+                let x: Index := pos - (y * width);
+                let cell: Index := ((y / power(metaBits)) * across) + (x / power(metaBits));
+                group := bitwiseAnd(nth(entropy, cell) / 256, (65535 : Index));
+            end if;
+            let g: Index := group * 5;
+            let green: Index := decodeSymbol(data, &~bits, codes, nth(bases, g));
+            if green < 256 then
+                let red: Index := decodeSymbol(data, &~bits, codes, nth(bases, g + 1));
+                let blue: Index := decodeSymbol(data, &~bits, codes, nth(bases, g + 2));
+                let alpha: Index := decodeSymbol(data, &~bits, codes, nth(bases, g + 3));
+                if ((red > 255) or (blue > 255)) or (alpha > 255) then
+                    result := broken;
+                else
+                    let argb: Index := argbOf(alpha, red, green, blue);
+                    storeNth(&~out, at + pos, argb);
+                    if cacheBits > 0 then
+                        storeNth(&!cache, cacheKey(argb, cacheBits), argb);
+                    end if;
+                    pos := pos + 1;
+                end if;
+            else
+                if green < 280 then
+                    let count: Index := prefixValue(data, &~bits, green - 256);
+                    let distanceSymbol: Index := decodeSymbol(data, &~bits, codes, nth(bases, g + 4));
+                    if distanceSymbol >= 40 then
+                        result := broken;
+                    else
+                        let distance: Index := planeDistance(prefixValue(data, &~bits, distanceSymbol), width);
+                        if (distance > pos) or ((pos + count) > total) then
+                            result := broken;
+                        else
+                            var k: Index := 0;
+                            while k < count do
+                                let argb: Index := nth(&out, (at + pos) - distance);
+                                storeNth(&~out, at + pos, argb);
+                                if cacheBits > 0 then
+                                    storeNth(&!cache, cacheKey(argb, cacheBits), argb);
+                                end if;
+                                pos := pos + 1;
+                                k := k + 1;
+                            end while;
+                        end if;
+                    end if;
+                else
+                    let slot: Index := green - 280;
+                    if (cacheBits = 0) or (slot >= power(cacheBits)) then
+                        result := broken;
+                    else
+                        let argb: Index := nth(&cache, slot);
+                        storeNth(&~out, at + pos, argb);
+                        storeNth(&!cache, cacheKey(argb, cacheBits), argb);
+                        pos := pos + 1;
+                    end if;
+                end if;
+            end if;
+            if bits->overrun then
+                result := broken;
+            end if;
+        end while;
+        destroyFree(cache);
+        return result;
+    end;
+
+    ---
+    --- Transforms
+    ---
+
+    function average(a: Index, b: Index): Index is
+        var v: Index := 0;
+        var k: Index := 0;
+        while k < 4 do
+            v := v + (((channel(a, k) + channel(b, k)) / 2) * power(k * 8));
+            k := k + 1;
+        end while;
+        return v;
+    end;
+
+    function difference(a: Index, b: Index): Index is
+        if a > b then
+            return a - b;
+        end if;
+        return b - a;
+    end;
+
+    -- left or top, the one nearer to left + top - topLeft.
+    function select(left: Index, top: Index, topLeft: Index): Index is
+        var nearLeft: Index := 0;
+        var nearTop: Index := 0;
+        var k: Index := 0;
+        while k < 4 do
+            nearLeft := nearLeft + difference(channel(top, k), channel(topLeft, k));
+            nearTop := nearTop + difference(channel(left, k), channel(topLeft, k));
+            k := k + 1;
+        end while;
+        if nearLeft < nearTop then
+            return left;
+        end if;
+        return top;
+    end;
+
+    -- a + b - c of each channel, held to 0..255.
+    function clampFull(a: Index, b: Index, c: Index): Index is
+        var v: Index := 0;
+        var k: Index := 0;
+        while k < 4 do
+            let sum: Index := channel(a, k) + channel(b, k);
+            var x: Index := 0;
+            if sum > channel(c, k) then
+                x := sum - channel(c, k);
+            end if;
+            if x > 255 then
+                x := (255 : Index);
+            end if;
+            v := v + (x * power(k * 8));
+            k := k + 1;
+        end while;
+        return v;
+    end;
+
+    -- a + (a - b) / 2 of each channel, the half towards 0, held to 0..255.
+    function clampHalf(a: Index, b: Index): Index is
+        var v: Index := 0;
+        var k: Index := 0;
+        while k < 4 do
+            let ca: Index := channel(a, k);
+            let cb: Index := channel(b, k);
+            var x: Index := 0;
+            if ca >= cb then
+                x := ca + ((ca - cb) / 2);
+                if x > 255 then
+                    x := (255 : Index);
+                end if;
+            else
+                let down: Index := (cb - ca) / 2;
+                if down < ca then
+                    x := ca - down;
+                end if;
+            end if;
+            v := v + (x * power(k * 8));
+            k := k + 1;
+        end while;
+        return v;
+    end;
+
+    -- The prediction of mode for a pixel with its neighbours (RFC 9649
+    -- 4.1); modes 14 and 15 predict black as 0 does.
+    function predict(mode: Index, left: Index, top: Index, topLeft: Index, topRight: Index): Index is
+        if mode = 1 then
+            return left;
+        end if;
+        if mode = 2 then
+            return top;
+        end if;
+        if mode = 3 then
+            return topRight;
+        end if;
+        if mode = 4 then
+            return topLeft;
+        end if;
+        if mode = 5 then
+            return average(average(left, topRight), top);
+        end if;
+        if mode = 6 then
+            return average(left, topLeft);
+        end if;
+        if mode = 7 then
+            return average(left, top);
+        end if;
+        if mode = 8 then
+            return average(topLeft, top);
+        end if;
+        if mode = 9 then
+            return average(top, topRight);
+        end if;
+        if mode = 10 then
+            return average(average(left, topLeft), average(top, topRight));
+        end if;
+        if mode = 11 then
+            return select(left, top, topLeft);
+        end if;
+        if mode = 12 then
+            return clampFull(left, top, topLeft);
+        end if;
+        if mode = 13 then
+            return clampHalf(average(left, top), topLeft);
+        end if;
+        return (4278190080 : Index);
+    end;
+
+    -- a + b of each channel, modulo 256.
+    function addPixels(a: Index, b: Index): Index is
+        var v: Index := 0;
+        var k: Index := 0;
+        while k < 4 do
+            v := v + (bitwiseAnd(channel(a, k) + channel(b, k), (255 : Index)) * power(k * 8));
+            k := k + 1;
+        end while;
+        return v;
+    end;
+
+    -- The predictor transform undone over the image of width by height,
+    -- the modes in the green of the sub-image at side from off, blocks of
+    -- 2 to the size bits a side.
+    generic [S: Region, O: Region]
+    function unpredict(side: &[Buffer[Index], S], off: Index, size: Index, width: Index, height: Index,
+                       out: &![Buffer[Index], O]): Unit is
+        let blocksAcross: Index := ((width + power(size)) - 1) / power(size);
+        var y: Index := 0;
+        while y < height do
+            var x: Index := 0;
+            while x < width do
+                let pos: Index := (y * width) + x;
+                var prediction: Index := 4278190080;
+                if (y = 0) and (x > 0) then
+                    prediction := nth(&out, pos - 1);
+                end if;
+                if (y > 0) and (x = 0) then
+                    prediction := nth(&out, pos - width);
+                end if;
+                if (y > 0) and (x > 0) then
+                    let mode: Index := channel(nth(side, (off + ((y / power(size)) * blocksAcross)) + (x / power(size))), 1);
+                    prediction := predict(bitwiseAnd(mode, (15 : Index)), nth(&out, pos - 1), nth(&out, pos - width),
+                                          nth(&out, (pos - width) - 1), nth(&out, (pos - width) + 1));
+                end if;
+                let restored: Index := addPixels(nth(&out, pos), prediction);
+                storeNth(&~out, pos, restored);
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return nil;
+    end;
+
+    -- A byte as a signed 8-bit number.
+    function signed(b: Index): Int64 is
+        case toInt64(b) of
+            when Some(value as n: Int64) do
+                if b >= 128 then
+                    return n - (256 : Int64);
+                end if;
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- (t times c) shifted right by 5, as the arithmetic shift of C does
+    -- (towards minus infinity), both signed bytes.
+    function colourDelta(t: Index, c: Index): Int64 is
+        let p: Int64 := signed(t) * signed(c);
+        if p >= (0 : Int64) then
+            return p / (32 : Int64);
+        end if;
+        let zero: Int64 := 0;
+        return zero - (((zero - p) + (31 : Int64)) / (32 : Int64));
+    end;
+
+    -- v + delta modulo 256, v a byte.
+    function plus(v: Index, delta: Int64): Index is
+        case toInt64(v) of
+            when Some(value as n: Int64) do
+                var x: Int64 := n + delta;
+                while x < (0 : Int64) do
+                    x := x + (256 : Int64);
+                end while;
+                case toIndex(x) of
+                    when Some(value as r: Index) do
+                        return bitwiseAnd(r, (255 : Index));
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The colour transform undone (RFC 9649 4.2): green to red from the
+    -- blue of the element, green to blue from its green, red to blue from
+    -- its red; red first, then blue with the red as it is now.
+    generic [S: Region, O: Region]
+    function uncolour(side: &[Buffer[Index], S], off: Index, size: Index, width: Index, height: Index,
+                      out: &![Buffer[Index], O]): Unit is
+        let blocksAcross: Index := ((width + power(size)) - 1) / power(size);
+        var y: Index := 0;
+        while y < height do
+            var x: Index := 0;
+            while x < width do
+                let pos: Index := (y * width) + x;
+                let element: Index := nth(side, (off + ((y / power(size)) * blocksAcross)) + (x / power(size)));
+                let argb: Index := nth(&out, pos);
+                let green: Index := channel(argb, 1);
+                let red: Index := plus(channel(argb, 2), colourDelta(channel(element, 0), green));
+                let blue: Index := plus(plus(channel(argb, 0), colourDelta(channel(element, 1), green)), colourDelta(channel(element, 2), red));
+                storeNth(&~out, pos, argbOf(channel(argb, 3), red, green, blue));
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The subtract green transform undone: green added to red and blue.
+    generic [O: Region]
+    function addGreen(total: Index, out: &![Buffer[Index], O]): Unit is
+        var pos: Index := 0;
+        while pos < total do
+            let argb: Index := nth(&out, pos);
+            let green: Index := channel(argb, 1);
+            storeNth(&~out, pos, argbOf(channel(argb, 3), bitwiseAnd(channel(argb, 2) + green, (255 : Index)), green,
+                                          bitwiseAnd(channel(argb, 0) + green, (255 : Index))));
+            pos := pos + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The colour indexing transform undone: the indices in the green of
+    -- the packed image, 2 to the bundle of them a pixel, looked up in the
+    -- palette of count colours at side from off (transparent black past
+    -- it); the image width wide after.
+    generic [S: Region, P: Region]
+    function unindex(side: &[Buffer[Index], S], off: Index, count: Index, bundle: Index, width: Index, height: Index,
+                     packed: &[Buffer[Index], P]): Buffer[Index] is
+        let packedWidth: Index := ((width + power(bundle)) - 1) / power(bundle);
+        let byteBits: Index := 8;
+        let bitsEach: Index := byteBits / power(bundle);
+        var out: Buffer[Index] := initialize(width * height, (0 : Index));
+        var y: Index := 0;
+        while y < height do
+            var x: Index := 0;
+            while x < width do
+                let green: Index := channel(nth(packed, (y * packedWidth) + (x / power(bundle))), 1);
+                let shift: Index := bitwiseAnd(x, power(bundle) - 1) * bitsEach;
+                let index: Index := bitwiseAnd(green / power(shift), power(bitsEach) - 1);
+                if index < count then
+                    storeNth(&!out, (y * width) + x, nth(side, off + index));
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return out;
+    end;
+
+    ---
+    --- The file
+    ---
+
+    -- A failed read: broken, unsupported (2) or too large.
+    function failed(code: Index): Either[WebpError, WebpPicture] is
+        if code = 2 then
+            return Left(left => WebpUnsupported());
+        end if;
+        if code = tooLarge then
+            return Left(left => WebpTooLarge());
+        end if;
+        return Left(left => WebpBroken());
+    end;
+
+    generic [D: Region]
+    function readWebp(data: Span[Nat8, D], maxPixels: Index): Either[WebpError, WebpPicture] is
+        let size: Index := spanLength(data);
+        if size < 12 then
+            return Left(left => NotWebp());
+        end if;
+        if (not isChunk(data, 0, 'R', 'I', 'F', 'F')) or (not isChunk(data, 8, 'W', 'E', 'B', 'P')) then
+            return Left(left => NotWebp());
+        end if;
+        var stop: Index := long(data, 4) + 8;
+        if stop > size then
+            stop := size;
+        end if;
+        var at: Index := 12;
+        var hasAlpha: Bool := false;
+        var alphaAt: Index := 0;
+        var alphaSize: Index := 0;
+        while (at + 8) <= stop do
+            let chunkSize: Index := long(data, at + 4);
+            if ((at + 8) + chunkSize) > stop then
+                return failed(broken);
+            end if;
+            if isChunk(data, at, 'V', 'P', '8', 'L') then
+                return lossless(data, at + 8, (at + 8) + chunkSize, maxPixels);
+            end if;
+            if isChunk(data, at, 'V', 'P', '8', ' ') then
+                return lossy(data, at + 8, chunkSize, hasAlpha, alphaAt, alphaSize, maxPixels);
+            end if;
+            if isChunk(data, at, 'A', 'L', 'P', 'H') then
+                hasAlpha := true;
+                alphaAt := at + 8;
+                alphaSize := chunkSize;
+            end if;
+            if isChunk(data, at, 'A', 'N', 'M', 'F') then
+                return failed(2);
+            end if;
+            if isChunk(data, at, 'V', 'P', '8', 'X') and (chunkSize > 0) then
+                if bitwiseAnd(wide(data[at + 8]), (2 : Index)) = 2 then
+                    -- the animation flag
+                    return failed(2);
+                end if;
+            end if;
+            at := ((at + 8) + chunkSize) + bitwiseAnd(chunkSize, (1 : Index));
+        end while;
+        return failed(broken);
+    end;
+
+    -- The VP8L bitstream from at to stop (RFC 9649 3 and 4): its header,
+    -- the transforms, the main image, the transforms undone.
+    generic [D: Region]
+    function lossless(data: Span[Nat8, D], at: Index, stop: Index, maxPixels: Index): Either[WebpError, WebpPicture] is
+        var bits: Bits := Bits(at => at, bit => 0, stop => stop, overrun => false);
+        if readBits(data, &!bits, 8) /= 47 then
+            return failed(broken);
+        end if;
+        let width: Index := readBits(data, &!bits, 14) + 1;
+        let height: Index := readBits(data, &!bits, 14) + 1;
+        let alphaUsed: Index := readBits(data, &!bits, 1);
+        let version: Index := readBits(data, &!bits, 3);
+        if bits.overrun or (version /= 0) then
+            return failed(broken);
+        end if;
+        if ((width > sideMost) or (height > sideMost)) or ((width * height) > maxPixels) then
+            return failed(tooLarge);
+        end if;
+        var image: Buffer[Index] := initialize(width * height, (0 : Index));
+        let result: Index := stream(data, &!bits, width, height, maxPixels, &!image);
+        if result /= fine then
+            destroyFree(image);
+            return failed(result);
+        else
+            let picture: WebpPicture := painted(&image, width, height);
+            destroyFree(image);
+            return Right(right => picture);
+        end if;
+    end;
+
+    -- An image stream of width by height from bits into image (width times
+    -- height slots): the transforms, the main image, the transforms undone
+    -- (RFC 9649 4 and 5); as the VP8L bitstream has it after its header and
+    -- an ALPH chunk without one.
+    generic [D: Region, B: Region, I: Region]
+    function stream(data: Span[Nat8, D], bits: &![Bits, B], width: Index, height: Index, maxPixels: Index,
+                    image: &![Buffer[Index], I]): Index is
+        let room: Index := (maxPixels * 4) + 100000;
+        -- each transform: kind, its bits, the width when it was read, where
+        -- its image is in side, the colours of a palette
+        var transforms: Buffer[Index] := allocateEmpty();
+        var side: Buffer[Index] := allocateEmpty();
+        var seen: Index := 0;
+        var packedWidth: Index := width;
+        var result: Index := fine;
+        var more: Bool := readBits(data, &~bits, 1) = 1;
+        while (result = fine) and more do
+            let kind: Index := readBits(data, &~bits, 2);
+            if bitwiseAnd(seen, power(kind)) /= 0 then
+                result := broken;
+            else
+                seen := seen + power(kind);
+                let off: Index := bufferLength(&side);
+                if (kind = 0) or (kind = 1) then
+                    let sizeBits: Index := readBits(data, &~bits, 3) + 2;
+                    let across: Index := ((packedWidth + power(sizeBits)) - 1) / power(sizeBits);
+                    let down: Index := ((height + power(sizeBits)) - 1) / power(sizeBits);
+                    grow(&!side, across * down);
+                    result := imageData(data, &~bits, across, down, false, &!side, off, room);
+                    remember(&!transforms, kind, sizeBits, packedWidth, off, 0);
+                end if;
+                if kind = 2 then
+                    remember(&!transforms, kind, 0, packedWidth, off, 0);
+                end if;
+                if kind = 3 then
+                    let count: Index := readBits(data, &~bits, 8) + 1;
+                    grow(&!side, count);
+                    result := imageData(data, &~bits, count, 1, false, &!side, off, room);
+                    var i: Index := 1;
+                    while i < count do
+                        let colour: Index := addPixels(nth(&side, off + i), nth(&side, (off + i) - 1));
+                        storeNth(&!side, off + i, colour);
+                        i := i + 1;
+                    end while;
+                    var bundle: Index := 0;
+                    if count <= 16 then
+                        bundle := (1 : Index);
+                    end if;
+                    if count <= 4 then
+                        bundle := (2 : Index);
+                    end if;
+                    if count <= 2 then
+                        bundle := (3 : Index);
+                    end if;
+                    remember(&!transforms, kind, bundle, packedWidth, off, count);
+                    packedWidth := ((packedWidth + power(bundle)) - 1) / power(bundle);
+                end if;
+            end if;
+            more := readBits(data, &~bits, 1) = 1;
+            if bits->overrun then
+                result := broken;
+            end if;
+        end while;
+        if result = fine then
+            result := imageData(data, &~bits, packedWidth, height, true, &~image, 0, room);
+        end if;
+        -- the transforms undone, the last read first
+        var t: Index := bufferLength(&transforms) / 5;
+        while (result = fine) and (t > 0) do
+            t := t - 1;
+            let kind: Index := nth(&transforms, t * 5);
+            let tBits: Index := nth(&transforms, (t * 5) + 1);
+            let tWidth: Index := nth(&transforms, (t * 5) + 2);
+            let off: Index := nth(&transforms, (t * 5) + 3);
+            if kind = 0 then
+                unpredict(&side, off, tBits, tWidth, height, &~image);
+            end if;
+            if kind = 1 then
+                uncolour(&side, off, tBits, tWidth, height, &~image);
+            end if;
+            if kind = 2 then
+                addGreen(tWidth * height, &~image);
+            end if;
+            if kind = 3 then
+                let unpacked: Buffer[Index] := unindex(&side, off, nth(&transforms, (t * 5) + 4), tBits, tWidth, height, &image);
+                var k: Index := 0;
+                while k < (tWidth * height) do
+                    let argb: Index := nth(&unpacked, k);
+                    storeNth(&~image, k, argb);
+                    k := k + 1;
+                end while;
+                destroyFree(unpacked);
+            end if;
+        end while;
+        destroyFree(transforms);
+        destroyFree(side);
+        return result;
+    end;
+
+    -- The VP8 chunk at at of size bytes (Wolly.Vp8) and the alpha of the
+    -- ALPH chunk before it, 255 without one.
+    generic [D: Region]
+    function lossy(data: Span[Nat8, D], at: Index, size: Index, hasAlpha: Bool, alphaAt: Index, alphaSize: Index,
+                   maxPixels: Index): Either[WebpError, WebpPicture] is
+        case readVp8(substring(data, at, at + size), maxPixels) of
+            when Right(right as frame: Vp8Picture) do
+                let width: Index := vp8Width(&frame);
+                let height: Index := vp8Height(&frame);
+                var alpha: Buffer[Index] := initialize(width * height, (255 : Index));
+                var code: Index := fine;
+                if hasAlpha then
+                    code := alphaPlane(data, alphaAt, alphaSize, width, height, maxPixels, &!alpha);
+                end if;
+                var pixels: StringBuilder := makeStringBuilder();
+                writeString(&!pixels, vp8Pixels(&frame));
+                destroyVp8(frame);
+                var alphaText: StringBuilder := makeStringBuilder();
+                var i: Index := 0;
+                while i < (width * height) do
+                    writeByte(&!alphaText, narrow(nth(&alpha, i)));
+                    i := i + 1;
+                end while;
+                destroyFree(alpha);
+                let rgb: String := finalize(pixels);
+                let alphaString: String := finalize(alphaText);
+                if code /= fine then
+                    destroyString(rgb);
+                    destroyString(alphaString);
+                    return failed(code);
+                else
+                    let picture: WebpPicture := WebpPicture(width => width, height => height, pixels => rgb, alpha => alphaString);
+                    return Right(right => picture);
+                end if;
+            when Left(left as code: Index) do
+                return failed(code);
+        end case;
+    end;
+
+    -- The alpha of the ALPH chunk at at of size bytes into alpha (the WebP
+    -- container): its header byte, then the alpha raw or as the green of an
+    -- image stream without header, then its filter undone.
+    generic [D: Region, A: Region]
+    function alphaPlane(data: Span[Nat8, D], at: Index, size: Index, width: Index, height: Index, maxPixels: Index,
+                        alpha: &![Buffer[Index], A]): Index is
+        if size < 1 then
+            return broken;
+        end if;
+        let header: Index := wide(data[at]);
+        let coding: Index := bitwiseAnd(header, (3 : Index));
+        let filter: Index := bitwiseAnd(header / 4, (3 : Index));
+        let total: Index := width * height;
+        if coding = 0 then
+            if (size - 1) < total then
+                return broken;
+            end if;
+            var i: Index := 0;
+            while i < total do
+                storeNth(&~alpha, i, wide(data[(at + 1) + i]));
+                i := i + 1;
+            end while;
+        else
+            if coding /= 1 then
+                return broken;
+            end if;
+            var bits: Bits := Bits(at => at + 1, bit => 0, stop => at + size, overrun => false);
+            let code: Index := stream(data, &!bits, width, height, maxPixels, &~alpha);
+            if code /= fine then
+                return code;
+            end if;
+            var i: Index := 0;
+            while i < total do
+                let green: Index := channel(nth(&alpha, i), 1);
+                storeNth(&~alpha, i, green);
+                i := i + 1;
+            end while;
+        end if;
+        unfilter(&~alpha, width, height, filter);
+        return fine;
+    end;
+
+    -- The filter of the alpha undone (libwebp's unfilters): 1 from the
+    -- left, 2 from above, 3 left + above - above left held to 0..255; the
+    -- first row from the left, the first column from above.
+    generic [A: Region]
+    function unfilter(alpha: &![Buffer[Index], A], width: Index, height: Index, filter: Index): Unit is
+        if filter = 0 then
+            return nil;
+        end if;
+        var y: Index := 0;
+        while y < height do
+            var x: Index := 0;
+            while x < width do
+                let pos: Index := (y * width) + x;
+                var prediction: Index := 0;
+                if y = 0 then
+                    if x > 0 then
+                        prediction := nth(&alpha, pos - 1);
+                    end if;
+                else
+                    if x = 0 then
+                        prediction := nth(&alpha, pos - width);
+                    else
+                        let left: Index := nth(&alpha, pos - 1);
+                        let above: Index := nth(&alpha, pos - width);
+                        let aboveLeft: Index := nth(&alpha, (pos - width) - 1);
+                        if filter = 1 then
+                            prediction := left;
+                        end if;
+                        if filter = 2 then
+                            prediction := above;
+                        end if;
+                        if filter = 3 then
+                            let sum: Index := left + above;
+                            if sum > aboveLeft then
+                                prediction := sum - aboveLeft;
+                            end if;
+                            if prediction > 255 then
+                                prediction := (255 : Index);
+                            end if;
+                        end if;
+                    end if;
+                end if;
+                let restored: Index := bitwiseAnd(nth(&alpha, pos) + prediction, (255 : Index));
+                storeNth(&~alpha, pos, restored);
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return nil;
+    end;
+
+    -- n more slots of 0 at the end of side.
+    generic [S: Region]
+    function grow(side: &![Buffer[Index], S], n: Index): Unit is
+        var i: Index := 0;
+        while i < n do
+            insertBack(&~side, (0 : Index));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [T: Region]
+    function remember(transforms: &![Buffer[Index], T], kind: Index, tBits: Index, width: Index, off: Index, count: Index): Unit is
+        insertBack(&~transforms, kind);
+        insertBack(&~transforms, tBits);
+        insertBack(&~transforms, width);
+        insertBack(&~transforms, off);
+        insertBack(&~transforms, count);
+        return nil;
+    end;
+
+    -- The picture of the ARGB image: red, green and blue, and the alpha.
+    generic [I: Region]
+    function painted(image: &[Buffer[Index], I], width: Index, height: Index): WebpPicture is
+        var pixels: StringBuilder := makeStringBuilder();
+        var alpha: StringBuilder := makeStringBuilder();
+        var pos: Index := 0;
+        while pos < (width * height) do
+            let argb: Index := nth(image, pos);
+            writeByte(&!pixels, narrow(channel(argb, 2)));
+            writeByte(&!pixels, narrow(channel(argb, 1)));
+            writeByte(&!pixels, narrow(channel(argb, 0)));
+            writeByte(&!alpha, narrow(channel(argb, 3)));
+            pos := pos + 1;
+        end while;
+        return WebpPicture(width => width, height => height, pixels => finalize(pixels), alpha => finalize(alpha));
+    end;
+
+    generic [P: Region]
+    function webpWidth(picture: &[WebpPicture, P]): Index is
+        return picture->width;
+    end;
+
+    generic [P: Region]
+    function webpHeight(picture: &[WebpPicture, P]): Index is
+        return picture->height;
+    end;
+
+    generic [P: Region]
+    function webpPixels(picture: &[WebpPicture, P]): Span[Nat8, P] is
+        return asSpan(&(picture->pixels));
+    end;
+
+    generic [P: Region]
+    function webpAlpha(picture: &[WebpPicture, P]): Span[Nat8, P] is
+        return asSpan(&(picture->alpha));
+    end;
+
+    function destroyWebp(picture: WebpPicture): Unit is
+        let { width as w: Index, height as h: Index, pixels as p: String, alpha as a: String } := picture;
+        destroyString(p);
+        destroyString(a);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,121 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The readable numbers were computed with Python's integers by the same
+-- rule, rounding half up at the tenth.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    nth,
+    destroyFree
+);
+import Wolly.Chart (
+    readableNumber,
+    median,
+    barHeight,
+    changeTenths
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Chart.Test is
+    constant largest: Int64 := 9223372036854775807;
+
+    -- A literal handed to the generic insertBack would be an Int32.
+    generic [R: Region]
+    function put(buffer: &![Buffer[Int64], R], value: Int64): Unit is
+        insertBack(&~buffer, value);
+        return nil;
+    end;
+
+    function reads(value: Int64, wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let text: String := readableNumber(value);
+        assertTrue(equal(asSpan(&text), wanted), message);
+        destroyString(text);
+        return nil;
+    end;
+
+    function testReadable(): Unit is
+        reads(0, "0", "zero");
+        reads(999, "999", "below a thousand, the digits");
+        reads(1000, "1.0 k", "a thousand");
+        reads(1234, "1.2 k", "1234");
+        reads(1249, "1.2 k", "1249 rounds down");
+        reads(1250, "1.3 k", "1250 rounds half up");
+        reads(999949, "999.9 k", "just below a million");
+        reads(999950, "1000.0 k", "half up past it, still in k, as below a million");
+        reads(1000000, "1.0 M", "a million is M, not k");
+        reads(1500000, "1.5 M", "a million and a half");
+        reads(2000000000, "2.0 G", "two billion");
+        reads(largest, "9223372036.9 G", "the largest Int64, without overflow");
+        return nil;
+    end;
+
+    function testMedian(): Unit is
+        var none: Buffer[Int64] := allocateEmpty();
+        assertTrue(median(&none) = 0, "no values, 0");
+        destroyFree(none);
+        var odd: Buffer[Int64] := allocateEmpty();
+        put(&!odd, 3);
+        put(&!odd, 1);
+        put(&!odd, 2);
+        assertTrue(median(&odd) = 2, "the middle of three");
+        assertTrue(nth(&odd, 0) = 3, "the values stay as they were");
+        destroyFree(odd);
+        var even: Buffer[Int64] := allocateEmpty();
+        put(&!even, 4);
+        put(&!even, 1);
+        put(&!even, 3);
+        put(&!even, 2);
+        assertTrue(median(&even) = 2, "the mean of 2 and 3, rounded down");
+        destroyFree(even);
+        var apart: Buffer[Int64] := allocateEmpty();
+        put(&!apart, 10);
+        put(&!apart, 1);
+        put(&!apart, 4);
+        put(&!apart, 2);
+        assertTrue(median(&apart) = 3, "the mean of 2 and 4, not the lower of them");
+        destroyFree(apart);
+        var big: Buffer[Int64] := allocateEmpty();
+        put(&!big, largest);
+        put(&!big, largest);
+        assertTrue(median(&big) = largest, "two of the largest Int64, without overflow");
+        destroyFree(big);
+        return nil;
+    end;
+
+    function testBars(): Unit is
+        assertTrue(barHeight(50, 200) = 25, "a quarter");
+        assertTrue(barHeight(1, 3) = 33, "a third, rounded down");
+        assertTrue(barHeight(300, 200) = 100, "above the most, 100");
+        assertTrue(barHeight(5, 0) = 0, "no most, 0");
+        assertTrue(barHeight(0, 10) = 0, "nothing, 0");
+        assertTrue(barHeight(largest - 1, largest) <= 100, "near the largest Int64, at most 100");
+        assertTrue(barHeight(largest / 2, largest) = 50, "half of the largest, without overflow");
+        return nil;
+    end;
+
+    function testChange(): Unit is
+        assertTrue(changeTenths(150, 100) = 5, "half again as much");
+        assertTrue(changeTenths(50, 100) = -5, "half of it");
+        assertTrue(changeTenths(100, 100) = 0, "the same");
+        assertTrue(changeTenths(125, 100) = 3, "2.5 tenths round away from zero");
+        assertTrue(changeTenths(75, 100) = -3, "-2.5 tenths too");
+        assertTrue(changeTenths(7, 0) = 70, "a median of 0, ten times today");
+        return nil;
+    end;
+end module body.

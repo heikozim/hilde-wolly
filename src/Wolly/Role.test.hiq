@@ -1,0 +1,219 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database in memory.  editor is granted write and
+-- read, viewer read; alice holds editor, bob viewer.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    startsWith,
+    contains
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Role (
+    isName,
+    prepareRoles,
+    grant,
+    revoke,
+    assign,
+    unassign,
+    unassignAll,
+    may,
+    forbidden
+);
+
+module body Wolly.Role.Test is
+    function yes(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertTrue(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function no(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertFalse(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function failed(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertTrue(false, message);
+            when Left(left as error: DbError) do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R]): Unit is
+        case prepareRoles(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the tables could not be made");
+            when None do
+                skip;
+        end case;
+        case prepareRoles(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a second prepareRoles fails");
+            when None do
+                skip;
+        end case;
+        yes(grant(&~db, "editor", "write"), "editor is granted write");
+        yes(grant(&~db, "editor", "read"), "and read");
+        yes(grant(&~db, "editor", "read"), "a second grant of read is no error");
+        yes(grant(&~db, "viewer", "read"), "viewer is granted read");
+        yes(assign(&~db, "alice", "editor"), "alice holds editor");
+        yes(assign(&~db, "alice", "editor"), "a second assign is no error");
+        yes(assign(&~db, "bob", "viewer"), "bob holds viewer");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runMay(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        yes(may(&~db, "alice", "write"), "alice may write");
+        yes(may(&~db, "alice", "read"), "alice may read");
+        yes(may(&~db, "bob", "read"), "bob may read");
+        no(may(&~db, "bob", "write"), "bob may not write");
+        no(may(&~db, "alice", "delete"), "an action granted to nobody is denied");
+        no(may(&~db, "carol", "read"), "a user who holds no role is denied");
+        no(may(&~db, "editor", "write"), "a role is no user");
+        no(may(&~db, "", "read"), "an empty user is denied");
+        no(may(&~db, "alice", ""), "an empty action is denied");
+        no(may(&~db, "alice' OR '1'='1", "write"), "a user that is no name is denied");
+        no(may(&~db, "Alice", "write"), "names are case-sensitive, and capitals are no name");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runChanges(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        no(grant(&~db, "Editor", "write"), "a role that is no name is not granted");
+        no(grant(&~db, "editor", "write all"), "nor an action that is no name");
+        no(assign(&~db, "alice", "admin role"), "nor a role that is no name assigned");
+        no(assign(&~db, "", "editor"), "nor to an empty user");
+        yes(revoke(&~db, "editor", "write"), "write is taken from editor");
+        no(may(&~db, "alice", "write"), "so alice may no longer write");
+        yes(may(&~db, "alice", "read"), "but still read");
+        no(revoke(&~db, "editor", "write"), "a second revoke finds nothing");
+        yes(unassign(&~db, "bob", "viewer"), "bob gives up viewer");
+        no(may(&~db, "bob", "read"), "so bob may not read");
+        no(unassign(&~db, "bob", "viewer"), "a second unassign finds nothing");
+        yes(may(&~db, "alice", "read"), "alice is untouched by bob's change");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runRemoval(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        yes(assign(&~db, "alice", "viewer"), "alice holds viewer too");
+        yes(may(&~db, "alice", "read"), "alice may read before");
+        yes(unassignAll(&~db, "alice"), "alice gives up every role");
+        no(may(&~db, "alice", "write"), "so alice may not write");
+        no(may(&~db, "alice", "read"), "nor read, which both roles allowed");
+        yes(may(&~db, "bob", "read"), "bob keeps viewer");
+        no(unassignAll(&~db, "alice"), "a second unassignAll finds nothing");
+        no(unassignAll(&~db, "carol"), "nor one for a user without a role");
+        return nil;
+    end;
+
+    function testMay(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runMay(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testChanges(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runChanges(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testRemoval(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runRemoval(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testUnprepared(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                failed(may(&!db, "alice", "write"), "without the tables may fails, it does not allow");
+                failed(grant(&!db, "editor", "write"), "and grant fails");
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testIsName(): Unit is
+        assertTrue(isName("a"), "one letter");
+        assertTrue(isName("site-admin_2.x"), "letters, digits and marks");
+        assertTrue(isName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "64 bytes");
+        assertFalse(isName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "65 bytes");
+        assertFalse(isName(""), "empty");
+        assertFalse(isName("a b"), "a space");
+        assertFalse(isName("A"), "a capital");
+        assertFalse(isName("a/b"), "a slash");
+        assertFalse(isName("`"), "the byte before a");
+        assertFalse(isName("{"), "the byte after z");
+        assertFalse(isName("/"), "the byte before 0");
+        assertFalse(isName(":"), "the byte after 9");
+        return nil;
+    end;
+
+    function testForbidden(): Unit is
+        let answer: String := forbidden();
+        assertTrue(startsWith(asSpan(&answer), "Status: 403 "), "the status is 403");
+        assertTrue(contains(asSpan(&answer), "\r\n\r\nforbidden\n"), "with a short text");
+        destroyString(answer);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,1007 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    nthRef,
+    length as bufferLength,
+    destroyEmpty
+);
+import Standard.Text (
+    substring,
+    indexOfByte,
+    equal,
+    toLower,
+    startsWith
+);
+import Standard.Base64 (
+    decode
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam
+);
+import Standard.Log (
+    Log
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish
+);
+import Wolly.OpKey (
+    RingKey,
+    KeyFamily,
+    activeKey,
+    familyOf,
+    signToken
+);
+import Wolly.OpRandom (
+    randomId
+);
+import Wolly.OpUrl (
+    QueryPair,
+    queryUnescape,
+    destroyPairs
+);
+import Wolly.OpClient (
+    OpClient,
+    ClientKind,
+    WebClient,
+    NativeClient,
+    ServiceClient,
+    Limits,
+    destroyClient,
+    authenticateClient,
+    effectiveLimits,
+    audienceOf
+);
+import Wolly.OpStore (
+    OpSession,
+    CodeRow,
+    RefreshRow,
+    NewRefresh,
+    destroySession,
+    destroyCode,
+    destroyRefresh,
+    destroyNewRefresh,
+    isAlive,
+    sessionById,
+    touchSession,
+    loadCode,
+    spendCode,
+    storeRefresh,
+    loadRefresh,
+    spendRefresh,
+    revokeFamily,
+    rolesFor
+);
+import Wolly.OpToken (
+    IdClaims,
+    AccessClaims,
+    destroyIdClaims,
+    destroyAccessClaims,
+    idTokenPayload,
+    accessTokenPayload,
+    tokenAnswer,
+    errorAnswer,
+    pkceHolds,
+    scopeHas,
+    idTokenType,
+    accessTokenType
+);
+import Wolly.OpBase (
+    OpSettings,
+    Subject,
+    destroySubject,
+    bodyOf,
+    valueOf,
+    hasValue,
+    activeSubject,
+    audit
+);
+
+import Standard.Task (
+    Lending,
+    Task,
+    openLendingWithStack,
+    closeLending,
+    spawnLending,
+    join
+);
+module body Wolly.OpGrant is
+    -- Why the endpoint refuses.
+    union Refusal: Free is
+        case BadRequest;
+        case BadClient;
+        case BadGrant;
+        case NotForClient;
+        case UnknownGrant;
+        case Broken;
+    end;
+
+    function codeOf(refusal: Refusal): Span[Nat8, Static] is
+        case refusal of
+            when BadRequest do
+                return "invalid_request";
+            when BadClient do
+                return "invalid_client";
+            when BadGrant do
+                return "invalid_grant";
+            when NotForClient do
+                return "unauthorized_client";
+            when UnknownGrant do
+                return "unsupported_grant_type";
+            when Broken do
+                return "server_error";
+        end case;
+    end;
+
+    function descriptionOf(refusal: Refusal): Span[Nat8, Static] is
+        case refusal of
+            when BadRequest do
+                return "malformed token request";
+            when BadClient do
+                return "client authentication failed";
+            when BadGrant do
+                return "the grant is invalid, expired or revoked";
+            when NotForClient do
+                return "this client may not use this grant";
+            when UnknownGrant do
+                return "authorization_code, refresh_token or client_credentials";
+            when Broken do
+                return "try again";
+        end case;
+    end;
+
+    function statusOf(refusal: Refusal): Nat16 is
+        case refusal of
+            when BadClient do
+                return 401;
+            when Broken do
+                return 500;
+            when BadRequest | BadGrant | NotForClient | UnknownGrant do
+                return 400;
+        end case;
+    end;
+
+    -- The answer of the endpoint: the JSON with status, no caching, and
+    -- for a failed Basic authentication its challenge.
+    generic [B: Region, S: Region]
+    function answer(status: Nat16, content: Span[Nat8, B], challenge: Bool, settings: &[OpSettings, S]): String is
+        var response: Response := addHeader(addHeader(makeResponse(status, "application/json"), "Cache-Control", "no-store"),
+            "Pragma", "no-cache");
+        if challenge then
+            let realm: String := toLower(asSpan(&(settings->name)));
+            var value: StringBuilder := makeStringBuilder();
+            writeString(&!value, "Basic realm=\"");
+            writeString(&!value, asSpan(&realm));
+            writeByte(&!value, '"');
+            destroyString(realm);
+            let text: String := finalize(value);
+            response := addHeader(response, "WWW-Authenticate", asSpan(&text));
+            destroyString(text);
+        end if;
+        return finish(response, content);
+    end;
+
+    generic [S: Region]
+    function refuse(refusal: Refusal, basic: Bool, settings: &[OpSettings, S]): String is
+        let json: String := errorAnswer(codeOf(refusal), descriptionOf(refusal));
+        let challenge: Bool := basic and (statusOf(refusal) = 401);
+        let output: String := answer(statusOf(refusal), asSpan(&json), challenge, settings);
+        destroyString(json);
+        return output;
+    end;
+
+    generic [U: Region]
+    function deviceLabel(userAgent: Span[Nat8, U]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var n: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(userAgent) do
+            let c: Nat8 := userAgent[i];
+            if (c >= 32) and (c < 127) and (n < 120) then
+                writeByte(&!out, c);
+                n := n + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The id and secret of an HTTP Basic header, as Go's BasicAuth reads it.
+    record Basic: Linear is
+        id: String;
+        secret: String;
+    end;
+
+    function destroyBasic(basic: Basic): Unit is
+        let { id: String, secret: String } := basic;
+        destroyString(id);
+        destroyString(secret);
+        return nil;
+    end;
+
+    generic [H: Region]
+    function basicOf(header: Span[Nat8, H]): Option[Basic] is
+        if spanLength(header) < 6 then
+            let none: Option[Basic] := None();
+            return none;
+        end if;
+        let scheme: String := toLower(substring(header, 0, 6));
+        let fits: Bool := equal(asSpan(&scheme), "basic ");
+        destroyString(scheme);
+        if not fits then
+            let none: Option[Basic] := None();
+            return none;
+        end if;
+        case decode(substring(header, 6, spanLength(header))) of
+            when Some(value as raw: String) do
+                let pair: Option[Basic] := splitBasic(asSpan(&raw));
+                destroyString(raw);
+                return pair;
+            when None do
+                let none: Option[Basic] := None();
+                return none;
+        end case;
+    end;
+
+    generic [T: Region]
+    function splitBasic(text: Span[Nat8, T]): Option[Basic] is
+        case indexOfByte(text, ':') of
+            when Some(value as colon: Index) do
+                return Some(value => Basic(id => fromSpan(substring(text, 0, colon)),
+                    secret => fromSpan(substring(text, colon + 1, spanLength(text)))));
+            when None do
+                let none: Option[Basic] := None();
+                return none;
+        end case;
+    end;
+
+    -- The client that proved itself, or why not; basic tells whether the
+    -- request carried a Basic header.
+    record Proven: Linear is
+        client: Option[OpClient];
+        refusal: Refusal;
+        basic: Bool;
+    end;
+
+    generic [Q: Region, R: Region, P: Region, L: Region, A: Region]
+    function authClient(request: &[Request, Q], db: &![Database[Writing], R], form: &[Buffer[QueryPair], P],
+        log: &![Log, L], ip: Span[Nat8, A]): Proven is
+        var header: String := fromSpan("");
+        case requestParam(request, "HTTP_AUTHORIZATION") of
+            when Some(value as found: String) do
+                destroyString(header);
+                header := found;
+            when None do
+                skip;
+        end case;
+        let basic: Option[Basic] := basicOf(asSpan(&header));
+        destroyString(header);
+        var id: String := fromSpan("");
+        var secret: String := fromSpan("");
+        var isBasic: Bool := false;
+        case basic of
+            when Some(value as pair: Basic) do
+                isBasic := true;
+                let { id as rawId: String, secret as rawSecret: String } := pair;
+                let decodedId: Option[String] := queryUnescape(asSpan(&rawId));
+                let decodedSecret: Option[String] := queryUnescape(asSpan(&rawSecret));
+                destroyString(rawId);
+                destroyString(rawSecret);
+                var bad: Bool := hasValue(form, "client_secret");
+                case decodedId of
+                    when Some(value as d: String) do
+                        destroyString(id);
+                        id := d;
+                    when None do
+                        bad := true;
+                end case;
+                case decodedSecret of
+                    when Some(value as d: String) do
+                        destroyString(secret);
+                        secret := d;
+                    when None do
+                        bad := true;
+                end case;
+                let formId: String := valueOf(form, "client_id");
+                if (length(&formId) > 0) and (not equal(asSpan(&formId), asSpan(&id))) then
+                    bad := true;
+                end if;
+                destroyString(formId);
+                if bad then
+                    destroyString(id);
+                    destroyString(secret);
+                    let none: Option[OpClient] := None();
+                    return Proven(client => none, refusal => BadRequest(), basic => true);
+                end if;
+            when None do
+                destroyString(id);
+                destroyString(secret);
+                id := valueOf(form, "client_id");
+                secret := valueOf(form, "client_secret");
+        end case;
+        let given: Bool := isBasic or hasValue(form, "client_secret");
+        let found: Either[DbError, Option[OpClient]] := authenticateClient(&~db, asSpan(&id), asSpan(&secret), given);
+        destroyString(secret);
+        case found of
+            when Left(left as error: DbError) do
+                destroyString(id);
+                let none: Option[OpClient] := None();
+                return Proven(client => none, refusal => Broken(), basic => isBasic);
+            when Right(right as maybe: Option[OpClient]) do
+                case maybe of
+                    when Some(value as client: OpClient) do
+                        destroyString(id);
+                        return Proven(client => Some(value => client), refusal => Broken(), basic => isBasic);
+                    when None do
+                        let shown: Span[Nat8, Static] := "";
+                        var cut: Index := length(&id);
+                        if cut > 64 then
+                            cut := 64;
+                        end if;
+                        borrow i: &[String, I] := &id do
+                            audit(&~log, "client.auth", substring(asSpan(i), 0, cut), shown, shown, shown, "fail", ip);
+                        end borrow;
+                        destroyString(id);
+                        let none: Option[OpClient] := None();
+                        return Proven(client => none, refusal => BadClient(), basic => isBasic);
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region, A: Region]
+    function tokenEndpoint(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], ip: Span[Nat8, A], now: Int64): String is
+        case bodyOf(request) of
+            when Some(value as form: Buffer[QueryPair]) do
+                let proven: Proven := authClient(request, &~db, &form, &~log, ip);
+                let { client as maybe: Option[OpClient], refusal: Refusal, basic: Bool } := proven;
+                case maybe of
+                    when Some(value as client: OpClient) do
+                        let result: Either[Refusal, String] := grant(request, &~db, settings, ring, &~log, ip, now, &form, &client);
+                        destroyClient(client);
+                        destroyPairs(form);
+                        case result of
+                            when Right(right as json: String) do
+                                let output: String := answer(200, asSpan(&json), false, settings);
+                                destroyString(json);
+                                return output;
+                            when Left(left as why: Refusal) do
+                                return refuse(why, basic, settings);
+                        end case;
+                    when None do
+                        destroyPairs(form);
+                        return refuse(refusal, basic, settings);
+                end case;
+            when None do
+                return refuse(BadRequest(), false, settings);
+        end case;
+    end;
+
+    generic [C: Region]
+    function kindOfClient(client: &[OpClient, C]): ClientKind is
+        return client->kind;
+    end;
+
+    function isService(kind: ClientKind): Bool is
+        case kind of
+            when ServiceClient do
+                return true;
+            when WebClient | NativeClient do
+                return false;
+        end case;
+    end;
+
+    function isNative(kind: ClientKind): Bool is
+        case kind of
+            when NativeClient do
+                return true;
+            when WebClient | ServiceClient do
+                return false;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region, A: Region, P: Region, C: Region]
+    function grant(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], ip: Span[Nat8, A], now: Int64,
+        form: &[Buffer[QueryPair], P], client: &[OpClient, C]): Either[Refusal, String] is
+        let kind: String := valueOf(form, "grant_type");
+        let service: Bool := isService(kindOfClient(client));
+        if equal(asSpan(&kind), "authorization_code") then
+            destroyString(kind);
+            if service then
+                return Left(left => NotForClient());
+            end if;
+            return grantCode(request, &~db, settings, ring, &~log, ip, now, form, client);
+        end if;
+        if equal(asSpan(&kind), "refresh_token") then
+            destroyString(kind);
+            if service then
+                return Left(left => NotForClient());
+            end if;
+            return grantRefresh(&~db, settings, ring, &~log, ip, now, form, client);
+        end if;
+        if equal(asSpan(&kind), "client_credentials") then
+            destroyString(kind);
+            if not service then
+                return Left(left => NotForClient());
+            end if;
+            return grantClient(settings, ring, &~log, ip, now, client);
+        end if;
+        destroyString(kind);
+        return Left(left => UnknownGrant());
+    end;
+
+    -- Whether the verifier of the form fits the challenge of a code: a code
+    -- without a challenge is held only for a client that is lax.
+    generic [C: Region, V: Region, H: Region]
+    function pkceFits(client: &[OpClient, C], verifier: Span[Nat8, V], challenge: Span[Nat8, H]): Bool is
+        if spanLength(challenge) = 0 then
+            return client->laxAuth;
+        end if;
+        return pkceHolds(verifier, challenge);
+    end;
+
+    generic [C: Region, T: Region]
+    function sameClient(client: &[OpClient, C], id: Span[Nat8, T]): Bool is
+        return equal(asSpan(&(client->id)), id);
+    end;
+
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region, A: Region, P: Region, C: Region]
+    function grantCode(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], ip: Span[Nat8, A], now: Int64,
+        form: &[Buffer[QueryPair], P], client: &[OpClient, C]): Either[Refusal, String] is
+        let token: String := valueOf(form, "code");
+        let loaded: Either[DbError, Option[CodeRow]] := loadCode(&~db, asSpan(&token));
+        case loaded of
+            when Left(left as error: DbError) do
+                destroyString(token);
+                return Left(left => Broken());
+            when Right(right as found: Option[CodeRow]) do
+                case found of
+                    when Some(value as code: CodeRow) do
+                        let result: Either[Refusal, String] := redeem(request, &~db, settings, ring, &~log, ip, now, form,
+                            client, asSpan(&token), &code);
+                        destroyCode(code);
+                        destroyString(token);
+                        return result;
+                    when None do
+                        destroyString(token);
+                        return Left(left => BadGrant());
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region, A: Region, P: Region, C: Region, T: Region, D: Region]
+    function redeem(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], ip: Span[Nat8, A], now: Int64,
+        form: &[Buffer[QueryPair], P], client: &[OpClient, C], token: Span[Nat8, T],
+        code: &[CodeRow, D]): Either[Refusal, String] is
+        let redirect: String := valueOf(form, "redirect_uri");
+        let verifier: String := valueOf(form, "code_verifier");
+        let fits: Bool := (now <= code->expires) and sameClient(client, asSpan(&(code->clientId))) and
+            equal(asSpan(&(code->redirectUri)), asSpan(&redirect)) and
+            pkceFits(client, asSpan(&verifier), asSpan(&(code->challenge)));
+        destroyString(redirect);
+        destroyString(verifier);
+        if not fits then
+            return Left(left => BadGrant());
+        end if;
+        let subjectId: Span[Nat8, D] := asSpan(&(code->subject));
+        case activeSubject(&~db, subjectId) of
+            when Left(left as error: DbError) do
+                return Left(left => Broken());
+            when Right(right as who: Option[Subject]) do
+                case who of
+                    when Some(value as subject: Subject) do
+                        let result: Either[Refusal, String] := redeemFor(request, &~db, settings, ring, &~log, ip, now,
+                            client, token, code, &subject);
+                        destroySubject(subject);
+                        return result;
+                    when None do
+                        return Left(left => BadGrant());
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, K: Region, L: Region, A: Region, C: Region, T: Region, D: Region, U: Region]
+    function redeemFor(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S],
+        ring: &[Buffer[RingKey], K], log: &![Log, L], ip: Span[Nat8, A], now: Int64,
+        client: &[OpClient, C], token: Span[Nat8, T], code: &[CodeRow, D],
+        subject: &[Subject, U]): Either[Refusal, String] is
+        case sessionById(&~db, asSpan(&(code->sessionId))) of
+            when Left(left as error: DbError) do
+                return Left(left => Broken());
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as session: OpSession) do
+                        let limits: Limits := settings->session;
+                        let alive: Bool := isAlive(&session, now, limits.idle, limits.max);
+                        destroySession(session);
+                        if not alive then
+                            return Left(left => BadGrant());
+                        end if;
+                    when None do
+                        return Left(left => BadGrant());
+                end case;
+        end case;
+        case randomId() of
+            when Some(value as family: String) do
+                case spendCode(&~db, token, asSpan(&family), now) of
+                    when Left(left as error: DbError) do
+                        destroyString(family);
+                        return Left(left => Broken());
+                    when Right(right as spent: Bool) do
+                        if not spent then
+                            destroyString(family);
+                            revokeReplayed(&~db, &~log, token, now);
+                            return Left(left => BadGrant());
+                        end if;
+                end case;
+                var device: String := fromSpan("");
+                if isNative(kindOfClient(client)) then
+                    destroyString(device);
+                    device := userAgentLabel(request);
+                end if;
+                let fresh: NewRefresh := NewRefresh(family => family, clientId => fromSpan(asSpan(&(client->id))),
+                    subject => fromSpan(asSpan(&(code->subject))), sessionId => fromSpan(asSpan(&(code->sessionId))),
+                    device => device, scope => fromSpan(asSpan(&(code->scope))), amr => fromSpan(asSpan(&(code->amr))),
+                    firstIp => fromSpan(ip), lastIp => fromSpan(ip), authTime => code->authTime, familyCreated => now);
+                let result: Either[Refusal, String] := issueUserTokens(&~db, settings, ring, client, subject, &fresh,
+                    asSpan(&(code->nonce)), now);
+                case result of
+                    when Right(right as json: String) do
+                        audit(&~log, "token.code", asSpan(&(client->id)), asSpan(&(code->subject)), asSpan(&(code->sessionId)),
+                            "", "ok", ip);
+                        destroyNewRefresh(fresh);
+                        return Right(right => json);
+                    when Left(left as why: Refusal) do
+                        destroyNewRefresh(fresh);
+                        return Left(left => why);
+                end case;
+            when None do
+                return Left(left => Broken());
+        end case;
+    end;
+
+    -- A code that came again: the family its first use made is revoked.
+    generic [R: Region, L: Region, T: Region]
+    function revokeReplayed(db: &![Database[Writing], R], log: &![Log, L], token: Span[Nat8, T], now: Int64): Unit is
+        case loadCode(&~db, token) of
+            when Left(left as error: DbError) do
+                skip;
+            when Right(right as found: Option[CodeRow]) do
+                case found of
+                    when Some(value as code: CodeRow) do
+                        revokeAndTell(&~db, &~log, familyOfCode(&code), "authorization code replayed", now);
+                        destroyCode(code);
+                    when None do
+                        skip;
+                end case;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, L: Region, F: Region]
+    function revokeAndTell(db: &![Database[Writing], R], log: &![Log, L], family: Span[Nat8, F], reason: Span[Nat8, Static],
+        now: Int64): Unit is
+        if spanLength(family) = 0 then
+            return nil;
+        end if;
+        case revokeFamily(&~db, family, now) of
+            when Some(value as error: DbError) do
+                skip;
+            when None do
+                let empty: Span[Nat8, Static] := "";
+                audit(&~log, "refresh.family.revoke", empty, empty, empty, reason, "ok", empty);
+        end case;
+        return nil;
+    end;
+
+    generic [Q: Region]
+    function userAgentLabel(request: &[Request, Q]): String is
+        case requestParam(request, "HTTP_USER_AGENT") of
+            when Some(value as agent: String) do
+                let label: String := deviceLabel(asSpan(&agent));
+                destroyString(agent);
+                return label;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var all: Buffer[String] := strings;
+        while bufferLength(&all) > 0 do
+            destroyString(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    -- The two tokens of a grant, each signed, or None where signing failed.
+    record SignedPair: Linear is
+        access: Option[String];
+        id: Option[String];
+    end;
+
+    -- What the task that signs the ID token is lent: the key, and the
+    -- payload it signs and then drops.
+    record SignJob[K: Region]: Linear is
+        key: &[RingKey, K];
+        payload: String;
+    end;
+
+    generic [K: Region]
+    function signIdJob(job: SignJob[K]): Option[String] is
+        let { key: &[RingKey, K], payload: String } := job;
+        let signed: Option[String] := signToken(key, idTokenType(), asSpan(&payload));
+        destroyString(payload);
+        return signed;
+    end;
+
+    -- Both payloads signed with key here, one after the other.
+    generic [K: Region]
+    function signedHere(key: &[RingKey, K], access: String, id: String): SignedPair is
+        let first: Option[String] := signToken(key, accessTokenType(), asSpan(&access));
+        let second: Option[String] := signToken(key, idTokenType(), asSpan(&id));
+        destroyString(access);
+        destroyString(id);
+        return SignedPair(access => first, id => second);
+    end;
+
+    -- The stack of the task that signs: a signature of ML-DSA needs 256 KiB
+    -- left in a task and gives None with less, the 64 KiB of a plain
+    -- lending scope among them.
+    constant signStack: Index := 1048576;
+
+    -- The access token and the ID token signed with the active key, the ID
+    -- token in a task of its own while the access token is signed here: a
+    -- signature of ML-DSA-44 is the most of a grant's time, and the two
+    -- then take the time of one.  The task only reads the key, which the
+    -- ring lends it.  When no task starts, both are signed here.
+    generic [K: Region]
+    function signedPair(ring: &[Buffer[RingKey], K], family: KeyFamily, access: String, id: String): SignedPair is
+        case activeKey(ring, family) of
+            when Some(value as i: Index) do
+                let key: &[RingKey, K] := nthRef(ring, i);
+                case openLendingWithStack(ring, signStack) of
+                    when Some(value as opened: Lending[K]) do
+                        var scope: Lending[K] := opened;
+                        let work: Fn[SignJob[K], Option[String]] := signIdJob;
+                        case spawnLending(&!scope, work, SignJob(key => key, payload => id)) of
+                            when Right(right as task: Task[Option[String]]) do
+                                let first: Option[String] := signToken(key, accessTokenType(), asSpan(&access));
+                                destroyString(access);
+                                closeLending(scope);
+                                return SignedPair(access => first, id => join(task));
+                            when Left(left as back: SignJob[K]) do
+                                closeLending(scope);
+                                let { key as again: &[RingKey, K], payload as unsigned: String } := back;
+                                return signedHere(again, access, unsigned);
+                        end case;
+                    when None do
+                        return signedHere(key, access, id);
+                end case;
+            when None do
+                destroyString(access);
+                destroyString(id);
+                let noAccess: Option[String] := None();
+                let noId: Option[String] := None();
+                return SignedPair(access => noAccess, id => noId);
+        end case;
+    end;
+
+    -- The family a token of client is signed with: the one its sign_alg
+    -- names, or the provider's when it names none.
+    generic [S: Region, C: Region]
+    function familyFor(settings: &[OpSettings, S], client: &[OpClient, C]): KeyFamily is
+        case familyOf(asSpan(&(client->signAlg))) of
+            when Some(value as family: KeyFamily) do
+                return family;
+            when None do
+                return settings->defaultFamily;
+        end case;
+    end;
+
+    -- Signs payload with the active key of the family of client.
+    generic [S: Region, K: Region, C: Region, P: Region]
+    function signFor(settings: &[OpSettings, S], ring: &[Buffer[RingKey], K], client: &[OpClient, C],
+        typ: Span[Nat8, Static], payload: Span[Nat8, P]): Option[String] is
+        case activeKey(ring, familyFor(settings, client)) of
+            when Some(value as i: Index) do
+                return signToken(nthRef(ring, i), typ, payload);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [D: Region]
+    function familyOfCode(code: &[CodeRow, D]): Span[Nat8, D] is
+        return asSpan(&(code->family));
+    end;
+
+    generic [R: Region, S: Region, K: Region, C: Region, U: Region, F: Region, N: Region]
+    function issueUserTokens(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K],
+        client: &[OpClient, C], subject: &[Subject, U], fresh: &[NewRefresh, F], nonce: Span[Nat8, N],
+        now: Int64): Either[Refusal, String] is
+        let roles: Either[DbError, Buffer[String]] := rolesFor(&~db, asSpan(&(client->id)), asSpan(&(fresh->subject)));
+        case roles of
+            when Left(left as error: DbError) do
+                return Left(left => Broken());
+            when Right(right as held: Buffer[String]) do
+                let idRoles: Buffer[String] := copyStrings(&held);
+                let scope: Span[Nat8, F] := asSpan(&(fresh->scope));
+                case randomId() of
+                    when Some(value as jti: String) do
+                        let access: AccessClaims := AccessClaims(issuer => fromSpan(asSpan(&(settings->issuer))),
+                            subject => fromSpan(asSpan(&(fresh->subject))), audience => audienceOf(client),
+                            clientId => fromSpan(asSpan(&(client->id))), issuedAt => now, expiry => now + settings->accessTtl,
+                            tokenId => jti, authTime => fresh->authTime, sessionId => fromSpan(asSpan(&(fresh->sessionId))),
+                            scope => fromSpan(scope), roles => held);
+                        var email: String := fromSpan("");
+                        if scopeHas(scope, "email") then
+                            destroyString(email);
+                            email := fromSpan(asSpan(&(subject->email)));
+                        end if;
+                        var name: String := fromSpan("");
+                        if scopeHas(scope, "profile") then
+                            destroyString(name);
+                            name := fromSpan(asSpan(&(subject->name)));
+                        end if;
+                        let id: IdClaims := IdClaims(issuer => fromSpan(asSpan(&(settings->issuer))),
+                            subject => fromSpan(asSpan(&(fresh->subject))), clientId => fromSpan(asSpan(&(client->id))),
+                            issuedAt => now, expiry => now + settings->idTokenTtl, authTime => fresh->authTime,
+                            sessionId => fromSpan(asSpan(&(fresh->sessionId))), amr => fromSpan(asSpan(&(fresh->amr))),
+                            nonce => fromSpan(nonce), email => email, name => name, roles => idRoles);
+                        let accessPayload: String := accessTokenPayload(&access);
+                        let idPayload: String := idTokenPayload(&id);
+                        destroyAccessClaims(access);
+                        destroyIdClaims(id);
+                        let { access as accessToken: Option[String], id as idToken: Option[String] } :=
+                            signedPair(ring, familyFor(settings, client), accessPayload, idPayload);
+                        return finishTokens(&~db, settings, client, fresh, accessToken, idToken, now);
+                    when None do
+                        destroyStrings(held);
+                        destroyStrings(idRoles);
+                        return Left(left => Broken());
+                end case;
+        end case;
+    end;
+
+    generic [B: Region]
+    function copyStrings(strings: &[Buffer[String], B]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(strings) do
+            insertBackString(&!out, asSpan(nthRef(strings, i)));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [O: Region, T: Region]
+    function insertBackString(out: &![Buffer[String], O], text: Span[Nat8, T]): Unit is
+        insertBack(out, fromSpan(text));
+        return nil;
+    end;
+
+    -- The answer once both tokens are signed: the refresh token is stored.
+    generic [R: Region, S: Region, C: Region, F: Region]
+    function finishTokens(db: &![Database[Writing], R], settings: &[OpSettings, S], client: &[OpClient, C],
+        fresh: &[NewRefresh, F], accessToken: Option[String], idToken: Option[String],
+        now: Int64): Either[Refusal, String] is
+        case accessToken of
+            when Some(value as access: String) do
+                case idToken of
+                    when Some(value as id: String) do
+                        let effective: Limits := effectiveLimits(client->limits, settings->session);
+                        let lifetime: Int64 := effective.refresh;
+                        case storeRefresh(&~db, fresh, now, lifetime) of
+                            when Left(left as error: DbError) do
+                                destroyString(access);
+                                destroyString(id);
+                                return Left(left => Broken());
+                            when Right(right as stored: Option[String]) do
+                                case stored of
+                                    when Some(value as refresh: String) do
+                                        let json: String := tokenAnswer(asSpan(&access), settings->accessTtl, asSpan(&id),
+                                            asSpan(&refresh), asSpan(&(fresh->scope)));
+                                        destroyString(access);
+                                        destroyString(id);
+                                        destroyString(refresh);
+                                        return Right(right => json);
+                                    when None do
+                                        destroyString(access);
+                                        destroyString(id);
+                                        return Left(left => Broken());
+                                end case;
+                        end case;
+                    when None do
+                        destroyString(access);
+                        return Left(left => Broken());
+                end case;
+            when None do
+                case idToken of
+                    when Some(value as id: String) do
+                        destroyString(id);
+                    when None do
+                        skip;
+                end case;
+                return Left(left => Broken());
+        end case;
+    end;
+
+    generic [R: Region, S: Region, K: Region, L: Region, A: Region, P: Region, C: Region]
+    function grantRefresh(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K],
+        log: &![Log, L], ip: Span[Nat8, A], now: Int64, form: &[Buffer[QueryPair], P],
+        client: &[OpClient, C]): Either[Refusal, String] is
+        let token: String := valueOf(form, "refresh_token");
+        let loaded: Either[DbError, Option[RefreshRow]] := loadRefresh(&~db, asSpan(&token));
+        case loaded of
+            when Left(left as error: DbError) do
+                destroyString(token);
+                return Left(left => Broken());
+            when Right(right as found: Option[RefreshRow]) do
+                case found of
+                    when Some(value as row: RefreshRow) do
+                        let result: Either[Refusal, String] := rotate(&~db, settings, ring, &~log, ip, now, client,
+                            asSpan(&token), &row);
+                        destroyRefresh(row);
+                        destroyString(token);
+                        return result;
+                    when None do
+                        destroyString(token);
+                        return Left(left => BadGrant());
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, S: Region, K: Region, L: Region, A: Region, C: Region, T: Region, W: Region]
+    function rotate(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K],
+        log: &![Log, L], ip: Span[Nat8, A], now: Int64, client: &[OpClient, C], token: Span[Nat8, T],
+        row: &[RefreshRow, W]): Either[Refusal, String] is
+        let family: Span[Nat8, W] := asSpan(&(row->family));
+        if row->revoked /= 0 then
+            return Left(left => BadGrant());
+        end if;
+        if row->used /= 0 then
+            revokeAndTell(&~db, &~log, family, "refresh token reused", now);
+            return Left(left => BadGrant());
+        end if;
+        if not sameClient(client, asSpan(&(row->clientId))) then
+            revokeAndTell(&~db, &~log, family, "refresh token presented by another client", now);
+            return Left(left => BadGrant());
+        end if;
+        case activeSubject(&~db, asSpan(&(row->subject))) of
+            when Left(left as error: DbError) do
+                return Left(left => Broken());
+            when Right(right as who: Option[Subject]) do
+                case who of
+                    when Some(value as subject: Subject) do
+                        let result: Either[Refusal, String] := rotateFor(&~db, settings, ring, &~log, ip, now, client, token,
+                            row, &subject);
+                        destroySubject(subject);
+                        return result;
+                    when None do
+                        revokeAndTell(&~db, &~log, family, "subject inactive", now);
+                        return Left(left => BadGrant());
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, S: Region, K: Region, L: Region, A: Region, C: Region, T: Region, W: Region, U: Region]
+    function rotateFor(db: &![Database[Writing], R], settings: &[OpSettings, S], ring: &[Buffer[RingKey], K],
+        log: &![Log, L], ip: Span[Nat8, A], now: Int64, client: &[OpClient, C], token: Span[Nat8, T],
+        row: &[RefreshRow, W], subject: &[Subject, U]): Either[Refusal, String] is
+        let limits: Limits := effectiveLimits(client->limits, settings->session);
+        let session: Limits := settings->session;
+        case sessionById(&~db, asSpan(&(row->sessionId))) of
+            when Left(left as error: DbError) do
+                return Left(left => Broken());
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as s: OpSession) do
+                        var current: OpSession := s;
+                        let holds: Bool := isAlive(&current, now, session.idle, session.max) and (now < row->expires) and
+                            ((now - row->created) <= limits.idle) and ((now - row->authTime) <= limits.max);
+                        if not holds then
+                            destroySession(current);
+                            return Left(left => BadGrant());
+                        end if;
+                        case spendRefresh(&~db, token, now) of
+                            when Left(left as error: DbError) do
+                                destroySession(current);
+                                return Left(left => Broken());
+                            when Right(right as spent: Bool) do
+                                if not spent then
+                                    destroySession(current);
+                                    revokeAndTell(&~db, &~log, asSpan(&(row->family)), "refresh token reused concurrently", now);
+                                    return Left(left => BadGrant());
+                                end if;
+                        end case;
+                        let touched: Option[DbError] := touchSession(&~db, &!current, "", now);
+                        destroySession(current);
+                        let fresh: NewRefresh := NewRefresh(family => fromSpan(asSpan(&(row->family))),
+                            clientId => fromSpan(asSpan(&(client->id))), subject => fromSpan(asSpan(&(row->subject))),
+                            sessionId => fromSpan(asSpan(&(row->sessionId))), device => fromSpan(asSpan(&(row->device))),
+                            scope => fromSpan(asSpan(&(row->scope))), amr => fromSpan(asSpan(&(row->amr))),
+                            firstIp => fromSpan(asSpan(&(row->firstIp))), lastIp => fromSpan(ip), authTime => row->authTime,
+                            familyCreated => row->familyCreated);
+                        let result: Either[Refusal, String] := issueUserTokens(&~db, settings, ring, client, subject, &fresh,
+                            "", now);
+                        case result of
+                            when Right(right as json: String) do
+                                audit(&~log, "token.refresh", asSpan(&(client->id)), asSpan(&(row->subject)),
+                                    asSpan(&(row->sessionId)), "", "ok", ip);
+                                destroyNewRefresh(fresh);
+                                return Right(right => json);
+                            when Left(left as why: Refusal) do
+                                destroyNewRefresh(fresh);
+                                return Left(left => why);
+                        end case;
+                    when None do
+                        return Left(left => BadGrant());
+                end case;
+        end case;
+    end;
+
+    generic [S: Region, K: Region, L: Region, A: Region, C: Region]
+    function grantClient(settings: &[OpSettings, S], ring: &[Buffer[RingKey], K], log: &![Log, L], ip: Span[Nat8, A],
+        now: Int64, client: &[OpClient, C]): Either[Refusal, String] is
+        case randomId() of
+            when Some(value as jti: String) do
+                let none: Buffer[String] := allocateEmpty();
+                let claims: AccessClaims := AccessClaims(issuer => fromSpan(asSpan(&(settings->issuer))),
+                    subject => fromSpan(asSpan(&(client->id))), audience => audienceOf(client),
+                    clientId => fromSpan(asSpan(&(client->id))), issuedAt => now, expiry => now + settings->accessTtl,
+                    tokenId => jti, authTime => 0, sessionId => fromSpan(""), scope => fromSpan(""), roles => none);
+                let payload: String := accessTokenPayload(&claims);
+                destroyAccessClaims(claims);
+                let signed: Option[String] := signFor(settings, ring, client, accessTokenType(), asSpan(&payload));
+                destroyString(payload);
+                case signed of
+                    when Some(value as access: String) do
+                        let empty: Span[Nat8, Static] := "";
+                        let json: String := tokenAnswer(asSpan(&access), settings->accessTtl, empty, empty, empty);
+                        destroyString(access);
+                        audit(&~log, "token.client", asSpan(&(client->id)), empty, empty, empty, "ok", ip);
+                        return Right(right => json);
+                    when None do
+                        return Left(left => Broken());
+                end case;
+            when None do
+                return Left(left => Broken());
+        end case;
+    end;
+end module body.

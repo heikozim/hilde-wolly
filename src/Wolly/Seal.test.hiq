@@ -1,0 +1,119 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each refusal has its control: the same call with the one thing changed
+-- back opens the value.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    equal
+);
+import Wolly.Seal (
+    sealKeyBytes,
+    overheadBytes,
+    sealValue,
+    openValue
+);
+
+module body Wolly.Seal.Test is
+    constant key: Span[Nat8, Static] := "0123456789abcdef0123456789abcdef";
+    constant otherKey: Span[Nat8, Static] := "0123456789abcdef0123456789abcdeX";
+    constant shortKey: Span[Nat8, Static] := "0123456789abcdef0123456789abcde";
+    constant seed: Span[Nat8, Static] := "twenty bytes of seed";
+
+    -- Whether sealed opens under k for purpose and context to seed.
+    generic [K: Region, S: Region, C: Region]
+    function opens(k: Span[Nat8, K], purpose: Span[Nat8, Static], sealed: Span[Nat8, S], context: Span[Nat8, C]): Bool is
+        case openValue(k, purpose, sealed, context) of
+            when Some(value as opened: String) do
+                let same: Bool := equal(asSpan(&opened), seed);
+                destroyString(opened);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- sealed with the byte at index changed.
+    generic [S: Region]
+    function flipped(sealed: Span[Nat8, S], index: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, substring(sealed, 0, index));
+        let byte: Nat8 := sealed[index];
+        if byte = 0 then
+            writeByte(&!out, 1);
+        else
+            writeByte(&!out, byte - 1);
+        end if;
+        writeString(&!out, substring(sealed, index + 1, spanLength(sealed)));
+        return finalize(out);
+    end;
+
+    function testRoundTrip(): Unit is
+        assertTrue(sealKeyBytes() = 32, "a key of 32 bytes");
+        assertTrue(overheadBytes() = 28, "12 of nonce and 16 of tag");
+        case sealValue(key, "totp", seed, "ann") of
+            when Some(value as sealed: String) do
+                assertTrue(length(&sealed) = (spanLength(seed) + 28), "the value and 28 bytes");
+                assertTrue(opens(key, "totp", asSpan(&sealed), "ann"), "it opens under the same key, purpose and context");
+                assertFalse(opens(key, "totp", asSpan(&sealed), "bob"), "not for another context");
+                assertFalse(opens(key, "other", asSpan(&sealed), "ann"), "not for another purpose");
+                assertFalse(opens(otherKey, "totp", asSpan(&sealed), "ann"), "not under another key");
+                assertFalse(opens(shortKey, "totp", asSpan(&sealed), "ann"), "not under a short key");
+                let nonce: String := flipped(asSpan(&sealed), 0);
+                assertFalse(opens(key, "totp", asSpan(&nonce), "ann"), "not with a byte of the nonce changed");
+                destroyString(nonce);
+                let inner: String := flipped(asSpan(&sealed), 12);
+                assertFalse(opens(key, "totp", asSpan(&inner), "ann"), "not with a byte of the ciphertext changed");
+                destroyString(inner);
+                let tag: String := flipped(asSpan(&sealed), length(&sealed) - 1);
+                assertFalse(opens(key, "totp", asSpan(&tag), "ann"), "not with a byte of the tag changed");
+                destroyString(tag);
+                assertFalse(opens(key, "totp", substring(asSpan(&sealed), 0, 27), "ann"), "not when shorter than the overhead");
+                assertFalse(equal(substring(asSpan(&sealed), 12, length(&sealed)), seed), "the seed is not in it as it is");
+                case sealValue(key, "totp", seed, "ann") of
+                    when Some(value as again: String) do
+                        assertFalse(equal(asSpan(&again), asSpan(&sealed)), "a second seal of the same value differs");
+                        assertTrue(opens(key, "totp", asSpan(&again), "ann"), "and opens too");
+                        destroyString(again);
+                    when None do
+                        assertTrue(false, "a second seal");
+                end case;
+                destroyString(sealed);
+            when None do
+                assertTrue(false, "the value is sealed");
+        end case;
+        return nil;
+    end;
+
+    function testShortKey(): Unit is
+        case sealValue(shortKey, "totp", seed, "ann") of
+            when Some(value as sealed: String) do
+                destroyString(sealed);
+                assertTrue(false, "a key of 31 bytes seals nothing");
+            when None do
+                assertTrue(true, "a key of 31 bytes seals nothing");
+        end case;
+        return nil;
+    end;
+end module body.

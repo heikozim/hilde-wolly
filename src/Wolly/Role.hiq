@@ -1,0 +1,164 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database, as Wolly.Limit: every statement is a
+-- constant, every value is bound, the tables are strict.
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    withText,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    finish
+);
+import Wolly.Dialect (
+    pick
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    finish as finishResponse
+);
+
+module body Wolly.Role is
+    constant makeGrants: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_grants (role TEXT NOT NULL, action TEXT NOT NULL, PRIMARY KEY (role, action)) STRICT";
+    constant makeHolders: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_holders (name TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (name, role)) STRICT";
+    constant makeGrantsPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_grants (role TEXT NOT NULL, action TEXT NOT NULL, PRIMARY KEY (role, action))";
+    constant makeHoldersPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_holders (name TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (name, role))";
+    constant addGrantPg: Span[Nat8, Static] := "INSERT INTO wolly_grants (role, action) VALUES (?, ?) ON CONFLICT DO NOTHING";
+    constant addHolderPg: Span[Nat8, Static] := "INSERT INTO wolly_holders (name, role) VALUES (?, ?) ON CONFLICT DO NOTHING";
+    constant addGrant: Span[Nat8, Static] := "INSERT OR IGNORE INTO wolly_grants (role, action) VALUES (?, ?)";
+    constant dropGrant: Span[Nat8, Static] := "DELETE FROM wolly_grants WHERE role = ? AND action = ?";
+    constant addHolder: Span[Nat8, Static] := "INSERT OR IGNORE INTO wolly_holders (name, role) VALUES (?, ?)";
+    constant dropHolder: Span[Nat8, Static] := "DELETE FROM wolly_holders WHERE name = ? AND role = ?";
+    constant dropHolders: Span[Nat8, Static] := "DELETE FROM wolly_holders WHERE name = ?";
+    constant countGranted: Span[Nat8, Static] := "SELECT count(*) FROM wolly_holders h JOIN wolly_grants g ON g.role = h.role WHERE h.name = ? AND g.action = ?";
+
+    generic [N: Region]
+    function isName(name: Span[Nat8, N]): Bool is
+        if (spanLength(name) = 0) or (spanLength(name) > 64) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            let letter: Bool := (byte >= 'a') and (byte <= 'z');
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let mark: Bool := ((byte = '.') or (byte = '-')) or (byte = '_');
+            if not ((letter or digit) or mark) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Runs one statement without values that returns no rows.
+    generic [R: Region]
+    function run(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Option[DbError] is
+        case execute(&~db, sql, noValues()) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepareRoles(db: &![Database[Writing], R]): Option[DbError] is
+        let grants: Span[Nat8, Static] := pick(&db, makeGrants, makeGrantsPg);
+        let holders: Span[Nat8, Static] := pick(&db, makeHolders, makeHoldersPg);
+        case run(&~db, grants) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                return run(&~db, holders);
+        end case;
+    end;
+
+    -- Runs sql with the two names; Right true when it changed a row, or
+    -- always when it succeeded and any is false.
+    generic [R: Region, A: Region, B: Region]
+    function pair(db: &![Database[Writing], R], sql: Span[Nat8, Static], first: Span[Nat8, A], second: Span[Nat8, B],
+        any: Bool): Either[DbError, Bool] is
+        case execute(&~db, sql, withText(withText(noValues(), first), second)) of
+            when Right(right as changed: Nat64) do
+                let done: Bool := (not any) or (changed > 0);
+                return Right(right => done);
+            when Left(left as error: DbError) do
+                return Left(left => error);
+        end case;
+    end;
+
+    generic [R: Region, O: Region, A: Region]
+    function grant(db: &![Database[Writing], R], role: Span[Nat8, O], action: Span[Nat8, A]): Either[DbError, Bool] is
+        if not (isName(role) and isName(action)) then
+            return Right(right => false);
+        end if;
+        let sql: Span[Nat8, Static] := pick(&db, addGrant, addGrantPg);
+        return pair(&~db, sql, role, action, false);
+    end;
+
+    generic [R: Region, O: Region, A: Region]
+    function revoke(db: &![Database[Writing], R], role: Span[Nat8, O], action: Span[Nat8, A]): Either[DbError, Bool] is
+        return pair(&~db, dropGrant, role, action, true);
+    end;
+
+    generic [R: Region, U: Region, O: Region]
+    function assign(db: &![Database[Writing], R], user: Span[Nat8, U], role: Span[Nat8, O]): Either[DbError, Bool] is
+        if not (isName(user) and isName(role)) then
+            return Right(right => false);
+        end if;
+        let sql: Span[Nat8, Static] := pick(&db, addHolder, addHolderPg);
+        return pair(&~db, sql, user, role, false);
+    end;
+
+    generic [R: Region, U: Region, O: Region]
+    function unassign(db: &![Database[Writing], R], user: Span[Nat8, U], role: Span[Nat8, O]): Either[DbError, Bool] is
+        return pair(&~db, dropHolder, user, role, true);
+    end;
+
+    generic [R: Region, U: Region]
+    function unassignAll(db: &![Database[Writing], R], user: Span[Nat8, U]): Either[DbError, Bool] is
+        case execute(&~db, dropHolders, withText(noValues(), user)) of
+            when Right(right as changed: Nat64) do
+                let held: Bool := changed > 0;
+                return Right(right => held);
+            when Left(left as error: DbError) do
+                return Left(left => error);
+        end case;
+    end;
+
+    generic [M: Free, R: Region, U: Region, A: Region]
+    function may(db: &![Database[M], R], user: Span[Nat8, U], action: Span[Nat8, A]): Either[DbError, Bool] is
+        -- No check of the names: grant and assign store none that is no
+        -- name, so such a name finds no row, and the values are bound.
+        var cursor: Cursor := start(&~db, countGranted, withText(withText(noValues(), user), action));
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                let granted: Bool := count > 0;
+                return Right(right => granted);
+        end case;
+    end;
+
+    function forbidden(): String is
+        return finishResponse(makeResponse(403, "text/plain; charset=utf-8"), "forbidden\n");
+    end;
+end module body.

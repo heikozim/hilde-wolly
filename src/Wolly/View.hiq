@@ -1,0 +1,3017 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    makeEmpty,
+    fromLiteral,
+    fromSpan,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    destroyEmpty,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    nthRef,
+    storeNth,
+    swapNth,
+    insertBack,
+    removeLast
+);
+import Standard.Text (
+    equal,
+    contains,
+    indexOf
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Template (
+    Render,
+    display,
+    JsValue,
+    jsValue,
+    jsQuote,
+    displayIndex,
+    writeHtml,
+    writeUrl,
+    writeUrlPath,
+    writeUrlQuery,
+    writeRaw,
+    writeJsString,
+    writeJsStringAttribute,
+    writeCssValue,
+    writeCssValueAttribute,
+    writeCssString,
+    writeCssStringAttribute,
+    upper,
+    lower,
+    trim,
+    capitalize,
+    title,
+    center,
+    concat
+);
+import Standard.File (
+    FileStatus,
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    statusOf
+);
+import Standard.Watch (
+    Watcher,
+    WatchResult,
+    WaitedOut,
+    WatchFailed,
+    Changed,
+    makeWatcher,
+    watchDirectory,
+    watchFile,
+    waitForChange,
+    destroyWatcher
+);
+import Wolly.ViewData (
+    ViewData,
+    ViewKind,
+    ViewText,
+    ViewInteger,
+    ViewBool,
+    ViewList,
+    ViewMap,
+    ViewMissing,
+    ViewHtml,
+    makeMapData,
+    makeListData,
+    makeTextData,
+    makeIntegerData,
+    makeBoolData,
+    makeMissingData,
+    destroyViewData,
+    rootNode,
+    kindOf,
+    isMap,
+    isList,
+    isTextual,
+    isInteger,
+    isBool,
+    isMissing,
+    isHtml,
+    textOf,
+    integerOf,
+    boolOf,
+    childCount,
+    nodeCount,
+    firstChild,
+    nextSibling,
+    memberNamed,
+    elementAt,
+    putText,
+    putInteger,
+    putMissing,
+    putMap,
+    addText,
+    addInteger,
+    addBool,
+    addMissing,
+    addCopy,
+    putCopy
+);
+import Wolly.ViewContext (
+    Writer,
+    HtmlWriter,
+    UrlWriter,
+    UrlPathWriter,
+    UrlQueryWriter,
+    ScriptWriter,
+    ScriptAttributeWriter,
+    JsStringWriter,
+    JsStringAttributeWriter,
+    CssValueWriter,
+    CssValueAttributeWriter,
+    CssStringWriter,
+    CssStringAttributeWriter
+);
+import Wolly.ViewCompile (
+    Program,
+    Step,
+    Expr,
+    compileView,
+    destroyProgram,
+    stepCount,
+    stepAt,
+    exprAt,
+    listAt,
+    textAt,
+    slotCount,
+    loopCount,
+    fileCount,
+    fileName,
+    pathCount,
+    pathAt,
+    stepText,
+    stepOut,
+    stepJump,
+    stepUnless,
+    stepBind,
+    stepRelease,
+    stepForEnter,
+    stepForItem,
+    stepForCount,
+    stepForStep,
+    stepForRestart,
+    stepIfEmpty,
+    stepCaptureBegin,
+    stepCaptureEnd,
+    bindReference,
+    bindNumber,
+    bindText,
+    bindMarkup,
+    exprText,
+    exprInteger,
+    exprBool,
+    exprData,
+    exprSlot,
+    exprLoop,
+    exprCycle,
+    exprNot,
+    exprAnd,
+    exprOr,
+    exprTextEquals,
+    exprCompare,
+    exprIsNone,
+    exprIn,
+    exprConcat,
+    exprArith,
+    exprFloorDivide,
+    exprModulo,
+    exprCond,
+    exprFilter,
+    exprJoin,
+    exprLength,
+    exprCall,
+    exprScriptValue,
+    exprTranslate,
+    exprTruth
+);
+
+module body Wolly.View is
+    function mostLoopTurns(): Index is
+        return 1000000;
+    end;
+
+    function mostOutputBytes(): Index is
+        return 16777216;
+    end;
+
+    function mostMadeBytes(): Index is
+        return 67108864;
+    end;
+
+    function mostMadeNodes(): Index is
+        return 4194304;
+    end;
+
+    function mostComparedBytes(): Index is
+        return 67108864;
+    end;
+
+    record ViewEngine: Linear is
+        directories: Buffer[String];
+        functionNames: Buffer[String];
+        functions: Buffer[Fn[ViewData, Either[String, ViewData]]];
+        catalogNames: Buffer[String];
+        catalogs: Buffer[Fn[ViewData, Either[String, ViewData]]];
+        keys: Buffer[String];
+        programs: Buffer[Option[Program]];
+        -- Holds one watcher, or none where watching is not built.
+        watchers: Buffer[Watcher];
+        -- The paths the watcher watches, each once.
+        watched: Buffer[String];
+        keeping: Bool;
+        trimBlocks: Bool;
+        lstripBlocks: Bool;
+        invariant length(&keys) = length(&programs);
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyPrograms(programs: Buffer[Option[Program]]): Unit is
+        var rest: Buffer[Option[Program]] := programs;
+        while length(&rest) > 0 do
+            case removeLast(&!rest) of
+                when Some(value as program: Program) do
+                    destroyProgram(program);
+                when None do
+                    skip;
+            end case;
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyWatchers(watchers: Buffer[Watcher]): Unit is
+        var rest: Buffer[Watcher] := watchers;
+        while length(&rest) > 0 do
+            destroyWatcher(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function makeViewEngine(): ViewEngine is
+        var watchers: Buffer[Watcher] := allocateEmpty();
+        var keeping: Bool := false;
+        case makeWatcher() of
+            when Some(value as watcher: Watcher) do
+                insertBack(&!watchers, watcher);
+                keeping := true;
+            when None do
+                skip;
+        end case;
+        return ViewEngine(directories => allocateEmpty(), functionNames => allocateEmpty(),
+            functions => allocateEmpty(), catalogNames => allocateEmpty(), catalogs => allocateEmpty(),
+            keys => allocateEmpty(), programs => allocateEmpty(), watchers => watchers, watched => allocateEmpty(), keeping => keeping,
+            trimBlocks => false, lstripBlocks => false);
+    end;
+
+    function destroyViewEngine(engine: ViewEngine): Unit is
+        let { directories: Buffer[String], functionNames: Buffer[String],
+            functions: Buffer[Fn[ViewData, Either[String, ViewData]]], catalogNames: Buffer[String],
+            catalogs: Buffer[Fn[ViewData, Either[String, ViewData]]], keys: Buffer[String],
+            programs: Buffer[Option[Program]], watchers: Buffer[Watcher], watched: Buffer[String], keeping: Bool,
+            trimBlocks: Bool, lstripBlocks: Bool } := engine;
+        destroyStrings(directories);
+        destroyStrings(functionNames);
+        destroyFree(functions);
+        destroyStrings(catalogNames);
+        destroyFree(catalogs);
+        destroyStrings(keys);
+        destroyStrings(watched);
+        destroyPrograms(programs);
+        destroyWatchers(watchers);
+        return nil;
+    end;
+
+    ---
+    --- The slots of the engine, one borrow each
+    ---
+
+    generic [R: Region]
+    function directoryCount(engine: &[ViewEngine, R]): Index is
+        return length(&(engine->directories));
+    end;
+
+    generic [R: Region]
+    function keptViews(engine: &[ViewEngine, R]): Index is
+        return length(&(engine->keys));
+    end;
+
+    generic [R: Region]
+    function keepsViews(engine: &[ViewEngine, R]): Bool is
+        return engine->keeping;
+    end;
+
+    generic [R: Region]
+    function keyCount(engine: &![ViewEngine, R]): Index is
+        return lengthMut(&!(engine->keys));
+    end;
+
+    generic [R: Region, K: Region]
+    function keyEquals(engine: &![ViewEngine, R], at: Index, key: Span[Nat8, K]): Bool is
+        return equal(asSpan(nthRef(&(engine->keys), at)), key);
+    end;
+
+    generic [R: Region]
+    function popKey(engine: &![ViewEngine, R]): String is
+        return removeLast(&!(engine->keys));
+    end;
+
+    generic [R: Region]
+    function watchedCount(engine: &![ViewEngine, R]): Index is
+        return lengthMut(&!(engine->watched));
+    end;
+
+    generic [R: Region, P: Region]
+    function watchedEquals(engine: &![ViewEngine, R], at: Index, path: Span[Nat8, P]): Bool is
+        return equal(asSpan(nthRef(&(engine->watched), at)), path);
+    end;
+
+    generic [R: Region]
+    function pushWatched(engine: &![ViewEngine, R], path: String): Unit is
+        insertBack(&!(engine->watched), path);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function popWatched(engine: &![ViewEngine, R]): String is
+        return removeLast(&!(engine->watched));
+    end;
+
+    generic [R: Region]
+    function pushKey(engine: &![ViewEngine, R], key: String): Unit is
+        insertBack(&!(engine->keys), key);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function popProgram(engine: &![ViewEngine, R]): Option[Program] is
+        return removeLast(&!(engine->programs));
+    end;
+
+    generic [R: Region]
+    function pushProgram(engine: &![ViewEngine, R], program: Option[Program]): Unit is
+        insertBack(&!(engine->programs), program);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function swapProgram(engine: &![ViewEngine, R], at: Index, program: Option[Program]): Option[Program] is
+        return swapNth(&!(engine->programs), at, program);
+    end;
+
+    generic [R: Region]
+    function watcherCount(engine: &![ViewEngine, R]): Index is
+        return lengthMut(&!(engine->watchers));
+    end;
+
+    generic [R: Region]
+    function popWatcher(engine: &![ViewEngine, R]): Watcher is
+        return removeLast(&!(engine->watchers));
+    end;
+
+    generic [R: Region]
+    function pushWatcher(engine: &![ViewEngine, R], watcher: Watcher): Unit is
+        insertBack(&!(engine->watchers), watcher);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function copyStrings(strings: &[Buffer[String], B]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < length(strings) do
+            insertBack(&!out, fromSpan(asSpan(nthRef(strings, i))));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region]
+    function directoriesOf(engine: &![ViewEngine, R]): Buffer[String] is
+        return copyStrings(&(engine->directories));
+    end;
+
+    generic [R: Region]
+    function functionNamesOf(engine: &![ViewEngine, R]): Buffer[String] is
+        return copyStrings(&(engine->functionNames));
+    end;
+
+    generic [R: Region]
+    function catalogNamesOf(engine: &![ViewEngine, R]): Buffer[String] is
+        return copyStrings(&(engine->catalogNames));
+    end;
+
+    generic [R: Region]
+    function functionsOf(engine: &![ViewEngine, R]): Buffer[Fn[ViewData, Either[String, ViewData]]] is
+        return copyFunctions(&(engine->functions));
+    end;
+
+    generic [R: Region]
+    function catalogsOf(engine: &![ViewEngine, R]): Buffer[Fn[ViewData, Either[String, ViewData]]] is
+        return copyFunctions(&(engine->catalogs));
+    end;
+
+    generic [R: Region]
+    function directoryCountMut(engine: &![ViewEngine, R]): Index is
+        return lengthMut(&!(engine->directories));
+    end;
+
+    generic [R: Region]
+    function directoryCopy(engine: &![ViewEngine, R], at: Index): String is
+        return fromSpan(asSpan(nthRef(&(engine->directories), at)));
+    end;
+
+    generic [R: Region]
+    function pushDirectory(engine: &![ViewEngine, R], directory: String): Unit is
+        insertBack(&!(engine->directories), directory);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function functionCount(engine: &![ViewEngine, R]): Index is
+        return lengthMut(&!(engine->functionNames));
+    end;
+
+    generic [R: Region, N: Region]
+    function functionNamed(engine: &![ViewEngine, R], at: Index, name: Span[Nat8, N]): Bool is
+        return equal(asSpan(nthRef(&(engine->functionNames), at)), name);
+    end;
+
+    generic [R: Region]
+    function pushFunctionName(engine: &![ViewEngine, R], name: String): Unit is
+        insertBack(&!(engine->functionNames), name);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushFunction(engine: &![ViewEngine, R], callable: Fn[ViewData, Either[String, ViewData]]): Unit is
+        insertBack(&!(engine->functions), callable);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function catalogCount(engine: &![ViewEngine, R]): Index is
+        return lengthMut(&!(engine->catalogNames));
+    end;
+
+    generic [R: Region, N: Region]
+    function catalogNamed(engine: &![ViewEngine, R], at: Index, name: Span[Nat8, N]): Bool is
+        return equal(asSpan(nthRef(&(engine->catalogNames), at)), name);
+    end;
+
+    generic [R: Region]
+    function pushCatalogName(engine: &![ViewEngine, R], name: String): Unit is
+        insertBack(&!(engine->catalogNames), name);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushCatalog(engine: &![ViewEngine, R], catalog: Fn[ViewData, Either[String, ViewData]]): Unit is
+        insertBack(&!(engine->catalogs), catalog);
+        return nil;
+    end;
+
+    ---
+    --- What is kept
+    ---
+
+    -- Everything kept dropped, and a new watcher made where there was one:
+    -- a watch cannot be removed one by one.
+    generic [R: Region]
+    function forget(engine: &![ViewEngine, R]): Unit is
+        while keyCount(&~engine) > 0 do
+            destroyString(popKey(&~engine));
+            case popProgram(&~engine) of
+                when Some(value as program: Program) do
+                    destroyProgram(program);
+                when None do
+                    skip;
+            end case;
+        end while;
+        while watchedCount(&~engine) > 0 do
+            destroyString(popWatched(&~engine));
+        end while;
+        if watcherCount(&~engine) > 0 then
+            destroyWatcher(popWatcher(&~engine));
+            case makeWatcher() of
+                when Some(value as watcher: Watcher) do
+                    pushWatcher(&~engine, watcher);
+                when None do
+                    engine->keeping := false;
+            end case;
+        end if;
+        return nil;
+    end;
+
+    -- Whether the watcher reported a change since it was last asked; a
+    -- failed wait counts as one.
+    function changesIn(watcher: Watcher): Pair[Watcher, Bool] is
+        var w: Watcher := watcher;
+        var changed: Bool := false;
+        var asking: Bool := true;
+        while asking do
+            case waitForChange(&!w, 0) of
+                when WaitedOut do
+                    asking := false;
+                when WatchFailed do
+                    changed := true;
+                    asking := false;
+                when Changed(watch as number: Index) do
+                    changed := true;
+            end case;
+        end while;
+        return Pair(first => w, second => changed);
+    end;
+
+    generic [R: Region]
+    function refresh(engine: &![ViewEngine, R]): Unit is
+        if watcherCount(&~engine) = 0 then
+            return nil;
+        end if;
+        let asked: Pair[Watcher, Bool] := changesIn(popWatcher(&~engine));
+        let { first: Watcher, second: Bool } := asked;
+        pushWatcher(&~engine, first);
+        if second then
+            forget(&~engine);
+        end if;
+        return nil;
+    end;
+
+    -- Whether the watcher watches path now: watched before, or watched
+    -- now; a path that is not there is left to the directory it would
+    -- come into, which is watched, and counts as watched.  False when a
+    -- path that is there could not be watched.
+    generic [R: Region, W: Region, P: Region]
+    function watchPath(engine: &![ViewEngine, R], watcher: &![Watcher, W], path: Span[Nat8, P], directory: Bool): Bool is
+        var i: Index := 0;
+        while i < watchedCount(&~engine) do
+            if watchedEquals(&~engine, i, path) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        case statusOf(path) of
+            when FileFound(status as found: FileStatus) do
+                skip;
+            when FileMissing do
+                return true;
+            when FileUnreadable do
+                return true;
+        end case;
+        var watched: Option[Index] := None();
+        if directory then
+            watched := watchDirectory(&~watcher, path);
+        else
+            watched := watchFile(&~watcher, path);
+        end if;
+        case watched of
+            when Some(value as number: Index) do
+                pushWatched(&~engine, fromSpan(path));
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The directories searched, watched; false as watchPath.
+    generic [R: Region, W: Region]
+    function watchDirectories(engine: &![ViewEngine, R], watcher: &![Watcher, W]): Bool is
+        var good: Bool := true;
+        var d: Index := 0;
+        while d < directoryCountMut(&~engine) do
+            let directory: String := directoryCopy(&~engine, d);
+            let watched: Bool := watchPath(&~engine, &~watcher, asSpan(&directory), true);
+            destroyString(directory);
+            good := good and watched;
+            d := d + 1;
+        end while;
+        return good;
+    end;
+
+    -- In every directory searched, the directories the template name
+    -- passes through (partials of partials/x.html), watched: a file a
+    -- tenant puts there later is a change; false as watchPath.
+    generic [R: Region, W: Region, N: Region]
+    function watchBelow(engine: &![ViewEngine, R], watcher: &![Watcher, W], name: Span[Nat8, N]): Bool is
+        var good: Bool := true;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if name[i] = '/' then
+                var d: Index := 0;
+                while d < directoryCountMut(&~engine) do
+                    let directory: String := directoryCopy(&~engine, d);
+                    var out: StringBuilder := makeStringBuilder();
+                    writeString(&!out, asSpan(&directory));
+                    writeByte(&!out, '/');
+                    var k: Index := 0;
+                    while k < i do
+                        writeByte(&!out, name[k]);
+                        k := k + 1;
+                    end while;
+                    destroyString(directory);
+                    let path: String := finalize(out);
+                    let watched: Bool := watchPath(&~engine, &~watcher, asSpan(&path), true);
+                    destroyString(path);
+                    good := good and watched;
+                    d := d + 1;
+                end while;
+            end if;
+            i := i + 1;
+        end while;
+        return good;
+    end;
+
+    -- The directories searched, the files a program was made of and the
+    -- directories its names pass through, watched once each.  False when
+    -- there is no watcher or a path that is there could not be watched:
+    -- the program is then not kept.
+    generic [R: Region, P: Region]
+    function watchProgram(engine: &![ViewEngine, R], program: &[Program, P]): Bool is
+        if watcherCount(&~engine) = 0 then
+            return false;
+        end if;
+        var watcher: Watcher := popWatcher(&~engine);
+        var good: Bool := watchDirectories(&~engine, &!watcher);
+        var p: Index := 0;
+        while p < pathCount(program) do
+            let watched: Bool := watchPath(&~engine, &!watcher, pathAt(program, p), false);
+            good := good and watched;
+            p := p + 1;
+        end while;
+        var f: Index := 0;
+        while f < fileCount(program) do
+            let below: Bool := watchBelow(&~engine, &!watcher, fileName(program, f));
+            good := good and below;
+            f := f + 1;
+        end while;
+        pushWatcher(&~engine, watcher);
+        return good;
+    end;
+
+    -- The directories searched, watched before a template is read, so that
+    -- a file put in while it is read is a change.
+    generic [R: Region]
+    function watchFirst(engine: &![ViewEngine, R]): Unit is
+        if watcherCount(&~engine) = 0 then
+            return nil;
+        end if;
+        var watcher: Watcher := popWatcher(&~engine);
+        let good: Bool := watchDirectories(&~engine, &!watcher);
+        pushWatcher(&~engine, watcher);
+        return nil;
+    end;
+
+    generic [R: Region, D: Region]
+    function addDirectory(engine: &![ViewEngine, R], directory: Span[Nat8, D]): Unit is
+        pushDirectory(&~engine, fromSpan(directory));
+        forget(&~engine);
+        return nil;
+    end;
+
+    generic [R: Region, N: Region]
+    function addFunction(engine: &![ViewEngine, R], name: Span[Nat8, N], callable: Fn[ViewData, Either[String, ViewData]]): Unit is
+        var i: Index := 0;
+        while i < functionCount(&~engine) do
+            if functionNamed(&~engine, i, name) then
+                return nil;
+            end if;
+            i := i + 1;
+        end while;
+        pushFunctionName(&~engine, fromSpan(name));
+        pushFunction(&~engine, callable);
+        forget(&~engine);
+        return nil;
+    end;
+
+    generic [R: Region, N: Region]
+    function addCatalog(engine: &![ViewEngine, R], name: Span[Nat8, N], catalog: Fn[ViewData, Either[String, ViewData]]): Unit is
+        var i: Index := 0;
+        while i < catalogCount(&~engine) do
+            if catalogNamed(&~engine, i, name) then
+                return nil;
+            end if;
+            i := i + 1;
+        end while;
+        pushCatalogName(&~engine, fromSpan(name));
+        pushCatalog(&~engine, catalog);
+        forget(&~engine);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setWhitespace(engine: &![ViewEngine, R], trimBlocks: Bool, lstripBlocks: Bool): Unit is
+        engine->trimBlocks := trimBlocks;
+        engine->lstripBlocks := lstripBlocks;
+        forget(&~engine);
+        return nil;
+    end;
+
+    -- The key a program is kept under: the layout, a line break and the
+    -- name; neither holds a line break.
+    generic [P: Region, L: Region]
+    function keyOf(page: Span[Nat8, P], layout: Span[Nat8, L]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, layout);
+        writeByte(&!out, 10);
+        writeString(&!out, page);
+        return finalize(out);
+    end;
+
+    generic [R: Region, K: Region]
+    function keptAt(engine: &![ViewEngine, R], key: Span[Nat8, K]): Index is
+        let total: Index := keyCount(&~engine);
+        var i: Index := 0;
+        while i < total do
+            if keyEquals(&~engine, i, key) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    generic [R: Region, P: Region, L: Region]
+    function compileFor(engine: &![ViewEngine, R], page: Span[Nat8, P], layout: Span[Nat8, L]): Either[String, Program] is
+        let trim: Bool := engine->trimBlocks;
+        let lstrip: Bool := engine->lstripBlocks;
+        let directories: Buffer[String] := directoriesOf(&~engine);
+        let functions: Buffer[String] := functionNamesOf(&~engine);
+        let catalogs: Buffer[String] := catalogNamesOf(&~engine);
+        let result: Either[String, Program] := compileWith(&directories, &functions, &catalogs, page, layout, trim, lstrip);
+        destroyStrings(directories);
+        destroyStrings(functions);
+        destroyStrings(catalogs);
+        return result;
+    end;
+
+    generic [D: Region, F: Region, C: Region, P: Region, L: Region]
+    function compileWith(directories: &[Buffer[String], D], functions: &[Buffer[String], F],
+        catalogs: &[Buffer[String], C], page: Span[Nat8, P], layout: Span[Nat8, L], trim: Bool,
+        lstrip: Bool): Either[String, Program] is
+        return compileView(directories, functions, catalogs, page, layout, trim, lstrip);
+    end;
+
+    -- The program of page in layout, kept or loaded now: Right with its
+    -- place among the kept ones, or with keyCount when it is not kept and
+    -- comes back in the second slot.
+    record Loaded: Linear is
+        at: Index;
+        program: Option[Program];
+    end;
+
+    generic [R: Region, P: Region, L: Region]
+    function loaded(engine: &![ViewEngine, R], page: Span[Nat8, P], layout: Span[Nat8, L]): Either[String, Loaded] is
+        refresh(&~engine);
+        let key: String := keyOf(page, layout);
+        let found: Index := keptAt(&~engine, asSpan(&key));
+        if found < keyCount(&~engine) then
+            destroyString(key);
+            let none: Option[Program] := None();
+            return Right(right => Loaded(at => found, program => none));
+        end if;
+        watchFirst(&~engine);
+        case compileFor(&~engine, page, layout) of
+            when Left(left as message: String) do
+                destroyString(key);
+                return Left(left => message);
+            when Right(right as program: Program) do
+                let watching: Bool := watchProgram(&~engine, &program);
+                if engine->keeping and watching then
+                    let at: Index := keyCount(&~engine);
+                    pushKey(&~engine, key);
+                    pushProgram(&~engine, Some(value => program));
+                    let none: Option[Program] := None();
+                    return Right(right => Loaded(at => at, program => none));
+                end if;
+                destroyString(key);
+                return Right(right => Loaded(at => keyCount(&~engine), program => Some(value => program)));
+        end case;
+    end;
+
+    generic [R: Region, N: Region]
+    function loadView(engine: &![ViewEngine, R], name: Span[Nat8, N]): Either[String, Unit] is
+        case loaded(&~engine, name, "") of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as made: Loaded) do
+                let { at: Index, program: Option[Program] } := made;
+                case program of
+                    when Some(value as p: Program) do
+                        destroyProgram(p);
+                    when None do
+                        skip;
+                end case;
+                return Right(right => nil);
+        end case;
+    end;
+
+    generic [R: Region, N: Region, D: Region, B: Region]
+    function renderView(engine: &![ViewEngine, R], name: Span[Nat8, N], data: &[ViewData, D],
+        out: &![StringBuilder, B]): Either[String, Unit] is
+        return renderPage(&~engine, name, "", data, &~out);
+    end;
+
+    generic [R: Region, P: Region, L: Region, D: Region, B: Region]
+    function renderPage(engine: &![ViewEngine, R], page: Span[Nat8, P], layout: Span[Nat8, L], data: &[ViewData, D],
+        out: &![StringBuilder, B]): Either[String, Unit] is
+        case loaded(&~engine, page, layout) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as made: Loaded) do
+                let { at: Index, program: Option[Program] } := made;
+                case program of
+                    when Some(value as own: Program) do
+                        let result: Either[String, Unit] := runProgram(&~engine, &own, data, &~out);
+                        destroyProgram(own);
+                        return result;
+                    when None do
+                        let none: Option[Program] := None();
+                        case swapProgram(&~engine, at, none) of
+                            when Some(value as kept: Program) do
+                                let result: Either[String, Unit] := runProgram(&~engine, &kept, data, &~out);
+                                let back: Option[Program] := swapProgram(&~engine, at, Some(value => kept));
+                                ignoreProgram(back);
+                                return result;
+                            when None do
+                                return Left(left => fromLiteral("Wolly.View: a kept template was not there"));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function ignoreProgram(program: Option[Program]): Unit is
+        case program of
+            when Some(value as p: Program) do
+                destroyProgram(p);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The page rendered into a builder of its own and written to out only
+    -- when it rendered whole: a page cut off by an error, in the middle of
+    -- an attribute or a script, never reaches out.
+    generic [R: Region, P: Region, D: Region, B: Region]
+    function runProgram(engine: &![ViewEngine, R], program: &[Program, P], data: &[ViewData, D],
+        out: &![StringBuilder, B]): Either[String, Unit] is
+        let functions: Buffer[Fn[ViewData, Either[String, ViewData]]] := functionsOf(&~engine);
+        let catalogs: Buffer[Fn[ViewData, Either[String, ViewData]]] := catalogsOf(&~engine);
+        var page: StringBuilder := makeStringBuilder();
+        let result: Either[String, Unit] := runWith(program, &functions, &catalogs, data, &!page);
+        destroyFree(functions);
+        destroyFree(catalogs);
+        let text: String := finalize(page);
+        case result of
+            when Left(left as message: String) do
+                destroyString(text);
+                return Left(left => message);
+            when Right(right as done: Unit) do
+                writeString(&~out, asSpan(&text));
+                destroyString(text);
+                return Right(right => nil);
+        end case;
+    end;
+
+    ---
+    --- Values of a render
+    ---
+
+    -- A value: a node of the data (doc 0) or of a function's result (doc
+    -- k, the k-th result), or one the template computed.  VUnset is a slot
+    -- nothing was bound to yet.
+    union Val: Linear is
+        case VUnset;
+        case VNode is
+            doc: Index;
+            node: Index;
+        case VText is
+            text: String;
+        case VInteger is
+            number: Int64;
+        case VBool is
+            truth: Bool;
+        case VHtml is
+            text: String;
+        case VMissing;
+    end;
+
+    -- Where a for stands: the list, the node it is on, how many elements
+    -- it walked and let through (counter), how many there are (total).
+    record LoopState: Free is
+        doc: Index;
+        list: Index;
+        cursor: Index;
+        hasCursor: Bool;
+        counter: Index;
+        total: Index;
+    end;
+
+    record Run: Linear is
+        slots: Buffer[Val];
+        loops: Buffer[LoopState];
+        captures: Buffer[StringBuilder];
+        results: Buffer[ViewData];
+        turns: Index;
+        written: Index;
+        made: Index;
+        nodes: Index;
+        searched: Index;
+    end;
+
+    function destroyVal(value: Val): Unit is
+        case value of
+            when VText(text as t: String) do
+                destroyString(t);
+            when VHtml(text as h: String) do
+                destroyString(h);
+            when VUnset do
+                skip;
+            when VNode(doc as d: Index, node as n: Index) do
+                skip;
+            when VInteger(number as i: Int64) do
+                skip;
+            when VBool(truth as b: Bool) do
+                skip;
+            when VMissing do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function copyVal(value: &[Val, R]): Val is
+        case value of
+            when VText(text as t: &[String, R]) do
+                return VText(text => fromSpan(asSpan(t)));
+            when VHtml(text as h: &[String, R]) do
+                return VHtml(text => fromSpan(asSpan(h)));
+            when VUnset do
+                return VUnset();
+            when VNode(doc as d: &[Index, R], node as n: &[Index, R]) do
+                return VNode(doc => !d, node => !n);
+            when VInteger(number as i: &[Int64, R]) do
+                return VInteger(number => !i);
+            when VBool(truth as b: &[Bool, R]) do
+                return VBool(truth => !b);
+            when VMissing do
+                return VMissing();
+        end case;
+    end;
+
+    function makeRun(slots: Index, loops: Index): Run is
+        var values: Buffer[Val] := allocateEmpty();
+        var i: Index := 0;
+        while i < slots do
+            insertBack(&!values, VUnset());
+            i := i + 1;
+        end while;
+        var states: Buffer[LoopState] := allocateEmpty();
+        var k: Index := 0;
+        while k < loops do
+            insertBack(&!states, LoopState(doc => 0, list => 0, cursor => 0, hasCursor => false, counter => 0,
+                total => 0));
+            k := k + 1;
+        end while;
+        return Run(slots => values, loops => states, captures => allocateEmpty(), results => allocateEmpty(),
+            turns => 0, written => 0, made => 0, nodes => 0, searched => 0);
+    end;
+
+    function destroyRun(run: Run): Unit is
+        let { slots: Buffer[Val], loops: Buffer[LoopState], captures: Buffer[StringBuilder],
+            results: Buffer[ViewData], turns: Index, written: Index, made: Index, nodes: Index,
+            searched: Index } := run;
+        var values: Buffer[Val] := slots;
+        while length(&values) > 0 do
+            destroyVal(removeLast(&!values));
+        end while;
+        destroyEmpty(values);
+        destroyFree(loops);
+        var open: Buffer[StringBuilder] := captures;
+        while length(&open) > 0 do
+            destroyString(finalize(removeLast(&!open)));
+        end while;
+        destroyEmpty(open);
+        var docs: Buffer[ViewData] := results;
+        while length(&docs) > 0 do
+            destroyViewData(removeLast(&!docs));
+        end while;
+        destroyEmpty(docs);
+        return nil;
+    end;
+
+    ---
+    --- The slots of a run, one borrow each
+    ---
+
+    generic [R: Region]
+    function slotCopy(run: &![Run, R], at: Index): Val is
+        return copyVal(nthRef(&(run->slots), at));
+    end;
+
+    generic [R: Region]
+    function storeSlot(run: &![Run, R], at: Index, value: Val): Unit is
+        let old: Val := swapNth(&!(run->slots), at, value);
+        destroyVal(old);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function loopOf(run: &![Run, R], at: Index): LoopState is
+        return nthMut(&!(run->loops), at);
+    end;
+
+    generic [R: Region]
+    function storeLoop(run: &![Run, R], at: Index, state: LoopState): Unit is
+        storeNth(&!(run->loops), at, state);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function captureCount(run: &![Run, R]): Index is
+        return lengthMut(&!(run->captures));
+    end;
+
+    generic [R: Region]
+    function popCapture(run: &![Run, R]): StringBuilder is
+        return removeLast(&!(run->captures));
+    end;
+
+    generic [R: Region]
+    function pushCapture(run: &![Run, R], builder: StringBuilder): Unit is
+        insertBack(&!(run->captures), builder);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function resultCount(run: &![Run, R]): Index is
+        return lengthMut(&!(run->results));
+    end;
+
+    generic [R: Region]
+    function pushResult(run: &![Run, R], result: ViewData): Unit is
+        insertBack(&!(run->results), result);
+        return nil;
+    end;
+
+    -- The kind of the node of a function's result, by a small code.
+    generic [R: Region]
+    function resultCode(run: &![Run, R], doc: Index, node: Index): Nat8 is
+        return codeOfKind(nthRef(&(run->results), doc - 1), node);
+    end;
+
+    generic [R: Region]
+    function resultText(run: &![Run, R], doc: Index, node: Index): String is
+        return fromSpan(textOf(nthRef(&(run->results), doc - 1), node));
+    end;
+
+    generic [R: Region]
+    function resultInteger(run: &![Run, R], doc: Index, node: Index): Int64 is
+        return integerOf(nthRef(&(run->results), doc - 1), node);
+    end;
+
+    generic [R: Region]
+    function resultBool(run: &![Run, R], doc: Index, node: Index): Bool is
+        return boolOf(nthRef(&(run->results), doc - 1), node);
+    end;
+
+    generic [R: Region]
+    function resultChildren(run: &![Run, R], doc: Index, node: Index): Index is
+        return childCount(nthRef(&(run->results), doc - 1), node);
+    end;
+
+    generic [R: Region]
+    function resultFirst(run: &![Run, R], doc: Index, node: Index): Option[Index] is
+        return firstChild(nthRef(&(run->results), doc - 1), node);
+    end;
+
+    generic [R: Region]
+    function resultNext(run: &![Run, R], doc: Index, node: Index): Option[Index] is
+        return nextSibling(nthRef(&(run->results), doc - 1), node);
+    end;
+
+    generic [R: Region, K: Region]
+    function resultMember(run: &![Run, R], doc: Index, node: Index, key: Span[Nat8, K]): Option[Index] is
+        return memberNamed(nthRef(&(run->results), doc - 1), node, key);
+    end;
+
+    generic [R: Region]
+    function resultElement(run: &![Run, R], doc: Index, node: Index, position: Index): Option[Index] is
+        return elementAt(nthRef(&(run->results), doc - 1), node, position);
+    end;
+
+    generic [R: Region, T: Region]
+    function resultCopyInto(run: &![Run, R], target: &![ViewData, T], list: Index, doc: Index, node: Index): Index is
+        return addCopy(&~target, list, nthRef(&(run->results), doc - 1), node);
+    end;
+
+    ---
+    --- Nodes of the data or of a result
+    ---
+
+    constant codeText: Nat8 := 1;
+    constant codeInteger: Nat8 := 2;
+    constant codeBool: Nat8 := 3;
+    constant codeList: Nat8 := 4;
+    constant codeMap: Nat8 := 5;
+    constant codeMissing: Nat8 := 6;
+    constant codeHtml: Nat8 := 7;
+
+    generic [D: Region]
+    function codeOfKind(data: &[ViewData, D], node: Index): Nat8 is
+        case kindOf(data, node) of
+            when ViewText do
+                return codeText;
+            when ViewInteger do
+                return codeInteger;
+            when ViewBool do
+                return codeBool;
+            when ViewList do
+                return codeList;
+            when ViewMap do
+                return codeMap;
+            when ViewMissing do
+                return codeMissing;
+            when ViewHtml do
+                return codeHtml;
+        end case;
+    end;
+
+    generic [D: Region, R: Region]
+    function codeAt(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index): Nat8 is
+        if doc = 0 then
+            return codeOfKind(data, node);
+        end if;
+        return resultCode(&~run, doc, node);
+    end;
+
+    generic [D: Region, R: Region]
+    function textAtNode(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index): String is
+        if doc = 0 then
+            return fromSpan(textOf(data, node));
+        end if;
+        return resultText(&~run, doc, node);
+    end;
+
+    generic [D: Region, R: Region]
+    function integerAtNode(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index): Int64 is
+        if doc = 0 then
+            return integerOf(data, node);
+        end if;
+        return resultInteger(&~run, doc, node);
+    end;
+
+    generic [D: Region, R: Region]
+    function boolAtNode(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index): Bool is
+        if doc = 0 then
+            return boolOf(data, node);
+        end if;
+        return resultBool(&~run, doc, node);
+    end;
+
+    generic [D: Region, R: Region]
+    function childrenAt(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index): Index is
+        if doc = 0 then
+            return childCount(data, node);
+        end if;
+        return resultChildren(&~run, doc, node);
+    end;
+
+    generic [D: Region, R: Region]
+    function firstAt(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index): Option[Index] is
+        if doc = 0 then
+            return firstChild(data, node);
+        end if;
+        return resultFirst(&~run, doc, node);
+    end;
+
+    generic [D: Region, R: Region]
+    function nextAt(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index): Option[Index] is
+        if doc = 0 then
+            return nextSibling(data, node);
+        end if;
+        return resultNext(&~run, doc, node);
+    end;
+
+    generic [D: Region, R: Region, K: Region]
+    function memberAt(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index, key: Span[Nat8, K]): Option[Index] is
+        if doc = 0 then
+            return memberNamed(data, node, key);
+        end if;
+        return resultMember(&~run, doc, node, key);
+    end;
+
+    generic [D: Region, R: Region]
+    function elementAtNode(data: &[ViewData, D], run: &![Run, R], doc: Index, node: Index, position: Index): Option[Index] is
+        if doc = 0 then
+            return elementAt(data, node, position);
+        end if;
+        return resultElement(&~run, doc, node, position);
+    end;
+
+    generic [D: Region, R: Region, T: Region]
+    function copyNodeInto(data: &[ViewData, D], run: &![Run, R], target: &![ViewData, T], list: Index, doc: Index,
+        node: Index): Index is
+        if doc = 0 then
+            return addCopy(&~target, list, data, node);
+        end if;
+        return resultCopyInto(&~run, &~target, list, doc, node);
+    end;
+
+    ---
+    --- Errors
+    ---
+
+    -- name:line: code: message, at the expression's or the step's place.
+    generic [P: Region]
+    function failure(program: &[Program, P], file: Index, line: Index, code: Span[Nat8, Static], message: String): String is
+        var out: StringBuilder := makeStringBuilder();
+        if file < fileCount(program) then
+            writeString(&!out, fileName(program, file));
+        else
+            writeString(&!out, "?");
+        end if;
+        writeByte(&!out, ':');
+        let digits: String := displayIndex(line);
+        writeString(&!out, asSpan(&digits));
+        destroyString(digits);
+        writeString(&!out, ": ");
+        writeString(&!out, code);
+        writeString(&!out, ": ");
+        writeString(&!out, asSpan(&message));
+        destroyString(message);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function refuse(program: &[Program, P], e: Expr, code: Span[Nat8, Static], message: Span[Nat8, Static]): Either[String, Val] is
+        return Left(left => failure(program, e.file, e.line, code, fromSpan(message)));
+    end;
+
+    generic [P: Region]
+    function refuseText(program: &[Program, P], e: Expr, code: Span[Nat8, Static], message: String): Either[String, Val] is
+        return Left(left => failure(program, e.file, e.line, code, message));
+    end;
+
+    ---
+    --- What a value is, asked
+    ---
+
+    -- The functions and catalogs of the engine, copied for a render.
+    record Calls: Linear is
+        functions: Buffer[Fn[ViewData, Either[String, ViewData]]];
+        catalogs: Buffer[Fn[ViewData, Either[String, ViewData]]];
+    end;
+
+    -- The words for what a value is, for a message.
+    function codeWords(code: Nat8): Span[Nat8, Static] is
+        if code = codeList then
+            return "a list";
+        else if code = codeMap then
+            return "a map";
+        else if code = codeMissing then
+            return "a missing value";
+        else if code = codeHtml then
+            return "HTML";
+        else if code = codeInteger then
+            return "a whole number";
+        else if code = codeBool then
+            return "a truth value";
+        end if;
+        return "a text";
+    end;
+
+    -- The code of a value: what it is, or what the node it names is; 0
+    -- for an unset slot.
+    generic [D: Region, R: Region, V: Region]
+    function codeOfVal(data: &[ViewData, D], run: &![Run, R], value: &[Val, V]): Nat8 is
+        case value of
+            when VText(text as t: &[String, V]) do
+                return codeText;
+            when VHtml(text as h: &[String, V]) do
+                return codeHtml;
+            when VUnset do
+                return 0;
+            when VNode(doc as d: &[Index, V], node as n: &[Index, V]) do
+                return codeAt(data, &~run, !d, !n);
+            when VInteger(number as i: &[Int64, V]) do
+                return codeInteger;
+            when VBool(truth as b: &[Bool, V]) do
+                return codeBool;
+            when VMissing do
+                return codeMissing;
+        end case;
+    end;
+
+    -- The text a value prints as, before it is escaped: Jinja2's spelling
+    -- of a truth value and a whole number in decimal.  A list, a map, a
+    -- missing value and an unset slot cannot be printed.
+    generic [P: Region, D: Region, R: Region]
+    function shown(program: &[Program, P], data: &[ViewData, D], run: &![Run, R], e: Expr, value: Val): Either[String, String] is
+        case value of
+            when VText(text as t: String) do
+                return Right(right => t);
+            when VHtml(text as h: String) do
+                return Right(right => h);
+            when VInteger(number as i: Int64) do
+                return Right(right => display(&i));
+            when VBool(truth as b: Bool) do
+                return Right(right => display(&b));
+            when VMissing do
+                return Left(left => failure(program, e.file, e.line, "V1004",
+                    fromLiteral("a missing value cannot be printed: ask `is not none' first")));
+            when VUnset do
+                return Left(left => failure(program, e.file, e.line, "V1000", fromLiteral("a name that was never bound")));
+            when VNode(doc as d: Index, node as n: Index) do
+                let code: Nat8 := codeAt(data, &~run, d, n);
+                if (code = codeText) or (code = codeHtml) then
+                    return Right(right => textAtNode(data, &~run, d, n));
+                else if code = codeInteger then
+                    let number: Int64 := integerAtNode(data, &~run, d, n);
+                    return Right(right => display(&number));
+                else if code = codeBool then
+                    let truth: Bool := boolAtNode(data, &~run, d, n);
+                    return Right(right => display(&truth));
+                else if code = codeMissing then
+                    return Left(left => failure(program, e.file, e.line, "V1004",
+                        fromLiteral("a missing value cannot be printed: ask `is not none' first")));
+                end if;
+                return Left(left => failure(program, e.file, e.line, "V1003", joinedText(codeWords(code),
+                    " cannot be printed")));
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function joinedText(first: Span[Nat8, A], second: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, first);
+        writeString(&!out, second);
+        return finalize(out);
+    end;
+
+    -- A whole number, or an error.
+    generic [P: Region, D: Region, R: Region]
+    function numberOf(program: &[Program, P], data: &[ViewData, D], run: &![Run, R], e: Expr, value: Val): Either[String, Int64] is
+        let code: Nat8 := codeOfVal(data, &~run, &value);
+        if code /= codeInteger then
+            destroyVal(value);
+            return Left(left => failure(program, e.file, e.line, "V1006", joinedText(codeWords(code),
+                " stands where a whole number is asked")));
+        end if;
+        case value of
+            when VInteger(number as i: Int64) do
+                return Right(right => i);
+            when VNode(doc as d: Index, node as n: Index) do
+                return Right(right => integerAtNode(data, &~run, d, n));
+            when VText(text as t: String) do
+                destroyString(t);
+            when VHtml(text as h: String) do
+                destroyString(h);
+            when VUnset do
+                skip;
+            when VBool(truth as b: Bool) do
+                skip;
+            when VMissing do
+                skip;
+        end case;
+        return Left(left => failure(program, e.file, e.line, "V1006", fromLiteral("no whole number")));
+    end;
+
+    -- A text, of the data or computed, for == and in; HTML counts as its
+    -- text.  Anything else is an error.
+    generic [P: Region, D: Region, R: Region]
+    function textValue(program: &[Program, P], data: &[ViewData, D], run: &![Run, R], e: Expr, value: Val): Either[String, String] is
+        let code: Nat8 := codeOfVal(data, &~run, &value);
+        if (code /= codeText) and (code /= codeHtml) then
+            destroyVal(value);
+            return Left(left => failure(program, e.file, e.line, "V1007", joinedText(codeWords(code),
+                " stands where a text is asked")));
+        end if;
+        return shown(program, data, &~run, e, value);
+    end;
+
+    -- Jinja2's truth: an empty text, a zero, an empty list or map and a
+    -- missing value are false.
+    generic [P: Region, D: Region, R: Region]
+    function truthOf(program: &[Program, P], data: &[ViewData, D], run: &![Run, R], e: Expr, value: Val): Either[String, Bool] is
+        case value of
+            when VText(text as t: String) do
+                let full: Bool := spanLength(asSpan(&t)) > 0;
+                destroyString(t);
+                return Right(right => full);
+            when VHtml(text as h: String) do
+                let full: Bool := spanLength(asSpan(&h)) > 0;
+                destroyString(h);
+                return Right(right => full);
+            when VInteger(number as i: Int64) do
+                return Right(right => i /= 0);
+            when VBool(truth as b: Bool) do
+                return Right(right => b);
+            when VMissing do
+                return Right(right => false);
+            when VUnset do
+                return Left(left => failure(program, e.file, e.line, "V1000", fromLiteral("a name that was never bound")));
+            when VNode(doc as d: Index, node as n: Index) do
+                let code: Nat8 := codeAt(data, &~run, d, n);
+                if (code = codeText) or (code = codeHtml) then
+                    let text: String := textAtNode(data, &~run, d, n);
+                    let full: Bool := spanLength(asSpan(&text)) > 0;
+                    destroyString(text);
+                    return Right(right => full);
+                else if code = codeInteger then
+                    return Right(right => integerAtNode(data, &~run, d, n) /= 0);
+                else if code = codeBool then
+                    return Right(right => boolAtNode(data, &~run, d, n));
+                else if code = codeMissing then
+                    return Right(right => false);
+                end if;
+                return Right(right => childrenAt(data, &~run, d, n) > 0);
+        end case;
+    end;
+
+    function boolVal(truth: Bool): Either[String, Val] is
+        return Right(right => VBool(truth => truth));
+    end;
+
+    function indexToInt(value: Index): Int64 is
+        case toInt64(value) of
+            when Some(value as n: Int64) do
+                return n;
+            when None do
+                return 9223372036854775807;
+        end case;
+    end;
+
+    ---
+    --- Expressions
+    ---
+
+    -- The segments of a path from first, count of them, joined by dots.
+    generic [P: Region]
+    function pathText(program: &[Program, P], list: Index, count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var k: Index := 0;
+        while k < count do
+            if k > 0 then
+                writeByte(&!out, '.');
+            end if;
+            writeString(&!out, textAt(program, listAt(program, list + k)));
+            k := k + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The node the segments name, walked from doc and node: each segment
+    -- a key of the map it stands on.  start: how many segments of the
+    -- path's text come before list, for the message.
+    generic [P: Region, D: Region, R: Region]
+    function walk(program: &[Program, P], data: &[ViewData, D], run: &![Run, R], e: Expr, doc: Index, node: Index,
+        list: Index, count: Index, named: Bool): Either[String, Val] is
+        var at: Index := node;
+        var k: Index := 0;
+        while k < count do
+            let segment: Span[Nat8, P] := textAt(program, listAt(program, list + k));
+            let code: Nat8 := codeAt(data, &~run, doc, at);
+            if code /= codeMap then
+                var out: StringBuilder := makeStringBuilder();
+                if (k = 0) and (not named) then
+                    writeString(&!out, "the data");
+                else
+                    let before: String := pathText(program, list, k);
+                    if named then
+                        writeString(&!out, "a value of the template");
+                        if k > 0 then
+                            writeString(&!out, ", ");
+                            writeString(&!out, asSpan(&before));
+                            writeByte(&!out, ',');
+                        end if;
+                    else
+                        writeString(&!out, asSpan(&before));
+                    end if;
+                    destroyString(before);
+                end if;
+                writeString(&!out, " is ");
+                writeString(&!out, codeWords(code));
+                writeString(&!out, ", which has no field ");
+                writeString(&!out, segment);
+                return Left(left => failure(program, e.file, e.line, "V1002", finalize(out)));
+            end if;
+            case memberAt(data, &~run, doc, at, segment) of
+                when Some(value as member: Index) do
+                    at := member;
+                when None do
+                    var out: StringBuilder := makeStringBuilder();
+                    if (k = 0) and (not named) then
+                        writeString(&!out, "the data has no ");
+                    else
+                        let before: String := pathText(program, list, k);
+                        if named then
+                            writeString(&!out, "a value of the template");
+                            if k > 0 then
+                                writeString(&!out, ", ");
+                                writeString(&!out, asSpan(&before));
+                                writeByte(&!out, ',');
+                            end if;
+                        else
+                            writeString(&!out, asSpan(&before));
+                        end if;
+                        destroyString(before);
+                        writeString(&!out, " has no ");
+                    end if;
+                    writeString(&!out, segment);
+                    return Left(left => failure(program, e.file, e.line, "V1001", finalize(out)));
+            end case;
+            k := k + 1;
+        end while;
+        return Right(right => VNode(doc => doc, node => at));
+    end;
+
+    generic [P: Region, D: Region, R: Region]
+    function slotPath(program: &[Program, P], data: &[ViewData, D], run: &![Run, R], e: Expr): Either[String, Val] is
+        let value: Val := slotCopy(&~run, e.a);
+        if e.c = 0 then
+            return Right(right => value);
+        end if;
+        case value of
+            when VNode(doc as d: Index, node as n: Index) do
+                return walk(program, data, &~run, e, d, n, e.b, e.c, true);
+            when VText(text as t: String) do
+                destroyString(t);
+            when VHtml(text as h: String) do
+                destroyString(h);
+            when VUnset do
+                skip;
+            when VInteger(number as i: Int64) do
+                skip;
+            when VBool(truth as b: Bool) do
+                skip;
+            when VMissing do
+                skip;
+        end case;
+        return refuse(program, e, "V1002", "a computed value has no fields");
+    end;
+
+    generic [R: Region]
+    function loopValue(run: &![Run, R], loop: Index, code: Index): Val is
+        let state: LoopState := loopOf(&~run, loop);
+        let counter: Int64 := indexToInt(state.counter);
+        let total: Int64 := indexToInt(state.total);
+        if code = 0 then
+            return VInteger(number => counter + 1);
+        else if code = 1 then
+            return VInteger(number => counter);
+        else if code = 2 then
+            return VInteger(number => total);
+        else if code = 3 then
+            return VInteger(number => total - counter);
+        else if code = 4 then
+            return VInteger(number => (total - counter) - 1);
+        else if code = 5 then
+            return VBool(truth => counter = 0);
+        end if;
+        return VBool(truth => (counter + 1) = total);
+    end;
+
+    -- The largest and the smallest Int64.
+    constant largestInt: Int64 := 9223372036854775807;
+    constant smallestInt: Int64 := -9223372036854775807;
+
+    -- a op b, or None when the result would leave Int64.  The smallest
+    -- Int64 itself is kept out, so that no negation can overflow.
+    function checkedArith(a: Int64, b: Int64, op: Index): Option[Int64] is
+        if op = 0 then
+            if (b > 0) and (a > (largestInt - b)) then
+                return None();
+            end if;
+            if (b < 0) and (a < (smallestInt - b)) then
+                return None();
+            end if;
+            return Some(value => a + b);
+        else if op = 1 then
+            if (b < 0) and (a > (largestInt + b)) then
+                return None();
+            end if;
+            if (b > 0) and (a < (smallestInt + b)) then
+                return None();
+            end if;
+            return Some(value => a - b);
+        end if;
+        if (a = 0) or (b = 0) then
+            return Some(value => 0);
+        end if;
+        let limit: Int64 := largestInt / absolute(b);
+        if absolute(a) > limit then
+            return None();
+        end if;
+        return Some(value => a * b);
+    end;
+
+    function absolute(value: Int64): Int64 is
+        if value < 0 then
+            return 0 - value;
+        end if;
+        return value;
+    end;
+
+    -- Python's division and remainder, which round towards minus infinity.
+    function floorDivide(a: Int64, b: Int64): Int64 is
+        let q: Int64 := a / b;
+        let r: Int64 := a - (q * b);
+        if (r /= 0) and ((r < 0) /= (b < 0)) then
+            return q - 1;
+        end if;
+        return q;
+    end;
+
+    function floorModulo(a: Int64, b: Int64): Int64 is
+        let r: Int64 := a - ((a / b) * b);
+        if (r /= 0) and ((r < 0) /= (b < 0)) then
+            return r + b;
+        end if;
+        return r;
+    end;
+
+    generic [V: Region, T: Region]
+    function textContains(value: Span[Nat8, V], part: Span[Nat8, T]): Bool is
+        -- Standard.Text searches in linear time; the empty part occurs.
+        return contains(value, part);
+    end;
+
+    -- |replace, as Standard.Template.replaceText does it, with the texts of
+    -- the template: every old by new from the left, the first limit only
+    -- when limit is not -1.
+    generic [O: Region, N: Region]
+    function replaced(text: String, old: Span[Nat8, O], new: Span[Nat8, N], limit: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        let bytes: Index := spanLength(asSpan(&text));
+        let oldSize: Index := spanLength(old);
+        var done: Int64 := 0;
+        var i: Index := 0;
+        -- Each search starts where the last match ended, in linear time
+        -- (Standard.Text.indexOf), so the whole is linear in the text.
+        var more: Bool := (oldSize > 0) and (i < bytes);
+        while more do
+            if (limit >= 0) and (done >= limit) then
+                more := false;
+            else
+                case indexOf(spanPart(asSpan(&text), i, bytes - i), old) of
+                    when Some(value as at: Index) do
+                        writeString(&!out, spanPart(asSpan(&text), i, at));
+                        writeString(&!out, new);
+                        done := done + 1;
+                        i := (i + at) + oldSize;
+                        more := i < bytes;
+                    when None do
+                        more := false;
+                end case;
+            end if;
+        end while;
+        writeString(&!out, spanPart(asSpan(&text), i, bytes - i));
+        destroyString(text);
+        return finalize(out);
+    end;
+
+    generic [Q: Region]
+    function byteAt(text: &[String, Q], at: Index): Nat8 is
+        let bytes: Span[Nat8, Q] := asSpan(text);
+        return bytes[at];
+    end;
+
+    generic [T: Region]
+    function codePoints(text: Span[Nat8, T]): Index is
+        var points: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let b: Nat8 := text[i];
+            if (b < 128) or (b >= 192) then
+                points := points + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return points;
+    end;
+
+    -- The byte where the code point numbered wanted begins, or the length.
+    generic [T: Region]
+    function codePointOffset(text: Span[Nat8, T], wanted: Index): Index is
+        let total: Index := spanLength(text);
+        var seen: Index := 0;
+        var i: Index := 0;
+        while i < total do
+            let b: Nat8 := text[i];
+            if (b < 128) or (b >= 192) then
+                if seen = wanted then
+                    return i;
+                end if;
+                seen := seen + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    -- |truncate, as Standard.Template.truncate does it.
+    generic [E: Region]
+    function truncated(text: String, limit: Index, killWords: Bool, ending: Span[Nat8, E], leeway: Index): String is
+        if codePoints(asSpan(&text)) <= (limit + leeway) then
+            return text;
+        end if;
+        let keep: Index := limit - codePoints(ending);
+        var cut: Index := codePointOffset(asSpan(&text), keep);
+        if not killWords then
+            var last: Index := cut;
+            var i: Index := 0;
+            while i < cut do
+                if byteAt(&text, i) = ' ' then
+                    last := i;
+                end if;
+                i := i + 1;
+            end while;
+            cut := last;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, spanPart(asSpan(&text), 0, cut));
+        writeString(&!out, ending);
+        destroyString(text);
+        return finalize(out);
+    end;
+
+    function intToIndex(value: Int64): Index is
+        case toIndex(value) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- How many times old stands in text from the left, not overlapping,
+    -- the first limit only when limit is not -1: what |replace replaces.
+    generic [T: Region, O: Region]
+    function occurrences(text: Span[Nat8, T], old: Span[Nat8, O], limit: Int64): Index is
+        let bytes: Index := spanLength(text);
+        let oldSize: Index := spanLength(old);
+        if oldSize = 0 then
+            return 0;
+        end if;
+        var count: Index := 0;
+        var done: Int64 := 0;
+        var i: Index := 0;
+        -- As replaced finds them, each search from the end of the last.
+        var more: Bool := i < bytes;
+        while more do
+            if (limit >= 0) and (done >= limit) then
+                more := false;
+            else
+                case indexOf(spanPart(text, i, bytes - i), old) of
+                    when Some(value as at: Index) do
+                        count := count + 1;
+                        done := done + 1;
+                        i := (i + at) + oldSize;
+                        more := i < bytes;
+                    when None do
+                        more := false;
+                end case;
+            end if;
+        end while;
+        return count;
+    end;
+
+    -- How long the text grows under the filter at most: |replace by new
+    -- for each old, |center to its width, any other filter within three
+    -- times its length (a letter's upper case may take more bytes).
+    generic [P: Region, T: Region]
+    function filteredBound(program: &[Program, P], e: Expr, text: Span[Nat8, T]): Index is
+        let size: Index := spanLength(text);
+        let code: Index := e.c;
+        if code = 5 then
+            let count: Index := occurrences(text, textAt(program, listAt(program, e.b)), e.number);
+            return size + (count * spanLength(textAt(program, listAt(program, e.b + 1))));
+        else if code > 6 then
+            let width: Index := intToIndex(e.number);
+            if width > size then
+                return width;
+            end if;
+            return size;
+        end if;
+        return size * 3;
+    end;
+
+    -- A filter of a value: the code and arguments the program gives.
+    generic [P: Region]
+    function applyFilter(program: &[Program, P], e: Expr, text: String): String is
+        let code: Index := e.c;
+        if code = 0 then
+            return upper(text);
+        else if code = 1 then
+            return lower(text);
+        else if code = 2 then
+            return trim(text);
+        else if code = 3 then
+            return capitalize(text);
+        else if code = 4 then
+            return title(text);
+        else if code = 5 then
+            return replaced(text, textAt(program, listAt(program, e.b)), textAt(program, listAt(program, e.b + 1)),
+                e.number);
+        else if code = 6 then
+            let kill: Bool := listAt(program, e.b + 1) = 1;
+            return truncated(text, intToIndex(e.number), kill, textAt(program, listAt(program, e.b)),
+                listAt(program, e.b + 2));
+        end if;
+        return center(text, intToIndex(e.number));
+    end;
+
+    -- The truth of the expression at at.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function condition(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], at: Index): Either[String, Bool] is
+        let e: Expr := exprAt(program, at);
+        case evaluate(program, calls, data, &~run, at) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                return truthOf(program, data, &~run, e, value);
+        end case;
+    end;
+
+    -- The whole number of the expression at at.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function numberAt(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], at: Index): Either[String, Int64] is
+        let e: Expr := exprAt(program, at);
+        case evaluate(program, calls, data, &~run, at) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                return numberOf(program, data, &~run, e, value);
+        end case;
+    end;
+
+    -- The printed text of the expression at at.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function shownAt(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], at: Index): Either[String, String] is
+        let e: Expr := exprAt(program, at);
+        case evaluate(program, calls, data, &~run, at) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                return shown(program, data, &~run, e, value);
+        end case;
+    end;
+
+    -- The bytes of a text or HTML value, 0 for any other.
+    generic [V: Region]
+    function sizeOfVal(value: &[Val, V]): Index is
+        case value of
+            when VText(text as t: &[String, V]) do
+                return spanLength(asSpan(t));
+            when VHtml(text as h: &[String, V]) do
+                return spanLength(asSpan(h));
+            when VUnset do
+                return 0;
+            when VNode(doc as d: &[Index, V], node as n: &[Index, V]) do
+                return 0;
+            when VInteger(number as i: &[Int64, V]) do
+                return 0;
+            when VBool(truth as b: &[Bool, V]) do
+                return 0;
+            when VMissing do
+                return 0;
+        end case;
+    end;
+
+    -- The value of the expression at at, its bytes counted: all a render
+    -- makes, kept or not, comes to at most mostMadeBytes.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function evaluate(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], at: Index): Either[String, Val] is
+        case evaluateRaw(program, calls, data, &~run, at) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                run->made := run->made + sizeOfVal(&value);
+                if run->made > mostMadeBytes() then
+                    destroyVal(value);
+                    return refuse(program, exprAt(program, at), "V1018", "the texts the page makes come to more than 64 MiB, the most a render makes");
+                end if;
+                return Right(right => value);
+        end case;
+    end;
+
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function evaluateRaw(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], at: Index): Either[String, Val] is
+        let e: Expr := exprAt(program, at);
+        let op: Nat8 := e.op;
+        if op = exprText then
+            return Right(right => VText(text => fromSpan(textAt(program, e.a))));
+        else if op = exprInteger then
+            return Right(right => VInteger(number => e.number));
+        else if op = exprBool then
+            return boolVal(e.number = 1);
+        else if op = exprData then
+            if codeAt(data, &~run, 0, rootNode()) /= codeMap then
+                return refuse(program, e, "V1002", "the data is no map, so it has no names");
+            end if;
+            return walk(program, data, &~run, e, 0, rootNode(), e.a, e.b, false);
+        else if op = exprSlot then
+            return slotPath(program, data, &~run, e);
+        else if op = exprLoop then
+            return Right(right => loopValue(&~run, e.a, e.b));
+        else if op = exprCycle then
+            let state: LoopState := loopOf(&~run, e.a);
+            let which: Index := rem(state.counter, e.c);
+            return Right(right => VText(text => fromSpan(textAt(program, listAt(program, e.b + which)))));
+        else if op = exprNot then
+            case condition(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as truth: Bool) do
+                    return boolVal(not truth);
+            end case;
+        else if (op = exprAnd) or (op = exprOr) then
+            case condition(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as first: Bool) do
+                    if (op = exprAnd) and (not first) then
+                        return boolVal(false);
+                    end if;
+                    if (op = exprOr) and first then
+                        return boolVal(true);
+                    end if;
+                    case condition(program, calls, data, &~run, e.b) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as second: Bool) do
+                            return boolVal(second);
+                    end case;
+            end case;
+        else if op = exprTruth then
+            case condition(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as truth: Bool) do
+                    return boolVal(truth);
+            end case;
+        else if op = exprTextEquals then
+            case evaluate(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as value: Val) do
+                    case textValue(program, data, &~run, e, value) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as text: String) do
+                            let same: Bool := equal(asSpan(&text), textAt(program, e.b));
+                            destroyString(text);
+                            return boolVal(same /= (e.number = 1));
+                    end case;
+            end case;
+        else if op = exprCompare then
+            case numberAt(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as a: Int64) do
+                    case numberAt(program, calls, data, &~run, e.b) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as b: Int64) do
+                            return boolVal(compared(a, b, e.c));
+                    end case;
+            end case;
+        else if op = exprIsNone then
+            case evaluate(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as value: Val) do
+                    let present: Bool := codeOfVal(data, &~run, &value) /= codeMissing;
+                    destroyVal(value);
+                    if e.number = 1 then
+                        return boolVal(present);
+                    end if;
+                    return boolVal(not present);
+            end case;
+        else if op = exprIn then
+            return holds(program, calls, data, &~run, e);
+        else if op = exprConcat then
+            return joinedValues(program, calls, data, &~run, e);
+        else if op = exprArith then
+            case numberAt(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as a: Int64) do
+                    case numberAt(program, calls, data, &~run, e.b) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as b: Int64) do
+                            case checkedArith(a, b, e.c) of
+                                when Some(value as result: Int64) do
+                                    return Right(right => VInteger(number => result));
+                                when None do
+                                    return refuse(program, e, "V1010", "the result leaves the whole numbers of Int64");
+                            end case;
+                    end case;
+            end case;
+        else if (op = exprFloorDivide) or (op = exprModulo) then
+            case numberAt(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as a: Int64) do
+                    if (a < smallestInt) and (e.number = -1) then
+                        return refuse(program, e, "V1010", "the result leaves the whole numbers of Int64");
+                    end if;
+                    if op = exprFloorDivide then
+                        return Right(right => VInteger(number => floorDivide(a, e.number)));
+                    end if;
+                    return Right(right => VInteger(number => floorModulo(a, e.number)));
+            end case;
+        else if op = exprCond then
+            case condition(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as truth: Bool) do
+                    if truth then
+                        return evaluate(program, calls, data, &~run, e.b);
+                    end if;
+                    if e.c = 0 then
+                        return Right(right => VText(text => makeEmpty()));
+                    end if;
+                    return evaluate(program, calls, data, &~run, e.c);
+            end case;
+        else if op = exprFilter then
+            case evaluate(program, calls, data, &~run, e.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as value: Val) do
+                    let html: Bool := codeOfVal(data, &~run, &value) = codeHtml;
+                    case shown(program, data, &~run, e, value) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as text: String) do
+                            if e.c = 5 then
+                                -- Two searches, one to bound the text and one to replace.
+                                run->searched := run->searched
+                                    + (2 * (spanLength(asSpan(&text)) + spanLength(textAt(program, listAt(program, e.b)))));
+                                if run->searched > mostComparedBytes() then
+                                    destroyString(text);
+                                    return refuse(program, e, "V1020", "searching texts takes more than 67108864 bytes searched, the most a render searches");
+                                end if;
+                            end if;
+                            if filteredBound(program, e, asSpan(&text)) > mostMadeBytes() then
+                                destroyString(text);
+                                return refuse(program, e, "V1018", "the texts the page makes come to more than 64 MiB, the most a render makes");
+                            end if;
+                            let made: String := applyFilter(program, e, text);
+                            if html then
+                                return Right(right => VHtml(text => made));
+                            end if;
+                            return Right(right => VText(text => made));
+                    end case;
+            end case;
+        else if op = exprJoin then
+            return joinedList(program, calls, data, &~run, e);
+        else if op = exprLength then
+            return lengthOf(program, calls, data, &~run, e);
+        else if op = exprCall then
+            return called(program, calls, data, &~run, e);
+        else if op = exprScriptValue then
+            return scriptValue(program, calls, data, &~run, e);
+        else if op = exprTranslate then
+            return translated(program, calls, data, &~run, e);
+        end if;
+        return refuse(program, e, "V1000", "an expression the engine does not know");
+    end;
+
+    function compared(a: Int64, b: Int64, op: Index): Bool is
+        if op = 0 then
+            return a = b;
+        else if op = 1 then
+            return a /= b;
+        else if op = 2 then
+            return a < b;
+        else if op = 3 then
+            return a <= b;
+        else if op = 4 then
+            return a > b;
+        end if;
+        return a >= b;
+    end;
+
+    -- in: a text in a text, or a text among the printed elements of a
+    -- list.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function holds(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], e: Expr): Either[String, Val] is
+        let needleExpr: Expr := exprAt(program, e.a);
+        case evaluate(program, calls, data, &~run, e.a) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as needleValue: Val) do
+                case textValue(program, data, &~run, needleExpr, needleValue) of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as needle: String) do
+                        case evaluate(program, calls, data, &~run, e.b) of
+                            when Left(left as message: String) do
+                                destroyString(needle);
+                                return Left(left => message);
+                            when Right(right as hay: Val) do
+                                let code: Nat8 := codeOfVal(data, &~run, &hay);
+                                if code = codeList then
+                                    case hay of
+                                        when VNode(doc as d: Index, node as n: Index) do
+                                            let found: Either[String, Bool] := amongElements(program, data, &~run, e, d, n,
+                                                asSpan(&needle));
+                                            destroyString(needle);
+                                            case found of
+                                                when Left(left as message: String) do
+                                                    return Left(left => message);
+                                                when Right(right as truth: Bool) do
+                                                    return boolVal(truth /= (e.number = 1));
+                                            end case;
+                                        when VText(text as t: String) do
+                                            destroyString(t);
+                                        when VHtml(text as h: String) do
+                                            destroyString(h);
+                                        when VUnset do
+                                            skip;
+                                        when VInteger(number as i: Int64) do
+                                            skip;
+                                        when VBool(truth as b: Bool) do
+                                            skip;
+                                        when VMissing do
+                                            skip;
+                                    end case;
+                                    destroyString(needle);
+                                    return refuse(program, e, "V1008", "in asks a text or a list");
+                                end if;
+                                if (code /= codeText) and (code /= codeHtml) then
+                                    destroyVal(hay);
+                                    destroyString(needle);
+                                    return refuseText(program, e, "V1008", joinedText(codeWords(code),
+                                        " stands where in asks a text or a list"));
+                                end if;
+                                case shown(program, data, &~run, e, hay) of
+                                    when Left(left as message: String) do
+                                        destroyString(needle);
+                                        return Left(left => message);
+                                    when Right(right as text: String) do
+                                        run->searched := run->searched + (spanLength(asSpan(&text)) + spanLength(asSpan(&needle)));
+                                        if run->searched > mostComparedBytes() then
+                                            destroyString(text);
+                                            destroyString(needle);
+                                            return refuse(program, e, "V1020", "searching texts takes more than 67108864 bytes searched, the most a render searches");
+                                        end if;
+                                        let found: Bool := textContains(asSpan(&text), asSpan(&needle));
+                                        destroyString(text);
+                                        destroyString(needle);
+                                        return boolVal(found /= (e.number = 1));
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- Whether one of the elements of the list prints as needle.
+    generic [P: Region, D: Region, R: Region, N: Region]
+    function amongElements(program: &[Program, P], data: &[ViewData, D], run: &![Run, R], e: Expr, doc: Index,
+        list: Index, needle: Span[Nat8, N]): Either[String, Bool] is
+        var element: Option[Index] := firstAt(data, &~run, doc, list);
+        var found: Bool := false;
+        var going: Bool := true;
+        while going do
+            case element of
+                when Some(value as at: Index) do
+                    case shown(program, data, &~run, e, VNode(doc => doc, node => at)) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as text: String) do
+                            if equal(asSpan(&text), needle) then
+                                found := true;
+                            end if;
+                            destroyString(text);
+                    end case;
+                    element := nextAt(data, &~run, doc, at);
+                when None do
+                    going := false;
+            end case;
+        end while;
+        return Right(right => found);
+    end;
+
+    -- ~: the two printed texts one after the other.  HTML cannot be
+    -- joined: it would come out half escaped.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function joinedValues(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], e: Expr): Either[String, Val] is
+        case evaluate(program, calls, data, &~run, e.a) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as a: Val) do
+                if codeOfVal(data, &~run, &a) = codeHtml then
+                    destroyVal(a);
+                    return refuse(program, e, "V1016", "~ joins texts that are escaped when printed; HTML cannot be joined to them");
+                end if;
+                case shown(program, data, &~run, e, a) of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as first: String) do
+                        case evaluate(program, calls, data, &~run, e.b) of
+                            when Left(left as message: String) do
+                                destroyString(first);
+                                return Left(left => message);
+                            when Right(right as b: Val) do
+                                if codeOfVal(data, &~run, &b) = codeHtml then
+                                    destroyVal(b);
+                                    destroyString(first);
+                                    return refuse(program, e, "V1016",
+                                        "~ joins texts that are escaped when printed; HTML cannot be joined to them");
+                                end if;
+                                case shown(program, data, &~run, e, b) of
+                                    when Left(left as message: String) do
+                                        destroyString(first);
+                                        return Left(left => message);
+                                    when Right(right as second: String) do
+                                        return Right(right => VText(text => concat(first, second)));
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- |join: the printed elements of a list with the separator between.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function joinedList(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], e: Expr): Either[String, Val] is
+        case evaluate(program, calls, data, &~run, e.a) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                let code: Nat8 := codeOfVal(data, &~run, &value);
+                case value of
+                    when VNode(doc as d: Index, node as n: Index) do
+                        if code = codeList then
+                            var out: StringBuilder := makeStringBuilder();
+                            var element: Option[Index] := firstAt(data, &~run, d, n);
+                            var first: Bool := true;
+                            var going: Bool := true;
+                            var size: Index := 0;
+                            while going do
+                                case element of
+                                    when Some(value as at: Index) do
+                                        if not first then
+                                            writeString(&!out, textAt(program, e.b));
+                                        end if;
+                                        first := false;
+                                        case shown(program, data, &~run, e, VNode(doc => d, node => at)) of
+                                            when Left(left as message: String) do
+                                                destroyString(finalize(out));
+                                                return Left(left => message);
+                                            when Right(right as text: String) do
+                                                writeString(&!out, asSpan(&text));
+                                                size := (size + spanLength(asSpan(&text))) + spanLength(textAt(program, e.b));
+                                                destroyString(text);
+                                                if size > mostMadeBytes() then
+                                                    destroyString(finalize(out));
+                                                    return refuse(program, e, "V1018", "the texts the page makes come to more than 64 MiB, the most a render makes");
+                                                end if;
+                                        end case;
+                                        element := nextAt(data, &~run, d, at);
+                                    when None do
+                                        going := false;
+                                end case;
+                            end while;
+                            return Right(right => VText(text => finalize(out)));
+                        end if;
+                    when VText(text as t: String) do
+                        destroyString(t);
+                    when VHtml(text as h: String) do
+                        destroyString(h);
+                    when VUnset do
+                        skip;
+                    when VInteger(number as i: Int64) do
+                        skip;
+                    when VBool(truth as b: Bool) do
+                        skip;
+                    when VMissing do
+                        skip;
+                end case;
+                return refuseText(program, e, "V1014", joinedText(codeWords(code), " stands where |join asks a list"));
+        end case;
+    end;
+
+    -- |length: the code points of a text, the elements of a list.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function lengthOf(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], e: Expr): Either[String, Val] is
+        case evaluate(program, calls, data, &~run, e.a) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                let code: Nat8 := codeOfVal(data, &~run, &value);
+                if code = codeList then
+                    case value of
+                        when VNode(doc as d: Index, node as n: Index) do
+                            return Right(right => VInteger(number => indexToInt(childrenAt(data, &~run, d, n))));
+                        when VText(text as t: String) do
+                            destroyString(t);
+                        when VHtml(text as h: String) do
+                            destroyString(h);
+                        when VUnset do
+                            skip;
+                        when VInteger(number as i: Int64) do
+                            skip;
+                        when VBool(truth as b: Bool) do
+                            skip;
+                        when VMissing do
+                            skip;
+                    end case;
+                    return refuse(program, e, "V1015", "|length asks a text or a list");
+                end if;
+                if (code = codeText) or (code = codeHtml) then
+                    case shown(program, data, &~run, e, value) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as text: String) do
+                            let points: Index := codePoints(asSpan(&text));
+                            destroyString(text);
+                            return Right(right => VInteger(number => indexToInt(points)));
+                    end case;
+                end if;
+                destroyVal(value);
+                return refuseText(program, e, "V1015", joinedText(codeWords(code), " stands where |length asks a text or a list"));
+        end case;
+    end;
+
+    -- A value added to the end of a list of a document of arguments.
+    generic [D: Region, R: Region, T: Region]
+    function addArgument(data: &[ViewData, D], run: &![Run, R], target: &![ViewData, T], list: Index, value: Val): Unit is
+        case value of
+            when VText(text as t: String) do
+                let made: Index := addText(&~target, list, asSpan(&t));
+                destroyString(t);
+            when VHtml(text as h: String) do
+                let made: Index := addText(&~target, list, asSpan(&h));
+                destroyString(h);
+            when VInteger(number as i: Int64) do
+                let made: Index := addInteger(&~target, list, i);
+            when VBool(truth as b: Bool) do
+                let made: Index := addBool(&~target, list, b);
+            when VMissing do
+                let made: Index := addMissing(&~target, list);
+            when VUnset do
+                let made: Index := addMissing(&~target, list);
+            when VNode(doc as d: Index, node as n: Index) do
+                let made: Index := copyNodeInto(data, &~run, &~target, list, d, n);
+        end case;
+        return nil;
+    end;
+
+    -- The value a function gave: a text, number, truth value, missing value
+    -- or HTML at its root as it is; a list or a map kept for the rest of
+    -- the render.
+    generic [R: Region]
+    function fromResult(run: &![Run, R], result: ViewData): Val is
+        case kindOf(&result, rootNode()) of
+            when ViewText do
+                let text: String := fromSpan(textOf(&result, rootNode()));
+                destroyViewData(result);
+                return VText(text => text);
+            when ViewHtml do
+                let text: String := fromSpan(textOf(&result, rootNode()));
+                destroyViewData(result);
+                return VHtml(text => text);
+            when ViewInteger do
+                let number: Int64 := integerOf(&result, rootNode());
+                destroyViewData(result);
+                return VInteger(number => number);
+            when ViewBool do
+                let truth: Bool := boolOf(&result, rootNode());
+                destroyViewData(result);
+                return VBool(truth => truth);
+            when ViewMissing do
+                destroyViewData(result);
+                return VMissing();
+            when ViewList do
+                pushResult(&~run, result);
+                return VNode(doc => resultCount(&~run), node => rootNode());
+            when ViewMap do
+                pushResult(&~run, result);
+                return VNode(doc => resultCount(&~run), node => rootNode());
+        end case;
+    end;
+
+    generic [K: Region]
+    function functionOf(calls: &[Calls, K], at: Index): Fn[ViewData, Either[String, ViewData]] is
+        return nth(&(calls->functions), at);
+    end;
+
+    generic [K: Region]
+    function catalogOf(calls: &[Calls, K], at: Index): Fn[ViewData, Either[String, ViewData]] is
+        return nth(&(calls->catalogs), at);
+    end;
+
+    -- A call of a function: its arguments copied into a list, its result
+    -- taken as a value.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function called(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], e: Expr): Either[String, Val] is
+        var arguments: ViewData := makeListData();
+        var k: Index := 0;
+        while k < e.c do
+            case evaluate(program, calls, data, &~run, listAt(program, e.b + k)) of
+                when Left(left as message: String) do
+                    destroyViewData(arguments);
+                    return Left(left => message);
+                when Right(right as value: Val) do
+                    addArgument(data, &~run, &!arguments, rootNode(), value);
+            end case;
+            k := k + 1;
+        end while;
+        run->nodes := run->nodes + nodeCount(&arguments);
+        if run->nodes > mostMadeNodes() then
+            destroyViewData(arguments);
+            return refuse(program, e, "V1019", "the values the functions are given and give come to more than 4194304 nodes, the most a render makes");
+        end if;
+        let callable: Fn[ViewData, Either[String, ViewData]] := functionOf(calls, e.a);
+        case callable(arguments) of
+            when Left(left as message: String) do
+                return refuseText(program, e, "V1011", message);
+            when Right(right as result: ViewData) do
+                run->nodes := run->nodes + nodeCount(&result);
+                if run->nodes > mostMadeNodes() then
+                    destroyViewData(result);
+                    return refuse(program, e, "V1019", "the values the functions are given and give come to more than 4194304 nodes, the most a render makes");
+                end if;
+                return Right(right => fromResult(&~run, result));
+        end case;
+    end;
+
+    -- A translation: the catalog given a map of lang, key, count and the
+    -- arguments printed, and its text taken.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function translated(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], e: Expr): Either[String, Val] is
+        var request: ViewData := makeMapData();
+        let root: Index := rootNode();
+        let key: Index := putText(&!request, root, "key", textAt(program, listAt(program, e.b)));
+        case shownAt(program, calls, data, &~run, listAt(program, e.b + 1)) of
+            when Left(left as message: String) do
+                destroyViewData(request);
+                return Left(left => message);
+            when Right(right as lang: String) do
+                let langNode: Index := putText(&!request, root, "lang", asSpan(&lang));
+                destroyString(lang);
+        end case;
+        let countAt: Index := listAt(program, e.b + 2);
+        if countAt = 0 then
+            let none: Index := putMissing(&!request, root, "count");
+        else
+            case numberAt(program, calls, data, &~run, countAt - 1) of
+                when Left(left as message: String) do
+                    destroyViewData(request);
+                    return Left(left => message);
+                when Right(right as count: Int64) do
+                    let countNode: Index := putInteger(&!request, root, "count", count);
+            end case;
+        end if;
+        let arguments: Index := putMap(&!request, root, "arguments");
+        var k: Index := 0;
+        while k < e.c do
+            let name: Span[Nat8, P] := textAt(program, listAt(program, (e.b + 3) + (2 * k)));
+            case shownAt(program, calls, data, &~run, listAt(program, (e.b + 4) + (2 * k))) of
+                when Left(left as message: String) do
+                    destroyViewData(request);
+                    return Left(left => message);
+                when Right(right as text: String) do
+                    let argument: Index := putText(&!request, arguments, name, asSpan(&text));
+                    destroyString(text);
+            end case;
+            k := k + 1;
+        end while;
+        let catalog: Fn[ViewData, Either[String, ViewData]] := catalogOf(calls, e.a);
+        case catalog(request) of
+            when Left(left as message: String) do
+                return refuseText(program, e, "V1017", message);
+            when Right(right as result: ViewData) do
+                if isTextual(&result, rootNode()) then
+                    let text: String := fromSpan(textOf(&result, rootNode()));
+                    destroyViewData(result);
+                    return Right(right => VText(text => text));
+                end if;
+                destroyViewData(result);
+                return refuse(program, e, "V1017", "the catalog gave no text");
+        end case;
+    end;
+
+    -- A value where a JavaScript expression goes, as Go's html/template
+    -- writes it: mode 0 by its kind, 1 a whole number bare between
+    -- spaces, 2 the printed text as a string literal.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function scriptValue(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R], e: Expr): Either[String, Val] is
+        case evaluate(program, calls, data, &~run, e.a) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                let code: Nat8 := codeOfVal(data, &~run, &value);
+                if e.number = 2 then
+                    case shown(program, data, &~run, e, value) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as text: String) do
+                            return Right(right => VText(text => jsQuote(text)));
+                    end case;
+                end if;
+                if code = codeInteger then
+                    case numberOf(program, data, &~run, e, value) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as number: Int64) do
+                            return Right(right => VText(text => jsValue(&number)));
+                    end case;
+                end if;
+                if e.number = 1 then
+                    destroyVal(value);
+                    return refuseText(program, e, "V1006", joinedText(codeWords(code), " stands where a whole number is asked"));
+                end if;
+                if code = codeBool then
+                    case truthOf(program, data, &~run, e, value) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as truth: Bool) do
+                            return Right(right => VText(text => jsValue(&truth)));
+                    end case;
+                end if;
+                if code = codeText then
+                    case shown(program, data, &~run, e, value) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as text: String) do
+                            return Right(right => VText(text => jsQuote(text)));
+                    end case;
+                end if;
+                destroyVal(value);
+                if code = codeHtml then
+                    return refuse(program, e, "V1005", "a value of HTML stands in HTML text only, not in JavaScript");
+                end if;
+                if code = codeMissing then
+                    return refuse(program, e, "V1004", "a missing value cannot be printed: ask `is not none' first");
+                end if;
+                return refuseText(program, e, "V1003", joinedText(codeWords(code), " cannot be printed"));
+        end case;
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    -- text escaped with the writer of its place, or as it is.
+    function escaped(writer: Writer, raw: Bool, text: String): String is
+        var out: StringBuilder := makeStringBuilder();
+        if raw then
+            writeRaw(&!out, text);
+            return finalize(out);
+        end if;
+        case writer of
+            when HtmlWriter do
+                writeHtml(&!out, text);
+            when UrlWriter do
+                writeUrl(&!out, text);
+            when UrlPathWriter do
+                writeUrlPath(&!out, text);
+            when UrlQueryWriter do
+                writeUrlQuery(&!out, text);
+            when ScriptWriter do
+                writeRaw(&!out, text);
+            when ScriptAttributeWriter do
+                writeHtml(&!out, text);
+            when JsStringWriter do
+                writeJsString(&!out, text);
+            when JsStringAttributeWriter do
+                writeJsStringAttribute(&!out, text);
+            when CssValueWriter do
+                writeCssValue(&!out, text);
+            when CssValueAttributeWriter do
+                writeCssValueAttribute(&!out, text);
+            when CssStringWriter do
+                writeCssString(&!out, text);
+            when CssStringAttributeWriter do
+                writeCssStringAttribute(&!out, text);
+        end case;
+        return finalize(out);
+    end;
+
+    function isHtmlWriter(writer: Writer): Bool is
+        case writer of
+            when HtmlWriter do
+                return true;
+            when UrlWriter do
+                return false;
+            when UrlPathWriter do
+                return false;
+            when UrlQueryWriter do
+                return false;
+            when ScriptWriter do
+                return false;
+            when ScriptAttributeWriter do
+                return false;
+            when JsStringWriter do
+                return false;
+            when JsStringAttributeWriter do
+                return false;
+            when CssValueWriter do
+                return false;
+            when CssValueAttributeWriter do
+                return false;
+            when CssStringWriter do
+                return false;
+            when CssStringAttributeWriter do
+                return false;
+        end case;
+    end;
+
+    -- text written where the render writes now: into the innermost block
+    -- being kept, or into out.  False when it would pass mostOutputBytes.
+    generic [R: Region, B: Region, T: Region]
+    function writeOut(run: &![Run, R], out: &![StringBuilder, B], text: Span[Nat8, T]): Bool is
+        let total: Index := run->written + spanLength(text);
+        if total > mostOutputBytes() then
+            return false;
+        end if;
+        run->written := total;
+        if captureCount(&~run) > 0 then
+            var top: StringBuilder := popCapture(&~run);
+            writeString(&!top, text);
+            pushCapture(&~run, top);
+        else
+            writeString(&~out, text);
+        end if;
+        return true;
+    end;
+
+    generic [P: Region]
+    function tooMuch(program: &[Program, P], step: Step): Either[String, Unit] is
+        return Left(left => failure(program, step.file, step.line, "V1013",
+            fromLiteral("the page grows larger than 16 MiB, the most a render writes")));
+    end;
+
+    -- A value written by a step: escaped for its place, or as it is when
+    -- the template marked it |safe.  HTML goes out as it is in HTML text,
+    -- and is an error anywhere else.
+    generic [P: Region, K: Region, D: Region, R: Region, B: Region]
+    function writeValue(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R],
+        out: &![StringBuilder, B], step: Step): Either[String, Unit] is
+        let e: Expr := exprAt(program, step.a);
+        case evaluate(program, calls, data, &~run, step.a) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                let html: Bool := codeOfVal(data, &~run, &value) = codeHtml;
+                var raw: Bool := step.raw;
+                if html and (not raw) then
+                    if step.inText and isHtmlWriter(step.writer) then
+                        raw := true;
+                    else
+                        destroyVal(value);
+                        return Left(left => failure(program, step.file, step.line, "V1005",
+                            fromLiteral("a value of HTML is written in HTML text only, not here")));
+                    end if;
+                end if;
+                case shown(program, data, &~run, e, value) of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as text: String) do
+                        let made: String := escaped(step.writer, raw, text);
+                        let fits: Bool := writeOut(&~run, &~out, asSpan(&made));
+                        destroyString(made);
+                        if not fits then
+                            return tooMuch(program, step);
+                        end if;
+                        return Right(right => nil);
+                end case;
+        end case;
+    end;
+
+    ---
+    --- Loops
+    ---
+
+    -- A for enters its list: the value must be a list.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function enterLoop(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R],
+        step: Step): Either[String, Unit] is
+        let e: Expr := exprAt(program, step.b);
+        case evaluate(program, calls, data, &~run, step.b) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                let code: Nat8 := codeOfVal(data, &~run, &value);
+                case value of
+                    when VNode(doc as d: Index, node as n: Index) do
+                        if code = codeList then
+                            var state: LoopState := LoopState(doc => d, list => n, cursor => 0, hasCursor => false,
+                                counter => 0, total => 0);
+                            case firstAt(data, &~run, d, n) of
+                                when Some(value as first: Index) do
+                                    state.cursor := first;
+                                    state.hasCursor := true;
+                                when None do
+                                    skip;
+                            end case;
+                            if step.c = 0 then
+                                state.total := childrenAt(data, &~run, d, n);
+                            end if;
+                            storeLoop(&~run, step.a, state);
+                            return Right(right => nil);
+                        end if;
+                    when VText(text as t: String) do
+                        destroyString(t);
+                    when VHtml(text as h: String) do
+                        destroyString(h);
+                    when VUnset do
+                        skip;
+                    when VInteger(number as i: Int64) do
+                        skip;
+                    when VBool(truth as b: Bool) do
+                        skip;
+                    when VMissing do
+                        skip;
+                end case;
+                return Left(left => failure(program, e.file, e.line, "V1008", joinedText(codeWords(code),
+                    " stands where a for walks a list")));
+        end case;
+    end;
+
+    -- The element a for stands on bound to its names: one name takes the
+    -- element, two or three the first, second and third of a map that has
+    -- them, or of a list.  False when the list is done.
+    generic [P: Region, D: Region, R: Region]
+    function bindItem(program: &[Program, P], data: &[ViewData, D], run: &![Run, R], step: Step): Either[String, Bool] is
+        let state: LoopState := loopOf(&~run, step.a);
+        if not state.hasCursor then
+            return Right(right => false);
+        end if;
+        if run->turns >= mostLoopTurns() then
+            return Left(left => failure(program, step.file, step.line, "V1012",
+                fromLiteral("the loops of the page turn more than 1000000 times, the most a render takes")));
+        end if;
+        run->turns := run->turns + 1;
+        let names: Index := step.d;
+        if names = 1 then
+            storeSlot(&~run, listAt(program, step.c), VNode(doc => state.doc, node => state.cursor));
+            return Right(right => true);
+        end if;
+        let code: Nat8 := codeAt(data, &~run, state.doc, state.cursor);
+        var k: Index := 0;
+        while k < names do
+            var part: Option[Index] := None();
+            if code = codeMap then
+                var key: Span[Nat8, Static] := "first";
+                if k = 1 then
+                    key := "second";
+                else if k = 2 then
+                    key := "third";
+                end if;
+                part := memberAt(data, &~run, state.doc, state.cursor, key);
+            else if code = codeList then
+                part := elementAtNode(data, &~run, state.doc, state.cursor, k);
+            end if;
+            case part of
+                when Some(value as at: Index) do
+                    storeSlot(&~run, listAt(program, step.c + k), VNode(doc => state.doc, node => at));
+                when None do
+                    return Left(left => failure(program, step.file, step.line, "V1009",
+                        fromLiteral("for a, b in ... takes a map with first and second (and third), or a list of as many elements")));
+            end case;
+            k := k + 1;
+        end while;
+        return Right(right => true);
+    end;
+
+    generic [D: Region, R: Region]
+    function stepLoop(data: &[ViewData, D], run: &![Run, R], step: Step): Unit is
+        var state: LoopState := loopOf(&~run, step.a);
+        if step.c = 1 then
+            state.counter := state.counter + 1;
+        end if;
+        if state.hasCursor then
+            case nextAt(data, &~run, state.doc, state.cursor) of
+                when Some(value as next: Index) do
+                    state.cursor := next;
+                when None do
+                    state.hasCursor := false;
+            end case;
+        end if;
+        storeLoop(&~run, step.a, state);
+        return nil;
+    end;
+
+    generic [D: Region, R: Region]
+    function restartLoop(data: &[ViewData, D], run: &![Run, R], loop: Index): Unit is
+        var state: LoopState := loopOf(&~run, loop);
+        let zero: Index := 0;
+        state.counter := zero;
+        state.hasCursor := false;
+        case firstAt(data, &~run, state.doc, state.list) of
+            when Some(value as first: Index) do
+                state.cursor := first;
+                state.hasCursor := true;
+            when None do
+                skip;
+        end case;
+        storeLoop(&~run, loop, state);
+        return nil;
+    end;
+
+    ---
+    --- The program run
+    ---
+
+    -- A value bound to a slot: a reference as it is, a number checked,
+    -- a text printed, a block's HTML as HTML.
+    generic [P: Region, K: Region, D: Region, R: Region]
+    function bindSlot(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R],
+        step: Step): Either[String, Unit] is
+        let e: Expr := exprAt(program, step.b);
+        case evaluate(program, calls, data, &~run, step.b) of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as value: Val) do
+                if step.c = bindReference then
+                    storeSlot(&~run, step.a, value);
+                    return Right(right => nil);
+                end if;
+                if step.c = bindNumber then
+                    case numberOf(program, data, &~run, e, value) of
+                        when Left(left as message: String) do
+                            return Left(left => message);
+                        when Right(right as number: Int64) do
+                            storeSlot(&~run, step.a, VInteger(number => number));
+                            return Right(right => nil);
+                    end case;
+                end if;
+                let html: Bool := (step.c = bindMarkup) or (codeOfVal(data, &~run, &value) = codeHtml);
+                case shown(program, data, &~run, e, value) of
+                    when Left(left as message: String) do
+                        return Left(left => message);
+                    when Right(right as text: String) do
+                        if html then
+                            storeSlot(&~run, step.a, VHtml(text => text));
+                        else
+                            storeSlot(&~run, step.a, VText(text => text));
+                        end if;
+                        return Right(right => nil);
+                end case;
+        end case;
+    end;
+
+    -- The step at pc done: the number of the step that follows, or the
+    -- error.
+    generic [P: Region, K: Region, D: Region, R: Region, B: Region]
+    function stepOnce(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], run: &![Run, R],
+        out: &![StringBuilder, B], pc: Index): Either[String, Index] is
+        let step: Step := stepAt(program, pc);
+        let op: Nat8 := step.op;
+        let next: Index := pc + 1;
+        if op = stepText then
+            if not writeOut(&~run, &~out, textAt(program, step.a)) then
+                return afterStep(tooMuch(program, step), next);
+            end if;
+            return Right(right => next);
+        else if op = stepOut then
+            return afterStep(writeValue(program, calls, data, &~run, &~out, step), next);
+        else if op = stepJump then
+            return Right(right => step.a);
+        else if op = stepUnless then
+            case condition(program, calls, data, &~run, step.a) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as truth: Bool) do
+                    if truth then
+                        return Right(right => next);
+                    end if;
+                    return Right(right => step.b);
+            end case;
+        else if op = stepBind then
+            return afterStep(bindSlot(program, calls, data, &~run, step), next);
+        else if op = stepRelease then
+            storeSlot(&~run, step.a, VUnset());
+            return Right(right => next);
+        else if op = stepForEnter then
+            return afterStep(enterLoop(program, calls, data, &~run, step), next);
+        else if op = stepForItem then
+            case bindItem(program, data, &~run, step) of
+                when Left(left as message: String) do
+                    return Left(left => message);
+                when Right(right as more: Bool) do
+                    if more then
+                        return Right(right => next);
+                    end if;
+                    return Right(right => step.b);
+            end case;
+        else if op = stepForCount then
+            var state: LoopState := loopOf(&~run, step.a);
+            state.total := state.total + 1;
+            storeLoop(&~run, step.a, state);
+            return Right(right => next);
+        else if op = stepForStep then
+            stepLoop(data, &~run, step);
+            return Right(right => step.b);
+        else if op = stepForRestart then
+            restartLoop(data, &~run, step.a);
+            return Right(right => next);
+        else if op = stepIfEmpty then
+            let state: LoopState := loopOf(&~run, step.a);
+            if state.total = 0 then
+                return Right(right => step.b);
+            end if;
+            return Right(right => next);
+        else if op = stepCaptureBegin then
+            pushCapture(&~run, makeStringBuilder());
+            return Right(right => next);
+        else if op = stepCaptureEnd then
+            let captured: String := finalize(popCapture(&~run));
+            storeSlot(&~run, step.a, VHtml(text => captured));
+            return Right(right => next);
+        end if;
+        return Left(left => failure(program, step.file, step.line, "V1000", fromLiteral("a step the engine does not know")));
+    end;
+
+    function afterStep(outcome: Either[String, Unit], next: Index): Either[String, Index] is
+        case outcome of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as done: Unit) do
+                return Right(right => next);
+        end case;
+    end;
+
+    generic [P: Region, K: Region, D: Region, B: Region]
+    function runSteps(program: &[Program, P], calls: &[Calls, K], data: &[ViewData, D], out: &![StringBuilder, B]): Either[String, Unit] is
+        var run: Run := makeRun(slotCount(program), loopCount(program));
+        let total: Index := stepCount(program);
+        var pc: Index := 0;
+        while pc < total do
+            case stepOnce(program, calls, data, &!run, &~out, pc) of
+                when Left(left as message: String) do
+                    destroyRun(run);
+                    return Left(left => message);
+                when Right(right as next: Index) do
+                    pc := next;
+            end case;
+        end while;
+        destroyRun(run);
+        return Right(right => nil);
+    end;
+
+    generic [B: Region]
+    function copyFunctions(functions: &[Buffer[Fn[ViewData, Either[String, ViewData]]], B]): Buffer[Fn[ViewData, Either[String, ViewData]]] is
+        var out: Buffer[Fn[ViewData, Either[String, ViewData]]] := allocateEmpty();
+        var i: Index := 0;
+        while i < length(functions) do
+            insertBack(&!out, nth(functions, i));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [P: Region, F: Region, C: Region, D: Region, B: Region]
+    function runWith(program: &[Program, P], functions: &[Buffer[Fn[ViewData, Either[String, ViewData]]], F],
+        catalogs: &[Buffer[Fn[ViewData, Either[String, ViewData]]], C], data: &[ViewData, D],
+        out: &![StringBuilder, B]): Either[String, Unit] is
+        let calls: Calls := Calls(functions => copyFunctions(functions), catalogs => copyFunctions(catalogs));
+        let result: Either[String, Unit] := runSteps(program, &calls, data, &~out);
+        let { functions as f: Buffer[Fn[ViewData, Either[String, ViewData]]],
+            catalogs as c: Buffer[Fn[ViewData, Either[String, ViewData]]] } := calls;
+        destroyFree(f);
+        destroyFree(c);
+        return result;
+    end;
+end module body.

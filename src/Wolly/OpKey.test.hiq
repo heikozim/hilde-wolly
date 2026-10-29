@@ -1,0 +1,659 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    nthRef,
+    length as bufferLength,
+    removeLast,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    contains,
+    startsWith,
+    indexOf,
+    substring,
+    bytesToHex
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.Jws (
+    base64UrlDecode,
+    base64UrlEncode
+);
+import Standard.File (
+    removeFileIfThere
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    createPepper,
+    createKey,
+    openVault,
+    closeVault,
+    setSecret,
+    getSecret
+);
+import Wolly.OpKey (
+    KeyFamily,
+    MlDsa,
+    Composite,
+    RingKey,
+    Verified,
+    algorithmOf,
+    familyOf,
+    makeRingKey,
+    newRingKey,
+    destroyRingKey,
+    keyEntry,
+    readKeyEntry,
+    entryName,
+    signToken,
+    publicJwk,
+    activeKey,
+    hasFamily,
+    isDue,
+    rotate,
+    prune,
+    keySet,
+    destroyRing,
+    destroyVerified,
+    verify,
+    loadRing,
+    saveRing
+);
+
+module body Wolly.OpKey.Test is
+    -- RFC 9964, Appendix A.1: the thumbprint and the start of the public key
+    -- of ML-DSA-44 for the all-zero seed.
+    constant rfcKid: Span[Nat8, Static] := "T4xl70S7MT6Zeq6r9V9fPJGVn76wfnXJ21-gyo0Gu6o";
+    constant rfcPubStart: Span[Nat8, Static] := "unH59k4RuutY-pxvu24U5h8YZD2rSVtHU5qRZsoBmBMcRPgmu9VuNOVdteXi1zNI";
+    constant zeroSeed: Span[Nat8, Static] := "\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}";
+    -- The vault value an earlier provider written in Go writes for that key.
+    constant goEntry: Span[Nat8, Static] := "{\"alg\":\"ML-DSA-44\",\"seed\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"created\":1700000000}";
+    constant goRetired: Span[Nat8, Static] := "{\"alg\":\"ML-DSA-44\",\"seed\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"created\":1700000000,\"retired\":1700000100}";
+    constant prefix: Span[Nat8, Static] := "RAMBO_SIGNING_KEY_";
+    constant day: Int64 := 86400;
+
+    function zeroKey(): RingKey is
+        case makeRingKey(MlDsa(), zeroSeed, 1700000000, 0) of
+            when Some(value as key: RingKey) do
+                return key;
+            when None do
+                abort("the key of the zero seed is not made");
+        end case;
+    end;
+
+    generic [K: Region]
+    function kidOf(key: &[RingKey, K]): Span[Nat8, K] is
+        return asSpan(&(key->kid));
+    end;
+
+    generic [K: Region]
+    function retiredOf(key: &[RingKey, K]): Int64 is
+        return key->retired;
+    end;
+
+    function testRfcVector(): Unit is
+        let key: RingKey := zeroKey();
+        assertTrue(equal(kidOf(&key), rfcKid), "the kid is the thumbprint of RFC 9964");
+        let jwk: String := publicJwk(&key);
+        assertTrue(startsWith(asSpan(&jwk), "{\"kty\":\"AKP\",\"alg\":\"ML-DSA-44\",\"kid\":\"T4xl70S7MT6Zeq6r9V9fPJGVn76wfnXJ21-gyo0Gu6o\",\"use\":\"sig\",\"pub\":\""),
+            "the JWK has kty, alg, kid, use and pub in this order");
+        assertTrue(contains(asSpan(&jwk), rfcPubStart), "the JWK holds the public key of RFC 9964");
+        destroyString(jwk);
+        let name: String := entryName(prefix, rfcKid);
+        assertTrue(length(&name) = 34, "the vault name is the prefix and 16 hex digits");
+        assertTrue(startsWith(asSpan(&name), prefix), "the vault name begins with the prefix");
+        destroyString(name);
+        destroyRingKey(key);
+        return nil;
+    end;
+
+    function testFamilies(): Unit is
+        assertTrue(equal(algorithmOf(MlDsa()), "ML-DSA-44"), "ML-DSA-44");
+        case familyOf("ML-DSA-65") of
+            when Some(value as f: KeyFamily) do
+                assertTrue(false, "ML-DSA-65 is no family of the ring");
+            when None do
+                skip;
+        end case;
+        case familyOf("RS256") of
+            when Some(value as f: KeyFamily) do
+                assertTrue(false, "RS256 is no family");
+            when None do
+                skip;
+        end case;
+        case makeRingKey(MlDsa(), "short", 1, 0) of
+            when Some(value as key: RingKey) do
+                assertTrue(false, "a seed of 5 bytes is refused");
+                destroyRingKey(key);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function testGoEntry(): Unit is
+        case readKeyEntry(goEntry) of
+            when Some(value as key: RingKey) do
+                assertTrue(equal(kidOf(&key), rfcKid), "the value of the Go provider gives the key of RFC 9964");
+                let back: String := keyEntry(&key);
+                assertTrue(equal(asSpan(&back), goEntry), "the value is written back byte for byte");
+                destroyString(back);
+                destroyRingKey(key);
+            when None do
+                assertTrue(false, "the value of the Go provider is read");
+        end case;
+        case readKeyEntry(goRetired) of
+            when Some(value as key: RingKey) do
+                assertTrue(retiredOf(&key) = 1700000100, "retired is read");
+                let back: String := keyEntry(&key);
+                assertTrue(equal(asSpan(&back), goRetired), "retired is written when it is not 0");
+                destroyString(back);
+                destroyRingKey(key);
+            when None do
+                assertTrue(false, "a retired value is read");
+        end case;
+        case readKeyEntry("{\"alg\":\"ML-DSA-44\",\"seed\":\"AAAA\",\"created\":1700000000}") of
+            when Some(value as key: RingKey) do
+                assertTrue(false, "a seed of 3 bytes is refused");
+                destroyRingKey(key);
+            when None do
+                skip;
+        end case;
+        case readKeyEntry("{\"alg\":\"ML-DSA-44\",\"seed\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}") of
+            when Some(value as key: RingKey) do
+                assertTrue(false, "a value without created is refused");
+                destroyRingKey(key);
+            when None do
+                skip;
+        end case;
+        case readKeyEntry("{\"alg\":\"ES256\",\"seed\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"created\":1}") of
+            when Some(value as key: RingKey) do
+                assertTrue(false, "another algorithm is refused");
+                destroyRingKey(key);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The header of a compact token, decoded.
+    generic [T: Region]
+    function headerOf(token: Span[Nat8, T]): String is
+        case indexOf(token, ".") of
+            when Some(value as dot: Index) do
+                case base64UrlDecode(substring(token, 0, dot)) of
+                    when Some(value as header: String) do
+                        return header;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The token with its last byte changed.
+    generic [T: Region]
+    function tampered(token: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let last: Index := spanLength(token) - 1;
+        writeString(&!out, substring(token, 0, last));
+        if token[last] = 'A' then
+            writeByte(&!out, 'B');
+        else
+            writeByte(&!out, 'A');
+        end if;
+        return finalize(out);
+    end;
+
+    generic [V: Region]
+    function typOf(found: &[Verified, V]): Span[Nat8, V] is
+        return asSpan(&(found->typ));
+    end;
+
+    generic [V: Region]
+    function payloadOf(found: &[Verified, V]): Span[Nat8, V] is
+        return asSpan(&(found->payload));
+    end;
+
+    generic [T: Region, R: Region]
+    function verifies(token: Span[Nat8, T], ring: &[Buffer[RingKey], R], typ: Span[Nat8, Static],
+        payload: Span[Nat8, Static]): Bool is
+        case verify(token, ring) of
+            when Some(value as found: Verified) do
+                let fits: Bool := equal(typOf(&found), typ) and equal(payloadOf(&found), payload);
+                destroyVerified(found);
+                return fits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- token with its header written anew as alg, kid of the old header and
+    -- the typ of an ID token; the payload and the signature stay.
+    generic [T: Region]
+    function withAlg(token: Span[Nat8, T], alg: Span[Nat8, Static]): String is
+        case indexOf(token, ".") of
+            when Some(value as dot: Index) do
+                var header: StringBuilder := makeStringBuilder();
+                writeString(&!header, "{\"alg\":\"");
+                writeString(&!header, alg);
+                writeString(&!header, "\",\"kid\":\"");
+                writeString(&!header, rfcKid);
+                writeString(&!header, "\",\"typ\":\"JWT\"}");
+                let text: String := finalize(header);
+                let encoded: String := base64UrlEncode(asSpan(&text));
+                destroyString(text);
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, asSpan(&encoded));
+                destroyString(encoded);
+                writeString(&!out, substring(token, dot, spanLength(token)));
+                return finalize(out);
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [R: Region]
+    function signFirst(ring: &[Buffer[RingKey], R], typ: Span[Nat8, Static], payload: Span[Nat8, Static]): String is
+        let key: &[RingKey, R] := nthRef(ring, 0);
+        case signToken(key, typ, payload) of
+            when Some(value as token: String) do
+                return token;
+            when None do
+                abort("a token is not signed");
+        end case;
+    end;
+
+    function testSignAndVerify(): Unit is
+        var ring: Buffer[RingKey] := allocateEmpty();
+        insertBack(&!ring, zeroKey());
+        let payload: Span[Nat8, Static] := "{\"iss\":\"https://auth.example.com\",\"sub\":\"a\"}";
+        let token: String := signFirst(&ring, "JWT", payload);
+        let header: String := headerOf(asSpan(&token));
+        assertTrue(equal(asSpan(&header), "{\"alg\":\"ML-DSA-44\",\"kid\":\"T4xl70S7MT6Zeq6r9V9fPJGVn76wfnXJ21-gyo0Gu6o\",\"typ\":\"JWT\"}"),
+            "the header is alg, kid and typ");
+        destroyString(header);
+        assertTrue(verifies(asSpan(&token), &ring, "JWT", payload), "the token verifies under its key");
+        let bad: String := tampered(asSpan(&token));
+        assertFalse(verifies(asSpan(&bad), &ring, "JWT", payload), "a changed signature is refused");
+        destroyString(bad);
+        destroyString(token);
+        let access: String := signFirst(&ring, "at+jwt", payload);
+        assertTrue(verifies(asSpan(&access), &ring, "at+jwt", payload), "the typ of an access token is given back");
+        destroyString(access);
+        -- The header of the token with alg RS256 and the same kid: refused.
+        let signedRs: String := signFirst(&ring, "JWT", payload);
+        let rsToken: String := withAlg(asSpan(&signedRs), "RS256");
+        assertFalse(verifies(asSpan(&rsToken), &ring, "JWT", payload), "RS256 is refused");
+        let mlToken: String := withAlg(asSpan(&signedRs), "ML-DSA-44");
+        assertTrue(verifies(asSpan(&mlToken), &ring, "JWT", payload), "the control: the same header rewritten as it was verifies");
+        destroyString(mlToken);
+        destroyString(rsToken);
+        destroyString(signedRs);
+        assertFalse(verifies("a.b", &ring, "JWT", payload), "two parts are no token");
+        assertFalse(verifies("a.b.c.d", &ring, "JWT", payload), "four parts are no token");
+        destroyRing(ring);
+        return nil;
+    end;
+
+    function testRing(): Unit is
+        var ring: Buffer[RingKey] := allocateEmpty();
+        let start: Int64 := 1700000000;
+        assertTrue(isDue(&ring, MlDsa(), start, 90 * day), "an empty ring is due");
+        case activeKey(&ring, MlDsa()) of
+            when Some(value as i: Index) do
+                assertTrue(false, "an empty ring has no active key");
+            when None do
+                skip;
+        end case;
+        var firstKid: String := fromSpan("");
+        case rotate(&!ring, MlDsa(), start) of
+            when Some(value as kid: String) do
+                destroyString(firstKid);
+                firstKid := kid;
+            when None do
+                assertTrue(false, "the first key is made");
+        end case;
+        assertTrue(bufferLength(&ring) = 1, "one key");
+        assertFalse(isDue(&ring, MlDsa(), start + (89 * day), 90 * day), "not due after 89 days");
+        assertTrue(isDue(&ring, MlDsa(), start + (90 * day), 90 * day), "due after 90 days");
+        let later: Int64 := start + (90 * day);
+        case rotate(&!ring, MlDsa(), later) of
+            when Some(value as kid: String) do
+                assertFalse(equal(asSpan(&kid), asSpan(&firstKid)), "the new key has a kid of its own");
+                destroyString(kid);
+            when None do
+                assertTrue(false, "the second key is made");
+        end case;
+        assertTrue(bufferLength(&ring) = 2, "two keys");
+        assertTrue(retiredOf(nthRef(&ring, 0)) = later, "the first key is retired at the rotation");
+        assertTrue(retiredOf(nthRef(&ring, 1)) = 0, "the second key signs");
+        case activeKey(&ring, MlDsa()) of
+            when Some(value as i: Index) do
+                assertTrue(i = 1, "the active key is the new one");
+            when None do
+                assertTrue(false, "there is an active key");
+        end case;
+        let keys: String := keySet(&ring);
+        assertTrue(startsWith(asSpan(&keys), "{\"keys\":[{\"kty\":\"AKP\""), "the key set lists AKP keys");
+        let a: Option[Index] := indexOf(asSpan(&keys), kidOf(nthRef(&ring, 0)));
+        let b: Option[Index] := indexOf(asSpan(&keys), kidOf(nthRef(&ring, 1)));
+        assertTrue(sortedBy(a, b, kidOf(nthRef(&ring, 0)), kidOf(nthRef(&ring, 1))), "the key set is sorted by kid");
+        destroyString(keys);
+        var gone: Buffer[String] := prune(&!ring, later + 1200, 1200);
+        assertTrue(bufferLength(&gone) = 0, "a key retired 1200 seconds ago stays");
+        destroyNames(gone);
+        var pruned: Buffer[String] := prune(&!ring, later + 1201, 1200);
+        assertTrue(bufferLength(&pruned) = 1, "a key retired longer ago goes");
+        if bufferLength(&pruned) = 1 then
+            assertTrue(equal(asSpan(nthRef(&pruned, 0)), asSpan(&firstKid)), "the old key goes");
+        end if;
+        destroyNames(pruned);
+        assertTrue(bufferLength(&ring) = 1, "one key is left");
+        destroyString(firstKid);
+        destroyRing(ring);
+        return nil;
+    end;
+
+    -- Whether the two kids stand in the key set in the order they sort.
+    generic [X: Region, Y: Region]
+    function sortedBy(a: Option[Index], b: Option[Index], x: Span[Nat8, X], y: Span[Nat8, Y]): Bool is
+        case a of
+            when Some(value as i: Index) do
+                case b of
+                    when Some(value as j: Index) do
+                        return (i < j) = before(x, y);
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [X: Region, Y: Region]
+    function before(x: Span[Nat8, X], y: Span[Nat8, Y]): Bool is
+        var i: Index := 0;
+        while (i < spanLength(x)) and (i < spanLength(y)) do
+            if x[i] /= y[i] then
+                return x[i] < y[i];
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(x) < spanLength(y);
+    end;
+
+    function destroyNames(names: Buffer[String]): Unit is
+        var n: Buffer[String] := names;
+        while bufferLength(&n) > 0 do
+            destroyString(removeLast(&!n));
+        end while;
+        destroyEmpty(n);
+        return nil;
+    end;
+
+    function tempPath(suffix: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/tmp/wolly-opkey-");
+        case randomBytes(8) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                writeString(&!out, asSpan(&hex));
+                destroyString(hex);
+                destroyString(raw);
+            when None do
+                abort("no random bytes");
+        end case;
+        writeString(&!out, "-");
+        writeString(&!out, suffix);
+        return finalize(out);
+    end;
+
+    function testVault(): Unit is
+        let env: String := tempPath("env");
+        let pepper: String := tempPath("pepper");
+        assertTrue(isRight(createPepper(asSpan(&pepper))), "a pepper is made");
+        assertTrue(isRight(createKey(asSpan(&env), asSpan(&pepper), "RAMBO_FERNET_KEY")), "a key is made");
+        case openVault(asSpan(&env), asSpan(&pepper), "RAMBO_FERNET_KEY") of
+            when Right(right as opened: Vault) do
+                var vault: Vault := opened;
+                assertTrue(isRight(setSecret(&!vault, "RAMBO_TOTP_KEY", "other")), "another secret is kept");
+                var ring: Buffer[RingKey] := allocateEmpty();
+                insertBack(&!ring, zeroKey());
+                case rotate(&!ring, MlDsa(), 1800000000) of
+                    when Some(value as kid: String) do
+                        destroyString(kid);
+                    when None do
+                        assertTrue(false, "a second key is made");
+                end case;
+                assertTrue(isRight(saveRing(&!vault, prefix, &ring)), "the ring is saved");
+                case loadRing(&vault, prefix) of
+                    when Right(right as back: Buffer[RingKey]) do
+                        assertTrue(bufferLength(&back) = 2, "two keys come back");
+                        if bufferLength(&back) = 2 then
+                            assertTrue(equal(kidOf(nthRef(&back, 0)), rfcKid), "the older key first");
+                            assertTrue(retiredOf(nthRef(&back, 0)) = 1800000000, "its retirement is kept");
+                        end if;
+                        destroyRing(back);
+                    when Left(left as error: VaultError) do
+                        assertTrue(false, "the ring is loaded");
+                end case;
+                var gone: Buffer[String] := prune(&!ring, 1900000000, 1200);
+                destroyNames(gone);
+                assertTrue(isRight(saveRing(&!vault, prefix, &ring)), "the pruned ring is saved");
+                case loadRing(&vault, prefix) of
+                    when Right(right as back: Buffer[RingKey]) do
+                        assertTrue(bufferLength(&back) = 1, "the pruned key is gone from the vault");
+                        destroyRing(back);
+                    when Left(left as error: VaultError) do
+                        assertTrue(false, "the pruned ring is loaded");
+                end case;
+                assertTrue(isRight(setSecret(&!vault, "RAMBO_SIGNING_KEY_1111111111111111", "{\"alg\":\"RS256\",\"der\":\"AAAA\",\"created\":1}")),
+                    "an RSA key of an older provider is in the vault");
+                case loadRing(&vault, prefix) of
+                    when Right(right as back: Buffer[RingKey]) do
+                        assertTrue(bufferLength(&back) = 1, "it is passed over");
+                        destroyRing(back);
+                    when Left(left as error: VaultError) do
+                        assertTrue(false, "it does not stop the load");
+                end case;
+                assertTrue(isRight(saveRing(&!vault, prefix, &ring)), "the ring is saved again");
+                case getSecret(&vault, "RAMBO_SIGNING_KEY_1111111111111111") of
+                    when Right(right as kept: String) do
+                        assertTrue(contains(asSpan(&kept), "RS256"), "and the RSA key stays in the vault");
+                        destroyString(kept);
+                    when Left(left as error: VaultError) do
+                        assertTrue(false, "and the RSA key stays in the vault");
+                end case;
+                assertTrue(isRight(setSecret(&!vault, "RAMBO_SIGNING_KEY_0000000000000000", "no key")), "a damaged value is kept");
+                case loadRing(&vault, prefix) of
+                    when Right(right as back: Buffer[RingKey]) do
+                        assertTrue(false, "a damaged value stops the load");
+                        destroyRing(back);
+                    when Left(left as error: VaultError) do
+                        skip;
+                end case;
+                destroyRing(ring);
+                closeVault(vault);
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the vault opens");
+        end case;
+        assertTrue(removeFileIfThere(asSpan(&env)), "the vault is removed");
+        assertTrue(removeFileIfThere(asSpan(&pepper)), "the pepper is removed");
+        destroyString(env);
+        destroyString(pepper);
+        return nil;
+    end;
+
+    -- The vectors of ML-DSA-44 with Ed25519 of a Go library: the composite
+    -- key of the seed 0x00 to 0x3f, the pure key of 0x40 to 0x5f, and thirteen
+    -- tokens, two that hold and eleven that are refused.
+    constant compositeSeed: Span[Nat8, Static] := "\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1a}\u{1b}\u{1c}\u{1d}\u{1e}\u{1f}\u{20}\u{21}\u{22}\u{23}\u{24}\u{25}\u{26}\u{27}\u{28}\u{29}\u{2a}\u{2b}\u{2c}\u{2d}\u{2e}\u{2f}\u{30}\u{31}\u{32}\u{33}\u{34}\u{35}\u{36}\u{37}\u{38}\u{39}\u{3a}\u{3b}\u{3c}\u{3d}\u{3e}\u{3f}";
+    constant pureSeed: Span[Nat8, Static] := "\u{40}\u{41}\u{42}\u{43}\u{44}\u{45}\u{46}\u{47}\u{48}\u{49}\u{4a}\u{4b}\u{4c}\u{4d}\u{4e}\u{4f}\u{50}\u{51}\u{52}\u{53}\u{54}\u{55}\u{56}\u{57}\u{58}\u{59}\u{5a}\u{5b}\u{5c}\u{5d}\u{5e}\u{5f}";
+    constant compositeKid: Span[Nat8, Static] := "pZLOwL6GEBBTjuCJLgOfmTwSK4DXjuAJ2jkwAKOLIa4";
+    constant compositeJwk: Span[Nat8, Static] := "{\"kty\":\"AKP\",\"alg\":\"ML-DSA-44-Ed25519\",\"kid\":\"pZLOwL6GEBBTjuCJLgOfmTwSK4DXjuAJ2jkwAKOLIa4\",\"use\":\"sig\",\"pub\":\"17K0clSq4NtF55MNSpjSyX2PE5fReJ2voXAksxbpvslPyZRtQvGbeadBO7qjPnFJy0LtURVpOsBB-suYit61_g4dhjEYSZW1ksOX0ilOLhT5CqQUujgmiZrEP0zMrLwm6agyuVEY1ctDPL75ZgsAE44IF_YediyidMNq1VTrIqrBFi5KsBrLoeOMTv2PgLZbMz0PcuVd_nHOnB67mInnxWEGwP1zgDoq7P6v3teqPLLO2lTRK9jNNqeM-XWUO0er0l6ICsRS5XQu0ejRqCr6huWQx1jBWuTShA2SvKGlCQ9ASWWX_KfYuVE_GhvabpUKqpjeRnUH1KT1pPBZkhZYLDVy9i7aiQWrNYFnDEoCd3oz4Mpylf2PT_bRoKOnaD1l9fX3_GDaAj6CbF-SFEwC99G6EHWYdVPqk2f8122ZC3-pnNRa_biDbUPkWfUYffBYR5cJoB6mg1k1-nBGCZDNPcG6QBupS6sd3kGsZ6szGdysoGBI1MTu8n7hOpwX0FOPQw8tZC3CQVZg3niHfY2KvHJSOXjAQuQoX0MZhGxEEmJCl2hEwQ5Va6IVtacZ5Z0MayqW05hZBx_cws3nUkp77a5U6FsxjoVOj-Ky8-36yXGRKCcKr9HlBEw6T9r9n_MfkHhLjo5FlhRKDa9YZRHT2ZYrnqla8Ze05fxg8rHtFd46W-9fib3HnZEFHZsoFudPpUUx79wcvnTUSIV_R2vNWPIcC2U7O3ak4HamVZowJxhVXMY_dIWaq6uSXwI4YcqM0Pe62yhx9n1VMm10URNa1F9KG6aRGPuyyKMO7JOS7z-XcGbJrdXHEMxkexUU0hfZWMcBfD6Q_SDATmdLkEhuk3CjGgAdMvRzl55JBnSefkd_oLdFCPil8jeDErg8Jb04jKCw__dHi69CtxZn7arJfEaxKWQ-WG5bBVoMIRlG1PNuZ1vtWGD6BCoxXZgmFk1qkjfDWl-_SVSQpb1N8ki5XEqud4S2BWcxZqxCRbW0sIKgnpMj5i8geMW3Z4NEbe_XNq06NwLUmwiYRJAKYYMzl7xEGbMNepegs4fBkRR0xNQbU-Mql3rLbw6nXbZbs55Z5wHnaVfe9vLURVnDGncSK1IE47XCGfFoixTtC8C4AbPm6C3NQ-nA6fQXRM2YFb0byIINi7Ej8E-s0bG2hd1aKxuNu_PtkzZw8JWhgLTxktCLELj6u9_MKyRRjjLuoKXgyQTKhEeACD87DNLQuLavZ7w1W5SUAl3HsKePqA46Lb_rUTKIUdYHgZjpSTZRrnh-wCUfkiujDp9R32Km1yeEzz3SBTkxdt-jJKUSvZSXCjbdNKUUqGeR8Os28BRbCatkZRtKAxOymWEaKhxIiRYnWYdooxFAYLpEQ0ht9RUioc6IswmFwhb45u0XjdVnswSg1Mr7qIKig0LxepqiauWNtjAIPSw1j99WbD9dYqQoVnvJ6ozpXKoPNUdLC_qPM5olCrTfzyCDvo7vvBBV4Y_hU3DuyyYFZtg_8GshGq7EPKKbVMzQD4gVokZe8LRlFcx-QfMSTwnv_3OTCatYspoUWaALzlA46TjJZ49y6w5O5f2q5m2fhXP8l_xCtJWfS_i2HXhDPoawM11ukZHE2L9IezkFwQjP1qwksM633LfPUfhNDtaHuV6uscUzwG8NlwI9kqcIJYN7Wbpst9TlawqHwgOGKujzFbpZJejt76Z5NpoiAnZhUfFqll-fgeznbMBwtVhp5NuXhM8FyDCzJCyDEimsuuFBvMrwsi4alNNNC8c2HlJtC_4SyJeUvJMilm3X\"}";
+    constant compositeEntry: Span[Nat8, Static] := "{\"alg\":\"ML-DSA-44-Ed25519\",\"seed\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw\",\"created\":1767225600}";
+    -- composite: holds
+    constant case0: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.njjMHzGv3qWmMX9A7jzbtHh8IO8FGsm3fTpEsD4Py1f1Ec64B-tNqIFAH-w2Fdlma10Y-wGb4Gp8WrU9NcGfuGR7Efg03jlUryba00Y8K2zYIDu6HLmABLVBduEuPqL5HFsZLfAVoEfw85MuB-Sm5eZhbjx84xmT7tv9kk1tWxb3AM-I2ZEKkOUULGP9JhnLMymVPH-ID2cSHMD0D3UTFRhyVE6rOzylMyZbzIgRrpoRq_2wbS0ZD_bIVWaCooxCz3giYjYP0_o_-xmrwTomkqBhf1jmeGhnBHQphjjnCG5VNwJofFs3gq8WBeV3_dwUWfQ2cp3mpEyn_JwRJRPir7q5wFNCvpFFUg88aO1DRqkJfxwMAh5OhcrHFvTuLXAoIO6Fw7sH-plofroZqTiWCCcpOA1TEMUz4xJVE2VuZz3aZWH_jE4TU650OP5coKLLMCf9gkLEsmswkohk-ZCLisrSaW6bVVqD4K9JQWwheNFsOnpEY1kl36-nPZUJKtSMTt_PpX0HM25IqIi6jdgrf3QXyVT1fo1oAoV0UE0Z4Ah5OHmRDudpAUsT93Y6kxeb1n3gx4QQiA38Qj2H4h6TLyyOX5lFrCsljcZQMyCkTTTgolyCm7OUWBg5Tfv09YRD1jzvg3MWHs1eSQQKyTgtg1Sd33_k1uj7yX8j3t5b-iLn8o6N9ZzNCrtUzIo9WtUZt1Fz8HPvn8kTj0BLvREEhGedn5hWeI1JZqSNwxEfcuZEhvYH70_9mwIqIHNRiRq8ARhdLdEc2rlwXn2EkLw_S3dToiKYusJ6WOnDCx7-WtGrWUhEA0e2hnWwj6oIHoGP6-XPfEXVH5vFeILX8cZ12LPT4gB9JnChzDETsV0KrSyj7-o73X_Qk5U3e8Zc8DpkK4NqHNAcY-iBF1_s1IDxyXvXmJPw2WmbgGrVPg2rBUv6ugbsvvrTnVgTo11XwZTBIg4NxIBZ4-jyTDDZxt4ulmeXkzLRx6UxJ6O96IdPPamNFkv6Pqok5Qhxl2mY-lBY_aCclh2luNs-jTz5YCBqQP-PrS9LQ1QB9Z-U9c7vVEKWomAMsT-yngKP3gCaDT9wU55aNaXjqXKyBm-xAXP-4erFg05_eE0ZwyMtmtcYZl5rZbFXgYL1Yp6vRCoUZaFSrJLaDZBH34gPHGxahaBL5idkfigv8DOMwZ28brCOHIaUCcWVUj70yxlaQkadzPpjIRCzv6GP14zst9TwRkKuZnb65f_kz5MJDv0kh8X-ws3MBIsoCFGMoGIUOe7_hbyTR43VYOu4oZYK-KhfRvdMJBchJKRDo6x3IZaRmueJrZQUuiE4s1CU8l3d2ST42IDznCq7o1hDveDyPdNbNFNSrJ2H9mRM8m_6P2nzqqK0IHS_J4PHTU3hpxa6xvuVeTWaz2F0lR5zPrNKkwDoN-eHO9_3u51Mmikls-3DysO7fiPElgcJwBMuF_7UfXnUJpLa256X6kpjuHn93XuWsv3XHZoyek9EJsz-PltMeGSHlR5VM2xU8GfngjktdV6wxDBokg6g_naJc0VaUv2Alm4WJY0zMT2Y81DOY9qSzdedvCP6iFNcTbjER0DwS_XdnJ_3X0TswxQkN2sEh8rjDof7KSgchqlrXHwPrXvXm_OoqvS64OFbIdoWyLLJBGN1h6CW5vCOjF82Wmgb-WDy5eARXy-e7DPeCtPXgtdyxqb9IGwSHKLv5lwEWAI_5Xy8fXnhbLBJemvFcicoCM_etEc0oYLs7US6p4xihoimBCw3_pKpSTlJ4AduaTi-zq0mq87O4jNLaTNEaTlcckYGWTSEm8z_ievj86pzJkqa3vQWEw1qlwSWIOguKcEW0mCcAkyt4e_okB1Zrla4NZAAL781e_IrMVuLMFuABr5YBQ6yPPEcScIHWkfXDKwOSjk0Er94e943NiBeTKsJ0UWPh9LI7ypWr6uDYQNl7dsOhN_J9nvY1hIvpQnj-7LU-gN3-cazLRcWjaY1er8znHDH6F0HWUkwLeM_ZkxZy53-H9U8srvM2jN1CeJCDwRrMEaoyqCi6m5VABYWXCtbNbHoscY7yQiCg_bc_SdEqqQlXFEXxpazeRyyTao_cF0SIeItvP7cPdXB6aR_umqb_ME_tt7w-USdpr6ORcUm2S90f_MjYAHSUG82KDpb4l7qpXXT3vqm8kVuH1n-SY8nhdkJ5UGixiqW1IZgVb40NyvzNYSRCNkIWSzGrBFfSlmpNqQVWBfMNwshTnFRqFV-WDs4UfwjY_QlnV4hhMX3SxjdhKJanNzWR1UEWOREJAEU_uu-O_5NjQmgqfcg9D8Nj4iTs5hoR690kWSxo2SYpgo1_IbJkYfx_05MdwnX75CZxTtU-Dpnk9OI1ywYi0GW_MrZMzb9M90CxJUO_KW_yEK4O-J6BO62cEzwzBmMMY-ehUKAjNCNaFDkVVxSlbm__BhZfLKrmlurYkfDDbAa8SNxL01xWqf_YytV7XVx9DdQ3F2XXzQ9FC7UWNZ712Dhyd1xCq4T2N9WWdvvJRNhKxgoC3sON6VFSZIlvyxLQ_YYGIdg75cLveFvKuYPlMjHDT-cNRECVMGWtGRh8n4Em2cPJfmtWM-hf_hjoSjxLIy1Zf1Ay9aU2ce708iofzGmarlXe-UlBXJL8Z6G1ECgMUkgl7WfiWBxrsIXWEu2B8-uiKcCUe5uLVbd85oi5vQcXmeqcsrsE6VzuK3QaDv-WmcqsZawMn85h-zk33NsyEh9A7NUicMNvJtWn2xyyKn7O2PYKCzrowz2NyMnxgWqPelzTd5SFnHZ8HBnEAvVis1eCW5wdBQDHhn-KyawB-STUMpAgQW1abdu3RmKzHH7IaYgsb87cjte6zZqb26Db38GAALIVdgyS9Wyo8xHCcVj9GVLnY7d-9GOmtXME0NyiAmWjnamK8hkBAUIOQ6Lem3_CpVJonUpSbV_xTgHpe9u03UcsCb862dlGGKrbmygALCatDLdgwyE5QZNPAxuFYkyQHD5HPEx9Uc3bK4LoadOwF91eMGyywvHB1s3OEA_LQAh_AO0JbcXnaI2rhaOwUUveYGYsQFCXYOaA39XbQTsXn2U0Y6V4eRBB1V9_Qnx3Ut8A6Hl4TwHCRU2SXmJl7O8yszTBhEgOT9SX29zmKC1wM0DCSMlODtLToKSlJagp8jN7_8hIiMrSUpRZpWhs7zj5AAAAAAAAAAAAAAAAAAAAAAAAAAAAA0bLTuGcqA9QsN5PVKKU3DN760o26VEWcY8qZPPfBD2E2vjOPmw-tEZ0N7N37X3Pqlt5zpKRd9TUpKtL4ETBPo47uYM";
+    -- pure ML-DSA-44: holds
+    constant case1: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQiLCJraWQiOiJnWmNHNy01LTBLck1iZWRHdUg4Qk9kcXYzeU9ZM21qZ2pjd2hBN0JRMHVRIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.dF-jKV2qkL_GZVelUUzqYuvvVak2hM44kYcbodk6ccR-e1jqhKK3u1kNEyAtr2raX3Vjz9Y0O3bFG7xyVebMOpE6Xh1g1RsrhMz6r9Iayhn7fTVURumS0KZWl-B6VKemukxxTKr6U78FBRjUXMQWWrq3962uECBMNFPMlb48mYs0mBiUJ4Xb4Ozz7EnUu1c0x68Op_WScX1BbHztPv6qTH-WjlMkgpJEj6jPyM72EHXdENOpsf2LczKEi1DplkpEkr1mJdF8WtTrRWrIXa56ucVQ1ptjWGPoJFwxUf-VfMKNK9xx2Ari8hC_Hl0QHQOrEdjoFHrf-UiKCoSU9nowvHZ0w_KgOHUjxf1aouoJyOvfISssi13FqGSeaTpJsDy3Jk-FA6JgNb4cTB-WvpJzulWiv4NnOBS0F7USxbe-LO2ysx7k8r2R8hFvUdCVVmTuRTiJQ8Ref9HyXokL130O_9E7bjxG3Vuq_XyCd20RyMrraOAfANwSBmkYwoDBsPdhAnxHIKGHUz0zvbjlerPiFpBjcHe7nvl7oWdsAC75Mj-m59bpOHvBQ4TyZPd-c-Wf8ITsT_ZAkRBaSVdAsMUZ6wciLkgfC5hI0Pv02Y1DnsRoj1g56EPk83lSvm9skwDy5tDa3u9KVAGZxGR4gsHa9ZsineVe-Ayozpi-GhP3LKN95bOude2Z7pBm6OVziuDhwa0UWgegUdg7UeOwONjntgWNBU9p-lXXRdsXUyVpOIHB0QtwMMDl0NhERlzKBf9FMmo2ArY7dlD3cj6_KaZE13a7O9PT0A29XEykfxnJ5NEwOdng_MzEn-1SzTuo8epBlhSBZCWsrQY0HV-x4FDm1JWoZpWnavrso2PIPa3wQjioiJCfAeJOY56vpQM1xzrXKhpIrBU3K0qaKQkxDPM2XRNEmlEL4twA6PEDR1LVTWPQoNc09eaMSDoEwjxNg4ZOeM-Trzkc50iRiZ7L-5BllehvEnifq0l_KnzujwHbh4mBZNU40EGDLuXX0b9JYU0ERMRONKpIpT8g-5gCmvnz7fVn_EW9ZjIxICnBWJ55Jox_JTow1ylVU61lEvhZSOuJ-ZDrbWboC5tWXs8tyE6DdzOoNC1IU4xcnx42dsgvnyK2DEErfN5TvIX5yqVauUkogVG54pxEr80TnJMZrgvN1d13MATpC5Z1W5UDw9by9NjoneEmxzBxIqymIZSq3CaDNbOG2tJBwazGuLCu_7rP6fl8oZAe5TZvKIAchPq-atPVco4qSfhDMmDpMRgQZcPF5PUNeurCoGJAl-Q3FqoMpC5kfK9Uu-GRZrf8g_2z43cwTDQVxQ_aZhu9T_D7neEQzJCQbwo4m0ItdO8i9Ivc65oNZVNIW-AX6Te4pvxsmOPzgRUsjpw9sHop8e7qwfYkB-_2agiZVdiBXtJfqVjlgN18-AcMXqzMLqMXGYsjkF4dc-IqsmVTNURFJd9McsS2rNISePH6GcTTAMg1D7PIMyOIbTprtZeyHZD9PUehDqB5AJkO1_t8Su-lLuTzhIduCNzb_taSWnZlp0zyjlHvmE6znWdb5U-vV6ipQM_0he3v1YjZkmh-iat4qTYPa_Y3d4J0BuHMRJwZQyW58E0Rf9UxAiJ3vPDP9MDTEQbasvxa4FDRuYA1w0_5MS2Nsg1TiejE9lzZAARpEOQlxFNzaOwaa5bdfjVAWvaKVggakbx9DzLtlYWNricnKxxwZm8Txv0CYUJ6rTfRlO-OnN39mVcbXQvSWkyAfS39_NBeaVbHaJ05RDlAtPbNu2p0rGoJ76-0WA7ARiwf5TByqx4ZT3rNcysVD39E-x6foViJFtKJHWWBxSLy6E-Lqt8uJbwG8OedXeYn1KOpKQq290mf_X6bQks7lKJcj9nZy5Z4X6hj7-qt9bGYBiyZTsZtii9Lj4GC-gxZ10A3khePuMLxG4ZjB_Kva1oFgOmYsNgBjHPSmWc9suE9gxBZDYhRQkHN6jQPEQszHOT-HWP5xOU73vzDzkL12blAoL-6BSKiuH7CIo5MkXxkiI6aIysS-lFBqnBV-K8D8d3vKjg2hh84PmUOKnPnXIycXvQcPSkg0BQbvRa797oVPNYIHc_K47zgw9231rAY85jVWWUTzMB3RMsGqmtzz-waUUuNkKhrBPArZUXGQoWgLyNh2zUQ2j9-vi2MGSXmgcr6yiizgzZ6C-kwWVDonLnkRyWUJVmvyLatP_BgkiqGZgEVi10d_6RKMtQ8esNLimpRMFA2iHDaTU8Q2hctDAAt7-5oaYXL9SZ-SAP5sDKjvZm30F--QbRviZ9OkwuiBBCqk3yM7pB7fBJUq2fnD5ZXSvNL916_0Wwb1ruojO1rTLrrW4p8KdBhJyttTeb1Hhdp15j84vQUx9HmYBTXyna0B2dSWblpAc_1Nh4IIdgCw7Loo2AWzrkn45tuXOrGSNeUC6-vco_dL5oKJXShGlNNT-qMjALyurgjRtvnCKYC8h0b86O2L8cP-Bi2-4JDiRuiVgdG93XY4n4bAunH7VjyFpRB4CWm_tjek_rTqMw_j20ADiuzAQPIYB4NL-qrRNl2E9CAXTZNIiwOi3jGjwSZVVr-5nv_S7hSh1PbA5XWQsTJBgO1JaBsmJsKgz-gRU1fQp6ab87yREFgCDV2qT5n5DPS4JRhGWRGC9acF7fvgl0qZROxjucvXg_VRMCriwyS1PMm5ub7lcvjPhcR5YQRR3gJ_fP8fkjI5O7yy2thCyPHkABoAMa8z_F8xVJ0dUtqp69q6UibC18HXOR0A2EDK5agfjfJP0pOO6a1Ok8byfyqIVQsHHEpxnGN00SJmwI_L5HfqDS_o_mjb1-DdhjDW9OAl23pdk-sPjuuYiFEjfYmuz3u530LpLg_cXSytc1RqDgOs3oEcZHnjwTwLAXYNuFQQ_PU_RLnmZDcA77k8iAQaCbAWuTCP28eEE2uUSEvmEO0mD_bf2FnEqX2Mxkf9Srn7vvHjydx1MobtdtBAt5i3VUVeCBXILecb2l27XPZHpGLaaSnauWcWw2xQFyM8kLb9s80KuProDqGrnQk0MIWDdl3TIC3B-ddSThv2asqFMzxFkPuLtU4fz_i7UcJ-XVQ7j5pzSkBDhYZK0BIS05UX2G6u8_X2d_h5wQOZXR5irS9x8rN0dbX6v0CExk8VF9ibZKcr93s9wEPJDQ2N0VpbYqjtuDn7wAAAAAAAAAAAAAAAAAAABQkMkE";
+    -- ml-dsa half broken: refused
+    constant case2: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.njjMHzGv3qWmMX9A7jzbtHh8IO8FGsm3fTpEsD4Py1f1Ec64B-tNqIFAH-w2Fdlma10Y-wGb4Gp8WrU9NcGfuGR7Efg03jlUryba00Y8K2zYIDu6HLmABLVBduEuPqL5HFsZLfEVoEfw85MuB-Sm5eZhbjx84xmT7tv9kk1tWxb3AM-I2ZEKkOUULGP9JhnLMymVPH-ID2cSHMD0D3UTFRhyVE6rOzylMyZbzIgRrpoRq_2wbS0ZD_bIVWaCooxCz3giYjYP0_o_-xmrwTomkqBhf1jmeGhnBHQphjjnCG5VNwJofFs3gq8WBeV3_dwUWfQ2cp3mpEyn_JwRJRPir7q5wFNCvpFFUg88aO1DRqkJfxwMAh5OhcrHFvTuLXAoIO6Fw7sH-plofroZqTiWCCcpOA1TEMUz4xJVE2VuZz3aZWH_jE4TU650OP5coKLLMCf9gkLEsmswkohk-ZCLisrSaW6bVVqD4K9JQWwheNFsOnpEY1kl36-nPZUJKtSMTt_PpX0HM25IqIi6jdgrf3QXyVT1fo1oAoV0UE0Z4Ah5OHmRDudpAUsT93Y6kxeb1n3gx4QQiA38Qj2H4h6TLyyOX5lFrCsljcZQMyCkTTTgolyCm7OUWBg5Tfv09YRD1jzvg3MWHs1eSQQKyTgtg1Sd33_k1uj7yX8j3t5b-iLn8o6N9ZzNCrtUzIo9WtUZt1Fz8HPvn8kTj0BLvREEhGedn5hWeI1JZqSNwxEfcuZEhvYH70_9mwIqIHNRiRq8ARhdLdEc2rlwXn2EkLw_S3dToiKYusJ6WOnDCx7-WtGrWUhEA0e2hnWwj6oIHoGP6-XPfEXVH5vFeILX8cZ12LPT4gB9JnChzDETsV0KrSyj7-o73X_Qk5U3e8Zc8DpkK4NqHNAcY-iBF1_s1IDxyXvXmJPw2WmbgGrVPg2rBUv6ugbsvvrTnVgTo11XwZTBIg4NxIBZ4-jyTDDZxt4ulmeXkzLRx6UxJ6O96IdPPamNFkv6Pqok5Qhxl2mY-lBY_aCclh2luNs-jTz5YCBqQP-PrS9LQ1QB9Z-U9c7vVEKWomAMsT-yngKP3gCaDT9wU55aNaXjqXKyBm-xAXP-4erFg05_eE0ZwyMtmtcYZl5rZbFXgYL1Yp6vRCoUZaFSrJLaDZBH34gPHGxahaBL5idkfigv8DOMwZ28brCOHIaUCcWVUj70yxlaQkadzPpjIRCzv6GP14zst9TwRkKuZnb65f_kz5MJDv0kh8X-ws3MBIsoCFGMoGIUOe7_hbyTR43VYOu4oZYK-KhfRvdMJBchJKRDo6x3IZaRmueJrZQUuiE4s1CU8l3d2ST42IDznCq7o1hDveDyPdNbNFNSrJ2H9mRM8m_6P2nzqqK0IHS_J4PHTU3hpxa6xvuVeTWaz2F0lR5zPrNKkwDoN-eHO9_3u51Mmikls-3DysO7fiPElgcJwBMuF_7UfXnUJpLa256X6kpjuHn93XuWsv3XHZoyek9EJsz-PltMeGSHlR5VM2xU8GfngjktdV6wxDBokg6g_naJc0VaUv2Alm4WJY0zMT2Y81DOY9qSzdedvCP6iFNcTbjER0DwS_XdnJ_3X0TswxQkN2sEh8rjDof7KSgchqlrXHwPrXvXm_OoqvS64OFbIdoWyLLJBGN1h6CW5vCOjF82Wmgb-WDy5eARXy-e7DPeCtPXgtdyxqb9IGwSHKLv5lwEWAI_5Xy8fXnhbLBJemvFcicoCM_etEc0oYLs7US6p4xihoimBCw3_pKpSTlJ4AduaTi-zq0mq87O4jNLaTNEaTlcckYGWTSEm8z_ievj86pzJkqa3vQWEw1qlwSWIOguKcEW0mCcAkyt4e_okB1Zrla4NZAAL781e_IrMVuLMFuABr5YBQ6yPPEcScIHWkfXDKwOSjk0Er94e943NiBeTKsJ0UWPh9LI7ypWr6uDYQNl7dsOhN_J9nvY1hIvpQnj-7LU-gN3-cazLRcWjaY1er8znHDH6F0HWUkwLeM_ZkxZy53-H9U8srvM2jN1CeJCDwRrMEaoyqCi6m5VABYWXCtbNbHoscY7yQiCg_bc_SdEqqQlXFEXxpazeRyyTao_cF0SIeItvP7cPdXB6aR_umqb_ME_tt7w-USdpr6ORcUm2S90f_MjYAHSUG82KDpb4l7qpXXT3vqm8kVuH1n-SY8nhdkJ5UGixiqW1IZgVb40NyvzNYSRCNkIWSzGrBFfSlmpNqQVWBfMNwshTnFRqFV-WDs4UfwjY_QlnV4hhMX3SxjdhKJanNzWR1UEWOREJAEU_uu-O_5NjQmgqfcg9D8Nj4iTs5hoR690kWSxo2SYpgo1_IbJkYfx_05MdwnX75CZxTtU-Dpnk9OI1ywYi0GW_MrZMzb9M90CxJUO_KW_yEK4O-J6BO62cEzwzBmMMY-ehUKAjNCNaFDkVVxSlbm__BhZfLKrmlurYkfDDbAa8SNxL01xWqf_YytV7XVx9DdQ3F2XXzQ9FC7UWNZ712Dhyd1xCq4T2N9WWdvvJRNhKxgoC3sON6VFSZIlvyxLQ_YYGIdg75cLveFvKuYPlMjHDT-cNRECVMGWtGRh8n4Em2cPJfmtWM-hf_hjoSjxLIy1Zf1Ay9aU2ce708iofzGmarlXe-UlBXJL8Z6G1ECgMUkgl7WfiWBxrsIXWEu2B8-uiKcCUe5uLVbd85oi5vQcXmeqcsrsE6VzuK3QaDv-WmcqsZawMn85h-zk33NsyEh9A7NUicMNvJtWn2xyyKn7O2PYKCzrowz2NyMnxgWqPelzTd5SFnHZ8HBnEAvVis1eCW5wdBQDHhn-KyawB-STUMpAgQW1abdu3RmKzHH7IaYgsb87cjte6zZqb26Db38GAALIVdgyS9Wyo8xHCcVj9GVLnY7d-9GOmtXME0NyiAmWjnamK8hkBAUIOQ6Lem3_CpVJonUpSbV_xTgHpe9u03UcsCb862dlGGKrbmygALCatDLdgwyE5QZNPAxuFYkyQHD5HPEx9Uc3bK4LoadOwF91eMGyywvHB1s3OEA_LQAh_AO0JbcXnaI2rhaOwUUveYGYsQFCXYOaA39XbQTsXn2U0Y6V4eRBB1V9_Qnx3Ut8A6Hl4TwHCRU2SXmJl7O8yszTBhEgOT9SX29zmKC1wM0DCSMlODtLToKSlJagp8jN7_8hIiMrSUpRZpWhs7zj5AAAAAAAAAAAAAAAAAAAAAAAAAAAAA0bLTuGcqA9QsN5PVKKU3DN760o26VEWcY8qZPPfBD2E2vjOPmw-tEZ0N7N37X3Pqlt5zpKRd9TUpKtL4ETBPo47uYM";
+    -- ed25519 half broken: refused
+    constant case3: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.njjMHzGv3qWmMX9A7jzbtHh8IO8FGsm3fTpEsD4Py1f1Ec64B-tNqIFAH-w2Fdlma10Y-wGb4Gp8WrU9NcGfuGR7Efg03jlUryba00Y8K2zYIDu6HLmABLVBduEuPqL5HFsZLfAVoEfw85MuB-Sm5eZhbjx84xmT7tv9kk1tWxb3AM-I2ZEKkOUULGP9JhnLMymVPH-ID2cSHMD0D3UTFRhyVE6rOzylMyZbzIgRrpoRq_2wbS0ZD_bIVWaCooxCz3giYjYP0_o_-xmrwTomkqBhf1jmeGhnBHQphjjnCG5VNwJofFs3gq8WBeV3_dwUWfQ2cp3mpEyn_JwRJRPir7q5wFNCvpFFUg88aO1DRqkJfxwMAh5OhcrHFvTuLXAoIO6Fw7sH-plofroZqTiWCCcpOA1TEMUz4xJVE2VuZz3aZWH_jE4TU650OP5coKLLMCf9gkLEsmswkohk-ZCLisrSaW6bVVqD4K9JQWwheNFsOnpEY1kl36-nPZUJKtSMTt_PpX0HM25IqIi6jdgrf3QXyVT1fo1oAoV0UE0Z4Ah5OHmRDudpAUsT93Y6kxeb1n3gx4QQiA38Qj2H4h6TLyyOX5lFrCsljcZQMyCkTTTgolyCm7OUWBg5Tfv09YRD1jzvg3MWHs1eSQQKyTgtg1Sd33_k1uj7yX8j3t5b-iLn8o6N9ZzNCrtUzIo9WtUZt1Fz8HPvn8kTj0BLvREEhGedn5hWeI1JZqSNwxEfcuZEhvYH70_9mwIqIHNRiRq8ARhdLdEc2rlwXn2EkLw_S3dToiKYusJ6WOnDCx7-WtGrWUhEA0e2hnWwj6oIHoGP6-XPfEXVH5vFeILX8cZ12LPT4gB9JnChzDETsV0KrSyj7-o73X_Qk5U3e8Zc8DpkK4NqHNAcY-iBF1_s1IDxyXvXmJPw2WmbgGrVPg2rBUv6ugbsvvrTnVgTo11XwZTBIg4NxIBZ4-jyTDDZxt4ulmeXkzLRx6UxJ6O96IdPPamNFkv6Pqok5Qhxl2mY-lBY_aCclh2luNs-jTz5YCBqQP-PrS9LQ1QB9Z-U9c7vVEKWomAMsT-yngKP3gCaDT9wU55aNaXjqXKyBm-xAXP-4erFg05_eE0ZwyMtmtcYZl5rZbFXgYL1Yp6vRCoUZaFSrJLaDZBH34gPHGxahaBL5idkfigv8DOMwZ28brCOHIaUCcWVUj70yxlaQkadzPpjIRCzv6GP14zst9TwRkKuZnb65f_kz5MJDv0kh8X-ws3MBIsoCFGMoGIUOe7_hbyTR43VYOu4oZYK-KhfRvdMJBchJKRDo6x3IZaRmueJrZQUuiE4s1CU8l3d2ST42IDznCq7o1hDveDyPdNbNFNSrJ2H9mRM8m_6P2nzqqK0IHS_J4PHTU3hpxa6xvuVeTWaz2F0lR5zPrNKkwDoN-eHO9_3u51Mmikls-3DysO7fiPElgcJwBMuF_7UfXnUJpLa256X6kpjuHn93XuWsv3XHZoyek9EJsz-PltMeGSHlR5VM2xU8GfngjktdV6wxDBokg6g_naJc0VaUv2Alm4WJY0zMT2Y81DOY9qSzdedvCP6iFNcTbjER0DwS_XdnJ_3X0TswxQkN2sEh8rjDof7KSgchqlrXHwPrXvXm_OoqvS64OFbIdoWyLLJBGN1h6CW5vCOjF82Wmgb-WDy5eARXy-e7DPeCtPXgtdyxqb9IGwSHKLv5lwEWAI_5Xy8fXnhbLBJemvFcicoCM_etEc0oYLs7US6p4xihoimBCw3_pKpSTlJ4AduaTi-zq0mq87O4jNLaTNEaTlcckYGWTSEm8z_ievj86pzJkqa3vQWEw1qlwSWIOguKcEW0mCcAkyt4e_okB1Zrla4NZAAL781e_IrMVuLMFuABr5YBQ6yPPEcScIHWkfXDKwOSjk0Er94e943NiBeTKsJ0UWPh9LI7ypWr6uDYQNl7dsOhN_J9nvY1hIvpQnj-7LU-gN3-cazLRcWjaY1er8znHDH6F0HWUkwLeM_ZkxZy53-H9U8srvM2jN1CeJCDwRrMEaoyqCi6m5VABYWXCtbNbHoscY7yQiCg_bc_SdEqqQlXFEXxpazeRyyTao_cF0SIeItvP7cPdXB6aR_umqb_ME_tt7w-USdpr6ORcUm2S90f_MjYAHSUG82KDpb4l7qpXXT3vqm8kVuH1n-SY8nhdkJ5UGixiqW1IZgVb40NyvzNYSRCNkIWSzGrBFfSlmpNqQVWBfMNwshTnFRqFV-WDs4UfwjY_QlnV4hhMX3SxjdhKJanNzWR1UEWOREJAEU_uu-O_5NjQmgqfcg9D8Nj4iTs5hoR690kWSxo2SYpgo1_IbJkYfx_05MdwnX75CZxTtU-Dpnk9OI1ywYi0GW_MrZMzb9M90CxJUO_KW_yEK4O-J6BO62cEzwzBmMMY-ehUKAjNCNaFDkVVxSlbm__BhZfLKrmlurYkfDDbAa8SNxL01xWqf_YytV7XVx9DdQ3F2XXzQ9FC7UWNZ712Dhyd1xCq4T2N9WWdvvJRNhKxgoC3sON6VFSZIlvyxLQ_YYGIdg75cLveFvKuYPlMjHDT-cNRECVMGWtGRh8n4Em2cPJfmtWM-hf_hjoSjxLIy1Zf1Ay9aU2ce708iofzGmarlXe-UlBXJL8Z6G1ECgMUkgl7WfiWBxrsIXWEu2B8-uiKcCUe5uLVbd85oi5vQcXmeqcsrsE6VzuK3QaDv-WmcqsZawMn85h-zk33NsyEh9A7NUicMNvJtWn2xyyKn7O2PYKCzrowz2NyMnxgWqPelzTd5SFnHZ8HBnEAvVis1eCW5wdBQDHhn-KyawB-STUMpAgQW1abdu3RmKzHH7IaYgsb87cjte6zZqb26Db38GAALIVdgyS9Wyo8xHCcVj9GVLnY7d-9GOmtXME0NyiAmWjnamK8hkBAUIOQ6Lem3_CpVJonUpSbV_xTgHpe9u03UcsCb862dlGGKrbmygALCatDLdgwyE5QZNPAxuFYkyQHD5HPEx9Uc3bK4LoadOwF91eMGyywvHB1s3OEA_LQAh_AO0JbcXnaI2rhaOwUUveYGYsQFCXYOaA39XbQTsXn2U0Y6V4eRBB1V9_Qnx3Ut8A6Hl4TwHCRU2SXmJl7O8yszTBhEgOT9SX29zmKC1wM0DCSMlODtLToKSlJagp8jN7_8hIiMrSUpRZpWhs7zj5AAAAAAAAAAAAAAAAAAAAAAAAAAAAA0bLTuGcqA9QsN5PVKKUnDN760o26VEWcY8qZPPfBD2E2vjOPmw-tEZ0N7N37X3Pqlt5zpKRd9TUpKtL4ETBPo47uYM";
+    -- halves swapped: refused
+    constant case4: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.hnKgPULDeT1SilNwze-tKNulRFnGPKmTz3wQ9hNr4zj5sPrRGdDezd-19z6pbec6SkXfU1KSrS-BEwT6OO7mDJ44zB8xr96lpjF_QO4827R4fCDvBRrJt306RLA-D8tX9RHOuAfrTaiBQB_sNhXZZmtdGPsBm-BqfFq1PTXBn7hkexH4NN45VK8m2tNGPCts2CA7uhy5gAS1QXbhLj6i-RxbGS3wFaBH8POTLgfkpuXmYW48fOMZk-7b_ZJNbVsW9wDPiNmRCpDlFCxj_SYZyzMplTx_iA9nEhzA9A91ExUYclROqzs8pTMmW8yIEa6aEav9sG0tGQ_2yFVmgqKMQs94ImI2D9P6P_sZq8E6JpKgYX9Y5nhoZwR0KYY45whuVTcCaHxbN4KvFgXld_3cFFn0NnKd5qRMp_ycESUT4q-6ucBTQr6RRVIPPGjtQ0apCX8cDAIeToXKxxb07i1wKCDuhcO7B_qZaH66Gak4lggnKTgNUxDFM-MSVRNlbmc92mVh_4xOE1OudDj-XKCiyzAn_YJCxLJrMJKIZPmQi4rK0mlum1Vag-CvSUFsIXjRbDp6RGNZJd-vpz2VCSrUjE7fz6V9BzNuSKiIuo3YK390F8lU9X6NaAKFdFBNGeAIeTh5kQ7naQFLE_d2OpMXm9Z94MeEEIgN_EI9h-Ieky8sjl-ZRawrJY3GUDMgpE004KJcgpuzlFgYOU379PWEQ9Y874NzFh7NXkkECsk4LYNUnd9_5Nbo-8l_I97eW_oi5_KOjfWczQq7VMyKPVrVGbdRc_Bz75_JE49AS70RBIRnnZ-YVniNSWakjcMRH3LmRIb2B-9P_ZsCKiBzUYkavAEYXS3RHNq5cF59hJC8P0t3U6IimLrCeljpwwse_lrRq1lIRANHtoZ1sI-qCB6Bj-vlz3xF1R-bxXiC1_HGddiz0-IAfSZwocwxE7FdCq0so-_qO91_0JOVN3vGXPA6ZCuDahzQHGPogRdf7NSA8cl715iT8Nlpm4Bq1T4NqwVL-roG7L76051YE6NdV8GUwSIODcSAWePo8kww2cbeLpZnl5My0celMSejveiHTz2pjRZL-j6qJOUIcZdpmPpQWP2gnJYdpbjbPo08-WAgakD_j60vS0NUAfWflPXO71RClqJgDLE_sp4Cj94Amg0_cFOeWjWl46lysgZvsQFz_uHqxYNOf3hNGcMjLZrXGGZea2WxV4GC9WKer0QqFGWhUqyS2g2QR9-IDxxsWoWgS-YnZH4oL_AzjMGdvG6wjhyGlAnFlVI-9MsZWkJGncz6YyEQs7-hj9eM7LfU8EZCrmZ2-uX_5M-TCQ79JIfF_sLNzASLKAhRjKBiFDnu_4W8k0eN1WDruKGWCvioX0b3TCQXISSkQ6OsdyGWkZrnia2UFLohOLNQlPJd3dkk-NiA85wqu6NYQ73g8j3TWzRTUqydh_ZkTPJv-j9p86qitCB0vyeDx01N4acWusb7lXk1ms9hdJUecz6zSpMA6Dfnhzvf97udTJopJbPtw8rDu34jxJYHCcATLhf-1H151CaS2tuel-pKY7h5_d17lrL91x2aMnpPRCbM_j5bTHhkh5UeVTNsVPBn54I5LXVesMQwaJIOoP52iXNFWlL9gJZuFiWNMzE9mPNQzmPaks3Xnbwj-ohTXE24xEdA8Ev13Zyf919E7MMUJDdrBIfK4w6H-ykoHIapa1x8D61715vzqKr0uuDhWyHaFsiyyQRjdYeglubwjoxfNlpoG_lg8uXgEV8vnuwz3grT14LXcsam_SBsEhyi7-ZcBFgCP-V8vH154WywSXprxXInKAjP3rRHNKGC7O1EuqeMYoaIpgQsN_6SqUk5SeAHbmk4vs6tJqvOzuIzS2kzRGk5XHJGBlk0hJvM_4nr4_OqcyZKmt70FhMNapcEliDoLinBFtJgnAJMreHv6JAdWa5WuDWQAC-_NXvyKzFbizBbgAa-WAUOsjzxHEnCB1pH1wysDko5NBK_eHveNzYgXkyrCdFFj4fSyO8qVq-rg2EDZe3bDoTfyfZ72NYSL6UJ4_uy1PoDd_nGsy0XFo2mNXq_M5xwx-hdB1lJMC3jP2ZMWcud_h_VPLK7zNozdQniQg8EazBGqMqgoupuVQAWFlwrWzWx6LHGO8kIgoP23P0nRKqkJVxRF8aWs3kcsk2qP3BdEiHiLbz-3D3Vwemkf7pqm_zBP7be8PlEnaa-jkXFJtkvdH_zI2AB0lBvNig6W-Je6qV10976pvJFbh9Z_kmPJ4XZCeVBosYqltSGYFW-NDcr8zWEkQjZCFksxqwRX0pZqTakFVgXzDcLIU5xUahVflg7OFH8I2P0JZ1eIYTF90sY3YSiWpzc1kdVBFjkRCQBFP7rvjv-TY0JoKn3IPQ_DY-Ik7OYaEevdJFksaNkmKYKNfyGyZGH8f9OTHcJ1--QmcU7VPg6Z5PTiNcsGItBlvzK2TM2_TPdAsSVDvylv8hCuDviegTutnBM8MwZjDGPnoVCgIzQjWhQ5FVcUpW5v_wYWXyyq5pbq2JHww2wGvEjcS9NcVqn_2MrVe11cfQ3UNxdl180PRQu1FjWe9dg4cndcQquE9jfVlnb7yUTYSsYKAt7DjelRUmSJb8sS0P2GBiHYO-XC73hbyrmD5TIxw0_nDURAlTBlrRkYfJ-BJtnDyX5rVjPoX_4Y6Eo8SyMtWX9QMvWlNnHu9PIqH8xpmq5V3vlJQVyS_GehtRAoDFJIJe1n4lgca7CF1hLtgfProinAlHubi1W3fOaIub0HF5nqnLK7BOlc7it0Gg7_lpnKrGWsDJ_OYfs5N9zbMhIfQOzVInDDbybVp9scsip-ztj2Cgs66MM9jcjJ8YFqj3pc03eUhZx2fBwZxAL1YrNXglucHQUAx4Z_ismsAfkk1DKQIEFtWm3bt0Zisxx-yGmILG_O3I7Xus2am9ug29_BgACyFXYMkvVsqPMRwnFY_RlS52O3fvRjprVzBNDcogJlo52pivIZAQFCDkOi3pt_wqVSaJ1KUm1f8U4B6XvbtN1HLAm_OtnZRhiq25soACwmrQy3YMMhOUGTTwMbhWJMkBw-RzxMfVHN2yuC6GnTsBfdXjBsssLxwdbNzhAPy0AIfwDtCW3F52iNq4WjsFFL3mBmLEBQl2DmgN_V20E7F59lNGOleHkQQdVff0J8d1LfAOh5eE8BwkVNkl5iZezvMrM0wYRIDk_Ul9vc5igtcDNAwkjJTg7S06CkpSWoKfIze__ISIjK0lKUWaVobO84-QAAAAAAAAAAAAAAAAAAAAAAAAAAAANGy07";
+    -- wrong label: refused
+    constant case5: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.ICx2Nyv9wk2GvUFmwCOWgdVz7mj8GOUlxe0X7l8ujti27TGX1_sowUVF-b-W0vKvhqpMgrnWRflsReuzghuGwXmvY19VmWn3po6vyMiAUb5MSzwRq5GiQVafA76FtH-JJ0EUH8Gf3z6G_O47jjR53jBmyvpFJQLhA7DPN2kHqMp-e1HTFQcqOQhGRpQqfiYmUQzrHvBlVUYTgcbgibtGD9o0tv6QfHxEWi2WR-K4lBQcgGzfUnfGPlGplCiNmFKs8rTof_Rku8YwPzv7Wg7cO4gOoTp6WnW7GFAa5h5XV5qz07wM7KN83CwLKKJHI3QsG9RKIn_WPxMOpbmIaoPTa3VWlGMkFQYxr8Xr-1gkgeLlmeeMBkWdzZxrsgGwxDHFmYsheO5m3H8BCLC7USUq3PQSuIEGw5sMNezI_lUPHlO8XhSAXWgybVcHwZd9wu3-F2x5IpMR_aPgoT_6vhBozEA2RdBM3if1sM8JYY6XIX4QY5ktMl_xO1st7t7ezVIQZSJqEK1gmrOvDvi-4w1jpyAP_00lgBzKejhkik9g3tEu2-yhMk4AF85I73RceGqZzzf97IrroVj7029ddqcyJMMyC03KmP0GATDb4Vy_-HCIkUxxZ6kBwDJcVpenzHS1-pEnDBxURcLOjB6N6kHVb_G0kkmMJ5zW4e42JaQ63LyZGy6m1-gmz0ISWKyaFcU3brrb_4lgtc_VU3847_1Pf9Q252whz_Oqy60uUa-WMk2v5YjI7JB0-hcT6jzMu-9MZL2nFKZjoxseGzaj9rLX5THtkW7HBa3y2onTTAo-03KBmiDMu26botN3OCwyJ02K4AKnZle-mMxyDqqP6Jmh5OhxW6AjdOsqNpIueeETaEarlbSQsb3RtIVJy6_geVVfnY151MmMVp1JZepwGvOnpqSEHxeysI-VBpaEtTajIY5Pd7ytd0XCUusbzNBhTppCuIcxuVTl-RGs859W__UAX6vsjar3FVSAgbqvWKzxDc3xY2isAexq2N7kNEaBitxZ3QA79SJosVwCz0SKM0AfyorshiktthLYQ5wtKR2Ye7crffoDD0AorYT9Z1ykFi1ttW4cjBYYS2IOWZGdDhO6QatLoOuMB5dHKfoJvNt6gRYdlxmnGLNdfC8gBOoLN3EKjMtpLsn-41p-ac_zvNMoO7w88Qf9yVCkpaBmEEOkoaCoA5YBe-mRgjdcabKyvvatMX5JslGTuz3EWk4DjntmhHHPgxStwCKw_p9VxsySumXK4vq4oMGfSwzLMsOT2941YgsD_67LYq5ZDnrbRU67OYag_jb0KOOJUkceaf67wcwnOjETqUM4etJ115vFz0IQr67HsrlaVSjTE-cnoNaef1dsZxEQOSxNS_JqM541W6zvl0iNkUXJaZ969hAO1vTRMs5FcKs4bcv95C2k9Yh5u_QhL0shbe6jxB1p4KZDmRKOAKMSZSSqKVNg2TOCkN1zl20kcSwVOBvkIaGeVRMqAAXnHZElYnVAjXaArkhOacaBRiYP3WaIhJ0l8Zqxawtrg1CjuLFnGeLsZnSRHuiXyXh7ZhPmw8yW9Xr6nEJNNiJ0lokuAyY3yxPqgxdvaJDmpY_7mnfuOfW1tk2EXh6-ixTzA58wr6K5KpSSDuylfiFHkTUG7LMSUs9iddHd-4iIJTT8VekGCEbfgp8aDpE8tFh4z6MdiUQ8soYptkSkGAZbZtVfgCWVCXxSyukoRUe9LIsG47O5BnPdJtbrFVZiSFsS7tslC4EgcKg4T7myuSytsj4qAJGNPXppjcUnVdYewuG2Q4ts_xe-_8mZE2wfA-YBpcgx5NcUL1Ce_QNqnIW662HbcqbaVKwv-kKRTec1SrYiGQcn57J5nr3G0L740Z89dW4emn1XI0c4ZQ3RZu5WBXhi9RfApHJmXyWZdRCsTpjf5uE9H_DKp8pr0nhH0wUetDqopejb-Rf_qLptkoL1bNeDXr2yn-cf94zfT58z97Kkthn-lgc_kxAShpfx-vHUTa1QSyAOJRnKD_8Lr69M0MjsBSh0wb6qFsin3d127jkrJH7EezcheDvpmocZ0EyZ0V3-9RKjMEw6odeV0DpL-TFcYWCUT2-s0m8aVAn-rTUl9B-up444izCSfyP_yc3SxAADVbW4EwmhRNRxvLM6aPgIhet7SuHkIJbbdOSpCXcVXmdSWmDb1e-xQ0nd_BV8DR_FVq2hYViRfGWYMHUGZ_ttSPi4oASfT51Jve2jLtsTq5RZWV-PXdkulLJ6WK5JD6z4Zlwpznr3fRG618fMMZIdkv5A0Xlz9i7TsP6CgjewxhMHVgDSnV1bVYPCIIaKfFKYB6LykQ2zxJVNjpqkhA-C-ECakqWa6mUrKHZvIddt3vlHK3QYyMCgcbvU8EMo2ktU1BrFeeVHn_OVwQdXfu7xRXXng6Mgiqp68TvR0dDuKKKNCNNeAL7hrI0Y8fsC95QwfGuLQ_wlpOMkK57liemtaqMoC6e5hEJJpKVRCESh1xpzWGpENNpofXhkCdsmdbeuyEoOGbiKmfCUTVj8Z1Pr04lUpWOLaih7vktTm3klR8A2QIKnVkvFXzHx5JIs-GX5Hvb1_VGxTZecwWgyt7CphoOe9RxcHHIlExq3yyhWyRbv6sqzlvBv4SVCQr7h2ZTiT8BdsTzxFvv-DDd2pm3nYXiYQLWS8n5YHKtOVFLEip97Bqc5NfiZeOB78wwKivYzqbcsv-ECLgE7ZxCWft-kuwud_DJZImDh05c2duq_iGuxgNHAqyhQDsBF59xsKB03-lY9MYyAJYWBhoiJW6DF7-LMsnIYOkn_m1U94rEHZCJzPf4Yjyl7HaEnWY2h_NpfMsRboYmMDX8lFL0h72alXAs-B0_D6S9VuhYwWQfbCbEm-S06PNuUrV_7Dlc7cxU6mKOZyhkvPS1X44LzmZXuzTg1BhZ6NobuQJf4D9_ks8QE8A5GHeidG6JBfy9bVqIeG0Hxyu6tOfmKIYlu81OXqsk_AmJlbSi4q4qdWNJE5JYHWzCjQ6-0eoosyJnDrbnwNTt97tIrwH6vat001oplbVHIiL7FnFEMiaunnSWZNut8jtMFV5cr9n_F5iNHZwl5LU3ZKU3D0Q5jeUQfS42PlcbN_QoOGhtUd3h_gI-pt9nn9AcKHTY9QWOHoqmtubu84_f8KkpWaGyJor7Lz9DR7QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgXKDVp2I4FVj-jQQ7haMOyrbv3r_xlaBQzvUXBL7Hnygyyg9xENhqPQne1KEwGuZ2H1ZLQ5HMu_WxMHJgXvSTScNcE";
+    -- ml-dsa without context: refused
+    constant case6: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.EmHHQaJXygqcCSnsJCyFZN2lhXpR2pknK840OUrd6NWHt-Rs6Y778kW41Cldhsr3-pWtuqAu6xtg_-OXpgnqeSDZkQqNbd42PpUo3PNCT9_HKj7FlBtUJq-2IeELK-u2VEpE893TZ5-a1K_LRBLoNPtT8-o8BEHzP31iGSPwV70z_akwbslIUQNFiltyKyr7FE5QK0oURkCJKQ47YxWYFqANNHEEqzyax9zzu2UUdnDFT7GJS0mLVh_uEjnFqGicz5RaPso6bOmesxVLwse3P4uGTRCc-kxPoxW8wAvXit6rRu8jyW4LalCTwvbnf4o7fa7DzZmlmvKwxxoA44ngobkpsnUTUKe8pAyBXsoH3wHw8e4DyvSSJvBEUo5hsX_d7YlLzwKUs0dNy6oQ2jfQbsBJJn9SDn3KtcrBT0KpdGv65SSKHbwzrzmf4dnmX6T89k-EVUBeMRpfrvc9PYX6zCPivLssuyJh-v5L0u-T6uDyZpUITsCU0Rpmx0a4tTGOLDLQyKwg8Ht0iXneTEqa_wWv5IAKueEFcMPyP8b1gC913yHpQTliQwaeT6kfBI3uBaOKwQez_EugxUkRp9I3Whnss5wiXXCmS5stmzPxbjTOSbXe1uT7vMgm2tqTtdmbTIxF_NBC8AWKZDNgkFf18hlm4kC2bCr56YOMWbneoYrmO1opFI6bdbA-FvdfgLmv7o0j7YMCvofIc1Inwa0SF4Bnic1VDMD5X6tzwowN_FxVf-2bMbdntNiWLADIn5BjPSe4Tb2KNXwoNGrMDPFxcGUl6yRQQF_rQbKTXIOM7Sgwzo5nl8wL-Nc8oYOBtsFwhR_MOotV3bwzSREVWQmOkMazygZE71gMY-GBzQ7b7M9AzgVhXOLwza42Fv9rpXGXb9rtVNxnafgiGCyp8sEnRuxOSPaBmk4gA8Qb-WNLSB_ueOYkphed01digyvdni45BKu44UC0CGV0z_FKNkFHHkxfox7AaRLOxONLQdvhrNWg1BqtXssWhW2Jupuy2MsC9AfUKsCAZtt1vaYS-Nam3zTrck__BaAPgyRyqMoDE9kbnuomIwY3yXiafWQiwBs-tlVDkIG10rU9APOcP4d8nc_OagzEhla3dV6Bjgt6mHszC8jxJgU30Bko2f8iT3qLTnGzjTBH0VSES3ZNUK1ZkGpogTxF2aaUrmQ1YJ9AJoX6SIjJ0i8uZ4p91F5FZAC5iSybFbAUHEt9E8xDiXzSqHtqYpPnyh-gcLmlsG-aO4dArKWvDP7fozfioqcgBh_nsUQBmS0XibC8uLVnmG2sa0AXMC9vZ31BJ1DhjO3WhbJjJHnL1g1ehRb3tTAKbSz6NFC-HYDFXn0S8gx5CvKG6eJ2f6FhwY773daR0r38w3daCnOL7O3f95YnPXYQpNFrWD7y9b24Sz9T4UnFD6fcp5lV-UILe-KyqQgJFXk99ZWTwBJVedFL1Vv9aksNc4vqr2UOTxANpLgO0Fm8WiUS9e0paZnt-aYak2OWqUs_IGG1Qadz8cBAJgz3CJTT6026_UDZMCnlr7MaFBXRnWdrC-cJ2XeZcleClS05Cz7klq3zXt9tVvaL9mL3TtCaVVXoBG3YPQa53jgO7JiwttWHPQ93h1eLdLpUhrUOhu-6U9QobgQsNw3bkuKklqxaQUDpgb9X9HQ9USYaNyguLLG3Is0Z2h1ZRQmJV6u_KoRdNBobB5b1RXp3P-fIcHy5EKjCoe_WUe7paGfCMYn5o0Xgl_nAfqfNngt-3kYR6hBLvEVurEBUa3A66gX0LqiUpWULuBWnZhrnoX_jPb5IpLNAQBy8VMNhX7Jcai-avZvC9NPQreInv--9vjcvPDJiVWA8DqUIPmQLQx0gQw0qAa7QsqEipXMnEuj5r6UCE4drdjMEqSNg-g2i1Ml8peuJ9vnPO6O-Zysy6eFyW8m_m6irVtt_Qg8mpD2YYdQmLn4fIgi6PyGarEziy8RaIfSi_XFJnJ_N6UkDBX16fGHMqNboqMm6oz6vKVjB0zXOjtwmkr2BRJSbAJxH8GYy8OuU2Q80kcAJgW4DVPuZTf5JTUQBi_JngKOk8gt2eOTUm2Tjyw_tJqgF9WG1ZoNYuGlC8C2UYDzL1hKM_I8a0RckC2xBihnWuE1-cDcC8Qfj2muaaMjnjm3FTaLSi0axUZlv9b6Jx4D7m4oX0s5AwGlbXI0EA6j9bc2T6Maj_WapKaf40MiWX0Oon_HUhaDc8AXIFMB3kAGtyRG7IK--SKivjDKPbCkQCFM5k_2ijFIAlv9cPKgGw4ULyFApbl40aZ4VWplVFqWlzjguK9Iho0yysyJx9mSuCKpZ8ULpCihzvy2JDv10R0kvsdMeDQ68ejWeStDq2rQZxmfofADeKKV4MVPPRySMwK1NiI6cJogRKRSF2TnSk0D4zz9YM7gHdkROz2PP989RkknmZVoFE2U_d8GifhvF7vmIhC5rBZTUHmPVyowA-V4xA04fU1iyTgIGOUvbj0tkvzSFXYVsVi8ADC7prFB_w_i1Gie6RjszXX56EVKBNDGbNyGEilwRhnXc_z1V6oiZV40ml_V54p9ojLGP8bdqT06Rv_gH5mnpaNfMm6SFeteXmvMphW-4YMyvWLpqdnVuxyFi6XqfMecneBkpaLH4qZ9NtLoz9izkXGFrpfVYlRf_GReAFjYRjpxNekvDiritXXB6Q2NIvFjgPMzabu9RdJ4usjp7erGNVr3UhdT8biBeiuNF50WQKQVVV5h7vEyqKtCnQsVfpKEss-qP6Vg6ahYIK2L4RGIjtwGWae7TUqpGBW8NHCSSqBGjOu5t43rrIU8aR9uXtyA02tcjo5P4mwxslIQ6s0QWhoVa1qEZUhP1FhMDkXambUBHWxgQuSFSkRTKFSGHQdnb3INy2mAvoRmzbHLWv_97Joordk86gypNsxvHteiEpAraqP8yQbaLpI1lJsUGbeRFp1I4iCU6alP9m13Dwd5EP_fBK6bHK7gSyU_Nd8G6x_uRpqwMZ74ya01yCvClmPY62LYcznYDlURQRFGHgZZ8DtcX7SBeLSfyJe5-k2lu-SokqPmnOa6j6nYVE36lEhOapDq0Px8IMZ5rynGZGk5NCL75Ve8OFRkiRkdrbXJ1e4KiudTi8v8oNDhIU2VmnJ67vMXH_QQFDSFMgaDT1OPkAgQQIkNKUFNYY3d8g5Gpxcra7O3wAAAAAAAAAAAAAAAAAAAAABIgK0CGcqA9QsN5PVKKU3DN760o26VEWcY8qZPPfBD2E2vjOPmw-tEZ0N7N37X3Pqlt5zpKRd9TUpKtL4ETBPo47uYM";
+    -- base64url of M': refused
+    constant case7: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.w_fmPqyMDVDfcgG_tMf1wNJVtejZQQBR9Kl2RQZ0gMde502Cl0jkCraTRF5LoepLnpJ_b1IbhZAcL3I7fTfOm1-6mlzVlAXOAXLm_5O7SzgPAxHe61xkL-VqQEfwluyRjzR5D8SbMNvuIIjZ6TmQDuSHwmcKKpOOTU-uhNp1efRP55_oZO_gkufY7LTaxh9PI-JbguJTTRLOWiAADEMTpniQdEBDub6k-UU97KPEaDs3K62EiKnehRafIjUrC934x4om2gLxuTJDcQ4BOszBteeJXkN0q4g12WQ8Xj1DS8xAZVqWlqTiAL3OCi8yUE9hbPTvH-9zKitZw_FKx9nxX6AT9hQQ29xSpMu03kGO8uX-k-m5ecD-wW9tU2cmH6qb6ziwgjYD0qdtVfGHCWB4qNw3bsTunU6e4OaRB7_muUQ1TVmGtsn-twSusKkLwChjcfnuD-bVEkOVy7YFXlTfZv6m_Kl6Gaa9HThVmZxBUEiWbqNFIjFOkQi93OiPLSoIQB3cKK0UQgAozMrREVO_g9YJ1-Zp7e7X4pSvu2F2hWmIQkLwOmDd60cN0Rn-30s0RMx8BIBqSAaKii2eBMnqpTmPOwWTHI6U3AjYplN97QS1DkskFnhxdduRbQaak5qMtyus74dS-EVEmiagPthQBnrTpBRiNVpBl2tPnWzwsTNarX8dHdrkXKp2n-z3lKlT5mbqD_e0bML7WBmaF2X6GRyoXGC9yEOgcwbrJEGxsPYcNAl7vbxi53EqbHqismrLviPVAp9Zq7pCwh7kJnopED0UWEof8i6FNuNOgxlDT6iep9W03gGcH2FwzmG39Te4XjH2LDm_F_mS2HhGJ3Of-fUvyPtvvdxjj4IA2SWlaySEplKx95kd2wufWLUHOyMvzHVA_omHboEw6XpKVxy4QVHrT0C4yHbjs3KsokqN3CkxBm3rkOeyb6M6ysX0-14OZRwm0p4TASRkJdMyAmm77ySKFN4tYNHGI5_cIWlxkdZvJzVMCqDM649fC0KhenlnT3ip-4PFwLFXGQVKbWMRUSE9HRO2eOZ895mg6W3jVAFiPluFQCksS8o6iL8QDJgnOJAFfKnsoVM8eKCaNUzp1jEHOq3joGRSzGUH9lpd72M5MRDKugO6xqEoyEUQ-ek1fomYfLBp4EYiw_NW839yLjgxVJf1nk6llW4t0F993uKnV5AdLgYepOLHmMKS-T7Gfk0paHYJ5MjKrFqjuHG81cvmAsTmUUXSH70MuCPeqYIMJ3mfyYBzixkMboKySzNijY5tQCxxhews92Rcl2fAcdGqmc57p_49Dn5EboFvmk5JNp6pn6i-jXb5MqZG9gUbiHceKAernS18Xw_-z_OmXsqqjq2EnwmeEYHp6LT2kKJvgFjZFot_b0nEn22GZdNaPcUcEyF2neeHWMzAcOKJBvyMAVKCokyF91EcGtq52L1pOrrm6dz5903fhZZ72-sE_zFc5oR3H8akw9UuvlKvT4Yf0RgKUBuabnvmunmYuR7f_Owp70-JoBGFLW36yUAXmvx4BVw7z6xHHC1xhwriFxCHJGnN3CGjQRxDB3g0e7Beho24IA4_HnoUkD5j1mkcgKD8EhoPO7X7bgmojZIda4K1ixAwd0HAKQmLwwhsMEiBpt3Hq0A6NZsSoAc6t_301ZtmUeomFei8owzsG_kUoq96MvaTYmtcPOtOpAk7TVOPNSNyqKJYLnRF0uSQiQsBHRFlFoHXQUWIkcI_Jp3C7HP_GnSx2cWb8B4ISGP40AdhFn4N8rbZ-XusVa0Q4nVA2BKPArElf7v-vN798RFwcXyJAxcHzHEBmrb3STFhXhPev25MhUjoCCP-EcBUmOJU1Z23IPdA_skKaklwBG7DBnUjS2WaiqZNLj2RTcH2pi3yHyx9rMAwV69q5IcTeS1hWnDYsL66mtgGNcQznkIw9TIwRCHRgBO6c8XHovGrrlhmSXFfyGGD1eqLFG8ePyqVO6-6LFoL_OvqstzImb39f1DC2621v165D7SL9LXMXELnjcRH3-q83oqPMZr9ah1xrMgqUPGm4KFpQ0BTkO2cc2HFBe1Yr_6LvllYQdL9glgl91FovihajXDwH_zS8zlQUVhFVUC4dvm5iHFz0esNu4nB8na1Ez_CE09FErYbMrTk0mnz8rgpiSYWyNx65cebyinCzUkuPulcQh0Ep9HSphN2CYOacHfNu_L5ipF-AZp_6oSoC6fgNdEfa2LYhYIOkFaaKRtqXQx2TvvFKPt91LsVqk3Y99kJHHDUaNclqY1E9UtyExm9IE-2ZMMCmYuOgD1p4PhORby0IDc7HdLYP_saernYL8vxu9TUKBmb5-5eeqFUKnank2GBKUOL2f34xxduHKk4gYQwNCIkXafAvXjrgX1sruQgmR3aZN6TetxZoj2EwVPJdGaFPKL-_k43RDdJtjhvsu55ILLlV11jYtB4Ihnkq7Gnw6zlqZxUcpQncF_1YM50tgTM6teQLq5PB_3SCoBB4xoWnLJVSVdgr-L_kvumUz5RDmvS76oSLvmscYGFuHw1hSqPY9OrTs9VLidaROGRyncrmx8n-WEQEUYiucmWtvYriEiC-8-AiVRM7qSGPN473LHB7JLOveM1WNOlw0xVRqt5Pe0kP4RucefrYehljgEqkTbYCo2iXU4Vq2IBhFdAqKjjuvbHMEP7bOEI9EY0zAFCe7cgn7zStV6S7cAiKMV4v3pzTRvNrnVlrBDL8lfULcnICito6mw-2BthdF59CRTbnCERYYh9VmM94vW-eF9LyR4PzNpbtT0nsuvEVJUcvm9lRX0CNIsgKTsaFhAVjeyDe3thwQW_ds2c2eoKQhBoNPKrtPhB5cGrrHod3b__N7AlQMqSWvC6n4HqD9nkifHh9dDZfOUOZw3XLiYyk1dgHyfMm5WCxGV9fMJ36dLA9-Twmon9HJ-ngDgTo8jpdI7g25b8c7VqoEZucwXgj3aq_uNxBe0pQCx2sqmbkXE7lAfv_cCtnAdTW1CvrzDL97Eow3zGvI8mB6aDHEl5G2SLraGkRxNeGw94rtPs4YV5yGj9huSuGPDZRPlQZJueLo8k74qi7qlpXzGy3fJFSmbijtZ7dLjq9pgNJTZjd4OatLnQ-PwXNDdRZnR1eHuSlqGiqLvDxtna5fRCXXScpK263gMGCwwSGzlGSEpPWXWjpLW2wszq8gAAAAAAAAAAAAAAAAAAAAAAAAwhKT5ULcKauW4aDVvaPP9hOZMp_dH8NKIRT2x9qfjrxzeVvJhRQSpJg8K-aqxI42DpQYemOnE49MVLh_ESh5gTRfYH";
+    -- ml-dsa half only: refused
+    constant case8: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.njjMHzGv3qWmMX9A7jzbtHh8IO8FGsm3fTpEsD4Py1f1Ec64B-tNqIFAH-w2Fdlma10Y-wGb4Gp8WrU9NcGfuGR7Efg03jlUryba00Y8K2zYIDu6HLmABLVBduEuPqL5HFsZLfAVoEfw85MuB-Sm5eZhbjx84xmT7tv9kk1tWxb3AM-I2ZEKkOUULGP9JhnLMymVPH-ID2cSHMD0D3UTFRhyVE6rOzylMyZbzIgRrpoRq_2wbS0ZD_bIVWaCooxCz3giYjYP0_o_-xmrwTomkqBhf1jmeGhnBHQphjjnCG5VNwJofFs3gq8WBeV3_dwUWfQ2cp3mpEyn_JwRJRPir7q5wFNCvpFFUg88aO1DRqkJfxwMAh5OhcrHFvTuLXAoIO6Fw7sH-plofroZqTiWCCcpOA1TEMUz4xJVE2VuZz3aZWH_jE4TU650OP5coKLLMCf9gkLEsmswkohk-ZCLisrSaW6bVVqD4K9JQWwheNFsOnpEY1kl36-nPZUJKtSMTt_PpX0HM25IqIi6jdgrf3QXyVT1fo1oAoV0UE0Z4Ah5OHmRDudpAUsT93Y6kxeb1n3gx4QQiA38Qj2H4h6TLyyOX5lFrCsljcZQMyCkTTTgolyCm7OUWBg5Tfv09YRD1jzvg3MWHs1eSQQKyTgtg1Sd33_k1uj7yX8j3t5b-iLn8o6N9ZzNCrtUzIo9WtUZt1Fz8HPvn8kTj0BLvREEhGedn5hWeI1JZqSNwxEfcuZEhvYH70_9mwIqIHNRiRq8ARhdLdEc2rlwXn2EkLw_S3dToiKYusJ6WOnDCx7-WtGrWUhEA0e2hnWwj6oIHoGP6-XPfEXVH5vFeILX8cZ12LPT4gB9JnChzDETsV0KrSyj7-o73X_Qk5U3e8Zc8DpkK4NqHNAcY-iBF1_s1IDxyXvXmJPw2WmbgGrVPg2rBUv6ugbsvvrTnVgTo11XwZTBIg4NxIBZ4-jyTDDZxt4ulmeXkzLRx6UxJ6O96IdPPamNFkv6Pqok5Qhxl2mY-lBY_aCclh2luNs-jTz5YCBqQP-PrS9LQ1QB9Z-U9c7vVEKWomAMsT-yngKP3gCaDT9wU55aNaXjqXKyBm-xAXP-4erFg05_eE0ZwyMtmtcYZl5rZbFXgYL1Yp6vRCoUZaFSrJLaDZBH34gPHGxahaBL5idkfigv8DOMwZ28brCOHIaUCcWVUj70yxlaQkadzPpjIRCzv6GP14zst9TwRkKuZnb65f_kz5MJDv0kh8X-ws3MBIsoCFGMoGIUOe7_hbyTR43VYOu4oZYK-KhfRvdMJBchJKRDo6x3IZaRmueJrZQUuiE4s1CU8l3d2ST42IDznCq7o1hDveDyPdNbNFNSrJ2H9mRM8m_6P2nzqqK0IHS_J4PHTU3hpxa6xvuVeTWaz2F0lR5zPrNKkwDoN-eHO9_3u51Mmikls-3DysO7fiPElgcJwBMuF_7UfXnUJpLa256X6kpjuHn93XuWsv3XHZoyek9EJsz-PltMeGSHlR5VM2xU8GfngjktdV6wxDBokg6g_naJc0VaUv2Alm4WJY0zMT2Y81DOY9qSzdedvCP6iFNcTbjER0DwS_XdnJ_3X0TswxQkN2sEh8rjDof7KSgchqlrXHwPrXvXm_OoqvS64OFbIdoWyLLJBGN1h6CW5vCOjF82Wmgb-WDy5eARXy-e7DPeCtPXgtdyxqb9IGwSHKLv5lwEWAI_5Xy8fXnhbLBJemvFcicoCM_etEc0oYLs7US6p4xihoimBCw3_pKpSTlJ4AduaTi-zq0mq87O4jNLaTNEaTlcckYGWTSEm8z_ievj86pzJkqa3vQWEw1qlwSWIOguKcEW0mCcAkyt4e_okB1Zrla4NZAAL781e_IrMVuLMFuABr5YBQ6yPPEcScIHWkfXDKwOSjk0Er94e943NiBeTKsJ0UWPh9LI7ypWr6uDYQNl7dsOhN_J9nvY1hIvpQnj-7LU-gN3-cazLRcWjaY1er8znHDH6F0HWUkwLeM_ZkxZy53-H9U8srvM2jN1CeJCDwRrMEaoyqCi6m5VABYWXCtbNbHoscY7yQiCg_bc_SdEqqQlXFEXxpazeRyyTao_cF0SIeItvP7cPdXB6aR_umqb_ME_tt7w-USdpr6ORcUm2S90f_MjYAHSUG82KDpb4l7qpXXT3vqm8kVuH1n-SY8nhdkJ5UGixiqW1IZgVb40NyvzNYSRCNkIWSzGrBFfSlmpNqQVWBfMNwshTnFRqFV-WDs4UfwjY_QlnV4hhMX3SxjdhKJanNzWR1UEWOREJAEU_uu-O_5NjQmgqfcg9D8Nj4iTs5hoR690kWSxo2SYpgo1_IbJkYfx_05MdwnX75CZxTtU-Dpnk9OI1ywYi0GW_MrZMzb9M90CxJUO_KW_yEK4O-J6BO62cEzwzBmMMY-ehUKAjNCNaFDkVVxSlbm__BhZfLKrmlurYkfDDbAa8SNxL01xWqf_YytV7XVx9DdQ3F2XXzQ9FC7UWNZ712Dhyd1xCq4T2N9WWdvvJRNhKxgoC3sON6VFSZIlvyxLQ_YYGIdg75cLveFvKuYPlMjHDT-cNRECVMGWtGRh8n4Em2cPJfmtWM-hf_hjoSjxLIy1Zf1Ay9aU2ce708iofzGmarlXe-UlBXJL8Z6G1ECgMUkgl7WfiWBxrsIXWEu2B8-uiKcCUe5uLVbd85oi5vQcXmeqcsrsE6VzuK3QaDv-WmcqsZawMn85h-zk33NsyEh9A7NUicMNvJtWn2xyyKn7O2PYKCzrowz2NyMnxgWqPelzTd5SFnHZ8HBnEAvVis1eCW5wdBQDHhn-KyawB-STUMpAgQW1abdu3RmKzHH7IaYgsb87cjte6zZqb26Db38GAALIVdgyS9Wyo8xHCcVj9GVLnY7d-9GOmtXME0NyiAmWjnamK8hkBAUIOQ6Lem3_CpVJonUpSbV_xTgHpe9u03UcsCb862dlGGKrbmygALCatDLdgwyE5QZNPAxuFYkyQHD5HPEx9Uc3bK4LoadOwF91eMGyywvHB1s3OEA_LQAh_AO0JbcXnaI2rhaOwUUveYGYsQFCXYOaA39XbQTsXn2U0Y6V4eRBB1V9_Qnx3Ut8A6Hl4TwHCRU2SXmJl7O8yszTBhEgOT9SX29zmKC1wM0DCSMlODtLToKSlJagp8jN7_8hIiMrSUpRZpWhs7zj5AAAAAAAAAAAAAAAAAAAAAAAAAAAAA0bLTs";
+    -- one byte more: refused
+    constant case9: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.njjMHzGv3qWmMX9A7jzbtHh8IO8FGsm3fTpEsD4Py1f1Ec64B-tNqIFAH-w2Fdlma10Y-wGb4Gp8WrU9NcGfuGR7Efg03jlUryba00Y8K2zYIDu6HLmABLVBduEuPqL5HFsZLfAVoEfw85MuB-Sm5eZhbjx84xmT7tv9kk1tWxb3AM-I2ZEKkOUULGP9JhnLMymVPH-ID2cSHMD0D3UTFRhyVE6rOzylMyZbzIgRrpoRq_2wbS0ZD_bIVWaCooxCz3giYjYP0_o_-xmrwTomkqBhf1jmeGhnBHQphjjnCG5VNwJofFs3gq8WBeV3_dwUWfQ2cp3mpEyn_JwRJRPir7q5wFNCvpFFUg88aO1DRqkJfxwMAh5OhcrHFvTuLXAoIO6Fw7sH-plofroZqTiWCCcpOA1TEMUz4xJVE2VuZz3aZWH_jE4TU650OP5coKLLMCf9gkLEsmswkohk-ZCLisrSaW6bVVqD4K9JQWwheNFsOnpEY1kl36-nPZUJKtSMTt_PpX0HM25IqIi6jdgrf3QXyVT1fo1oAoV0UE0Z4Ah5OHmRDudpAUsT93Y6kxeb1n3gx4QQiA38Qj2H4h6TLyyOX5lFrCsljcZQMyCkTTTgolyCm7OUWBg5Tfv09YRD1jzvg3MWHs1eSQQKyTgtg1Sd33_k1uj7yX8j3t5b-iLn8o6N9ZzNCrtUzIo9WtUZt1Fz8HPvn8kTj0BLvREEhGedn5hWeI1JZqSNwxEfcuZEhvYH70_9mwIqIHNRiRq8ARhdLdEc2rlwXn2EkLw_S3dToiKYusJ6WOnDCx7-WtGrWUhEA0e2hnWwj6oIHoGP6-XPfEXVH5vFeILX8cZ12LPT4gB9JnChzDETsV0KrSyj7-o73X_Qk5U3e8Zc8DpkK4NqHNAcY-iBF1_s1IDxyXvXmJPw2WmbgGrVPg2rBUv6ugbsvvrTnVgTo11XwZTBIg4NxIBZ4-jyTDDZxt4ulmeXkzLRx6UxJ6O96IdPPamNFkv6Pqok5Qhxl2mY-lBY_aCclh2luNs-jTz5YCBqQP-PrS9LQ1QB9Z-U9c7vVEKWomAMsT-yngKP3gCaDT9wU55aNaXjqXKyBm-xAXP-4erFg05_eE0ZwyMtmtcYZl5rZbFXgYL1Yp6vRCoUZaFSrJLaDZBH34gPHGxahaBL5idkfigv8DOMwZ28brCOHIaUCcWVUj70yxlaQkadzPpjIRCzv6GP14zst9TwRkKuZnb65f_kz5MJDv0kh8X-ws3MBIsoCFGMoGIUOe7_hbyTR43VYOu4oZYK-KhfRvdMJBchJKRDo6x3IZaRmueJrZQUuiE4s1CU8l3d2ST42IDznCq7o1hDveDyPdNbNFNSrJ2H9mRM8m_6P2nzqqK0IHS_J4PHTU3hpxa6xvuVeTWaz2F0lR5zPrNKkwDoN-eHO9_3u51Mmikls-3DysO7fiPElgcJwBMuF_7UfXnUJpLa256X6kpjuHn93XuWsv3XHZoyek9EJsz-PltMeGSHlR5VM2xU8GfngjktdV6wxDBokg6g_naJc0VaUv2Alm4WJY0zMT2Y81DOY9qSzdedvCP6iFNcTbjER0DwS_XdnJ_3X0TswxQkN2sEh8rjDof7KSgchqlrXHwPrXvXm_OoqvS64OFbIdoWyLLJBGN1h6CW5vCOjF82Wmgb-WDy5eARXy-e7DPeCtPXgtdyxqb9IGwSHKLv5lwEWAI_5Xy8fXnhbLBJemvFcicoCM_etEc0oYLs7US6p4xihoimBCw3_pKpSTlJ4AduaTi-zq0mq87O4jNLaTNEaTlcckYGWTSEm8z_ievj86pzJkqa3vQWEw1qlwSWIOguKcEW0mCcAkyt4e_okB1Zrla4NZAAL781e_IrMVuLMFuABr5YBQ6yPPEcScIHWkfXDKwOSjk0Er94e943NiBeTKsJ0UWPh9LI7ypWr6uDYQNl7dsOhN_J9nvY1hIvpQnj-7LU-gN3-cazLRcWjaY1er8znHDH6F0HWUkwLeM_ZkxZy53-H9U8srvM2jN1CeJCDwRrMEaoyqCi6m5VABYWXCtbNbHoscY7yQiCg_bc_SdEqqQlXFEXxpazeRyyTao_cF0SIeItvP7cPdXB6aR_umqb_ME_tt7w-USdpr6ORcUm2S90f_MjYAHSUG82KDpb4l7qpXXT3vqm8kVuH1n-SY8nhdkJ5UGixiqW1IZgVb40NyvzNYSRCNkIWSzGrBFfSlmpNqQVWBfMNwshTnFRqFV-WDs4UfwjY_QlnV4hhMX3SxjdhKJanNzWR1UEWOREJAEU_uu-O_5NjQmgqfcg9D8Nj4iTs5hoR690kWSxo2SYpgo1_IbJkYfx_05MdwnX75CZxTtU-Dpnk9OI1ywYi0GW_MrZMzb9M90CxJUO_KW_yEK4O-J6BO62cEzwzBmMMY-ehUKAjNCNaFDkVVxSlbm__BhZfLKrmlurYkfDDbAa8SNxL01xWqf_YytV7XVx9DdQ3F2XXzQ9FC7UWNZ712Dhyd1xCq4T2N9WWdvvJRNhKxgoC3sON6VFSZIlvyxLQ_YYGIdg75cLveFvKuYPlMjHDT-cNRECVMGWtGRh8n4Em2cPJfmtWM-hf_hjoSjxLIy1Zf1Ay9aU2ce708iofzGmarlXe-UlBXJL8Z6G1ECgMUkgl7WfiWBxrsIXWEu2B8-uiKcCUe5uLVbd85oi5vQcXmeqcsrsE6VzuK3QaDv-WmcqsZawMn85h-zk33NsyEh9A7NUicMNvJtWn2xyyKn7O2PYKCzrowz2NyMnxgWqPelzTd5SFnHZ8HBnEAvVis1eCW5wdBQDHhn-KyawB-STUMpAgQW1abdu3RmKzHH7IaYgsb87cjte6zZqb26Db38GAALIVdgyS9Wyo8xHCcVj9GVLnY7d-9GOmtXME0NyiAmWjnamK8hkBAUIOQ6Lem3_CpVJonUpSbV_xTgHpe9u03UcsCb862dlGGKrbmygALCatDLdgwyE5QZNPAxuFYkyQHD5HPEx9Uc3bK4LoadOwF91eMGyywvHB1s3OEA_LQAh_AO0JbcXnaI2rhaOwUUveYGYsQFCXYOaA39XbQTsXn2U0Y6V4eRBB1V9_Qnx3Ut8A6Hl4TwHCRU2SXmJl7O8yszTBhEgOT9SX29zmKC1wM0DCSMlODtLToKSlJagp8jN7_8hIiMrSUpRZpWhs7zj5AAAAAAAAAAAAAAAAAAAAAAAAAAAAA0bLTuGcqA9QsN5PVKKU3DN760o26VEWcY8qZPPfBD2E2vjOPmw-tEZ0N7N37X3Pqlt5zpKRd9TUpKtL4ETBPo47uYMAA";
+    -- composite key under ML-DSA-44 header: refused
+    constant case10: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQiLCJraWQiOiJwWkxPd0w2R0VCQlRqdUNKTGdPZm1Ud1NLNERYanVBSjJqa3dBS09MSWE0IiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.r5bS3vf4Gj6KSM77xn2s95XwvaZslEzlIfmOSAbOrouy_PwK1bnoVa43GzlewwFp--_paN_mP1AzD7NiqqOrgVnm02Ax0qBYBTmlPX71DeeCW4sHnmQbcHD5cGMCdDiTOgMFRBSjMzL78g-WZaq3LgwnSL-QVJxD0e6UIhshovjY3HFuU1fuzGwbSJwxppQLzy1E1BdvaNAAWypNz3PD_ReGTLWtbydGz6q-S_DGbWngQR8lOudH22ciRmhNxqM9RlxowXKSxAucne5NcNc6DwjguT5ywvhlPzljBin6vYpZQl2fQ2KBi8BHJI82fR_HLvrchxnKY8ORIbqz9ZyEHQglp0yIXj8TrgMxtQk9pXcBod4cFTYUmlXfkxm1iVm6DSiRGBu5GRYIrWkM7YogpY8feeWnXszDJZ04hPsXpotUKjWnFOg81nxS1FRjQzJwZur7hiPnQA-snav1bl3fiOWqaHZkr0F_8VHF2A9xftrdjzGk-yN9aHrYIXH9jb_EXm9VN1B0J6CFSzLCAtB1GFR51qhLhp8MdKV9aduqay9NfcVyP2NTAb9a-1Vuel7_7Bu7XpZwWUkqEWSGHhklLcj_NlC5v80UR1OOTqpfsrWBtTk6kPkbSlWd_DFJDvMEbl2j9TyZUrQWFCZJTVA8zhL6REjT_q5EgyVnL5MTLslvHkzIGie9-bjysFRFHWheTxF3Zx1pL2LK-uZrx0Xzs3MkKmU2_Gb4a7mNv-RUG7FAz1XG5TBmHfdLqy_YEzfYoU__35lI1ecPZpdvbM583pQhfePX8p8yUoEOwzNmtRhkLZ35UYIKHgB2fqlWf5m4Ye2lwkgMSdaGcbNmtOS2439huiFJZqkz-KDIgCaVjh34c2wFWj4BNYhK09j8Wq0UfAF8m-oiwjRT9c1-N0TMlUIxTFVWfStDVQ-6D--EZzWrI--R8OmHwqtIc9xTsq0a_NEKivZaty_XXv5LZ1-RA9JNNFQ2xnaWxDDqiPsoTF2U-FHtd18Cn08VNIiuMU8fQiNmwn78YAjKm0YjEOWf2Y9d7X9XcfQhnFH5IWn9FTqTmifLBUFTCch0f8eleK-cNK7eY-uD3l7drk-9QX5Dh9SXzls4POr1i9ujjRxBm0xp57zz2e1YU_oco50Qz97dffHjDYRXA2qrS1Go6YVb4BFhCW8eYQNJObRxlhK--vCMkL7EE1DGT2WglulU9K48LS29uD05OxnLdQBFfpxJpyDg-nIl1IjLDY6Y6ErImjzWMMekhEDuNGocM0j6Ti8F7XAsXZqY_gYbPXr1-W2rJAo6JEAj4jpFTyj-8GWXR3_dmbWgigg0CMzENo-ohzrEnCltioCAu0B1zysFABYwvTTgJTVERSheCzmuwR2SAuL3xelUrn0TSIy3dDGGjdMxjhW7b25eAjNXXq4rvFpNYold3KRzbU67iT_g6Qk4z2ZxUxQSyq6MKNJ5jtSZdF2X_Tpkg7kI7d4f3uYE7MJjxqCeZ0jStki9cT-VCwOmSsUzVA4qA0eestj5rIrI1QsArxO2_Rrw1bOpc0UP5U9oTRKM-vGiwi12J4EEINT2yMTlJm8gbbB72F9K0g0d0SFUGYqx7hTlXA4uqkzY3TS07LJiu34irBaQOnF9gTMdI6be6qwd7BTb3dWLGpuMNMo9JWDVnCafAoEDvyLm0YF6hpk0NXUW8JLk84xQLMT7x_34LNRfO8ReLsIiJG7nyK8G2s_lQ3rFShJ6jtxxQWTIXxukK-9CXPBQ500HWNwmvIyt5nIChe9SNnevnVmr81oX0GinA3pWCEeeTq6MJ0X6F3oCOx0WfGKFd6gGiyVO5ybADnkuNmwogZRJNf6rpt3kCLkvNF9q9_GdZy0D-rqSqRlX1ymc7YDzvocFnZDwOjrjTJj8V0prV6VQcmQ5kx4soHAg24j440G0pVVkSytT1Ecq24v2CBPd3HPpoKJ7_yRSfO2Q1YJYzdGQRDjOPSJPhqF5eXOauIhBeNMfHaw8CR_MuknhjP4UYrEw60K7dUcj8j4JCzYXaa7feffvO_Dv66PgTZdXMlba-3_9CZqCs92DHyQTD1GCq-_lcN0ArjTnCF67N2M1yWB6uquvQOVDpEeKpCtiHhNKYyepogk1BB1_oulL5Jdnzptstz-xVeSAA_PzghioIpKJZ739rAJk53IiCdOgDJVLPhUSNuBIip3bPD9Noqrhw-Fy164k3yks0XReLUGzQKXOUEzENmHDvrTBOd199ZhrSxwcQnCEIA82kGCwjBEJda6bVeFJ4Mk5RH0hIc6oVPbUPiXsr3Hx36YCDOV0Z4D2EgcnS7qDvytQc5iyIG7qT6v-D43WsSXn9wRD2e6--voHy83E6GoL3HReOWxspxkkAYqbdKCSoVL5DwmII5ZDuv-WREe7Mw0GHHYvmonzlrCVO1fbhO1EmfVS3WkA0uXQ1_lmfo0BH0Q51gJ8dw51sXP5j9YcCaEjyjU3H-WptJu3biXC596R7zFX0unuJtiFHHGKtCGtm-Ayj7h3fRzKUSl0moyvuqcnUYfWEJk5L3p3JpAlG8UnBUOhVCRbaqEPXAYce7_3WX9gB5jvL0EK676XncJz_Zv0nW2Ho2-FuxEB99spQo1C5PEUjmPmj4VRyH6i2Qrc7MuDmYSSmTZNpJHFqtVyXn8_i9Aug3rhz9Ul-lKIODfUr8QKfYN8SQWjS2hgYwf_L0Xh0nf46skThytUJU1A6GBJhYBQ8DoS9HAti-zQ2cajdrdOi6Gv_ITWR6S1ol_xR0XgkAzra-2HJj8h0TXeGvPE5BLQgAcMaotjiMqSTCF_VIywREJwTlKfkO6b_SFat_mkhCjyKE3DOa3mqty1VFS26kqOaenxSElzIu2wXMNAl4juKrty0_7H8NEWah1eO1-jKcc2NZsx7G--A-lZd-nh014rZvcOpbOeLMOXIkI0rIl1O_KqyXaRphOKsCCFsEsg80gPYw9q0YGV4wy7-YsXYxPLpetKX60HaI8X4kDVRD6RxojaIe0OG88EeI85eKo8w1Nm-ttP2FPhgEWGfuertzVjQ35r3uxuoZIDUGO51GiJklGr5z8C-ZgSPz_FvXUK_vqXp3--kRzlArOQzQAQGSgrUVVkZ3uhptzo8fMWJCkxSKyzucTa8_4iPUFETGGBtLXA5-v5-g0fISkyWl9ia3N2j5Scpbm-w8nL0dni6gAAAAAAAAAAAAAAAAAAAA8bKUGDaB7xdrounjy552_92XgDP-mVDRAoMP3AIDFpD3-uJ0ATXiHJ71xTs-A9ypPQLExf8FSsg-t5I7e6goetwPIK";
+    -- pure signature under composite header: refused
+    constant case11: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MxIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.SEkjwHkSwNuHzL_0f6IZZko_ekdqyxSy6nCrvcewheBE_mHDPdiAxr6czAXVQHhidObSMFpJI2TP4TZoNNpWrg-J7Do62TrRKSbLKizwHmPKEon7gGaV_ZX4RfoKFwpFkPJK-erNhX476FpbctPjx0Xr6BF0rWyl5TymZozLT0GFqmdRtrgab_Xux0FNkgIxJbCQjJCnn3jWfORPDhEfkXSX1Gh-FCTui4JP-6GcFV_T39VLG9R93syWelAna3Lj_BescLgQfzKheVFXUJGWniOzYVA5kV8yGzl-CqgEv5PHsa4chykmPyQz9julkU5Nud3KouW-opxJEfnowAfSp0JKnTg8FYGspZDLwAjI64uQkyfwvlBU9voU1czyDGBIBusBzqDZpt4UANojIg7P62eEjp_JY3aFtWXi_l5IHZ6WDL_Cp_eu6E72DIa3fAm3G34sGBwPWrvmegBVBXkBw3USxIsGtxposRsNBLN2T0RwqQ1aREbbnJyHCVnZOGAy49ClXmdQGZb70byWh4iiWTITFSbE-tFW1IeVIu8Db5tLUPERjqyvVj030fQrZIKAPV5Rrd89mZHG3A8u7g8dFKstW6Bofz1oZ-Fa4CuHckzccqGPOXtUM_fJYpLBGxH06Ew4NH-KVRsyeFJNWVTul36Ncnl4nXV-6JUV-Esi2BB16gLzkrh6vEJcxOTqLJiUqa47XAcU7343lSaUgVueXn3mpBMn6OtuUh0pzcV-6heDGHAyLFNQS2FMcdzPC8seKliQ6Z6u_8TW7a3aISfgEjdYdBi8xt_Bm4ezVedCfmNePN84XL6qnb5A0kyrglhr7fgrkc_AklqnHD3cXH3f9kaRbBuxHqwDlt94OFBO-pOvYQsKMlf5oIrHx3iOWjr7IW9iBwUQCHkAHRReVS1vSa0uAUvDIFw2nfp7fUIqpnKoJTBXRB8dbHEdeJq_V47qFQYZT1JxjU86z9KoWxXc34XbP2r6bVsyhWIVwroGPxxysmQAuv8LnNtA_Pbpya0ImVPRMINs-7-rQTIzjYv_FDBzC0-RS_ZGY-ITfSN_-7s2u4MP7DOqnn29yyqRFlkbTp4oRSB6jeBDQ51pQMoFcgx05czE8i8rxVf3IPZxOHEQnew_nkoDllPWkHe6gfpYm1dyW98lEd1Rgv-lGAvwE07aH1QuibW133NfoYROxX77AInfjxCYIKcj-nNqFHzRIXB-2MFnb3CAv-YAvjg7Ar5B0T3E67VTCsKTsm1F51_K8uVuj6MurD9juIra8GesQFM465VZKEGYiYj9V-CQQu74R2LgwlGdS0xsh8pd--j469jGAw9a9E6HxBwWNtVAAbI97Afc0I_2a0fyn6F9ZicsxUnaNyko0gaOD5P6A-nh9pI8qCUUNrw_0d8vI0fbQ9_oKYq_I_WOASDNoQ7S5v7TqUpjxiSqbQI1nziEkA5qxD7b9qBrwaiQxrB7KC_IHGevqdIQZuLW0rxNLdn7RkeHr7y6FFH-x036I5QNdrQVjNwl1ciwUgTeSyya4pqeUEl0oNaaxr-Av32WV_YM02rOkimNLcAblEKUk3Gfy7qZGf5Igq4DrM-WSDHuwEjIOxIls91ldDrhXSeTFpAOnfWJPU6EoXF-7HjHhRdRWTAPAEF1G1vkMPn0ofhZbylYIWimquClRvtaHXbHMqrWhQRe_qKxduoCwT1xNIQo1_RVrUBGS-r67lYKlXmsB8_ItmJ421GWBbslEnnxWUGOwBMJgPUU_CMXrJfGRr7C-kG26cAplO9hpNfbaM3Iyu-hMThQMxVFfJ6CCmgtV6bonKJNRy4nOlviN6UNWjuBTWu8R_0JZI09Jn9fwMTiYPXt-Kf3ampAmC-P2idnEh79nihntrP8eZ3po-3tKbTVNanxN4Nj2e81xUnMTvW8rK95yeXNLRk8wtYF9AmAwOgg11SisSZpG5rmjI8Jw4VlAs2DYkWEE6_eUVFBCSpo9nKOgietjQvK_WJ0MWJAjUQtI-KV8QzPqvvklE0EIDJG-WuKIiUJfx2rPgb0fLJhdnfJWRxEONZW_M9hyn3XJELufpyyS0Qy3OA_uU8U5fDd2G-sAV9lndqYkBjHMJ4sWrqTcd7nFg_E3BRaAJJHecHGVBx4X3wjIOJ6S4d0X04C2AUrDAGxAO2I00tz9OlI4deraD6-to3rGrqGhdNDpQLB1ciWPnxcwdNqJEvsAwooC8teIK_zlLG481mMz1MCDfF5f2gjjuHOc34bBQ1WC39E7myVuGFQ6aSfsh_jLOLa3ECDfCm4UeQS8VUr-S9xjVhw5PkxaqPwfFOGpy-0ppKkG0Erff3T0FA9IfUEsRqeCoh9-dCgCOis8kplhGXWgaI-qtKJ3BCjI3S781a07M0ACKZUUvQKfkb_xpGTeQgotpbAADxe1_qjC_h2ubXgOrTA5n6joZo0OuadphrL2pn4F8SXiH2xz3GMeStTDEi3XZNPBh2H6vAEeJdaM1SWx_wv9iRDVQKYE_fTv4EqUxDwyPeNsU0P3qOHCLMB0P_yTQuvv67V5lycvlkUFLxm5aO57O-RsGiQdi8D3E2b6XVlhrWxd_lpgnYIuhKkVSFlUJR-wxnr6BK87QMWxO5kIdlzPZgVy9oMN0DqHybt_fDhV4DI1ZLJX2r_FUrzDtBScwSN1eSNPSnTGYELqaG2OjPm_j6hUhfOzcgBb91eCXS8F7d_AJlXQk6ZO-ltzP2CD2Kq62FImkXc3EKWYEOiNz4Njr41SrbsOfNZgpx4mQAAovK3kXw47No8HOwTI5G-iRowjHW82IZMNKFBnjGQ8Jle8JZ4ztXH6KfArn2oRe-vYJW1IVuT5tncGaUcb9MrrDro3bZ267HgcgO22WrbhpOv1ibsgMIYCzP2rqXdg6Tw4vO2AiLu6DD2J5h6uGe2Hb9NohQF-sb5SWuA3gGjjccjz-bQgBf2Z7TY7noSaiiqyX5Zgz1wHdHh4SkHz1qw4SPn4ya-k25MdovjK_QajrQyXnmPa71Unx9ImMDw7FtIEW0bbMbRaRMI6MFkBCLAmLnwWo9Z-LYaH4Niq8yCiJJFBCMyJwUqvGa8uFEFBfow695qHpo8hl2KcdRz4B9WEYlBbYGfrbTlEB4pKkxaXIKNj6asrbrA0ecBIC9aX2V_uMLJy9Td5vchO0JDXWJlcHiWoKaruL7C19rl_gAAAAAAAAAAAAAAAAAAAAAAAAAAAAcYJzs";
+    -- payload changed: refused
+    constant case12: Span[Nat8, Static] := "eyJhbGciOiJNTC1EU0EtNDQtRWQyNTUxOSIsImtpZCI6InBaTE93TDZHRUJCVGp1Q0pMZ09mbVR3U0s0RFhqdUFKMmprd0FLT0xJYTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJzdWIiOiJhY2MyIiwiYXVkIjoid2ViIiwiaWF0IjoxNzYxMjIwODAwLCJleHAiOjE3NjEyMjE0MDB9.njjMHzGv3qWmMX9A7jzbtHh8IO8FGsm3fTpEsD4Py1f1Ec64B-tNqIFAH-w2Fdlma10Y-wGb4Gp8WrU9NcGfuGR7Efg03jlUryba00Y8K2zYIDu6HLmABLVBduEuPqL5HFsZLfAVoEfw85MuB-Sm5eZhbjx84xmT7tv9kk1tWxb3AM-I2ZEKkOUULGP9JhnLMymVPH-ID2cSHMD0D3UTFRhyVE6rOzylMyZbzIgRrpoRq_2wbS0ZD_bIVWaCooxCz3giYjYP0_o_-xmrwTomkqBhf1jmeGhnBHQphjjnCG5VNwJofFs3gq8WBeV3_dwUWfQ2cp3mpEyn_JwRJRPir7q5wFNCvpFFUg88aO1DRqkJfxwMAh5OhcrHFvTuLXAoIO6Fw7sH-plofroZqTiWCCcpOA1TEMUz4xJVE2VuZz3aZWH_jE4TU650OP5coKLLMCf9gkLEsmswkohk-ZCLisrSaW6bVVqD4K9JQWwheNFsOnpEY1kl36-nPZUJKtSMTt_PpX0HM25IqIi6jdgrf3QXyVT1fo1oAoV0UE0Z4Ah5OHmRDudpAUsT93Y6kxeb1n3gx4QQiA38Qj2H4h6TLyyOX5lFrCsljcZQMyCkTTTgolyCm7OUWBg5Tfv09YRD1jzvg3MWHs1eSQQKyTgtg1Sd33_k1uj7yX8j3t5b-iLn8o6N9ZzNCrtUzIo9WtUZt1Fz8HPvn8kTj0BLvREEhGedn5hWeI1JZqSNwxEfcuZEhvYH70_9mwIqIHNRiRq8ARhdLdEc2rlwXn2EkLw_S3dToiKYusJ6WOnDCx7-WtGrWUhEA0e2hnWwj6oIHoGP6-XPfEXVH5vFeILX8cZ12LPT4gB9JnChzDETsV0KrSyj7-o73X_Qk5U3e8Zc8DpkK4NqHNAcY-iBF1_s1IDxyXvXmJPw2WmbgGrVPg2rBUv6ugbsvvrTnVgTo11XwZTBIg4NxIBZ4-jyTDDZxt4ulmeXkzLRx6UxJ6O96IdPPamNFkv6Pqok5Qhxl2mY-lBY_aCclh2luNs-jTz5YCBqQP-PrS9LQ1QB9Z-U9c7vVEKWomAMsT-yngKP3gCaDT9wU55aNaXjqXKyBm-xAXP-4erFg05_eE0ZwyMtmtcYZl5rZbFXgYL1Yp6vRCoUZaFSrJLaDZBH34gPHGxahaBL5idkfigv8DOMwZ28brCOHIaUCcWVUj70yxlaQkadzPpjIRCzv6GP14zst9TwRkKuZnb65f_kz5MJDv0kh8X-ws3MBIsoCFGMoGIUOe7_hbyTR43VYOu4oZYK-KhfRvdMJBchJKRDo6x3IZaRmueJrZQUuiE4s1CU8l3d2ST42IDznCq7o1hDveDyPdNbNFNSrJ2H9mRM8m_6P2nzqqK0IHS_J4PHTU3hpxa6xvuVeTWaz2F0lR5zPrNKkwDoN-eHO9_3u51Mmikls-3DysO7fiPElgcJwBMuF_7UfXnUJpLa256X6kpjuHn93XuWsv3XHZoyek9EJsz-PltMeGSHlR5VM2xU8GfngjktdV6wxDBokg6g_naJc0VaUv2Alm4WJY0zMT2Y81DOY9qSzdedvCP6iFNcTbjER0DwS_XdnJ_3X0TswxQkN2sEh8rjDof7KSgchqlrXHwPrXvXm_OoqvS64OFbIdoWyLLJBGN1h6CW5vCOjF82Wmgb-WDy5eARXy-e7DPeCtPXgtdyxqb9IGwSHKLv5lwEWAI_5Xy8fXnhbLBJemvFcicoCM_etEc0oYLs7US6p4xihoimBCw3_pKpSTlJ4AduaTi-zq0mq87O4jNLaTNEaTlcckYGWTSEm8z_ievj86pzJkqa3vQWEw1qlwSWIOguKcEW0mCcAkyt4e_okB1Zrla4NZAAL781e_IrMVuLMFuABr5YBQ6yPPEcScIHWkfXDKwOSjk0Er94e943NiBeTKsJ0UWPh9LI7ypWr6uDYQNl7dsOhN_J9nvY1hIvpQnj-7LU-gN3-cazLRcWjaY1er8znHDH6F0HWUkwLeM_ZkxZy53-H9U8srvM2jN1CeJCDwRrMEaoyqCi6m5VABYWXCtbNbHoscY7yQiCg_bc_SdEqqQlXFEXxpazeRyyTao_cF0SIeItvP7cPdXB6aR_umqb_ME_tt7w-USdpr6ORcUm2S90f_MjYAHSUG82KDpb4l7qpXXT3vqm8kVuH1n-SY8nhdkJ5UGixiqW1IZgVb40NyvzNYSRCNkIWSzGrBFfSlmpNqQVWBfMNwshTnFRqFV-WDs4UfwjY_QlnV4hhMX3SxjdhKJanNzWR1UEWOREJAEU_uu-O_5NjQmgqfcg9D8Nj4iTs5hoR690kWSxo2SYpgo1_IbJkYfx_05MdwnX75CZxTtU-Dpnk9OI1ywYi0GW_MrZMzb9M90CxJUO_KW_yEK4O-J6BO62cEzwzBmMMY-ehUKAjNCNaFDkVVxSlbm__BhZfLKrmlurYkfDDbAa8SNxL01xWqf_YytV7XVx9DdQ3F2XXzQ9FC7UWNZ712Dhyd1xCq4T2N9WWdvvJRNhKxgoC3sON6VFSZIlvyxLQ_YYGIdg75cLveFvKuYPlMjHDT-cNRECVMGWtGRh8n4Em2cPJfmtWM-hf_hjoSjxLIy1Zf1Ay9aU2ce708iofzGmarlXe-UlBXJL8Z6G1ECgMUkgl7WfiWBxrsIXWEu2B8-uiKcCUe5uLVbd85oi5vQcXmeqcsrsE6VzuK3QaDv-WmcqsZawMn85h-zk33NsyEh9A7NUicMNvJtWn2xyyKn7O2PYKCzrowz2NyMnxgWqPelzTd5SFnHZ8HBnEAvVis1eCW5wdBQDHhn-KyawB-STUMpAgQW1abdu3RmKzHH7IaYgsb87cjte6zZqb26Db38GAALIVdgyS9Wyo8xHCcVj9GVLnY7d-9GOmtXME0NyiAmWjnamK8hkBAUIOQ6Lem3_CpVJonUpSbV_xTgHpe9u03UcsCb862dlGGKrbmygALCatDLdgwyE5QZNPAxuFYkyQHD5HPEx9Uc3bK4LoadOwF91eMGyywvHB1s3OEA_LQAh_AO0JbcXnaI2rhaOwUUveYGYsQFCXYOaA39XbQTsXn2U0Y6V4eRBB1V9_Qnx3Ut8A6Hl4TwHCRU2SXmJl7O8yszTBhEgOT9SX29zmKC1wM0DCSMlODtLToKSlJagp8jN7_8hIiMrSUpRZpWhs7zj5AAAAAAAAAAAAAAAAAAAAAAAAAAAAA0bLTuGcqA9QsN5PVKKU3DN760o26VEWcY8qZPPfBD2E2vjOPmw-tEZ0N7N37X3Pqlt5zpKRd9TUpKtL4ETBPo47uYM";
+
+    function compositeKey(): RingKey is
+        case makeRingKey(Composite(), compositeSeed, 1767225600, 0) of
+            when Some(value as key: RingKey) do
+                return key;
+            when None do
+                abort("the composite key of the vector seed is not made");
+        end case;
+    end;
+
+    function pureKey(): RingKey is
+        case makeRingKey(MlDsa(), pureSeed, 1767225600, 0) of
+            when Some(value as key: RingKey) do
+                return key;
+            when None do
+                abort("the pure key of the vector seed is not made");
+        end case;
+    end;
+
+    function testCompositeVector(): Unit is
+        let key: RingKey := compositeKey();
+        assertTrue(equal(kidOf(&key), compositeKid), "the kid of the composite key is the vector's");
+        let jwk: String := publicJwk(&key);
+        assertTrue(equal(asSpan(&jwk), compositeJwk), "the JWK of the composite key is the vector's, byte for byte");
+        destroyString(jwk);
+        let entry: String := keyEntry(&key);
+        assertTrue(equal(asSpan(&entry), compositeEntry), "the vault value is the vector's, byte for byte");
+        destroyString(entry);
+        case readKeyEntry(compositeEntry) of
+            when Some(value as back: RingKey) do
+                assertTrue(equal(kidOf(&back), compositeKid), "the vault value reads back to the same key");
+                destroyRingKey(back);
+            when None do
+                assertTrue(false, "the vault value of the vector reads");
+        end case;
+        assertTrue(equal(algorithmOf(Composite()), "ML-DSA-44-Ed25519"), "the name of the composite");
+        case makeRingKey(Composite(), zeroSeed, 1, 0) of
+            when Some(value as short: RingKey) do
+                assertTrue(false, "a seed of 32 bytes is no composite key");
+                destroyRingKey(short);
+            when None do
+                skip;
+        end case;
+        destroyRingKey(key);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function holds(token: Span[Nat8, Static], ring: &[Buffer[RingKey], R]): Bool is
+        case verify(token, ring) of
+            when Some(value as v: Verified) do
+                destroyVerified(v);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function testCompositeCases(): Unit is
+        var ring: Buffer[RingKey] := allocateEmpty();
+        insertBack(&!ring, compositeKey());
+        insertBack(&!ring, pureKey());
+        assertTrue(holds(case0, &ring), "composite holds");
+        assertTrue(holds(case1, &ring), "pure ML-DSA-44 holds");
+        assertFalse(holds(case2, &ring), "ml-dsa half broken is refused");
+        assertFalse(holds(case3, &ring), "ed25519 half broken is refused");
+        assertFalse(holds(case4, &ring), "halves swapped is refused");
+        assertFalse(holds(case5, &ring), "wrong label is refused");
+        assertFalse(holds(case6, &ring), "ml-dsa without context is refused");
+        assertFalse(holds(case7, &ring), "base64url of M' is refused");
+        assertFalse(holds(case8, &ring), "ml-dsa half only is refused");
+        assertFalse(holds(case9, &ring), "one byte more is refused");
+        assertFalse(holds(case10, &ring), "composite key under ML-DSA-44 header is refused");
+        assertFalse(holds(case11, &ring), "pure signature under composite header is refused");
+        assertFalse(holds(case12, &ring), "payload changed is refused");
+        destroyRing(ring);
+        return nil;
+    end;
+
+    function testCompositeSignAndVerify(): Unit is
+        var ring: Buffer[RingKey] := allocateEmpty();
+        insertBack(&!ring, compositeKey());
+        let payload: Span[Nat8, Static] := "{\"iss\":\"https://auth.example.com\",\"sub\":\"a\"}";
+        let token: String := signFirst(&ring, "JWT", payload);
+        let header: String := headerOf(asSpan(&token));
+        assertTrue(equal(asSpan(&header), "{\"alg\":\"ML-DSA-44-Ed25519\",\"kid\":\"pZLOwL6GEBBTjuCJLgOfmTwSK4DXjuAJ2jkwAKOLIa4\",\"typ\":\"JWT\"}"),
+            "the header of a composite token is alg, kid and typ");
+        destroyString(header);
+        assertTrue(verifies(asSpan(&token), &ring, "JWT", payload), "a composite token verifies under its key");
+        let bad: String := tampered(asSpan(&token));
+        assertFalse(verifies(asSpan(&bad), &ring, "JWT", payload), "a changed composite signature is refused");
+        destroyString(bad);
+        let pure: String := withAlg(asSpan(&token), "ML-DSA-44");
+        assertFalse(verifies(asSpan(&pure), &ring, "JWT", payload), "a composite token under the header ML-DSA-44 is refused");
+        destroyString(pure);
+        destroyString(token);
+        destroyRing(ring);
+        return nil;
+    end;
+
+    function isRight(result: Either[VaultError, Unit]): Bool is
+        case result of
+            when Right(right as done: Unit) do
+                return true;
+            when Left(left as error: VaultError) do
+                return false;
+        end case;
+    end;
+end module body.

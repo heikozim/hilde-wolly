@@ -1,0 +1,488 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    bytesToHex,
+    equal
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    Temporary,
+    statusOf,
+    openRead,
+    readAll,
+    writeAll,
+    closeFile,
+    syncFile,
+    syncDirectory,
+    setFileMode,
+    renameFile,
+    removeFileIfThere,
+    createTemporaryBeside
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonKind,
+    JsonNull,
+    JsonBoolean,
+    JsonNumber,
+    JsonString,
+    JsonArray,
+    JsonObject,
+    JsonWriter,
+    readJson,
+    destroyJson,
+    kindAt,
+    stringAt,
+    numberAt,
+    boolAt,
+    countAt,
+    nameAt,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    writeName,
+    writeNull,
+    writeBool,
+    writeNumber,
+    finishJson
+);
+import Standard.Json (
+    writeString as writeJsonString
+);
+import Standard.Calendar (
+    Stamp,
+    parseRfc3339
+);
+import Standard.Log (
+    Log,
+    Entry,
+    Info,
+    JsonLines,
+    logToFile,
+    closeLog,
+    makeEntry,
+    addText,
+    addInteger,
+    writeEntry
+);
+
+module body Wolly.AuditLog is
+    -- The mode of the log, 0640, as Standard.Log gives a log it makes.
+    constant logMode: Nat32 := 416;
+
+    -- What becomes of one line that names the removed user.
+    union Rewritten: Linear is
+        case Same;
+        case Changed is
+            line: String;
+        case Broken;
+    end;
+
+    function retentionSeconds(): Int64 is
+        return 31536000;
+    end;
+
+    function newPseudonym(): Option[String] is
+        case randomBytes(8) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                destroyString(raw);
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "deleted-");
+                writeString(&!out, asSpan(&hex));
+                destroyString(hex);
+                let pseudonym: String := finalize(out);
+                return Some(value => pseudonym);
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The text of the log at path; empty when there is none, None when it
+    -- cannot be read.
+    generic [P: Region]
+    function readLog(path: Span[Nat8, P]): Option[String] is
+        case statusOf(path) of
+            when FileMissing do
+                return Some(value => fromSpan(""));
+            when FileUnreadable do
+                return None();
+            when FileFound(status: FileStatus) do
+                case openRead(path) of
+                    when Some(value as opened: FileDescriptor) do
+                        var file: FileDescriptor := opened;
+                        let text: Option[String] := readAll(&!file);
+                        let closed: Bool := closeFile(file);
+                        if closed then
+                            return text;
+                        else
+                            case text of
+                                when Some(value as read: String) do
+                                    destroyString(read);
+                                when None do
+                                    skip;
+                            end case;
+                            return None();
+                        end if;
+                    when None do
+                        return None();
+                end case;
+        end case;
+    end;
+
+    -- The directory part of path, or . when it has none.
+    generic [P: Region]
+    function directoryOf(path: Span[Nat8, P]): String is
+        var last: Index := spanLength(path);
+        var i: Index := 0;
+        while i < spanLength(path) do
+            if path[i] = '/' then
+                last := i;
+            end if;
+            i := i + 1;
+        end while;
+        if last = spanLength(path) then
+            return fromSpan(".");
+        end if;
+        if last = 0 then
+            return fromSpan("/");
+        end if;
+        return fromSpan(substring(path, 0, last));
+    end;
+
+    -- Writes text beside path, syncs it and renames it over path, then
+    -- syncs the directory, so that the old log does not come back after a
+    -- crash.  False when any step failed; the file beside is removed then.
+    generic [P: Region, T: Region]
+    function replaceLog(path: Span[Nat8, P], text: Span[Nat8, T]): Bool is
+        case createTemporaryBeside(path) of
+            when Some(value as made: Temporary) do
+                let { file as opened: FileDescriptor, name as temporary: String } := made;
+                var file: FileDescriptor := opened;
+                let moded: Bool := setFileMode(&!file, logMode);
+                let written: Bool := writeAll(&!file, text);
+                let synced: Bool := syncFile(&!file);
+                let closed: Bool := closeFile(file);
+                var done: Bool := false;
+                if ((moded and written) and synced) and closed then
+                    done := renameFile(asSpan(&temporary), path);
+                end if;
+                if not done then
+                    let removed: Bool := removeFileIfThere(asSpan(&temporary));
+                end if;
+                destroyString(temporary);
+                if done then
+                    let directory: String := directoryOf(path);
+                    let durable: Bool := syncDirectory(asSpan(&directory));
+                    destroyString(directory);
+                    return durable;
+                end if;
+                return false;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Where the line that starts at at ends: the index of its line feed,
+    -- or the size of text.
+    generic [T: Region]
+    function lineEnd(text: Span[Nat8, T], at: Index): Index is
+        var i: Index := at;
+        while (i < spanLength(text)) and (text[i] /= '\n') do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- The JSON pointer of the member name: a slash, then name with ~ as ~0
+    -- and / as ~1.
+    generic [N: Region]
+    function pointerOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, '/');
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if name[i] = '~' then
+                writeString(&!out, "~0");
+            else if name[i] = '/' then
+                writeString(&!out, "~1");
+            else
+                writeByte(&!out, name[i]);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Copies the value at pointer to writer: a string, a number, true,
+    -- false or null.  False for an array, an object, or no value.
+    generic [R: Region, P: Region, W: Region]
+    function copyValue(document: &[Json, R], pointer: Span[Nat8, P], writer: &![JsonWriter, W]): Bool is
+        case kindAt(document, pointer) of
+            when Some(value as kind: JsonKind) do
+                case kind of
+                    when JsonString do
+                        case stringAt(document, pointer) of
+                            when Some(value as text: String) do
+                                writeJsonString(&~writer, asSpan(&text));
+                                destroyString(text);
+                                return true;
+                            when None do
+                                return false;
+                        end case;
+                    when JsonNumber do
+                        case numberAt(document, pointer) of
+                            when Some(value as text: String) do
+                                writeNumber(&~writer, asSpan(&text));
+                                destroyString(text);
+                                return true;
+                            when None do
+                                return false;
+                        end case;
+                    when JsonBoolean do
+                        case boolAt(document, pointer) of
+                            when Some(value as truth: Bool) do
+                                writeBool(&~writer, truth);
+                                return true;
+                            when None do
+                                return false;
+                        end case;
+                    when JsonNull do
+                        writeNull(&~writer);
+                        return true;
+                    when JsonArray do
+                        return false;
+                    when JsonObject do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The line of document with pseudonym as its user and its client, the
+    -- other members as they were, in their order.
+    generic [R: Region, S: Region]
+    function rebuilt(document: &[Json, R], pseudonym: Span[Nat8, S]): Rewritten is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        var broken: Bool := false;
+        var count: Index := 0;
+        case countAt(document, "") of
+            when Some(value as members: Index) do
+                count := members;
+            when None do
+                broken := true;
+        end case;
+        var n: Index := 0;
+        while (n < count) and (not broken) do
+            case nameAt(document, "", n) of
+                when Some(value as member: String) do
+                    writeName(&!writer, asSpan(&member));
+                    if equal(asSpan(&member), "user") or equal(asSpan(&member), "client") then
+                        writeJsonString(&!writer, pseudonym);
+                    else
+                        let pointer: String := pointerOf(asSpan(&member));
+                        broken := not copyValue(document, asSpan(&pointer), &!writer);
+                        destroyString(pointer);
+                    end if;
+                    destroyString(member);
+                when None do
+                    broken := true;
+            end case;
+            n := n + 1;
+        end while;
+        endObject(&!writer);
+        case finishJson(writer) of
+            when Some(value as text: String) do
+                if broken then
+                    destroyString(text);
+                    return Broken();
+                else
+                    return Changed(line => text);
+                end if;
+            when None do
+                return Broken();
+        end case;
+    end;
+
+    -- What becomes of line: Same unless it is a JSON object whose user is
+    -- name.
+    generic [L: Region, N: Region, S: Region]
+    function rewriteLine(line: Span[Nat8, L], name: Span[Nat8, N], pseudonym: Span[Nat8, S]): Rewritten is
+        case readJson(line) of
+            when Left(left as error: JsonError) do
+                return Same();
+            when Right(right as document: Json) do
+                var named: Bool := false;
+                case stringAt(&document, "/user") of
+                    when Some(value as user: String) do
+                        named := equal(asSpan(&user), name);
+                        destroyString(user);
+                    when None do
+                        skip;
+                end case;
+                if named then
+                    let result: Rewritten := rebuilt(&document, pseudonym);
+                    destroyJson(document);
+                    return result;
+                else
+                    destroyJson(document);
+                    return Same();
+                end if;
+        end case;
+    end;
+
+    generic [P: Region, N: Region, S: Region]
+    function pseudonymize(path: Span[Nat8, P], name: Span[Nat8, N], pseudonym: Span[Nat8, S]): Option[Int64] is
+        case readLog(path) of
+            when Some(value as log: String) do
+                var out: StringBuilder := makeStringBuilder();
+                var changed: Int64 := 0;
+                var failed: Bool := false;
+                let size: Index := spanLength(asSpan(&log));
+                var at: Index := 0;
+                while (at < size) and (not failed) do
+                    let stop: Index := lineEnd(asSpan(&log), at);
+                    case rewriteLine(substring(asSpan(&log), at, stop), name, pseudonym) of
+                        when Same do
+                            writeString(&!out, substring(asSpan(&log), at, stop));
+                        when Changed(line as fresh: String) do
+                            writeString(&!out, asSpan(&fresh));
+                            destroyString(fresh);
+                            changed := changed + 1;
+                        when Broken do
+                            failed := true;
+                    end case;
+                    if stop < size then
+                        writeByte(&!out, '\n');
+                    end if;
+                    at := stop + 1;
+                end while;
+                destroyString(log);
+                let text: String := finalize(out);
+                var kept: Bool := not failed;
+                if kept and (changed > 0) then
+                    kept := replaceLog(path, asSpan(&text));
+                end if;
+                destroyString(text);
+                if kept then
+                    return Some(value => changed);
+                end if;
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The second of the time of line, or None when it has none that can
+    -- be read.
+    generic [L: Region]
+    function lineSeconds(line: Span[Nat8, L]): Option[Int64] is
+        case readJson(line) of
+            when Left(left as error: JsonError) do
+                return None();
+            when Right(right as document: Json) do
+                let time: Option[String] := stringAt(&document, "/time");
+                destroyJson(document);
+                case time of
+                    when Some(value as text: String) do
+                        let stamp: Option[Stamp] := parseRfc3339(asSpan(&text));
+                        destroyString(text);
+                        case stamp of
+                            when Some(value as read: Stamp) do
+                                return Some(value => read.instant.seconds);
+                            when None do
+                                return None();
+                        end case;
+                    when None do
+                        return None();
+                end case;
+        end case;
+    end;
+
+    generic [P: Region]
+    function prune(path: Span[Nat8, P], now: Int64): Option[Int64] is
+        let cutoff: Int64 := now - retentionSeconds();
+        case readLog(path) of
+            when Some(value as log: String) do
+                var out: StringBuilder := makeStringBuilder();
+                var removed: Int64 := 0;
+                let size: Index := spanLength(asSpan(&log));
+                var at: Index := 0;
+                while at < size do
+                    let stop: Index := lineEnd(asSpan(&log), at);
+                    var old: Bool := false;
+                    case lineSeconds(substring(asSpan(&log), at, stop)) of
+                        when Some(value as seconds: Int64) do
+                            old := seconds < cutoff;
+                        when None do
+                            skip;
+                    end case;
+                    if old then
+                        removed := removed + 1;
+                    else
+                        writeString(&!out, substring(asSpan(&log), at, stop));
+                        if stop < size then
+                            writeByte(&!out, '\n');
+                        end if;
+                    end if;
+                    at := stop + 1;
+                end while;
+                destroyString(log);
+                let text: String := finalize(out);
+                var kept: Bool := true;
+                if removed > 0 then
+                    kept := replaceLog(path, asSpan(&text));
+                end if;
+                destroyString(text);
+                if kept then
+                    return Some(value => removed);
+                end if;
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [P: Region, U: Region]
+    function note(path: Span[Nat8, P], event: Span[Nat8, Static], user: Span[Nat8, U], lines: Int64): Bool is
+        case logToFile(path, Info(), JsonLines()) of
+            when Some(value as opened: Log) do
+                var log: Log := opened;
+                let entry: Entry := addInteger(addText(addText(addText(makeEntry(Info(), event), "user", user), "client", "-"), "outcome", "ok"), "lines", lines);
+                let written: Bool := writeEntry(&!log, entry);
+                let closed: Bool := closeLog(log);
+                return written and closed;
+            when None do
+                return false;
+        end case;
+    end;
+end module body.

@@ -1,0 +1,226 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Checks: View ViewFunctions
+--
+-- The budgets of a render of Wolly.View for its calls: the nodes given to
+-- functions and given back, the bytes in and |replace compare, and the
+-- options selectOptions reads.  The other budgets are in
+-- ViewBudgets.test.hiq.  The templates are written below view-calls-root in
+-- the working directory of the test.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    Listener,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory,
+    listenUnix,
+    closeListener
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData,
+    makeMapData,
+    rootNode,
+    putList,
+    putText,
+    addInteger
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    renderView,
+    mostMadeBytes
+);
+import Standard.Template (
+    displayIndex
+);
+import Wolly.ViewFunctions (
+    addStandardFunctions
+);
+
+module body Wolly.ViewCalls.Test is
+    constant root: Span[Nat8, Static] := "view-calls-root";
+
+    function prepared(): Bool is
+        let made: Bool := createDirectory(root);
+        return true;
+    end;
+
+    generic [N: Region]
+    function pathOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, root);
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [N: Region, T: Region]
+    function written(name: Span[Nat8, N], text: Span[Nat8, T]): Bool is
+        let path: String := pathOf(name);
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                destroyString(path);
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                destroyString(path);
+                return false;
+        end case;
+    end;
+
+    generic [T: Region]
+    function repeated(text: Span[Nat8, T], count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeString(&!out, text);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The template name rendered with data by an engine of the directory
+    -- and the functions of Wolly.ViewFunctions: Right with the length of
+    -- the output, Left with the error.
+    generic [N: Region]
+    function outcome(name: Span[Nat8, N], data: ViewData): Either[String, Index] is
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, root);
+        addStandardFunctions(&!engine);
+        var out: StringBuilder := makeStringBuilder();
+        let result: Either[String, Unit] := renderView(&!engine, name, &data, &!out);
+        destroyViewData(data);
+        destroyViewEngine(engine);
+        let text: String := finalize(out);
+        let length: Index := spanLength(asSpan(&text));
+        destroyString(text);
+        case result of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as done: Unit) do
+                return Right(right => length);
+        end case;
+    end;
+
+    -- {"xs": [1, ...], "big": "x..."}: count elements, a text of size bytes.
+    function listData(count: Index, size: Index): ViewData is
+        var data: ViewData := makeMapData();
+        let list: Index := putList(&!data, rootNode(), "xs");
+        var i: Index := 0;
+        while i < count do
+            let added: Index := addInteger(&!data, list, 1);
+            i := i + 1;
+        end while;
+        let big: String := repeated("x", size);
+        let put: Index := putText(&!data, rootNode(), "big", asSpan(&big));
+        destroyString(big);
+        return data;
+    end;
+
+    generic [N: Region]
+    function rendersLength(name: Span[Nat8, N], data: ViewData, expected: Index, message: Span[Nat8, Static]): Unit is
+        case outcome(name, data) of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, message);
+            when Right(right as length: Index) do
+                if length /= expected then
+                    print("length ");
+                    printLn(length);
+                end if;
+                assertTrue(length = expected, message);
+        end case;
+        return nil;
+    end;
+
+    generic [N: Region]
+    function refuses(name: Span[Nat8, N], data: ViewData, code: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case outcome(name, data) of
+            when Left(left as failure: String) do
+                let found: Bool := contains(asSpan(&failure), code);
+                if not found then
+                    printLn(asSpan(&failure));
+                end if;
+                destroyString(failure);
+                assertTrue(found, message);
+            when Right(right as length: Index) do
+                printLn("rendered where an error was asked for");
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function testNodes(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        assertTrue(written("len.jinja", "{% for a in xs %}{{ len(xs) }}{% endfor %}"), "the loop is written");
+        rendersLength("len.jinja", listData(1000, 1), 4000, "a million nodes given to len are allowed");
+        refuses("len.jinja", listData(2100, 1), "V1019", "four million and more nodes given to len are refused");
+        return nil;
+    end;
+
+    function testSearched(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        assertTrue(written("in.jinja", "{% for a in xs %}{% if big in big %}y{% endif %}{% endfor %}"),
+            "the search is written");
+        -- A search of 32768 bytes for 32768 bytes counts 2 ^ 16: 1024 of them are 2 ^ 26.
+        rendersLength("in.jinja", listData(1024, 32768), 1024, "2 ^ 26 bytes searched are allowed");
+        refuses("in.jinja", listData(1025, 32768), "V1020", "2 ^ 26 and 2 ^ 16 bytes searched are refused");
+        return nil;
+    end;
+
+    -- {"opts": "[\"\", ... \"\"]"} with count options.
+    function optionsData(count: Index): ViewData is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "[\"\"");
+        var i: Index := 1;
+        while i < count do
+            writeString(&!out, ",\"\"");
+            i := i + 1;
+        end while;
+        writeString(&!out, "]");
+        let options: String := finalize(out);
+        var data: ViewData := makeMapData();
+        let put: Index := putText(&!data, rootNode(), "opts", asSpan(&options));
+        destroyString(options);
+        return data;
+    end;
+
+    function testSelectOptions(): Unit is
+        assertTrue(prepared(), "the directory is made");
+        assertTrue(written("options.jinja", "{{ len(selectOptions(opts)) }}"), "the options are written");
+        rendersLength("options.jinja", optionsData(1000), 4, "1000 options are read");
+        refuses("options.jinja", optionsData(1001), "1000 options", "1001 options are refused");
+        return nil;
+    end;
+end module body.

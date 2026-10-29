@@ -1,0 +1,252 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- One graph of kind next in a database in memory:
+--
+--     a -1-> b -1-> c -1-> d
+--     a ----5-----> c
+--     d -1-> b              (a cycle b, c, d)
+--
+-- and one edge e -> f of kind other.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Edges (
+    EdgeRoute,
+    NoRoute,
+    Found,
+    mostNodes,
+    isNodeName,
+    prepareEdges,
+    addEdge,
+    removeEdge,
+    reachable,
+    ancestors,
+    lightestRoute,
+    fewestEdges,
+    findCycleOf,
+    destroyRoute
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Edges.Test is
+
+    function yes(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertTrue(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function no(result: Either[DbError, Bool], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as answer: Bool) do
+                assertFalse(answer, message);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function names(result: Either[DbError, String], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as found: String) do
+                assertTrue(equal(asSpan(&found), wanted), message);
+                destroyString(found);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function routeIs(result: Either[DbError, EdgeRoute], weight: Nat64, nodes: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as route: EdgeRoute) do
+                case route of
+                    when Found(weight as got: Nat64, nodes as path: String) do
+                        assertTrue((got = weight) and equal(asSpan(&path), nodes), message);
+                        destroyString(path);
+                    when NoRoute do
+                        assertTrue(false, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function noRoute(result: Either[DbError, EdgeRoute], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as route: EdgeRoute) do
+                case route of
+                    when Found(weight as got: Nat64, nodes as path: String) do
+                        destroyString(path);
+                        assertTrue(false, message);
+                    when NoRoute do
+                        assertTrue(true, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function built(db: &![Database[Writing], R]): Unit is
+        case prepareEdges(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table is made");
+            when None do
+                skip;
+        end case;
+        case prepareEdges(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a second prepareEdges fails");
+            when None do
+                skip;
+        end case;
+        yes(addEdge(&~db, "a", "b", "next", 1), "a to b");
+        yes(addEdge(&~db, "b", "c", "next", 1), "b to c");
+        yes(addEdge(&~db, "c", "d", "next", 1), "c to d");
+        yes(addEdge(&~db, "a", "c", "next", 5), "a to c, heavy");
+        yes(addEdge(&~db, "d", "b", "next", 1), "d to b, the cycle");
+        yes(addEdge(&~db, "e", "f", "other", 1), "e to f of another kind");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runReach(db: &![Database[Writing], R]): Unit is
+        built(&~db);
+        names(reachable(&~db, "a", "next"), "b\nc\nd\n", "from a: b, c and d, and the cycle ends the query");
+        names(reachable(&~db, "b", "next"), "b\nc\nd\n", "from b: b itself too, along the cycle");
+        names(reachable(&~db, "d", "other"), "", "no edge of that kind");
+        names(reachable(&~db, "e", "other"), "f\n", "the other kind");
+        names(ancestors(&~db, "c", "next"), "a\nb\nc\nd\n", "above c: a, b, d and c along the cycle");
+        names(ancestors(&~db, "a", "next"), "", "nothing above a");
+        names(reachable(&~db, "nobody", "next"), "", "an unknown node reaches nothing");
+        yes(addEdge(&~db, "x", "x", "loop", 1), "an edge to itself");
+        names(reachable(&~db, "x", "loop"), "x\n", "which ends the recursion too");
+        no(addEdge(&~db, "a b", "c", "next", 1), "a name with a space is refused");
+        no(addEdge(&~db, "a", "c/d", "next", 1), "a slash too");
+        no(addEdge(&~db, "a", "c", "", 1), "an empty kind too");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runRoutes(db: &![Database[Writing], R]): Unit is
+        built(&~db);
+        routeIs(lightestRoute(&~db, "next", "a", "d"), 3, "a\nb\nc\nd\n", "the lightest route goes round the heavy edge");
+        routeIs(fewestEdges(&~db, "next", "a", "d"), 2, "a\nc\nd\n", "the route of fewest edges takes it");
+        yes(addEdge(&~db, "a", "c", "next", 1), "a to c, light now");
+        routeIs(lightestRoute(&~db, "next", "a", "d"), 2, "a\nc\nd\n", "a second add changes the weight");
+        yes(removeEdge(&~db, "a", "c", "next"), "a to c removed");
+        no(removeEdge(&~db, "a", "c", "next"), "a second removal finds nothing");
+        routeIs(fewestEdges(&~db, "next", "a", "d"), 3, "a\nb\nc\nd\n", "without it the long way");
+        noRoute(lightestRoute(&~db, "next", "d", "a"), "nothing leads to a");
+        noRoute(lightestRoute(&~db, "next", "a", "zz"), "an unknown goal");
+        noRoute(fewestEdges(&~db, "next", "zz", "a"), "an unknown start");
+        noRoute(lightestRoute(&~db, "other", "a", "d"), "the edges of another kind");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runCycle(db: &![Database[Writing], R]): Unit is
+        built(&~db);
+        case findCycleOf(&~db, "next") of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as cycle: String) do
+                        assertTrue(equal(asSpan(&cycle), "b\nc\nd\nb\n"), "the cycle b, c, d, back to b");
+                        destroyString(cycle);
+                    when None do
+                        assertTrue(false, "there is a cycle");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "there is a cycle");
+        end case;
+        yes(removeEdge(&~db, "d", "b", "next"), "the edge that closes it removed");
+        case findCycleOf(&~db, "next") of
+            when Right(right as gone: Option[String]) do
+                case gone of
+                    when Some(value as still: String) do
+                        destroyString(still);
+                        assertTrue(false, "no cycle is left");
+                    when None do
+                        assertTrue(true, "no cycle is left");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "no cycle is left");
+        end case;
+        return nil;
+    end;
+
+    function testReach(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runReach(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testRoutes(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runRoutes(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testCycle(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                runCycle(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no database in memory");
+        end case;
+        return nil;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(mostNodes() = 10000, "at most 10000 nodes a query");
+        assertTrue(isNodeName("user:42") and isNodeName("Doc_7.v-2"), "letters, digits, dot, colon, hyphen, underscore");
+        assertFalse(isNodeName(""), "empty");
+        assertFalse(isNodeName("a\nb"), "a line feed");
+        assertTrue(isNodeName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "128 bytes");
+        assertFalse(isNodeName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "129 bytes");
+        return nil;
+    end;
+end module body.

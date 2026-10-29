@@ -1,0 +1,83 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+VP8 key frames read in Hilde alone (RFC 6386), the lossy pictures of WebP:
+the frame header, segments, the loop filter (simple and normal), the
+coefficient partitions, intra prediction of 16x16, 4x4 and chroma blocks,
+the inverse DCT and WHT.  The pixels come as red, green and blue, chroma
+upsampled and converted as libwebp does.
+
+The tables of RFC 6386 (token and mode probabilities, dequantisation) are
+taken from golang.org/x/image/vp8 (Copyright 2011 The Go Authors,
+BSD-3-Clause), which the decoding follows.
+
+Nothing of the data is trusted: the partitions are checked against what is
+left, the size against maxPixels and 16000 a side before anything is
+allocated, and a partition read past its end answers Broken.  Wolly.Webp
+calls it for the VP8 chunk.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Vp8 is
+    """
+    A frame read: its width, its height and its pixels.
+    """
+    type Vp8Picture: Linear;
+
+    """
+    The key frame in data, the payload of a VP8 chunk, with at most
+    maxPixels pixels; Left 1 when it is broken, 2 when it is no key frame
+    or not shown, 3 when it is too large.  An Either read from bytes, so no
+    ensures.
+    """
+    generic [D: Region]
+    function readVp8(data: Span[Nat8, D], maxPixels: Index): Either[Index, Vp8Picture]
+        requires maxPixels > 0;
+
+    generic [P: Region]
+    function vp8Width(picture: &[Vp8Picture, P]): Index
+        ensures (result >= 1) and (result <= 16000);
+
+    generic [P: Region]
+    function vp8Height(picture: &[Vp8Picture, P]): Index
+        ensures (result >= 1) and (result <= 16000);
+
+    """
+    The pixels: red, green and blue, width times height times 3 bytes.
+    """
+    generic [P: Region]
+    function vp8Pixels(picture: &[Vp8Picture, P]): Span[Nat8, P]
+        ensures spanLength(result) = ((vp8Width(picture) * vp8Height(picture)) * 3);
+
+    """
+    The luma plane, width times height bytes (as libwebp's dwebp -yuv
+    writes it).
+    """
+    generic [P: Region]
+    function vp8Luma(picture: &[Vp8Picture, P]): Span[Nat8, P]
+        ensures spanLength(result) = (vp8Width(picture) * vp8Height(picture));
+
+    """
+    The Cb and the Cr plane, half the width and half the height each,
+    rounded up.
+    """
+    generic [P: Region]
+    function vp8Blue(picture: &[Vp8Picture, P]): Span[Nat8, P]
+        ensures spanLength(result) = (((vp8Width(picture) + 1) / 2) * ((vp8Height(picture) + 1) / 2));
+
+    generic [P: Region]
+    function vp8Red(picture: &[Vp8Picture, P]): Span[Nat8, P]
+        ensures spanLength(result) = (((vp8Width(picture) + 1) / 2) * ((vp8Height(picture) + 1) / 2));
+
+    """
+    Gives the picture and its pixels back.
+    No contract: it only gives the value back.
+    """
+    function destroyVp8(picture: Vp8Picture): Unit;
+end module.

@@ -1,0 +1,90 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The lexers are Ted Unangst's synlight (humungus.tedunangst.com/r/webs),
+-- under this notice:
+--
+--   Copyright (c) 2018,2019 Ted Unangst <tedu@tedunangst.com>
+--
+--   Permission to use, copy, modify, and distribute this software for any
+--   purpose with or without fee is hereby granted, provided that the above
+--   copyright notice and this permission notice appear in all copies.
+--
+--   THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+--   WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+--   MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+--   ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+--   WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+--   ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+--   OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+--
+"""
+Syntax highlighting to HTML, after tedu's synlight: a lexer of regular
+expressions for each language, tried in their order at each place of the
+code, the first that matches taking its text.  A keyword, a builtin, a
+string, a number, a type, an operator, a comment, an added and a deleted
+line of a diff each go into a span of their own class (kw, bi, st, nm, tp,
+op, cm, al, dl); brackets take the classes of string, keyword, comment and
+builtin in turn, so that a pair can be told from its neighbours.  Every
+byte of the code is escaped for HTML; no markup of the code survives.
+
+The languages are synlight's: C, diff, Go, HTML, JavaScript, Lua, Python,
+Rust and SQL, chosen by the extension of a file name.  The regular
+expressions are Standard.Regex's (RE2, linear in the text), checked when
+the programme is compiled.  Code of more than mostHighlightBytes bytes is not lexed
+but only escaped, so that a request cannot buy much time.
+"""
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.Highlight is
+    """
+    The languages.
+    """
+    union Language: Free is
+        case CLanguage;
+        case Diff;
+        case GoLanguage;
+        case HtmlLanguage;
+        case JavaScript;
+        case Lua;
+        case Python;
+        case Rust;
+        case SqlLanguage;
+    end;
+
+    """
+    The most bytes of code that are lexed: 65536.
+    """
+    function mostHighlightBytes(): Index
+        ensures result = 65536;
+
+    """
+    The language of a file name by its extension (c, h, diff, patch, go,
+    html, xml, js, lua, py, python, rs, rust, sql); None for another.
+    No contract: an Option of a union has no equality to state it with.
+    """
+    generic [N: Region]
+    function languageOf(fileName: Span[Nat8, N]): Option[Language];
+
+    """
+    code as HTML, highlighted for language, for the inside of a pre.
+    No contract: what the markup adds follows from every byte, more than
+    O(1).
+    """
+    generic [C: Region]
+    function highlight(code: Span[Nat8, C], language: Language): String;
+
+    """
+    code escaped for HTML and nothing else: what highlight gives for a
+    language it does not know.
+    """
+    generic [C: Region]
+    function escapeCode(code: Span[Nat8, C]): String
+        ensures length(&result) >= spanLength(code);
+end module.

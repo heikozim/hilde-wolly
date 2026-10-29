@@ -1,0 +1,244 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A query language for the lines of Wolly.LogStore after the model of
+Qualys QQL:
+
+    host:web1 and level:error and time:last 24h and "mariadb"
+
+- field:value, with the fields host, source and level (equal; host and
+  source with a final * as a prefix, a value in quotes as written; a host
+  in any case), time and id;
+- a range field:[a .. b], both ends taken, for time and id; a time is
+  seconds since 1970 or a day YYYY-MM-DD in UTC, in quotes also
+  "YYYY-MM-DDTHH:MM:SSZ"; a day as the end of a range takes all of it,
+  and time:YYYY-MM-DD is that day;
+- time:last N followed by s, m, h, d or w, the window up to now;
+- text in quotes, the words of a line in that order (the full-text index
+  of Standard.Search, FTS5);
+- and, or, not (in any case), and parentheses; not binds closest, then
+  and, then or.
+
+A query is never SQL text: every statement is a constant and every value
+is bound, and the words in quotes reach FTS5 as one phrase of letters and
+digits, so nothing a visitor writes is FTS5 syntax.  A query is refused
+with the position of the byte that is wrong, before anything runs: more
+than mostQueryBytes bytes, nesting deeper than mostQueryDepth, more than
+mostQueryNodes terms and operators or mostQueryTexts texts, a byte no part of the
+language, or a value its field does not take.  A line is found by its
+text only when the full-text document under its number is its own (its
+title is its host, source and level), so a document another part of the
+programme put into Standard.Search under the same key is not taken.
+"""
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Query is
+    """
+    What is wrong with a query.
+    """
+    union QueryProblem: Free is
+        """
+        More than mostQueryBytes bytes.
+        """
+        case QueryTooLong;
+        """
+        Nothing but spaces.
+        """
+        case NoQuery;
+        """
+        Nesting of parentheses and not deeper than mostQueryDepth.
+        """
+        case TooDeep;
+        """
+        More than mostQueryNodes terms and operators.
+        """
+        case TooManyTerms;
+        """
+        A byte that is no part of the language: a control byte, or one of
+        ' ; = , and the like outside quotes.
+        """
+        case UnexpectedByte;
+        """
+        A quote that is not closed.
+        """
+        case UnclosedQuote;
+        """
+        A parenthesis that is not closed.
+        """
+        case UnclosedParenthesis;
+        """
+        An operator, a parenthesis or the end where a term belongs.
+        """
+        case ExpectedTerm;
+        """
+        A term where and, or, a closing parenthesis or the end belongs.
+        """
+        case ExpectedOperator;
+        """
+        A word without a field and without quotes.
+        """
+        case UnquotedWord;
+        """
+        A field that is none of host, source, level, time and id.
+        """
+        case UnknownQueryField;
+        """
+        A value its field does not take.
+        """
+        case BadValue;
+        """
+        A time that is no time.
+        """
+        case BadTime;
+        """
+        A range whose start lies after its end.
+        """
+        case BadRange;
+        """
+        Text in quotes of more than 16 words, or a word of more than 64
+        bytes.
+        """
+        case TooManyWords;
+        """
+        More than mostQueryTexts texts in quotes.
+        """
+        case TooManyTexts;
+    end;
+
+    """
+    A refused query: the problem and the byte where it is, counted from 0.
+    """
+    record QueryError: Free is
+        position: Index;
+        problem: QueryProblem;
+    end;
+
+    """
+    Why a query found nothing.
+    """
+    union QueryFailure: Free is
+        """
+        The query is refused.
+        """
+        case QueryRefused is
+            reason: QueryError;
+        """
+        More lines than mostLines lie in the time window of the query.
+        """
+        case TooManyLines;
+        """
+        SQLite refused a statement.
+        """
+        case QueryStorage is
+            error: DbError;
+    end;
+
+    """
+    What a query found: how many lines in all, and the numbers of at most
+    limit of them after offset, newest first.
+    """
+    record QueryResult: Linear is
+        total: Int64;
+        keys: Buffer[Int64];
+    end;
+
+    """
+    The most bytes of a query: 1024.
+    """
+    function mostQueryBytes(): Index
+        ensures result = 1024;
+
+    """
+    The deepest nesting of parentheses and not: 16.
+    """
+    function mostQueryDepth(): Index
+        ensures result = 16;
+
+    """
+    The most terms and operators of a query: 64.
+    """
+    function mostQueryNodes(): Index
+        ensures result = 64;
+
+    """
+    The most texts in quotes of a query: 8.  Each looks up all its matches
+    in FTS5, whatever the time window.
+    """
+    function mostQueryTexts(): Index
+        ensures result = 8;
+
+    """
+    The start of a window of seconds up to now: now - seconds, at least 0.
+    """
+    function windowStart(now: Int64, seconds: Int64): Int64
+        requires now >= 0
+        requires seconds >= 0
+        ensures (result >= 0) and (result <= now);
+
+    """
+    None when the query is one, or why not.  now is the time a window like
+    time:last 24h ends at.  (A parser answering an Option: no ensures, as
+    for every parser that answers an Option.)
+    """
+    generic [T: Region]
+    function checkQuery(text: Span[Nat8, T], now: Int64): Option[QueryError]
+        requires now >= 0;
+
+    """
+    The lines of the store of Wolly.LogStore that the query finds, newest
+    first, at most limit after offset, and how many in all.  Fails with
+    TooManyLines when more than mostLines lines lie in the time window of
+    the query (the times its outermost and joins together), before any
+    term is looked up.  Runs in a transaction that takes no write lock of
+    the store (BEGIN DEFERRED on SQLite, a plain BEGIN on PostgreSQL), so
+    the lines do not change under it and a writer beside it goes on (on
+    SQLite in the WAL mode; in the journal mode of a rollback a writer's
+    commit waits for the end of the search).  The sets of the terms live in
+    a temporary table of the connection, which both allow.  limit, offset
+    and mostLines are the caller's to bound.
+    (An I/O result: no ensures.)
+    """
+    generic [R: Region, T: Region]
+    function findByQuery(db: &![Database[Writing], R], text: Span[Nat8, T], now: Int64, mostLines: Int64,
+                         limit: Int64, offset: Int64): Either[QueryFailure, QueryResult]
+        requires now >= 0
+        requires (mostLines >= 1) and (mostLines <= 10000000)
+        requires (limit >= 1) and (limit <= 100)
+        requires offset >= 0;
+
+    """
+    Frees what a query found.
+    No contract: it only gives the value back.
+    """
+    function destroyResult(result: QueryResult): Unit;
+
+    """
+    The statement of the term host: on SQLite as findByQuery runs it, with
+    EXPLAIN QUERY PLAN in front, so that a test reads its plan: the index
+    wolly_log_lines_host of Wolly.LogStore, not a scan of the window.  Its
+    values: the node, the low and the high end of the window, the host.
+    """
+    function hostTermSql(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The statement of a text term in a window of few lines: on SQLite as
+    findByQuery runs it, with EXPLAIN QUERY PLAN in front, so that a test
+    reads its plan: FTS5 reads the hits between two rowids, not every hit of
+    the store.  Its values: the node, the phrase, then the low and the high
+    end of the window three times.
+    """
+    function textTermSql(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+end module.

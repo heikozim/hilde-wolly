@@ -1,0 +1,353 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Log files under /tmp with a random name each run, written and grown
+-- here: whole lines only, nothing twice, a cut file and a rotated file
+-- from their start, a file without a whole first line not at all; a
+-- rotated file with the same first line from its start by its inode; a
+-- table made before the inode was kept holds its offsets.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex,
+    equal
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha256
+);
+import Standard.File (
+    FileDescriptor,
+    createNewFile,
+    openAppend,
+    writeAll,
+    closeFile,
+    renameFile,
+    removeFileIfThere
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    noValues,
+    withText,
+    withInt64,
+    execute,
+    closeDatabase
+);
+import Wolly.Dialect (
+    pick
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.LogTail (
+    TailFailure,
+    Unreadable,
+    Storage,
+    mostTailBytes,
+    mostFirstLine,
+    prepareTail,
+    readNew
+);
+
+module body Wolly.LogTail.Test is
+
+    -- /tmp/wolly-logtail-<16 hex digits>-<suffix>
+    function tempPath(suffix: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/tmp/wolly-logtail-");
+        case randomBytes(8) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                writeString(&!out, asSpan(&hex));
+                destroyString(hex);
+                destroyString(raw);
+            when None do
+                abort("no random bytes");
+        end case;
+        writeString(&!out, "-");
+        writeString(&!out, suffix);
+        return finalize(out);
+    end;
+
+    -- Makes the file new with text.
+    generic [P: Region]
+    function fresh(path: Span[Nat8, P], text: Span[Nat8, Static]): Unit is
+        let removed: Bool := removeFileIfThere(path);
+        case createNewFile(path, #o600) of
+            when Some(value as made: FileDescriptor) do
+                var file: FileDescriptor := made;
+                assertTrue(writeAll(&!file, text), "written");
+                let closed: Bool := closeFile(file);
+            when None do
+                assertTrue(false, "the file made");
+        end case;
+        return nil;
+    end;
+
+    generic [P: Region]
+    function grow(path: Span[Nat8, P], text: Span[Nat8, Static]): Unit is
+        case openAppend(path, #o600) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                assertTrue(writeAll(&!file, text), "appended");
+                let closed: Bool := closeFile(file);
+            when None do
+                assertTrue(false, "the file opened");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, P: Region]
+    function gives(db: &![Database[Writing], R], path: Span[Nat8, P], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case readNew(&~db, path) of
+            when Right(right as lines: String) do
+                let fit: Bool := equal(asSpan(&lines), wanted);
+                if not fit then
+                    printLn(asSpan(&lines));
+                end if;
+                assertTrue(fit, message);
+                destroyString(lines);
+            when Left(left as failure: TailFailure) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, P: Region]
+    function refused(db: &![Database[Writing], R], path: Span[Nat8, P], message: Span[Nat8, Static]): Unit is
+        case readNew(&~db, path) of
+            when Right(right as lines: String) do
+                destroyString(lines);
+                assertTrue(false, message);
+            when Left(left as failure: TailFailure) do
+                case failure of
+                    when Unreadable do
+                        assertTrue(true, message);
+                    when Storage(error as storageError: DbError) do
+                        assertTrue(false, message);
+                end case;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        case prepareTail(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table");
+            when None do
+                assertTrue(true, "the table");
+        end case;
+        let path: String := tempPath("app.log");
+        fresh(asSpan(&path), "first\nsecond\npart");
+        gives(&~db, asSpan(&path), "first\nsecond\n", "whole lines, the part waits");
+        gives(&~db, asSpan(&path), "", "nothing new");
+        grow(asSpan(&path), "ial\nthird\n");
+        gives(&~db, asSpan(&path), "partial\nthird\n", "the part with its rest, and the next line");
+        gives(&~db, asSpan(&path), "", "nothing new again");
+        -- Cut: the same first line, shorter than the offset.
+        fresh(asSpan(&path), "first\nx\n");
+        gives(&~db, asSpan(&path), "first\nx\n", "a cut file from its start");
+        -- Rotated: another first line, longer than the offset.
+        fresh(asSpan(&path), "a new file begins here\nand goes on\n");
+        gives(&~db, asSpan(&path), "a new file begins here\nand goes on\n", "a rotated file from its start");
+        gives(&~db, asSpan(&path), "", "and not twice");
+        -- Rotated again: a first line that begins as the one before.
+        fresh(asSpan(&path), "a new file begins here, too\nand goes on further\n");
+        gives(&~db, asSpan(&path), "a new file begins here, too\nand goes on further\n", "a first line with the same beginning is another");
+        -- Rotated with the same first line, longer than the offset: the
+        -- old file stays under another name, so the new one has another
+        -- inode; only the inode tells them apart.
+        rotateSame(&~db, asSpan(&path));
+        let removed: Bool := removeFileIfThere(asSpan(&path));
+        refused(&~db, asSpan(&path), "a file that is gone");
+        destroyString(path);
+        let young: String := tempPath("young.log");
+        fresh(asSpan(&young), "no end yet");
+        gives(&~db, asSpan(&young), "", "no whole first line: nothing");
+        grow(asSpan(&young), "\nnext\n");
+        gives(&~db, asSpan(&young), "no end yet\nnext\n", "the first line, once it is whole");
+        let gone: Bool := removeFileIfThere(asSpan(&young));
+        destroyString(young);
+        let empty: String := tempPath("empty.log");
+        fresh(asSpan(&empty), "");
+        gives(&~db, asSpan(&empty), "", "an empty file");
+        let emptyGone: Bool := removeFileIfThere(asSpan(&empty));
+        destroyString(empty);
+        -- A first line of 1 MiB and 10 bytes without an end: given cut at
+        -- 1 MiB, so that the file goes on; the 10 bytes wait.
+        let long: String := tempPath("long.log");
+        fresh(asSpan(&long), "");
+        case openAppend(asSpan(&long), #o600) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var block: StringBuilder := makeStringBuilder();
+                var i: Index := 0;
+                while i < 1024 do
+                    writeString(&!block, "x");
+                    i := i + 1;
+                end while;
+                let kilo: String := finalize(block);
+                var k: Index := 0;
+                while k < 1024 do
+                    let written: Bool := writeAll(&!file, asSpan(&kilo));
+                    k := k + 1;
+                end while;
+                destroyString(kilo);
+                assertTrue(writeAll(&!file, "yyyyyyyyyy"), "ten more");
+                let closed: Bool := closeFile(file);
+            when None do
+                assertTrue(false, "the long file");
+        end case;
+        case readNew(&~db, asSpan(&long)) of
+            when Right(right as lines: String) do
+                assertTrue(spanLength(asSpan(&lines)) = mostTailBytes(), "1 MiB of an endless line");
+                destroyString(lines);
+            when Left(left as failure: TailFailure) do
+                assertTrue(false, "the long line");
+        end case;
+        gives(&~db, asSpan(&long), "", "the rest without an end waits");
+        let longGone: Bool := removeFileIfThere(asSpan(&long));
+        destroyString(long);
+        refused(&~db, "/tmp", "a directory");
+        refused(&~db, "", "no path");
+        return nil;
+    end;
+
+    -- path renamed to path.1, a new file under path with the first line of
+    -- the old and more bytes than were read of it: read from its start.
+    generic [R: Region, P: Region]
+    function rotateSame(db: &![Database[Writing], R], path: Span[Nat8, P]): Unit is
+        var older: StringBuilder := makeStringBuilder();
+        writeString(&!older, path);
+        writeString(&!older, ".1");
+        let old: String := finalize(older);
+        assertTrue(renameFile(path, asSpan(&old)), "rotated away");
+        fresh(path, "a new file begins here, too\nand goes on further\nand further still\n");
+        gives(&~db, path, "a new file begins here, too\nand goes on further\nand further still\n", "the same first line in another file from its start");
+        gives(&~db, path, "", "and not twice");
+        let oldGone: Bool := removeFileIfThere(asSpan(&old));
+        destroyString(old);
+        return nil;
+    end;
+
+    -- The hex SHA-256 of a first line, as LogTail keeps it.
+    function printOf(line: Span[Nat8, Static]): String is
+        case sha256(line) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                destroyString(raw);
+                return hex;
+            when None do
+                abort("no digest");
+        end case;
+    end;
+
+    -- A table as LogTail made it before the inode was kept, with the
+    -- offset of a file after its first line: prepareTail adds the column,
+    -- the offset holds, and after the next read a rotation with the same
+    -- first line is found by the inode.
+    generic [R: Region]
+    function upgrade(db: &![Database[Writing], R]): Unit is
+        let oldTable: Span[Nat8, Static] := pick(&db,
+            "CREATE TABLE wolly_tail (path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, offset INTEGER NOT NULL CHECK (offset >= 0)) STRICT",
+            "CREATE TABLE wolly_tail (path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, \"offset\" BIGINT NOT NULL CHECK (\"offset\" >= 0))");
+        case execute(&~db, oldTable, noValues()) of
+            when Left(left as error: DbError) do
+                assertTrue(false, "the table of before");
+            when Right(right as made: Nat64) do
+                assertTrue(true, "the table of before");
+        end case;
+        let path: String := tempPath("old-table.log");
+        fresh(asSpan(&path), "first\nsecond\n");
+        let print: String := printOf("first\n");
+        let oldRow: Span[Nat8, Static] := pick(&db,
+            "INSERT INTO wolly_tail (path, fingerprint, offset) VALUES (?, ?, ?)",
+            "INSERT INTO wolly_tail (path, fingerprint, \"offset\") VALUES (?, ?, ?)");
+        let six: Int64 := 6;
+        case execute(&~db, oldRow, withInt64(withText(withText(noValues(), asSpan(&path)), asSpan(&print)), six)) of
+            when Left(left as error: DbError) do
+                assertTrue(false, "a row of before");
+            when Right(right as put: Nat64) do
+                assertTrue(true, "a row of before");
+        end case;
+        destroyString(print);
+        case prepareTail(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the column added");
+            when None do
+                assertTrue(true, "the column added");
+        end case;
+        case prepareTail(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "and a second time nothing to add");
+            when None do
+                assertTrue(true, "and a second time nothing to add");
+        end case;
+        gives(&~db, asSpan(&path), "second\n", "the offset of before holds");
+        grow(asSpan(&path), "third\n");
+        gives(&~db, asSpan(&path), "third\n", "and moves on");
+        -- Rotated with the same first line "first": the row of before took
+        -- the inode at the read above, so the new file is another.
+        var older: StringBuilder := makeStringBuilder();
+        writeString(&!older, asSpan(&path));
+        writeString(&!older, ".1");
+        let old: String := finalize(older);
+        assertTrue(renameFile(asSpan(&path), asSpan(&old)), "rotated away");
+        fresh(asSpan(&path), "first\nsecond\nthird\nfourth\n");
+        gives(&~db, asSpan(&path), "first\nsecond\nthird\nfourth\n", "a row of before knows its file after one read");
+        let oldGone: Bool := removeFileIfThere(asSpan(&old));
+        destroyString(old);
+        let removed: Bool := removeFileIfThere(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    function testUpgrade(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                upgrade(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database");
+        end case;
+        return nil;
+    end;
+
+    function testLimits(): Unit is
+        assertTrue(mostTailBytes() = 1048576, "1 MiB a call");
+        assertTrue(mostFirstLine() = 4096, "4096 bytes of a first line");
+        return nil;
+    end;
+
+    function testTail(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

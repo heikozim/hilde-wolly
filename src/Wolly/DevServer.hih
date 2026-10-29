@@ -1,0 +1,55 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A handler of FastCGI served over HTTP/1.1 on a loopback address, for development without a web server in front.
+
+- It listens only on 127.0.0.1, ::1 or localhost; any other address is refused.
+- One connection at a time, one request on each, then the connection is closed.
+- A GET or a head request whose path names a regular file below root is answered with that file.
+- Every other request goes to the handler as the web server would send it, its answer back as HTTP.
+- A request head over 16 KiB or a body over 1 MiB is refused with 431 or 413.
+- It runs until the process ends.
+
+    case serveHttp("127.0.0.1:8480", handle, "/usr/local/share/app/www") of
+        when Some(value as why: String) do
+            ...
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.DevServer is
+    """
+    Serves handler at addr, host and port as 127.0.0.1:8480 or [::1]:8480,
+    with the files below root.  Returns only when it cannot listen, with
+    the reason.
+    No contract: it serves until the process ends.
+    """
+    generic [A: Region, R: Region]
+    function serveHttp(addr: Span[Nat8, A], handler: Fn[Request, String], root: Span[Nat8, R]): Option[String];
+
+    """
+    The HTTP answer of the CGI output output: the status line of its Status
+    header, its other headers, a Content-Length and Connection: close, and
+    its body unless head is true.  A 502 for output without an empty line.
+    """
+    generic [O: Region]
+    function httpOfCgi(output: Span[Nat8, O], head: Bool): String
+        ensures length(&result) > 0;
+
+    """
+    Whether path may name a file below a root: it starts with a slash, has
+    no empty, dot or dot-dot part, no backslash and no byte below a blank.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [P: Region]
+    function isStaticPath(path: Span[Nat8, P]): Bool;
+end module.

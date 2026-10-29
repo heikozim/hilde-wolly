@@ -1,0 +1,130 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The WebPs here were written for the test by a VP8L writer of its own
+-- (two Python scripts), one feature
+
+-- switched on at a time, and macOS's ImageIO decodes each to the source
+-- pixels, alpha and colour under it included; each digest is the SHA-256
+-- of the source's red, green and blue, or of its alpha, row by row.  The
+-- gopher-doc files were written by libwebp (golang.org/x/image testdata,
+-- Copyright 2009 The Go Authors, BSD-3-Clause), as are blue-purple-pink and
+-- yellow_rose, their digests those of ImageIO's decoding.  The c- files
+-- were written by cwebp 1.6.0, their digests those of
+
+-- dwebp's decoding (-pam); for the lossless ones that is the source.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    hexToBytes,
+    bytesToHex,
+    startsWith,
+    substring,
+    equal
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Wolly.Webp (
+    WebpError,
+    NotWebp,
+    WebpTooLarge,
+    WebpUnsupported,
+    WebpBroken,
+    WebpPicture,
+    readWebp,
+    webpWidth,
+    webpHeight,
+    webpPixels,
+    webpAlpha,
+    destroyWebp
+);
+
+module body Wolly.WebpPart4.Test is
+    constant predictHex: Span[Nat8, Static] := "5249464662130000574542505650384c551300002f3fc00b000d28088004b103e5fff588fe87a87964f52cee29ea91d5b3b8a7a87954cfe29ea2e691d58b7b8a9a4756cfe2296a1e593d8b7baa7964f52cee296a91d5b3b8a7a87964cfe29ea2e691d5837b8a9a4756cfe2286a1e593d8b7b8a7964f52cee296a9ed5b3b8a7a879642d84048462b7df96084808e5986b9e0b04080b8ee5c9ea7fac3e50ad3e50f940b5fa40b502d5ea03d5ea57ab0f54ab0fac3e50ad3e50f940b5fa40b582a6006d00c0e4fefbee3982c1601004411004411004411004411004411004411004411004c16030180c0683c1603018ecc9f01dfcae7b77a3ef6f7dd6fa755f7befec154208210cf31686e19861240c43291d1dad56abd5d15142381c0e473bee98b7319452aad568fa90de470f89d2bf4a0921d49346d387bb4d1fecaebdaf6b2d3b0870c9c29d9c117f0b0761413656b037b545e02fac6cac2c2c04051b8dc50246919da5310ada682a650beeb0344b2382580417589aa45a6ecc33b97933c97d93c9993bf7ccf77d111f9cbf03814020100804193264c8902143860c0281402010080413264c983061c2840902814020100804193264c8902143860c0281402010080413264c983061c284d98107fbaf1f1cbf7c10bf008140a02851a244495bdad296b6c6d5b81a57e35a60810516d0bad6b5ae752777722777f21c3972e4a8b1c61a6b5cf6655ff665870c19326464c890213bf1c4134f7cf04fdf7af0cfdf7870ef4b0ffef5b33061c284d981871ffcfce15f7ff6707f04040281a2448912256d694b5bda1a57e36a5c8d6b8105165840eb5ad7bad69ddcc99ddcc973e4c891a3c61a6bac71d9977dd9971d3264c89091214386ecc4134f3cf1e1bf7df9e14b9f7bf8ef9f7af81f1f87091326cc0e3cfadd4f1eddfdf8d1073f028140a02851a244495bdad296b6c6d5b81a57e35a60810516d0bad6b5ae752777722777f21c3972e4a8b1c61a6b5cf6655ff665870c19326464c890213bf1c4134f7cf4e14f3ffac8038f3efad1471ffb104c98306176a09ded6c67b18a55ac628d36da68a359922559922529282828d4a31ef5a847cb68192da3656cf6cdbed9373b0804022143860cd9255ee2255ee2873ff9e0873f7de0c3b71ffcf09daf824020501e79e491471659649145b5566bb5566b07dad9ce7616ab58c52ad668a38d369a255992255992828282423dea518f7ab48c96d1325ac666dfec9b7db3834020103264c8905de2255ee2257ef4d3f77ef4f6fb3f7ae7231fbdfb09100804ca238f3cf2c8228b2cb2a8d66aadd66aed403bdbd9ce6215ab58c51a6db4d146b3244bb2244b52505050a8473dea518f96d1325a46cbd8ec9b7db36f7610080442860c19b24bbcc44bbcc48fdf7ef7c7efbce7e377dffbf1cfde0f02814079e491471e5964914516d55aadd55aad1d68673bdb59ac6215ab58a38d36da689664499664490a0a0a0af5a8473dead1325a46cb68199b7db36ff6cd0e028140c8902143768997788997f8c93b6ffae4dd777df2b3777ff28bf7804020501e79e491471659649145b5566bb5566b144bb2244b32c30c6f9237a91ef5a8473d3a57e7ea5c9d6bb36ff6cdbed961c2840913193264c84e3ae9a4933efdee573e7de3a14f1f7fefd3273f820c1932e43cf2c8238fdaaaaddaaaad6aadd66aadd6d9393b67e7ec5454545474d041071d8c624996644966986186193d8a7ad4a31e9dab7375aeceb5d937fb66dfec3061c284890c193264279d74d2499fbdf1f1cf1e7fe6b3275ff9eccd872043860c398f3cf2c8a3b66aabb66aab5aabb55aab7576ceced9393b151515151d74d04107a3589225599219669861463d7a14f5a847e7ea5c9dab736df6cdbed9373b4c9830612243860cd949279d74d2e78f3ff0f9930f7ffee6039fffe841c8902143ce238f3cf2a8addaaaaddaaad66aadd66a9d9db37376ce4e45454545071d74d0c128966449966486196698518f7af428ead1b93a57e7ea5c9b7db36ff6cd0e13264c98c890214376d249279df4c593db2fde7cdf173ffac0173ffe3064c89021e791471e79d4566dd5566d556bb5566bb5ceced9393b67a7a2a2a2a2830e3ae86094d25eda4bfbb22ffbb22f3b080402d18d64c8905d8ecb71392ec7971f9e5f7ea47df9d1bb5f7eec19100804ea40073ad081b4a52d6d69eb3aba8eaea3eb5860810516f0022ff0022f7072277772276f3bda8eb6a3eda8b1c61a6b5c68a185bcbb17a5b497f6d2beeccbbeeccb0e028140c808e362c82ec7e5b81c97e3ab8f97af3e79e7ab4f3ff1d5671f038140a00e74a0031d485bdad296b6aea3ebe83aba8e05165860012ff0022ff0022777722777f2b6a3ed683bda8e1a6bacb1c685165ac8bb7b514a7b692fedcbbeeccbbeec201008840c196ec8eea5cf5f8ecb7139befefc935f7fe1f1afbff89faf5ffe3b08040275a0031de840dad296b6b4751d5d47d7d1752cb0c0020b78811778811738b9933bb993b71d6d47dbd176d458638d352eb4d042dedd8b52da4b7b695ff6655ff6650781402064c89021bbb7be702f7dfe725c8e6f5ef9ef37f7fff1cd83bf7df3f0cf201008d4810e74a003694b5bdad2d675741d5d47d7b1c0020b2ce0055ee0055ee0e44eeee44ede76b41d6d47db51638d35d6b8d0420b79772f0f64c8909d78e289277efbf1b77cfbc9d77ffbe9fced675f0913264c981de840073ad0ce76b6b39d5d47d7d175741da38d36da685ee0055ee0050a0a0a0a6d47dbd176b41d2da365b48c96b1d0420b2d04028140c890214376899778899798073264c84e3cf1c413bffbfc6bbefbc2abbefba2be7bf984091326cc0e74a0031d68673bdbd9ceaea3ebe83aba8ed1461b6d342ff0022ff00205050585b6a3ed683bda8e96d1325a46cb5868a185160281402064c89021bbc44bbcc44bcc03193264279e78e289dfbf62dfdf9fdf3f68df3fbc0b13264c981de840073ad0ce76b6b39d5d47d7d175741da38d36da685ee0055ee0050a0a0a0a6d47dbd176b41d2da365b48c96b1d0420b2d04028140c890214376899778899798073264c84e3cf1c4137f78f4d20f5f2e3fdcdcf9e1ff9e80091326cc0e74a0031d68673bdbd9ceaea3ebe83aba8ed1461b6d342ff0022ff00205050585b6a3ed683bda8e96d1325a46cb5868a185160281402064c89021bbc44bbcc44bcc030402e591471e796491451659546bb5566bb5ce35d75c73292a2afaa5577b93cc30c38c4aaff44aaff4ced5b93a57e75ac73ad6b10e983061c244860c19b2934e3ae9a41f9f7fe78f2fbce3c77f78fb8ffff836c89021438e12254a943c4020501e79e491471659649145b5566bb556eb5c73cd3597a2a2a2a237c99b648619955ee9955ee99dab7375aeceb58e75ac631d3061c284890c193264279d74d2493f3dfbb69f9e7beb4fcfbfe5a717de0c193264c851a2448992070804ca238f3cf2c8228b2cb2a8d66aadd66a9d6baeb9e65254545434c39be44d32a3d22bbdd22bbd7375aeced5b9d6b18e75ac03264c983091214386eca4934e3ae9e7a7dffcf3336ffaf9d937fefcdc1b2043860c394a942851f200814079e491471e5964914516d55aadd55aad73cd35d75c8a8a8a8a6698e14df226557aa5577aa577aeced5b93ad73ad6b18e75c0840913263264c8909d74d24927fd32bfe197a75effcbd3affbe599d742860c1972942851a2b4f66aadd66a9d9db37376ce4e45454545071d74d0c14aaff44aaff4d25eda4b7b695fc73ad6b17f411e201008193264c82ec7e5b81c97e3d79fbff3d75fbde3d7f7defeebfb6f058140a02851a244495bdad296b6c6d5b81a57e35a608105bcbbafb5576bb556ebec9c9db373762a2a2a2a3ae8a0830e567aa5577aa597f6d25eda4bfb3ad6b18e7580f2008190214386ec725c8ecb71397efb4cf9ed73cffff6dffb6ffff31c080402458912254adad296b6b435aec6d5b81ad7020b2ce0dd7dadbd5aabb55a67e7ec9c9db353515151d141071d74b0d22bbdd22bbdb497f6d25edad7b18e75ac0304ca0304173264c82ec7e5b81c97e3f74f3cf7fba79efdfd33777effdc3320100814254a9428694b5bdad2d6b81a57e36a5c0b2cb08077f7b5f66aadd66a9d9db37376ce4e45454545071d74d0c14aaff44aaff4d25eda4b7b695fc73ad6b10e100804a2bf92b49021bb1c97efbf7cffe5fbfff8cffffdf15f4ffff189ed8f4f3d0502814051a2448992b6b4a52d6d8dab7135aec6b5c0020b78775f6b77722777f2b6a3ed683bda8e1a6bacb1c685165a6821c890214346860c19b2134f3cf1c43fef5ef1e707e9cfbfda9fbb60c28409b3b5b7f6d6dedadbd9ce76b6b358c52a56b1461b6db4d12cc9922cc99214141414ea518f7ad4a3b53bb9933b79dbd176b41d6d478d35d658e3420b2db41064c890212343860cd989279e78bafdebb7f8eb0febaf3fc55f7fb960c28409b3b5b7f6d6dedadbd9ce76b6b358c52a56b1461b6db4d12cc9922cc99214141414ea518f7ad4a3b53bb9933b79dbd176b41d6d478d35d658e3420b2db41064c8902123434286ec747bba3dc5897fbf77fefdfef8fbf7fef71f5f86091326ccd6deda5b7b6b6f673bdbd9ce6215ab58c51a6db4d146b3244bb2244b52505050a8473dea518fd6eee44eeee46d47dbd176b41d35d658638d0b2db4d042902143868c0c053264279e78e289fffcf2a57f7eddfef9cdbd7f7e77c0840913666b6fedadbdb5b7b39ded6c67b18a55ac628d36da68a359922559922529282828d4a31ef5a84707165a682110080442860c19d2a5db4bb7976e2fddfefbc6f5efe3f9ef93f3df3707080402b5f6d6deda5b7b1659649145b18a55ac62cdb57b73b737bbbdf1d51b4bb2244b32c30c33cca8473dea518fced5b93a57e7daec9b7db36f76983061c2ecc0420b2d04028140c8902143718997788997f8df775efeeffbfdbfdb97fefb61038140a0d6deda5b7b6bcf228b2cb22856b18a55acb9e69a6bf7a625f9ea8d25599219669861463dea518f7a74aeced5b93ad766dfec9b7db3c38409136607165afc65f11710080442860c19b24bbcc44bbcc4ff5f3bfe7ffdc5ffbff7c2ff3fa8201008d4da5b7b6b6fed5964914516c52a56b18a35d75c73cd654996e4ab37966486196698518f7ad4a31e9dab7375aeceb5d937fb66dfec3061c284d981c5ed420b814020103264c8905de2255ee2253efec6ddc7df7afef1b7f7c7df7d0e0402815a7b6b6fedad3d8b2cb2c8a258c52a56b1e69a6baeb92cc9922cc9576fbc49669861463dea518f7a74aeced5b93ad766dfec9b7db3c384091366074e3ae9a427afbdf8e4f5179e7caf3cf9c15dc89021438e12254a94daaaaddaaaadc6d5b81a57e39a9db37376ce4ead6b5deb5a77d041071dcc9123478ed25eda4b7bff7b67376d6f9dcbbeec201008840c19326497e3725c8ecbf1e4bd479ebcff8327bffffe933f7ea703279d74d2d3afdf7dfacde79fbeb63f7dfd59c89021438e12254a94daaaaddaaaadc6d5b81a57e39a9db37376ce4ead6b5deb5a77d041071dcc9123478ed25eda4b7b69df8b7d376d6f9dcb0e028140c890214376392ec7e5b81c4ffffcf0d3bf7df7e9dfbff9f4fc5a074e3ae9a4675ffdf7b3affdffd9d7ef3cfbe633902143861c254a9428b5555bb5555b8dab7135aec6353b67e7ec9c9d5ad7bad6b5eea0830e3a9823478e1ca5bdb497f6d2beec7bb1efa6edad1304028190214386ec725c8ecb71399ef5879e5dbefe2c7ff1d9871eecc049279df4fcfffff1fc2b7f7ffed5a79e7fed49c89021438e12254a94daaaaddaaaadc6d5b81a57e39a9db37376ce4ead6b5deb5a77d041071dcc9123478ed25eda4b7b695ff6655ff6bdd8f3008140c890214376392ec7e5b81ccfe72f3d7feab3cf9ffee4f3673e16254a9428694b5bdad2d6b81a57e36a5c0b2cb0c0025ad7bad6b5eee44eeee44e9e23478e1c35d658638dcbbeeccbbeec902143868c0c193264279e78e2892ffefcb7177ffbf38bbfffe1c5f95b983061c2ec40073ad08176b6b39d3c7e344a942851d296b6b4a5ad7135aec6d5b81658608105b4ae75ad6bddc99ddcc99d3c478e1c396aacb1c61a977dd9977dd92143860c19193264c84e3cf1c4135ff63fbdbcfcfe65fed5cb0ffd14264c98303bd0810e74a09ded6c278f1f8d12254a94b4a52d6d696b5c8dab7135ae0516586001ad6b5deb5a777227777227cf9123478e1a6bacb1c6655ff6655f76c890214346860c19b2134f3cf1c457f3af5f3df5c8aba77ff0ea99efc384091366073ad0810eb4b39dede4f1a351a2448992b6b4a52d6d8dab7135aec6b5c0020b2ca075ad6b5deb4eeee44eeee43972e4c851638d35d6b8eccbbeeccb0e193264c8c890214376e289279ef8fad91fbe7eeee1d7cf7ff7f50bdf84091326cc0e74a0031d68673bdbc9e347a38c36da689664499664490a0a0a0af5a8473dead1325a46cb68199b7db36ff6cd0e028140c8902143768997788997f8e6e57fbe79e5b137f79f7ef3a0824020501e79e491471659649145b5566bb556eb6e6fe69a6b2e454545c528a38d369a255992255992828282423dea518f7ab48c96d1325ac666dfec9b7db3834020103264c8905de2255ee225be7de58f6feffff5ed837fbd7df838080402e591471e796491451659546bb5566bb5eef666b73773cda5a8a8a81865b4d146b3244bb2244b52505050a8473dea518f96d1325a46cbd8ec9b7db36f7610080442860c19b24bbcc44bbcc477f77ff2eec16fde3dfce3bb477f058140a03cf2c8238f2cb2c8228b6aadd66aadd6dd9bbbbdd9edcd5c8a8a8a8a51461b6d344bb2244bb224050505857ad4a31ef568192da365b48ccdbed937fb660781402064c89021bbc44bbcc44b7cffe0dbef1f3efcfed18fdf7ff93720100894471e79e4914516596451add55aadd53ad7eecddddeecf6c62fbd5a51511100";
+
+    function bytesOf(hex: Span[Nat8, Static]): String is
+        case hexToBytes(hex) of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                assertTrue(false, "the fixture is hex");
+                return bytesOf("00");
+        end case;
+    end;
+
+    generic [D: Region]
+    function errorOf(data: Span[Nat8, D], maxPixels: Index): Index is
+        case readWebp(data, maxPixels) of
+            when Right(right as picture: WebpPicture) do
+                destroyWebp(picture);
+                return 0;
+            when Left(left as error: WebpError) do
+                case error of
+                    when NotWebp do
+                        return 1;
+                    when WebpTooLarge do
+                        return 2;
+                    when WebpUnsupported do
+                        return 3;
+                    when WebpBroken do
+                        return 4;
+                end case;
+        end case;
+    end;
+
+    -- data with the byte at at inverted.
+    generic [D: Region]
+    function changedOf(data: Span[Nat8, D], at: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, substring(data, 0, at));
+        writeByte(&!out, bitwiseXor(data[at], (255 : Nat8)));
+        writeString(&!out, substring(data, at + 1, spanLength(data)));
+        return finalize(out);
+    end;
+
+    -- Part part of four: the files with the byte at part, part + 4 and so
+    -- on of hex inverted; none fails other than with an error, and some
+    -- of them are refused.
+    function invertedPart(hex: Span[Nat8, Static], part: Index, message: Span[Nat8, Static]): Unit is
+        let data: String := bytesOf(hex);
+        var read: Index := 0;
+        var tried: Index := 0;
+        var at: Index := part;
+        while at < length(&data) do
+            let bytes: String := changedOf(asSpan(&data), at);
+            if errorOf(asSpan(&bytes), 16000000) = 0 then
+                read := read + 1;
+            end if;
+            destroyString(bytes);
+            tried := tried + 1;
+            at := at + 4;
+        end while;
+        destroyString(data);
+        assertTrue(read < tried, message);
+        return nil;
+    end;
+
+    function testRobustPredict3(): Unit is
+        invertedPart(predictHex, 3, "predict: each byte inverted, not all read");
+        return nil;
+    end;
+end module body.

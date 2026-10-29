@@ -1,0 +1,171 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The lossy WebPs here and the golden YUV planes their digests come from
+-- are golang.org/x/image's testdata (Copyright 2009 The Go Authors,
+-- BSD-3-Clause), written and decoded by libwebp; the RGB digests are those
+-- of macOS's ImageIO decoding the same files.  The c- frames were written
+-- by cwebp 1.6.0 from pictures made for the test (sharpness, simple filter,
+-- one segment, quality 5 and 100, the skip flag), their planes and RGB
+-- dwebp's (-yuv, -pam).
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    hexToBytes,
+    bytesToHex,
+    startsWith,
+    substring,
+    equal
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Wolly.Vp8 (
+    Vp8Picture,
+    readVp8,
+    vp8Width,
+    vp8Height,
+    vp8Pixels,
+    vp8Luma,
+    vp8Blue,
+    vp8Red,
+    destroyVp8
+);
+
+module body Wolly.Vp8Part4.Test is
+    constant bluePurplePinkLossyHex: Span[Nat8, Static] := "524946468a09000057454250565038207e090000322f009d012a960064003e8d389547a2a18c0683411404625940359936c3b524fe67eb87c1dd46fcbfea3d5c6ddde777d3b98190d637da72098993a3ed85c0dbe83cebd33d35bf28afc24bfd13ee18507a701fae64ea655a217aab0b85d30502ea906735ac28067acd3880a3d48a62409998725de1b80c1cbce26081890c59c01df2d0004651199ca4bca65949c93ca8467bc46e8e4a0867cd74814e49887fce36e3a2f6aa6ba5efc3fa2822e741bcf9432d8f1395334d83235717f33a2257f92e2b4b8702d7d06aa242dde6618274806022dc9fd0328fda4c1db7e4d092516dd17d1fc09908184691c205d8afa818847e8155bfe9a46f98fb5035c228cb381d161b7e677d65a6ad1f17f843d8996a9e6364bc3b0a9dd182fc0f99d811f4fe54d76fd4bf10b44d2aa58a22b7cdfe1d8f6a8eb08a3663f4a3b9fb2341bec9ef759c8d985141d8efc91d59e7dd7b5877350437dc36173e76b1fc0e00c5eb3086117277779c46031e31f2c3876f4f9861af90594a51401e0cfb237016c39a82232fd88000fefe9fda29c36ccf1f177783ff51eb06667f4ab8f0be6ccec5b66e8c39eb8cbb964fdf358039be2c90dc7714571798c19ace6b041984311e055278d67d16a55eb7821473f41a8cbe49d9388b232009bd29cc4fc4595caa2da94841d340d267e873bd284c146c1cb8f053bef0015ba4d16082dd094370155386665e32c90f6f1a2e47b8a0cf6b482c2ede5f3fc4b8c03f1d272dbb4f1dcff8c5254b77a0892018dd89e547668442587ceba8853cf1f8534eb2ebe546b6f6eaf8dd8a87bcf5e22ffece858b864f69bdf5a485730c9bd30f2ed97480e12d73dc4b2272f278a6dbde46d40fad3fbd1704e9deb7d368e973d7fcb72096f6a720d8b841798ec7d9a91e687ffa6d7697e6b738e5e9ac03ee7cca2030c5b686796145e43c82a943166f05fe0481d39458d379ab6ff1297c863925b329313db1694add1d08cfff9e7f59745837b4b4e0ababdb90a85eedd58d3521ac69f003d83625032187e0fd37db42e5ae26df9df928be4296c6e932fef4ee18e06702bff065c2f67b283edf809ccf12a964a87bec1f98fd552a1f82e70b604e11d20f9a0904ff33866b64b9c3236a7dd72d3d336160c3ad47f1c53ae91592ffefe6ae44e1a9688729006942121222ea45b6999244e4872a5d3807e27ea6326c24aa942602c2c6aa54be2c0e16dea7f7517d5a20f2d9a04a87a1f8c225f83fde3d1f1e0f9eadcfa11810a9c754df00697be914ae7417748530b72768430985425cf0fbc617f133feaed7f87290dc9f384f31496ec731afb7a8cc778530c1fdfe1d25e435d8e1a4effa2211e203347676e36c41e0b0a3fad402de373dbc6ef9b08476b4ac505af6e255b246f55b79397003330b5464c5f27fb13fbe47eee38cdb0d7375e420a52bc0fea766bc338695c0bc9c78b454283e19ead64ef9e04803246d7a501637eecd2e305200b13fac9491d0d0e1a69c4f1a5abf685c87b4d9b9bf080217c845afc671dc1d34f122a8450f85f31c627e3027bba29218fdd12438f70a503eb3350f083ce4ff5e90ef586c3fa24fd47082c7a3243741d0a052a143af5ae6d49b79c166d971648d8578dfd4bb8acf026b91fd6b1dffcab5fe2d02d7d6affad086e9f7d6c4e0dab6e2e5f58a399ba5dbd798de78146153c78126ffbef3e2b0faaa5dd7e724ba62973d2efd5bc23c55687e7d550037c928d389917b4223143fbfb44a64caed75492644966cc121c867df79d231d08bb2936c8a330d23cc1d4cb96b0d95cdf352e3bbfa77860ebc6636a4c5b943807abe1d44f858abbab23e898928c815b27c0271287739f0f4390983945ea0bba5d8a765588b072ef49186db3db814d7a6e89003f6cc047f5015bdf864e57dd01435d1ac914ee71b351b81eeebb78e54a9a4d970a4eee466cddd87e53f1536b92ecdc5618eb8282d182bb53b6cd7d763155d22a01e562fea975d63a116b3a41e129be0b4a01d42ff0c2662125544b5cb7f97a26d68c20786472aa980ef5dba53663eddd474ae0f062573f7b9f841b5fa411a2868094fbc599481834ed422578961a4ccfd2f34fd8936eed4ca6b71873ed46420078d6d9a149eece9c34e64874a98292ad9bc39880e236523ecfac9d3893f2017250a9d22bb2ef73bad438936af6abcda19b40802f6630384e0385958cd47670124a420cdf82d46c54b3296db6f7149ae80e4bb1e55859da7075e9306812a818a90568e56762bca8cd38b189a807dc5f684c8c4dd42b562ef034f9a9f42b46e00ad98e6b1aeb744964a6a4b657e6808ef8a5e06de87d9b393550b60971a582542281cb96c6aec9c450dffd2fcaa46a1276b05e05269fda1bb5804e6ffd9cd7ef9008bc961ccffe459841af47509a542f780125c4d1778c855cc3c0dd2774a783500542f1d437465b17823fd7b2bc3dfdfa75a41e060921fac4aa5a57683e53ae926de4efd76d06bb225c878cf8a68e7490b237f959775f20638bdb5407180a581fabb9e2ad637fa58669cf329f2b3ba09144337e8dc94a7e513b17e29c67d51696191289f04524dd727919754640ef4107b6080f6bd1e77ef6e77b7658d622ac36e3bbdc3c6df049d368c33a012365148c3f85592eeb57a2da73428f36e7d78b0020a18d65fc38375cbc47ff3b04f040da08f216468a67643448082e1334cd894e7bf7efbf855d931bd4de83178627bdbf5e93ee437db0bd863f307ffcfd052e133e40a3b16dd82e4e7303bc7e956c4a1eb97eb03bfa36c1e73a89dfd03996f47b985b56bab6520717a5b1e6d1b627f83b80e5ee054f9d335149557bb713be69ecb4d67ea745f1f74df337f58c8e62ef82dd7f6f6b321f385181316b68ff43a379f2f613599c8ac2ac68f31d1b6b56a7beb57811e99359fa6fe3c32146ecfdab5db8e7921a47b843000e7fe24f6e6cbbeddcf003bad6f364b197c2b1bb78fa4c9c7d127e8b85e220fd3cae8da0efecb262946f9cf9b227da2331531c1adc4cc2a034c57dd516c0f36918bf461262d8eab778d297d1198d214e38aa12e424682a7ea4c5bf488775e813575802d64986e518db4d93dc387475a7521e109207adf05d49afa050048c8b54bbb7772b0a306d21c98f8b315b1068bf1330d5ec03cefaf1b9db7fde486d9fa22891514a471542e5638ff2c4e7287b0776f1f158faf5cde4b6d46d92885791fc1a25255fa55f3e29989a1d1c17fa65c6133d70a663ca8ae8558831d824b4603691c757171449107cfe578e9cd129fe29f74eec75828572a10f4256e61c58c489db12284a51f815bded0872639479aa124b858796f73f1d69374650a184df9b6adafed82a8adbc860a5adbbb3f2c6617a999485b71b7a6fb0bf0903d405b4ef8fdf4a935d4c223395a8d43b3fbe4873ea4ae6de9360000000000";
+
+    function bytesOf(hex: Span[Nat8, Static]): String is
+        case hexToBytes(hex) of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                assertTrue(false, "the fixture is hex");
+                return bytesOf("00");
+        end case;
+    end;
+
+    function wide(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The payload of the first chunk of a plain WebP file (its VP8 chunk).
+    generic [D: Region]
+    function chunkOf(data: Span[Nat8, D]): Span[Nat8, D] is
+        let size: Index := ((wide(data[16]) + (wide(data[17]) * 256)) + (wide(data[18]) * 65536)) + (wide(data[19]) * 16777216);
+        return substring(data, 20, size + 20);
+    end;
+
+    -- 0 when the frame reads, else the code readVp8 answers.
+    generic [D: Region]
+    function codeOf(data: Span[Nat8, D], maxPixels: Index): Index is
+        case readVp8(data, maxPixels) of
+            when Right(right as picture: Vp8Picture) do
+                destroyVp8(picture);
+                return 0;
+            when Left(left as code: Index) do
+                return code;
+        end case;
+    end;
+
+    -- The chunk of blue-purple-pink with the byte at at set to value, when
+    -- it was was; else no bytes.
+    function changed(at: Index, was: Nat8, value: Nat8): String is
+        let data: String := bytesOf(bluePurplePinkLossyHex);
+        var out: StringBuilder := makeStringBuilder();
+        if byteAt(chunkOf(asSpan(&data)), at) = was then
+            writeString(&!out, substring(chunkOf(asSpan(&data)), 0, at));
+            writeByte(&!out, value);
+            writeString(&!out, substring(chunkOf(asSpan(&data)), at + 1, spanLength(chunkOf(asSpan(&data)))));
+        end if;
+        destroyString(data);
+        return finalize(out);
+    end;
+
+    generic [D: Region]
+    function byteAt(data: Span[Nat8, D], at: Index): Nat8 is
+        return data[at];
+    end;
+
+    function changedCode(at: Index, was: Nat8, value: Nat8, maxPixels: Index): Index is
+        let bytes: String := changed(at, was, value);
+        var code: Index := 99;
+        if length(&bytes) > 0 then
+            code := codeOf(asSpan(&bytes), maxPixels);
+        end if;
+        destroyString(bytes);
+        return code;
+    end;
+
+    -- No prefix and no inverted byte of the frame of blue-purple-pink makes
+    -- the reader fail other than with a code; measured: 2428
+
+    -- of 2430 prefixes refused, 1452 of 2430 inverted bytes read.  In 16
+    -- parts, part k the offsets k, k + 16, k + 32 and so on, so that each
+    -- stays under the 1800 s hilde test gives a test under valgrind (the
+    -- whole took longer); the 16 together are every offset.
+    constant robustParts: Index := 16;
+
+    function robustPart(part: Index): Unit is
+        let data: String := bytesOf(bluePurplePinkLossyHex);
+        let size: Index := spanLength(chunkOf(asSpan(&data)));
+        var wrong: Index := 0;
+        var cut: Index := part;
+        while cut < size do
+            let refused: Bool := codeOf(substring(chunkOf(asSpan(&data)), 0, cut), 16000000) /= 0;
+            let needed: Bool := cut < (size - 2);
+            if refused /= needed then
+                wrong := wrong + 1;
+            end if;
+            cut := cut + robustParts;
+        end while;
+        assertTrue(wrong = 0, "every prefix refused but the two that leave out bytes the decoder never needs");
+        var read: Index := 0;
+        var tried: Index := 0;
+        var at: Index := part;
+        while at < size do
+            let was: Nat8 := byteAt(chunkOf(asSpan(&data)), at);
+            if changedCode(at, was, bitwiseXor(was, (255 : Nat8)), 16000000) = 0 then
+                read := read + 1;
+            end if;
+            tried := tried + 1;
+            at := at + robustParts;
+        end while;
+        assertTrue(read < tried, "each byte inverted: some of this part refused");
+        destroyString(data);
+        return nil;
+    end;
+
+    function testRobust08(): Unit is
+        robustPart(8);
+        return nil;
+    end;
+
+    function testRobust09(): Unit is
+        robustPart(9);
+        return nil;
+    end;
+end module body.

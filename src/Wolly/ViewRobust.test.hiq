@@ -1,0 +1,204 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Checks: View ViewCompile ViewContext
+--
+-- Wolly.View on broken templates: every prefix of one template that uses
+-- every kind of tag, and the template with each byte inverted and with
+-- each byte made a brace, loaded and rendered.  Each must end in a Right
+-- or a Left, never in a crash or a loop that does not end; the whole
+-- template renders.  In robustParts parts, part k the offsets k, k +
+-- robustParts and so on,
+-- each part asserting that some of its templates render and some fail.
+-- The templates are written below view-robust-root in the working
+-- directory of the test.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData,
+    makeMapData
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    renderView
+);
+
+module body Wolly.ViewRobust.Test is
+    constant root: Span[Nat8, Static] := "view-robust-root";
+    constant robustParts: Index := 4;
+
+    constant template: Span[Nat8, Static] := "{% macro field(name, value) %}<label for=\"{{ name }}\">{{ name|upper }}</label><input name=\"{{ name }}\" value=\"{{ value }}\">{% endmacro %}<!DOCTYPE html><html><head><title>{{ title }}</title><style>p { color: {{ color }}; }</style><script>var n = {{ count }}; var s = \"{{ title }}\";</script></head><body>{# a comment #}{% raw %}{{ raw }}{% endraw %}{% for item in items if item.shown %}<a href=\"/item?id={{ item.id }}&amp;q={{ query }}\" title=\"{{ loop.index }}\">{{ item.name }}</a>{% else %}<p>none</p>{% endfor %}{% if count > 2 %}many{% elif count == 2 %}two{% else %}few{% endif %}{% set total = (count * 2) + 1 %}{{ total }}{% with x = title ~ \"!\" %}{{ x|length }}{{ x|lower }}{% endwith %}{{ field(\"user\", title) }}{{ items|length }}</body></html>";
+
+    constant json: Span[Nat8, Static] := "{\"title\": \"T <&>\", \"color\": \"red\", \"count\": 3, \"query\": \"a b\", \"items\": [{\"id\": 1, \"name\": \"one\", \"shown\": true}, {\"id\": 2, \"name\": \"two\", \"shown\": false}]}";
+
+    generic [T: Region]
+    function written(text: Span[Nat8, T]): Bool is
+        let made: Bool := createDirectory(root);
+        case openWrite("view-robust-root/r.jinja") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the text, as a template, renders with the data; loud prints
+    -- the error.
+    generic [T: Region]
+    function rendersLoud(text: Span[Nat8, T], loud: Bool): Bool is
+        assertTrue(written(text), "the template is written");
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, root);
+        var data: ViewData := makeMapData();
+        case readViewJson(json) of
+            when Right(right as read: ViewData) do
+                destroyViewData(data);
+                data := read;
+            when Left(left as message: String) do
+                destroyString(message);
+                assertTrue(false, "the data is read");
+        end case;
+        var out: StringBuilder := makeStringBuilder();
+        let result: Either[String, Unit] := renderView(&!engine, "r.jinja", &data, &!out);
+        let text2: String := finalize(out);
+        destroyString(text2);
+        destroyViewData(data);
+        destroyViewEngine(engine);
+        case result of
+            when Left(left as message: String) do
+                if loud then
+                    printLn(asSpan(&message));
+                end if;
+                destroyString(message);
+                return false;
+            when Right(right as done: Unit) do
+                return true;
+        end case;
+    end;
+
+    generic [T: Region]
+    function renders(text: Span[Nat8, T]): Bool is
+        return rendersLoud(text, false);
+    end;
+
+    -- The template, its first count bytes.
+    function prefix(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        let text: Span[Nat8, Static] := template;
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!out, text[i]);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The template, the byte at offset made what it gives: inverted, or a
+    -- brace.
+    function changed(offset: Index, brace: Bool): String is
+        var out: StringBuilder := makeStringBuilder();
+        let text: Span[Nat8, Static] := template;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if i = offset then
+                if brace then
+                    writeByte(&!out, '{');
+                else
+                    writeByte(&!out, 255 - text[i]);
+                end if;
+            else
+                writeByte(&!out, text[i]);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Part part: the prefixes, inversions and braces at its offsets.
+    function robustPart(part: Index): Unit is
+        var rendered: Index := 0;
+        var failed: Index := 0;
+        let size: Index := spanLength(template);
+        var offset: Index := part;
+        while offset <= size do
+            let cut: String := prefix(offset);
+            if renders(asSpan(&cut)) then
+                rendered := rendered + 1;
+            else
+                failed := failed + 1;
+            end if;
+            destroyString(cut);
+            if offset < size then
+                let inverted: String := changed(offset, false);
+                if renders(asSpan(&inverted)) then
+                    rendered := rendered + 1;
+                else
+                    failed := failed + 1;
+                end if;
+                destroyString(inverted);
+                let braced: String := changed(offset, true);
+                if renders(asSpan(&braced)) then
+                    rendered := rendered + 1;
+                else
+                    failed := failed + 1;
+                end if;
+                destroyString(braced);
+            end if;
+            offset := offset + robustParts;
+        end while;
+        assertTrue(rendered > 0, "some of the templates of the part render");
+        assertTrue(failed > 0, "some of the templates of the part fail");
+        return nil;
+    end;
+
+    function testWhole(): Unit is
+        assertTrue(rendersLoud(template, true), "the whole template renders");
+        return nil;
+    end;
+
+    function testRobust0(): Unit is
+        return robustPart(0);
+    end;
+
+    function testRobust1(): Unit is
+        return robustPart(1);
+    end;
+
+    function testRobust2(): Unit is
+        return robustPart(2);
+    end;
+
+    function testRobust3(): Unit is
+        return robustPart(3);
+    end;
+end module body.

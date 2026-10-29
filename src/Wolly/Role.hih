@@ -1,0 +1,105 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Roles: a user may do an action when one of the roles the user holds has
+been granted it.  Nothing else allows anything: a role, a user or an
+action nobody named is denied, and so is a name that is no name.
+
+Grants and holders are kept in SQLite beside the users of Wolly.Auth, so
+that they hold across the processes of an application and an
+administrator can change them without a new build.  What an action means,
+and on which resource, is the application's: the handler asks may and
+answers forbidden when it says no.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Role is
+    """
+    Whether name may name a role, an action or a user: 1 to 64 bytes of a
+    to z, 0 to 9, dot, hyphen and underscore, the alphabet of the user
+    names of Wolly.Auth.
+    No contract: a walk over name.
+    """
+    generic [N: Region]
+    function isName(name: Span[Nat8, N]): Bool;
+
+    """
+    Makes the tables of grants and of holders, if they are not there.
+    None when both exist afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareRoles(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Grants action to role.  Right true when the grant is there afterwards,
+    also when it was there before; Right false when role or action is no
+    name, and then nothing is stored.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, O: Region, A: Region]
+    function grant(db: &![Database[Writing], R], role: Span[Nat8, O], action: Span[Nat8, A]): Either[DbError, Bool];
+
+    """
+    Takes action from role.  Right true when a grant was removed, Right
+    false when there was none.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, O: Region, A: Region]
+    function revoke(db: &![Database[Writing], R], role: Span[Nat8, O], action: Span[Nat8, A]): Either[DbError, Bool];
+
+    """
+    Gives role to user.  Right true when user holds role afterwards, also
+    when it did before; Right false when user or role is no name, and then
+    nothing is stored.  Whether user exists in Wolly.Auth is not asked: a
+    role of a user that cannot log in allows nothing.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, U: Region, O: Region]
+    function assign(db: &![Database[Writing], R], user: Span[Nat8, U], role: Span[Nat8, O]): Either[DbError, Bool];
+
+    """
+    Takes role from user.  Right true when user held it, Right false when
+    not.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, U: Region, O: Region]
+    function unassign(db: &![Database[Writing], R], user: Span[Nat8, U], role: Span[Nat8, O]): Either[DbError, Bool];
+
+    """
+    Takes every role from user, for a user who is removed.  Right true when
+    user held one, Right false when not.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, U: Region]
+    function unassignAll(db: &![Database[Writing], R], user: Span[Nat8, U]): Either[DbError, Bool];
+
+    """
+    Whether user may do action: Right true only when a role user holds has
+    been granted action.  Right false for a name that is no name, since
+    grant and assign store none.  Fails
+    with the error of SQLite, which the caller takes as a no.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, U: Region, A: Region]
+    function may(db: &![Database[M], R], user: Span[Nat8, U], action: Span[Nat8, A]): Either[DbError, Bool];
+
+    """
+    The answer to a request the user may not make: 403 and a short text,
+    as the CGI output.
+    """
+    function forbidden(): String
+        ensures length(&result) > 0;
+end module.

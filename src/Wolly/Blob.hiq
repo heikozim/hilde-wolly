@@ -1,0 +1,364 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex
+);
+import Standard.Libcrypto (
+    sha256,
+    randomBytes
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction,
+    Values,
+    Cursor,
+    noValues,
+    withText,
+    withBytes,
+    execute,
+    start,
+    advance,
+    columnText,
+    columnBytes,
+    finish,
+    begin,
+    commit,
+    rollback
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.Blob is
+    constant blobMost: Index := 16777216;
+    constant xidBytes: Index := 16;
+    constant nameMost: Index := 255;
+    constant mediaMost: Index := 127;
+    constant makeBlobs: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_blobs (xid TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, content BLOB NOT NULL) STRICT";
+    constant makeBlobsPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_blobs (xid TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, content BYTEA NOT NULL)";
+    constant makeNames: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_blob_names (id INTEGER PRIMARY KEY, xid TEXT NOT NULL, name TEXT NOT NULL, media TEXT NOT NULL) STRICT";
+    constant makeNamesPg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_blob_names (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, xid TEXT NOT NULL, name TEXT NOT NULL, media TEXT NOT NULL)";
+    constant makeIndex: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_blob_names_xid ON wolly_blob_names (xid)";
+    constant findHash: Span[Nat8, Static] := "SELECT xid FROM wolly_blobs WHERE hash = ?";
+    constant putBlob: Span[Nat8, Static] := "INSERT INTO wolly_blobs (xid, hash, content) VALUES (?, ?, ?)";
+    constant putName: Span[Nat8, Static] := "INSERT INTO wolly_blob_names (xid, name, media) VALUES (?, ?, ?)";
+    constant getBlob: Span[Nat8, Static] := "SELECT content FROM wolly_blobs WHERE xid = ?";
+    constant getNames: Span[Nat8, Static] := "SELECT name, media FROM wolly_blob_names WHERE xid = ? ORDER BY id";
+    constant dropNames: Span[Nat8, Static] := "DELETE FROM wolly_blob_names WHERE xid = ?";
+    constant dropBlob: Span[Nat8, Static] := "DELETE FROM wolly_blobs WHERE xid = ?";
+
+    -- The two answers of a lookup, typed: a None alone has no type.
+    function nothing(): Either[DbError, Option[String]] is
+        return Right(right => None());
+    end;
+
+    function something(text: String): Either[DbError, Option[String]] is
+        let some: Option[String] := Some(value => text);
+        let result: Either[DbError, Option[String]] := Right(right => some);
+        return result;
+    end;
+
+    function mostBlobBytes(): Index is
+        return blobMost;
+    end;
+
+    generic [T: Region]
+    function isXid(text: Span[Nat8, T]): Bool is
+        if spanLength(text) /= (xidBytes * 2) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            let digit: Bool := (byte >= 48) and (byte <= 57);
+            let letter: Bool := (byte >= 97) and (byte <= 102);
+            if not (digit or letter) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function isMediaByte(byte: Nat8): Bool is
+        let letter: Bool := ((byte >= 65) and (byte <= 90)) or ((byte >= 97) and (byte <= 122));
+        let digit: Bool := (byte >= 48) and (byte <= 57);
+        let mark1: Bool := ((byte = 33) or (byte = 35)) or ((byte = 36) or (byte = 38));
+        let mark2: Bool := ((byte = 45) or (byte = 94)) or ((byte = 95) or (byte = 46));
+        return ((letter or digit) or (mark1 or mark2)) or (byte = 43);
+    end;
+
+    generic [T: Region]
+    function isMediaType(text: Span[Nat8, T]): Bool is
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > mediaMost) then
+            return false;
+        end if;
+        var slashes: Index := 0;
+        var slashAt: Index := 0;
+        var i: Index := 0;
+        while i < size do
+            if text[i] = 47 then
+                slashes := slashes + 1;
+                slashAt := i;
+            else
+                if not isMediaByte(text[i]) then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        if slashes /= 1 then
+            return false;
+        end if;
+        return (slashAt > 0) and ((slashAt + 1) < size);
+    end;
+
+    generic [T: Region]
+    function isBlobName(text: Span[Nat8, T]): Bool is
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > nameMost) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if ((byte < 32) or (byte = 127)) or ((byte = 47) or (byte = 92)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function prepareBlobs(db: &![Database[Writing], R]): Option[DbError] is
+        let makeBlobsSql: Span[Nat8, Static] := pick(&db, makeBlobs, makeBlobsPg);
+        case execute(&~db, makeBlobsSql, noValues()) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as made: Nat64) do
+                let makeNamesSql: Span[Nat8, Static] := pick(&db, makeNames, makeNamesPg);
+                case execute(&~db, makeNamesSql, noValues()) of
+                    when Left(left as failure: DbError) do
+                        return Some(value => failure);
+                    when Right(right as named: Nat64) do
+                        case execute(&~db, makeIndex, noValues()) of
+                            when Left(left as broken: DbError) do
+                                return Some(value => broken);
+                            when Right(right as indexed: Nat64) do
+                                return None();
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The xid of the content whose hash is hash, if it is kept.
+    generic [R: Region, H: Region]
+    function xidOfHash(db: &![Database[Writing], R], hash: Span[Nat8, H]): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, findHash, withText(noValues(), hash));
+        if advance(&!cursor) then
+            let xid: String := fromSpan(columnText(&cursor, 0));
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    destroyString(xid);
+                    return Left(left => error);
+                when None do
+                    return something(xid);
+            end case;
+        else
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return Left(left => error);
+                when None do
+                    return nothing();
+            end case;
+        end if;
+    end;
+
+    -- A new blob and its first name, in one transaction.
+    generic [R: Region, X: Region, H: Region, C: Region, N: Region, M: Region]
+    function storeNew(db: &![Database[Writing], R], xid: Span[Nat8, X], hash: Span[Nat8, H], content: Span[Nat8, C],
+                      name: Span[Nat8, N], media: Span[Nat8, M]): Option[DbError] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as transaction: Transaction) do
+                case execute(&~db, putBlob, withBytes(withText(withText(noValues(), xid), hash), content)) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Some(value => error);
+                    when Right(right as stored: Nat64) do
+                        case execute(&~db, putName, withText(withText(withText(noValues(), xid), name), media)) of
+                            when Left(left as error: DbError) do
+                                rollback(&~db, transaction);
+                                return Some(value => error);
+                            when Right(right as named: Nat64) do
+                                case commit(&~db, transaction) of
+                                    when Left(left as error: DbError) do
+                                        return Some(value => error);
+                                    when Right(right as done: Unit) do
+                                        return None();
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- A new name for content kept already.
+    generic [R: Region, X: Region, N: Region, M: Region]
+    function addName(db: &![Database[Writing], R], xid: Span[Nat8, X], name: Span[Nat8, N], media: Span[Nat8, M]): Option[DbError] is
+        case execute(&~db, putName, withText(withText(withText(noValues(), xid), name), media)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as named: Nat64) do
+                return None();
+        end case;
+    end;
+
+    -- The xid when there was no error, the error otherwise.
+    function outcome(error: Option[DbError], xid: String): Either[DbError, Option[String]] is
+        case error of
+            when Some(value as failure: DbError) do
+                destroyString(xid);
+                return Left(left => failure);
+            when None do
+                return something(xid);
+        end case;
+    end;
+
+    generic [R: Region, H: Region, C: Region, N: Region, M: Region]
+    function saveNew(db: &![Database[Writing], R], hash: Span[Nat8, H], content: Span[Nat8, C], name: Span[Nat8, N],
+                     media: Span[Nat8, M]): Either[DbError, Option[String]] is
+        case randomBytes(xidBytes) of
+            when None do
+                return nothing();
+            when Some(value as raw: String) do
+                let xid: String := bytesToHex(asSpan(&raw));
+                destroyString(raw);
+                let error: Option[DbError] := storeNew(&~db, asSpan(&xid), hash, content, name, media);
+                return outcome(error, xid);
+        end case;
+    end;
+
+    generic [R: Region, C: Region, N: Region, M: Region]
+    function saveBlob(db: &![Database[Writing], R], content: Span[Nat8, C], name: Span[Nat8, N],
+                      media: Span[Nat8, M]): Either[DbError, Option[String]] is
+        let size: Index := spanLength(content);
+        if ((size = 0) or (size > blobMost)) or ((not isBlobName(name)) or (not isMediaType(media))) then
+            return nothing();
+        end if;
+        case sha256(content) of
+            when None do
+                return nothing();
+            when Some(value as digest: String) do
+                let hash: String := bytesToHex(asSpan(&digest));
+                destroyString(digest);
+                case xidOfHash(&~db, asSpan(&hash)) of
+                    when Left(left as error: DbError) do
+                        destroyString(hash);
+                        return Left(left => error);
+                    when Right(right as found: Option[String]) do
+                        case found of
+                            when Some(value as xid: String) do
+                                destroyString(hash);
+                                let error: Option[DbError] := addName(&~db, asSpan(&xid), name, media);
+                                return outcome(error, xid);
+                            when None do
+                                let saved: Either[DbError, Option[String]] := saveNew(&~db, asSpan(&hash), content, name, media);
+                                destroyString(hash);
+                                return saved;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [Q: Free, R: Region, X: Region]
+    function loadBlob(db: &![Database[Q], R], xid: Span[Nat8, X]): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, getBlob, withText(noValues(), xid));
+        if advance(&!cursor) then
+            let content: String := fromSpan(columnBytes(&cursor, 0));
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    destroyString(content);
+                    return Left(left => error);
+                when None do
+                    return something(content);
+            end case;
+        else
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return Left(left => error);
+                when None do
+                    return nothing();
+            end case;
+        end if;
+    end;
+
+    generic [Q: Free, R: Region, X: Region]
+    function blobNames(db: &![Database[Q], R], xid: Span[Nat8, X]): Either[DbError, String] is
+        var cursor: Cursor := start(&~db, getNames, withText(noValues(), xid));
+        var out: StringBuilder := makeStringBuilder();
+        while advance(&!cursor) do
+            writeString(&!out, columnText(&cursor, 0));
+            writeByte(&!out, '\t');
+            writeString(&!out, columnText(&cursor, 1));
+            writeByte(&!out, '\n');
+        end while;
+        let names: String := finalize(out);
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyString(names);
+                return Left(left => error);
+            when None do
+                return Right(right => names);
+        end case;
+    end;
+
+    generic [R: Region, X: Region]
+    function deleteBlob(db: &![Database[Writing], R], xid: Span[Nat8, X]): Either[DbError, Bool] is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as transaction: Transaction) do
+                case execute(&~db, dropNames, withText(noValues(), xid)) of
+                    when Left(left as error: DbError) do
+                        rollback(&~db, transaction);
+                        return Left(left => error);
+                    when Right(right as names: Nat64) do
+                        case execute(&~db, dropBlob, withText(noValues(), xid)) of
+                            when Left(left as error: DbError) do
+                                rollback(&~db, transaction);
+                                return Left(left => error);
+                            when Right(right as blobs: Nat64) do
+                                case commit(&~db, transaction) of
+                                    when Left(left as error: DbError) do
+                                        return Left(left => error);
+                                    when Right(right as done: Unit) do
+                                        let removed: Bool := blobs > 0;
+                                        return Right(right => removed);
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+end module body.

@@ -1,0 +1,87 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+GIF read in Hilde alone: GIF87a and GIF89a, the first picture of the file
+as pixels of red, green and blue, row by row from the top, three bytes a
+pixel, on the logical screen the file names.
+
+The picture's codes are LZW of 2 to 12 bits, read from its sub-blocks;
+an interlaced picture is put back in row order.  Pixels the picture does
+not cover, and those the graphic control extension names transparent,
+take the background colour of the global table, black when there is none.
+Extensions are skipped; a file of several pictures gives its first.
+
+Nothing of the file is trusted: every length is checked against what is
+left, the screen against maxPixels and 16000 a side before anything is
+allocated, and a code the decoder does not know yet answers Broken, never
+a read out of bounds.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Gif is
+    """
+    Why a GIF was not read.
+    """
+    union GifError: Free is
+        """
+        The bytes do not begin with GIF87a or GIF89a.
+        """
+        case NotGif;
+        """
+        The screen is wider or higher than 16000 or has more than maxPixels
+        pixels.
+        """
+        case GifTooLarge;
+        """
+        The file ends early, a length does not fit, or the codes are not
+        LZW of the picture.
+        """
+        case Broken;
+    end;
+
+    """
+    A picture read: its width, its height and its pixels.
+    """
+    type GifPicture: Linear;
+
+    """
+    The most pixels a side: 16000.
+    """
+    function gifSideMost(): Index
+        ensures result = 16000;
+
+    """
+    The first picture of the GIF in data, with at most maxPixels pixels on
+    its screen.  An Either read from bytes, so no ensures.
+    """
+    generic [D: Region]
+    function readGif(data: Span[Nat8, D], maxPixels: Index): Either[GifError, GifPicture]
+        requires maxPixels > 0;
+
+    generic [P: Region]
+    function gifWidth(picture: &[GifPicture, P]): Index
+        ensures (result >= 1) and (result <= 16000);
+
+    generic [P: Region]
+    function gifHeight(picture: &[GifPicture, P]): Index
+        ensures (result >= 1) and (result <= 16000);
+
+    """
+    The pixels: red, green and blue, width times height times 3 bytes.
+    """
+    generic [P: Region]
+    function gifPixels(picture: &[GifPicture, P]): Span[Nat8, P]
+        ensures spanLength(result) = ((gifWidth(picture) * gifHeight(picture)) * 3);
+
+    """
+    Gives the picture and its pixels back.
+    No contract: it only gives the value back.
+    """
+    function destroyGif(picture: GifPicture): Unit;
+end module.

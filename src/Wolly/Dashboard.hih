@@ -1,0 +1,241 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A dashboard drawn on the server: panels of the samples of Wolly.Metrics as
+tiles, lines and bars of Wolly.Svg, in a page from templates.
+dashboardPage has no line of script: the page is fresh each time it is
+loaded, and a refresh of 5 to 3600 seconds lets the browser load it again
+by itself.
+
+Each panel is a fragment of its own, a <section> with the id
+panel-<name>, made by panelFragment alone: an application can send it by
+itself under a path of its own (/dashboard/panel/<name>, found with
+findPanel); dashboardPage puts the fragments of all panels into one page.
+
+liveDashboardPage is the same page with htmx: it loads the
+script at a path of the application, and every panel, made by
+livePanelFragment, asks for its own fragment again every so many seconds
+and puts the answer in its place, so the page is not loaded again.  The
+fragment it gets carries the same attributes and goes on asking.  htmx is
+told to add no style and to evaluate no script, so a policy of
+script-src 'self' and style-src 'self' holds; without script the page
+loads itself again as dashboardPage does.
+
+The panels are the application's, written in its code: names, titles and
+metric names are constants, which validPanels checks once.  Everything a
+panel shows is escaped by the templates and by Wolly.Svg.  top is HTML the
+caller made and escaped itself, for instance a search form; it is put in
+as it is, and the dashboard does not escape it.
+
+Who may see a dashboard is the duty of the handler that sends it.
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    DbError
+);
+import Wolly.Metrics (
+    Fold
+);
+
+module Wolly.Dashboard is
+    """
+    What a panel shows.
+    """
+    union PanelKind: Free is
+        """
+        The latest sample of the metric as a tile.
+        """
+        case TilePanel;
+        """
+        The last bucket as a tile, with how far it lies from the bucket
+        before.
+        """
+        case ChangePanel;
+        """
+        The buckets as a line.
+        """
+        case LinePanel;
+        """
+        The buckets as bars, each with the time it starts at (UTC): HH:MM
+        for buckets shorter than a day, MM-DD else.
+        """
+        case BarPanel;
+    end;
+
+    """
+    Why there is no page.
+    """
+    union DashboardFailure: Free is
+        """
+        SQLite refused a statement.
+        """
+        case DashboardStorage is
+            error: DbError;
+        """
+        The panels are not validPanels: the application's mistake.
+        """
+        case UnfitPanels;
+    end;
+
+    """
+    A panel: its name (in the id and the path of its fragment), its title,
+    the metric it shows, how, and its buckets: buckets of step seconds up
+    to the bucket that holds now, made with fold.
+    """
+    record Panel: Free is
+        name: Span[Nat8, Static];
+        title: Span[Nat8, Static];
+        metric: Span[Nat8, Static];
+        kind: PanelKind;
+        fold: Fold;
+        step: Int64;
+        buckets: Index;
+    end;
+
+    """
+    How a page of liveDashboardPage keeps itself fresh: every panel asks for
+    base followed by its name every every seconds; the page loads the
+    script of htmx from script.  Both are paths of the application.
+    """
+    record Live: Free is
+        base: Span[Nat8, Static];
+        script: Span[Nat8, Static];
+        every: Int64;
+    end;
+
+    """
+    The most panels of a page: 32.
+    """
+    function mostPanels(): Index
+        ensures result = 32;
+
+    """
+    Whether name may name a panel: 1 to 32 bytes of a to z, 0 to 9 and
+    hyphen.
+    No contract: it is the check over outside input; false is its answer
+    for a bad one, and reading every byte costs more than O(1).
+    """
+    generic [N: Region]
+    function isPanelName(name: Span[Nat8, N]): Bool;
+
+    """
+    Whether path may stand in a Live: 2 to 128 bytes, a slash first, then
+    letters, digits and - _ . / without two dots or two slashes in a row.
+    No contract: it is the check over outside input; false is its answer
+    for a bad one, and reading every byte costs more than O(1).
+    """
+    generic [P: Region]
+    function isLivePath(path: Span[Nat8, P]): Bool;
+
+    """
+    Whether live can be used: base and script isLivePath, base ending in a
+    slash and script not, every of 5 to 3600 seconds.
+    No contract: it is the check itself; false is its answer for a bad
+    live, and reading the paths costs more than O(1).
+    """
+    function isLive(live: Live): Bool;
+
+    """
+    Whether panel can be drawn: a panel name, a title of 1 to 200 bytes
+    without a control byte, a metric name (Wolly.Metrics.isMetricName), a
+    step of 60 seconds to 366 days, and 2 to 1000 buckets (a change tile
+    uses the last two of them).
+    No contract: it is the check itself; false is its answer for a bad
+    panel, and reading its names costs more than O(1).
+    """
+    function isPanel(panel: Panel): Bool;
+
+    """
+    The start of the first of buckets buckets of step seconds, aligned to
+    step, the last of which holds now; 0 when they would reach back before
+    1970.
+    """
+    function firstBucket(now: Int64, step: Int64, buckets: Int64): Int64
+        requires now >= 0
+        requires step >= 1
+        requires buckets >= 1
+        ensures (result >= 0) and (result <= now);
+
+    """
+    Whether panels are at most mostPanels panels that can be drawn, with no
+    name twice.
+    No contract: a condition may not read a buffer (H3098), and the check
+    costs more than O(1).
+    """
+    generic [P: Region]
+    function validPanels(panels: &[Buffer[Panel], P]): Bool;
+
+    """
+    The panel named name, or None.  name may come from a request.
+    No contract: an Option over outside input; None is its answer for a
+    name no panel has.
+    """
+    generic [P: Region, N: Region]
+    function findPanel(panels: &[Buffer[Panel], P], name: Span[Nat8, N]): Option[Panel];
+
+    """
+    The fragment of panel at now: <section class="wolly-panel"
+    id="panel-name"> with its title and its chart, or a note when there is
+    no sample yet.  (An I/O result: no ensures.)
+    """
+    generic [Q: Free, R: Region]
+    function panelFragment(db: &![Database[Q], R], panel: Panel, now: Int64): Either[DbError, String]
+        requires isPanel(panel)
+        requires now >= 0;
+
+    """
+    The fragment of panel at now as panelFragment makes it, which asks for
+    itself again: hx-get the base of live and the panel's name, every the
+    seconds of live, the answer in place of the section.  (An I/O result:
+    no ensures.)
+    """
+    generic [Q: Free, R: Region]
+    function livePanelFragment(db: &![Database[Q], R], panel: Panel, now: Int64, live: Live): Either[DbError, String]
+        requires isPanel(panel)
+        requires isLive(live)
+        requires now >= 0;
+
+    """
+    The whole page: title, the style sheet at style, top, the fragments of
+    all panels and the time of now; with a refresh above 0 the browser
+    loads it again after that many seconds.  UnfitPanels when the panels are
+    not validPanels, checked here since a condition may not read a buffer
+    (H3098).  (An I/O result: no ensures.)
+    """
+    generic [Q: Free, R: Region, P: Region, T: Region, S: Region, H: Region]
+    function dashboardPage(db: &![Database[Q], R], panels: &[Buffer[Panel], P], title: Span[Nat8, T],
+                           style: Span[Nat8, S], top: Span[Nat8, H], now: Int64, refresh: Int64): Either[DashboardFailure, String]
+        requires now >= 0
+        requires (refresh = 0) or ((refresh >= 5) and (refresh <= 3600));
+
+    """
+    The whole page as dashboardPage makes it, with htmx: the script of live,
+    told to add no style and to evaluate nothing, the fragments of
+    livePanelFragment, and for a browser without script a refresh after the
+    seconds of live.  UnfitPanels as dashboardPage.  (An I/O result: no
+    ensures.)
+    """
+    generic [Q: Free, R: Region, P: Region, T: Region, S: Region, H: Region]
+    function liveDashboardPage(db: &![Database[Q], R], panels: &[Buffer[Panel], P], title: Span[Nat8, T],
+                               style: Span[Nat8, S], top: Span[Nat8, H], now: Int64, live: Live): Either[DashboardFailure, String]
+        requires now >= 0
+        requires isLive(live);
+
+    """
+    The style sheet of the page, to be sent under the path given as style:
+    a grid of panels, light and dark after the browser's choice, the charts
+    drawn in currentColor.
+    """
+    function dashboardStyle(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+end module.

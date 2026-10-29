@@ -1,0 +1,402 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Images are made with Standard.Png and read back with it; the text chunk
+-- of the test is made by hand, with the CRC of Standard.Gzip.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length,
+    nthByte,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    contains,
+    substring
+);
+import Standard.Gzip (
+    crc32
+);
+import Standard.Png (
+    Image,
+    PngColor,
+    Gray,
+    Rgb,
+    PngError,
+    makeImage,
+    imageWidth,
+    imageHeight,
+    imagePixels,
+    encodePng,
+    decodePng,
+    destroyImage
+);
+import Wolly.Image (
+    ImageError,
+    NotAnImage,
+    ImageTooLarge,
+    ImageTooManyBytes,
+    fittedWidth,
+    fittedHeight,
+    RgbImage,
+    pngOfRgb,
+    rgbOfPng,
+    destroyRgb,
+    vacuumPng
+);
+
+module body Wolly.Image.Test is
+    function sizeIs(width: Index, height: Index, box: Index, w: Index, h: Index, message: Span[Nat8, Static]): Unit is
+        let fw: Index := fittedWidth(width, height, box, box);
+        let fh: Index := fittedHeight(width, height, box, box);
+        if (fw /= w) or (fh /= h) then
+            printLn(fw);
+            printLn(fh);
+        end if;
+        assertTrue((fw = w) and (fh = h), message);
+        return nil;
+    end;
+
+    function testFitted(): Unit is
+        sizeIs(100, 50, 40, 40, 20, "a wide image: the width to the box, the height in proportion");
+        sizeIs(50, 100, 40, 20, 40, "a tall image: the height to the box");
+        sizeIs(30, 20, 40, 30, 20, "an image that fits stays as it is");
+        sizeIs(40, 40, 40, 40, 40, "one that fits exactly too");
+        sizeIs(41, 41, 40, 40, 40, "one pixel more is scaled");
+        sizeIs(16000, 1, 10, 10, 1, "a line keeps at least one pixel");
+        sizeIs(1, 16000, 10, 1, 10, "and a column");
+        sizeIs(16000, 16000, 16000, 16000, 16000, "the largest sides as they are");
+        sizeIs(9260656408219841379, 7220676901988789713, 6056616057409641356, 16000, 16000, "sides near 2^63 count as 16000, no overflow (the input of the contract test)");
+        sizeIs(32000, 16000, 100000, 16000, 16000, "a side above 16000 counts as 16000");
+        return nil;
+    end;
+
+    -- The PNG of an image of width by height of color with these pixels.
+    function pngOf(width: Index, height: Index, color: PngColor, pixels: Span[Nat8, Static]): String is
+        case makeImage(width, height, color, fromSpan(pixels)) of
+            when Right(right as image: Image) do
+                let png: String := encodePng(&image);
+                destroyImage(image);
+                return png;
+            when Left(left as back: String) do
+                destroyString(back);
+                assertTrue(false, "the test image could not be made");
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The pixels of png, read back; empty when it is no PNG.
+    generic [R: Region]
+    function pixelsOf(png: Span[Nat8, R], width: Index, height: Index): String is
+        case decodePng(png, 100000000) of
+            when Right(right as image: Image) do
+                assertTrue((imageWidth(&image) = width) and (imageHeight(&image) = height), "the size read back");
+                let pixels: String := fromSpan(imagePixels(&image));
+                destroyImage(image);
+                return pixels;
+            when Left(left as error: PngError) do
+                assertTrue(false, "the result is a PNG");
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [R: Region]
+    function sameBytes(a: &[String, R], b: Span[Nat8, Static]): Bool is
+        let s: Span[Nat8, R] := asSpan(a);
+        if spanLength(s) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(b) do
+            if s[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function testMean(): Unit is
+        -- 2 by 2 of gray 0, 100, 200, 40: one pixel of their mean, 85.
+        var b: StringBuilder := makeStringBuilder();
+        writeByte(&!b, 0);
+        writeByte(&!b, 100);
+        writeByte(&!b, 200);
+        writeByte(&!b, 40);
+        let four: String := finalize(b);
+        case makeImage(2, 2, Gray(), four) of
+            when Right(right as image: Image) do
+                let png: String := encodePng(&image);
+                destroyImage(image);
+                case vacuumPng(asSpan(&png), 4, 1, 1, 100000) of
+                    when Right(right as out: String) do
+                        let pixels: String := pixelsOf(asSpan(&out), 1, 1);
+                        assertTrue(length(&pixels) = 1, "one gray pixel");
+                        assertTrue(nthByte(&pixels, 0) = 85, "the mean of the four");
+                        destroyString(pixels);
+                        destroyString(out);
+                    when Left(left as error: ImageError) do
+                        assertTrue(false, "a small image is taken");
+                end case;
+                destroyString(png);
+            when Left(left as back: String) do
+                destroyString(back);
+                assertTrue(false, "the test image could not be made");
+        end case;
+        return nil;
+    end;
+
+    function testKept(): Unit is
+        -- 3 by 2 of RGB within the box: the pixels as they were.
+        let png: String := pngOf(3, 2, Rgb(), "abcdefghijklmnopqr");
+        case vacuumPng(asSpan(&png), 6, 3, 2, 100000) of
+            when Right(right as out: String) do
+                let pixels: String := pixelsOf(asSpan(&out), 3, 2);
+                assertTrue(sameBytes(&pixels, "abcdefghijklmnopqr"), "an image within the box keeps every pixel");
+                destroyString(pixels);
+                destroyString(out);
+            when Left(left as error: ImageError) do
+                assertTrue(false, "an image within the box is taken");
+        end case;
+        destroyString(png);
+        return nil;
+    end;
+
+    -- A big-endian Nat32 written as four bytes.
+    generic [R: Region]
+    function writeNat32(out: &![StringBuilder, R], value: Nat32): Unit is
+        var divisor: Nat32 := 16777216;
+        var rest: Nat32 := value;
+        while divisor > 0 do
+            case toNat8(rest / divisor) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&~out, byte);
+                when None do
+                    writeByte(&~out, 0);
+            end case;
+            rest := rest - ((rest / divisor) * divisor);
+            divisor := divisor / 256;
+        end while;
+        return nil;
+    end;
+
+    function testStripped(): Unit is
+        let png: String := pngOf(2, 1, Gray(), "AB");
+        -- The chunk after IHDR: 8 bytes of signature, 25 of IHDR.
+        var chunk: StringBuilder := makeStringBuilder();
+        writeString(&!chunk, "tEXtComment");
+        writeByte(&!chunk, 0);
+        writeString(&!chunk, "private note");
+        -- Type and data: the length counts the 20 bytes of data, the CRC
+        -- covers type and data.
+        let typed: String := finalize(chunk);
+        var framed: StringBuilder := makeStringBuilder();
+        writeString(&!framed, substring(asSpan(&png), 0, 33));
+        writeNat32(&!framed, 20);
+        writeString(&!framed, asSpan(&typed));
+        writeNat32(&!framed, crc32(asSpan(&typed)));
+        writeString(&!framed, substring(asSpan(&png), 33, length(&png)));
+        let marked: String := finalize(framed);
+        destroyString(typed);
+        assertTrue(contains(asSpan(&marked), "private note"), "the control: the upload holds the note");
+        let back: String := pixelsOf(asSpan(&marked), 2, 1);
+        assertTrue(sameBytes(&back, "AB"), "the control: the chunk is valid, Standard.Png reads the file");
+        destroyString(back);
+        case vacuumPng(asSpan(&marked), 2, 2, 1, 100000) of
+            when Right(right as out: String) do
+                assertTrue(not contains(asSpan(&out), "private note"), "the note does not come through");
+                assertTrue(not contains(asSpan(&out), "tEXt"), "nor its chunk");
+                let pixels: String := pixelsOf(asSpan(&out), 2, 1);
+                assertTrue(sameBytes(&pixels, "AB"), "the pixels do");
+                destroyString(pixels);
+                destroyString(out);
+            when Left(left as error: ImageError) do
+                assertTrue(false, "a PNG with a text chunk is taken");
+        end case;
+        destroyString(marked);
+        destroyString(png);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function refusedAs(data: Span[Nat8, R], maxPixels: Index, maxBytes: Index, expected: Nat8, message: Span[Nat8, Static]): Unit is
+        case vacuumPng(data, maxPixels, 100, 100, maxBytes) of
+            when Right(right as out: String) do
+                destroyString(out);
+                assertTrue(false, message);
+            when Left(left as error: ImageError) do
+                var found: Nat8 := 0;
+                case error of
+                    when NotAnImage do
+                        found := (1 : Nat8);
+                    when ImageTooLarge do
+                        found := (2 : Nat8);
+                    when ImageTooManyBytes do
+                        found := (3 : Nat8);
+                end case;
+                assertTrue(found = expected, message);
+        end case;
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        refusedAs("hello", 100, 100000, 1, "text is no image");
+        let png: String := pngOf(2, 2, Gray(), "abcd");
+        refusedAs(asSpan(&png), 3, 100000, 2, "four pixels where three are allowed");
+        case vacuumPng(asSpan(&png), 4, 100, 100, 100000) of
+            when Right(right as out: String) do
+                destroyString(out);
+                assertTrue(true, "the control: four where four are allowed");
+            when Left(left as error: ImageError) do
+                assertTrue(false, "the control: four where four are allowed");
+        end case;
+        refusedAs(asSpan(&png), 4, 10, 3, "no PNG has 10 bytes: refused after the tries");
+        destroyString(png);
+        -- A side of 16001 is refused whatever maxPixels allows; 16000 is read.
+        let long: String := rowPng(16001);
+        refusedAs(asSpan(&long), 100000, 100000, 2, "a side of 16001 pixels");
+        destroyString(long);
+        let most: String := rowPng(16000);
+        case vacuumPng(asSpan(&most), 100000, 100, 100, 100000) of
+            when Right(right as out: String) do
+                destroyString(out);
+                assertTrue(true, "the control: a side of 16000 is read");
+            when Left(left as error: ImageError) do
+                assertTrue(false, "the control: a side of 16000 is read");
+        end case;
+        destroyString(most);
+        return nil;
+    end;
+
+    -- The PNG of a row of n gray pixels.
+    function rowPng(n: Index): String is
+        var row: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < n do
+            writeByte(&!row, 128);
+            i := i + 1;
+        end while;
+        case makeImage(n, 1, Gray(), finalize(row)) of
+            when Right(right as image: Image) do
+                let png: String := encodePng(&image);
+                destroyImage(image);
+                return png;
+            when Left(left as back: String) do
+                destroyString(back);
+                assertTrue(false, "the row could not be made");
+                return fromSpan("");
+        end case;
+    end;
+
+    function testBytes(): Unit is
+        -- 64 by 64 of RGB whose bytes do not repeat: a PNG of some kilobytes,
+        -- which scaling brings under 2000 bytes.
+        var b: StringBuilder := makeStringBuilder();
+        -- The generator of C's rand, modulo 2^31; x stays below 2^31, so x
+        -- times the factor stays below 2^62.
+        var i: Index := 0;
+        var x: Index := 7;
+        while i < 12288 do
+            let next: Index := (x * 1103515245) + 12345;
+            x := next - ((next / 2147483648) * 2147483648);
+            case toNat8(x / 8388608) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&!b, byte);
+                when None do
+                    writeByte(&!b, 0);
+            end case;
+            i := i + 1;
+        end while;
+        let noise: String := finalize(b);
+        case makeImage(64, 64, Rgb(), noise) of
+            when Right(right as image: Image) do
+                let png: String := encodePng(&image);
+                destroyImage(image);
+                assertTrue(length(&png) > 2000, "the control: the PNG of the noise is above 2000 bytes");
+                case vacuumPng(asSpan(&png), 4096, 64, 64, 2000) of
+                    when Right(right as out: String) do
+                        assertTrue(length(&out) <= 2000, "scaled down until it fits 2000 bytes");
+                        destroyString(out);
+                    when Left(left as error: ImageError) do
+                        assertTrue(false, "noise of 64 by 64 can be brought under 2000 bytes");
+                end case;
+                destroyString(png);
+            when Left(left as back: String) do
+                destroyString(back);
+                assertTrue(false, "the noise image could not be made");
+        end case;
+        return nil;
+    end;
+
+    -- The RGB layer of Wolly.Bunti: 3 by 2 pixels through PNG and back.
+    function testRgb(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 18 do
+            writeByte(&!out, narrowOf((i * 13) + 1));
+            i := i + 1;
+        end while;
+        let pixels: String := finalize(out);
+        let copy: String := fromSpan(asSpan(&pixels));
+        case pngOfRgb(3, 2, pixels) of
+            when Some(value as png: String) do
+                case rgbOfPng(asSpan(&png), 100) of
+                    when Right(right as image: RgbImage) do
+                        let { width as w: Index, height as h: Index, pixels as back: String } := image;
+                        assertTrue((w = 3) and (h = 2), "3 by 2");
+                        var same: Bool := length(&back) = 18;
+                        var k: Index := 0;
+                        while same and (k < 18) do
+                            same := nthByte(&back, k) = nthByte(&copy, k);
+                            k := k + 1;
+                        end while;
+                        assertTrue(same, "every byte of red, green and blue back");
+                        destroyString(back);
+                    when Left(left as error: ImageError) do
+                        assertTrue(false, "the PNG reads");
+                end case;
+                destroyString(png);
+            when None do
+                assertTrue(false, "a PNG of 3 by 2");
+        end case;
+        destroyString(copy);
+        case pngOfRgb(3, 2, fromSpan("short")) of
+            when Some(value as png: String) do
+                destroyString(png);
+                assertTrue(false, "pixels of the wrong length make no PNG");
+            when None do
+                assertTrue(true, "pixels of the wrong length make no PNG");
+        end case;
+        case rgbOfPng("not a png", 100) of
+            when Right(right as image: RgbImage) do
+                destroyRgb(image);
+                assertTrue(false, "no PNG");
+            when Left(left as error: ImageError) do
+                assertTrue(true, "no PNG");
+        end case;
+        return nil;
+    end;
+
+    function narrowOf(n: Index): Nat8 is
+        case toNat8(n - ((n / 256) * 256)) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 0;
+        end case;
+    end;
+end module body.
