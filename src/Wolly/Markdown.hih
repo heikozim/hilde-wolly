@@ -1,0 +1,52 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Markdown to HTML, the plain part of it, safe to put into a page as it is.
+
+Blocks: headings (# to ######), paragraphs, lists with - or * and with
+1., no nesting, a quote with >, a fenced code block with ```, a rule with
+---.  Inline: `code`, **strong**, *emphasis* and [links](url).
+
+A backslash before an ASCII punctuation character writes that character
+as it is, without its meaning: \\* is a star and no emphasis, \\# at the
+start of a line no heading.  A backslash before anything else stays.
+
+Nothing of the text reaches the page unescaped: every <, >, &, " and ' is
+written as an entity, raw HTML included, which is shown and not obeyed.
+A link is made only for a URL that starts with https://, http://,
+mailto:, a single / or #, and holds no space, no control byte, no
+backslash and none of < > " '; any other is shown as its text.  So no
+javascript: URL, no event attribute and no tag can come out of it.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Markdown is
+    """
+    The most bytes markdownToHtml takes: 1048576.  Longer text is cut
+    there, at a line end, by the caller's choice of what to show.
+    """
+    function mostMarkdownBytes(): Index
+        ensures result = 1048576;
+
+    """
+    text, Markdown, as HTML.  Only the first mostMarkdownBytes bytes are
+    read.
+    No contract: the length of the HTML depends on the text.
+    """
+    generic [T: Region]
+    function markdownToHtml(text: Span[Nat8, T]): String;
+
+    """
+    Whether url may be the target of a link: see the description of the
+    module.
+    No contract: a walk over url, more than O(1) to state.
+    """
+    generic [U: Region]
+    function isSafeLink(url: Span[Nat8, U]): Bool;
+end module.

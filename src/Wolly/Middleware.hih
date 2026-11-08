@@ -1,0 +1,100 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Steps around the router: before it, each step either hands the request on
+or answers it itself; after it, each step changes the finished answer.
+
+A step before is a Fn[Request, Step]: Next gives the request to the next
+step and in the end to the router, Answer stops the chain with an answer
+of its own.  A step after is a Fn[String, String] over the CGI output, as
+securityHeaders is.  dispatchWith runs the steps before in the order of
+their buffer, then Wolly.Router.dispatch, then the steps after in the order
+of theirs; a step after also sees an answer that a step before gave.
+dispatchLogged does the same and writes one line of access log for it.
+
+A step is a plain function: Hilde has no closures, so what a step needs
+it reads from the request, from a file or from a database, and a step for
+some paths only looks at the path itself.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.Router (
+    Route
+);
+
+module Wolly.Middleware is
+    """
+    What a step before comes to.  Linear: it carries the request or the
+    answer.
+    """
+    union Step: Linear is
+        """
+        Go on with the request.
+        """
+        case Next is
+            request: Request;
+        """
+        Stop: this is the answer.
+        """
+        case Answer is
+            output: String;
+    end;
+
+    """
+    The answer to request: the steps before, the route, the steps after.
+    """
+    generic [R: Region, B: Region, A: Region]
+    function dispatchWith(request: Request, routes: &[Buffer[Route], R], befores: &[Buffer[Fn[Request, Step]], B],
+                          afters: &[Buffer[Fn[String, String]], A]): String
+        ensures length(&result) > 0;
+
+    """
+    The answer of dispatchWith, and one line for it in log: the entry
+    "request" with the method, the path without the query, the client as
+    the web server names it in REMOTE_ADDR and the status of the answer,
+    after the steps after, and request_id, a new random id of 32 hex digits
+    that the answer carries as X-Request-Id too, so that the line of an
+    answer can be found.  A part the request does not have is "-", a
+    status the answer does not begin with is 0, an id the system cannot
+    make is "-".  The query stays out of the log, since it can carry a
+    token; a line that cannot be written is lost and the answer goes out
+    all the same.
+    """
+    generic [R: Region, B: Region, A: Region, L: Region]
+    function dispatchLogged(request: Request, routes: &[Buffer[Route], R], befores: &[Buffer[Fn[Request, Step]], B],
+                            afters: &[Buffer[Fn[String, String]], A], log: &![Log, L]): String
+        ensures length(&result) > 0;
+
+    """
+    A step before: a request whose method is not one of the seven that a
+    web application answers -- get, head, options, post, put, patch and
+    delete -- gets 405 with an Allow header that lists them, and a request
+    without a method gets 400; any other goes on.  The trace
+    and connect methods, which a web application has no use for, end here.
+    No contract: it is taken as a function pointer.
+    """
+    function knownMethods(request: Request): Step;
+
+    """
+    A step after: X-Content-Type-Options that forbids guessing the type,
+    X-Frame-Options that forbids framing and a Referrer-Policy of
+    same-origin, each unless the answer has a header of its name already.
+    """
+    function securityHeaders(output: String): String
+        ensures length(&result) > 0;
+end module.

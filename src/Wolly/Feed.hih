@@ -1,0 +1,52 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A feed of a site's news as Atom (RFC 4287), written into a StringBuilder
+of the caller: beginFeed, writeEntry for each entry, endFeed.  Served as
+application/atom+xml.
+
+Every text is escaped for XML (& < > " '), so a title cannot open an
+element.  A link is written only for a URL that Wolly.Markdown.isSafeLink
+takes (http, https, mailto, a path, an anchor); the times are RFC 3339 in
+UTC (Standard.Calendar.formatRfc3339).
+"""
+import Standard.StringBuilder (
+    StringBuilder
+);
+
+module Wolly.Feed is
+    """
+    The XML declaration and the feed element with its id, title, link and
+    the time it was last updated, in seconds since 1970.
+    """
+    generic [B: Region, I: Region, T: Region, L: Region]
+    function beginFeed(out: &![StringBuilder, B], id: Span[Nat8, I], title: Span[Nat8, T], link: Span[Nat8, L],
+                       updated: Int64): Unit
+        requires (updated >= 0) and (updated <= 253402300799);
+
+    """
+    One entry: its id, title, link, time, and a summary as plain text.
+    """
+    generic [B: Region, I: Region, T: Region, L: Region, S: Region]
+    function writeEntry(out: &![StringBuilder, B], id: Span[Nat8, I], title: Span[Nat8, T], link: Span[Nat8, L],
+                        updated: Int64, summary: Span[Nat8, S]): Unit
+        requires (updated >= 0) and (updated <= 253402300799);
+
+    """
+    The end of the feed element.
+    No contract: it only writes a fixed text to out, and the builder holds
+    no length to state cheaply.
+    """
+    generic [B: Region]
+    function endFeed(out: &![StringBuilder, B]): Unit;
+
+    """
+    The media type of an Atom feed.
+    """
+    function feedType(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+end module.

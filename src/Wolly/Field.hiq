@@ -1,0 +1,210 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Text (
+    substring,
+    parseNat
+);
+
+module body Wolly.Field is
+    function letters(): Span[Nat8, Static] is
+        return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    end;
+
+    function digits(): Span[Nat8, Static] is
+        return "0123456789";
+    end;
+
+    generic [A: Region]
+    function holds(allowed: Span[Nat8, A], byte: Nat8): Bool is
+        var i: Index := 0;
+        while i < spanLength(allowed) do
+            if allowed[i] = byte then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [V: Region, A: Region]
+    function onlyFrom(value: Span[Nat8, V], allowed: Span[Nat8, A], most: Index): Bool is
+        if spanLength(value) > most then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(value) do
+            if not holds(allowed, value[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function isLetter(byte: Nat8): Bool is
+        return ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    -- The local part: 1 to 64 bytes, no dot first, last or twice in a row.
+    generic [L: Region]
+    function isLocal(local: Span[Nat8, L]): Bool is
+        let size: Index := spanLength(local);
+        if (size = 0) or (size > 64) then
+            return false;
+        end if;
+        if (local[0] = '.') or (local[size - 1] = '.') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := local[i];
+            let mark: Bool := (((byte = '.') or (byte = '_')) or ((byte = '%') or (byte = '+'))) or (byte = '-');
+            if not ((isLetter(byte) or isDigit(byte)) or mark) then
+                return false;
+            end if;
+            if ((byte = '.') and ((i + 1) < size)) and (local[i + 1] = '.') then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- One label of a domain: 1 to 63 bytes of letters, digits and
+    -- hyphens, no hyphen first or last; the last label of letters only,
+    -- at least two.
+    generic [L: Region]
+    function isLabel(label: Span[Nat8, L], last: Bool): Bool is
+        let size: Index := spanLength(label);
+        if (size = 0) or (size > 63) then
+            return false;
+        end if;
+        if (label[0] = '-') or (label[size - 1] = '-') then
+            return false;
+        end if;
+        if last and (size < 2) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := label[i];
+            if last then
+                if not isLetter(byte) then
+                    return false;
+                end if;
+            else
+                if not ((isLetter(byte) or isDigit(byte)) or (byte = '-')) then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The domain: two or more labels separated by dots.
+    generic [D: Region]
+    function isDomain(domain: Span[Nat8, D]): Bool is
+        let size: Index := spanLength(domain);
+        var start: Index := 0;
+        var labels: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (domain[i] = '.') then
+                if not isLabel(substring(domain, start, i), i = size) then
+                    return false;
+                end if;
+                labels := labels + 1;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return labels >= 2;
+    end;
+
+    generic [V: Region]
+    function isEmail(value: Span[Nat8, V]): Bool is
+        let size: Index := spanLength(value);
+        if (size < 6) or (size > 254) then
+            return false;
+        end if;
+        var at: Index := size;
+        var i: Index := 0;
+        while i < size do
+            if value[i] = '@' then
+                -- The last @ splits the address; an earlier one stays in the
+                -- local part, which holds none.
+                at := i;
+            end if;
+            i := i + 1;
+        end while;
+        if at = size then
+            return false;
+        end if;
+        return isLocal(substring(value, 0, at)) and isDomain(substring(value, at + 1, size));
+    end;
+
+    -- The number the digits of value from start to stop stand for, 0 when
+    -- they are none.
+    generic [V: Region]
+    function numberAt(value: Span[Nat8, V], start: Index, stop: Index): Nat64 is
+        case parseNat(substring(value, start, stop)) of
+            when Some(value as parsed: Nat64) do
+                return parsed;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Whether number divides by divisor without a rest.
+    function divides(number: Nat64, divisor: Nat64): Bool is
+        return (number - ((number / divisor) * divisor)) = 0;
+    end;
+
+    function daysIn(month: Nat64, year: Nat64): Nat64 is
+        if month = 2 then
+            let leap: Bool := (divides(year, 4) and (not divides(year, 100))) or divides(year, 400);
+            if leap then
+                return 29;
+            else
+                return 28;
+            end if;
+        end if;
+        if (((month = 4) or (month = 6)) or (month = 9)) or (month = 11) then
+            return 30;
+        end if;
+        return 31;
+    end;
+
+    generic [V: Region]
+    function isDate(value: Span[Nat8, V]): Bool is
+        if spanLength(value) /= 10 then
+            return false;
+        end if;
+        if (value[4] /= '-') or (value[7] /= '-') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < 10 do
+            if ((i /= 4) and (i /= 7)) and (not isDigit(value[i])) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        let year: Nat64 := numberAt(value, 0, 4);
+        let month: Nat64 := numberAt(value, 5, 7);
+        let day: Nat64 := numberAt(value, 8, 10);
+        if (year < 1) or ((month < 1) or (month > 12)) then
+            return false;
+        end if;
+        return (day >= 1) and (day <= daysIn(month, year));
+    end;
+end module body.

@@ -1,0 +1,127 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- What must not come out first: a tag, a javascript: link, a way out of
+-- the attribute.  Then that what should come out does.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    contains,
+    equal
+);
+import Wolly.Markdown (
+    mostMarkdownBytes,
+    markdownToHtml,
+    isSafeLink
+);
+
+module body Wolly.Markdown.Test is
+
+    function becomes(text: Span[Nat8, Static], html: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtml(text);
+        assertTrue(equal(asSpan(&made), html), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    function lacks(text: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtml(text);
+        assertFalse(contains(asSpan(&made), part), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    -- A backslash before ASCII punctuation takes its meaning away; before
+    -- anything else it stays.
+    function testEscapes(): Unit is
+        becomes("2 \\* 3 \\* 4", "<p>2 * 3 * 4</p>\n", "escaped stars are no emphasis");
+        becomes("\\# x", "<p># x</p>\n", "an escaped hash is no heading");
+        becomes("1\\. x", "<p>1. x</p>\n", "an escaped dot is no list");
+        becomes("\\- x", "<p>- x</p>\n", "an escaped hyphen is no list");
+        becomes("\\[a\\](/b)", "<p>[a](/b)</p>\n", "escaped brackets are no link");
+        becomes("\\`x\\`", "<p>`x`</p>\n", "escaped backticks are no code");
+        becomes("a\\b", "<p>a\\b</p>\n", "a backslash before a letter stays");
+        becomes("\\\\*x*", "<p>\\<em>x</em></p>\n", "an escaped backslash");
+        becomes("a\\!b\\~c\\{", "<p>a!b~c{</p>\n", "other punctuation, both ends of the range");
+        becomes("x\\", "<p>x\\</p>\n", "a backslash at the end stays");
+        return nil;
+    end;
+
+    function testAttacks(): Unit is
+        becomes("<script>alert(1)</script>", "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n", "a tag is shown, not obeyed");
+        lacks("[x](javascript:alert(1))", "<a", "no link to javascript:");
+        lacks("[x](JavaScript:alert(1))", "<a", "nor in capitals");
+        lacks("[x](//evil.example/)", "<a", "no link that leaves for another host without a scheme");
+        lacks("[x](https://a.example/\"onmouseover=\"alert(1))", "<a", "no link with a quote");
+        lacks("[x](https://a.example/ onmouseover=alert(1))", "<a", "no link with a space");
+        lacks("[x](data:text/html,<script>)", "<a", "no data: link");
+        becomes("**<b>**", "<p><strong>&lt;b&gt;</strong></p>\n", "a tag inside strong is escaped");
+        becomes("`<img src=x onerror=alert(1)>`", "<p><code>&lt;img src=x onerror=alert(1)&gt;</code></p>\n", "a tag inside code is escaped");
+        becomes("[<img>](https://a.example/)", "<p><a href=\"https://a.example/\">&lt;img&gt;</a></p>\n", "a tag inside a link text is escaped");
+        becomes("it's \"quoted\" & so", "<p>it&#39;s &#34;quoted&#34; &amp; so</p>\n", "quotes and ampersands become entities");
+        becomes("```\n<script>\n```", "<pre><code>&lt;script&gt;\n</code></pre>\n", "a tag in a code block is escaped");
+        return nil;
+    end;
+
+    function testBlocks(): Unit is
+        becomes("# Title", "<h1>Title</h1>\n", "a heading");
+        becomes("###### Six", "<h6>Six</h6>\n", "the sixth level");
+        becomes("####### Seven", "<p>####### Seven</p>\n", "a seventh is a paragraph");
+        becomes("#Title", "<p>#Title</p>\n", "a hash without a space is text");
+        becomes("one\ntwo\n\nthree", "<p>one\ntwo</p>\n<p>three</p>\n", "a blank line ends a paragraph");
+        becomes("- a\n- b", "<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n", "a list of bullets");
+        becomes("* a", "<ul>\n<li>a</li>\n</ul>\n", "a star as a bullet");
+        becomes("1. a\n2. b", "<ol>\n<li>a</li>\n<li>b</li>\n</ol>\n", "a numbered list");
+        becomes("- a\n1. b", "<ul>\n<li>a</li>\n</ul>\n<ol>\n<li>b</li>\n</ol>\n", "a bullet list then a numbered one");
+        becomes("> said\n> more", "<blockquote><p>said\nmore</p></blockquote>\n", "a quote of two lines");
+        becomes("---", "<hr>\n", "a rule");
+        becomes("text\n```\ncode **not bold**\n```\nafter", "<p>text</p>\n<pre><code>code **not bold**\n</code></pre>\n<p>after</p>\n", "a code block between paragraphs, its marks left alone");
+        becomes("```\nopen", "<pre><code>open\n</code></pre>\n", "a code block that is never closed is closed at the end");
+        becomes("", "", "nothing");
+        assertTrue(mostMarkdownBytes() = 1048576, "a mebibyte at most");
+        return nil;
+    end;
+
+    function testInline(): Unit is
+        becomes("a **b** c", "<p>a <strong>b</strong> c</p>\n", "strong");
+        becomes("a *b* c", "<p>a <em>b</em> c</p>\n", "emphasis");
+        becomes("**a *b* c**", "<p><strong>a <em>b</em> c</strong></p>\n", "emphasis inside strong");
+        becomes("a `*b*` c", "<p>a <code>*b*</code> c</p>\n", "no marks inside code");
+        becomes("a * b", "<p>a * b</p>\n", "a lone star");
+        becomes("****", "<p>****</p>\n", "an empty strong is no strong");
+        becomes("[home](/)", "<p><a href=\"/\">home</a></p>\n", "a link to a path");
+        becomes("[top](#top)", "<p><a href=\"#top\">top</a></p>\n", "a link to an anchor");
+        becomes("[mail](mailto:ann@example.com)", "<p><a href=\"mailto:ann@example.com\">mail</a></p>\n", "a mail link");
+        becomes("[a **b**](https://example.com/x?y=1&z=2)", "<p><a href=\"https://example.com/x?y=1&amp;z=2\">a <strong>b</strong></a></p>\n", "the URL is escaped for the attribute, the text rendered");
+        becomes("[x](ftp://example.com/)", "<p>[x](ftp://example.com/)</p>\n", "another scheme is shown as text");
+        return nil;
+    end;
+
+    function testLinks(): Unit is
+        assertTrue(isSafeLink("https://example.com/"), "https");
+        assertTrue(isSafeLink("http://example.com/"), "http");
+        assertTrue(isSafeLink("mailto:a@b.co"), "mailto");
+        assertTrue(isSafeLink("/path"), "a path");
+        assertTrue(isSafeLink("/"), "the root");
+        assertTrue(isSafeLink("#a"), "an anchor");
+        assertFalse(isSafeLink(""), "empty");
+        assertFalse(isSafeLink("//host"), "two slashes");
+        assertFalse(isSafeLink("javascript:x"), "javascript:");
+        assertFalse(isSafeLink("https://a b"), "a space");
+        assertFalse(isSafeLink("https://a\\b"), "a backslash");
+        assertFalse(isSafeLink("https://a<b"), "a <");
+        assertFalse(isSafeLink("https://a'b"), "an apostrophe");
+        assertFalse(isSafeLink("relative/path"), "a relative path");
+        return nil;
+    end;
+end module body.

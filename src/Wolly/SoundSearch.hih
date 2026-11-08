@@ -1,0 +1,108 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Things found by the sound of their names, with a phonetic
+column: Mayer finds what was indexed as
+Meier.  A text is cut into words, runs of letters (ASCII letters and every
+byte of UTF-8 above 127), and each word is kept as its Kölner Phonetik, its
+Soundex or both (Wolly.Phonetic), under the key of what it names.  A search
+finds the keys that have, for every word searched with a code, one of its
+codes; a word without a code (a digit, an h alone) asks nothing.
+
+No full-text index: a table of key and code with constant SQL, so that it
+needs no FTS5 and moves to Postgres as it is.  Standard.Search is the
+full-text search of words as they are written; this is the one of names as
+they sound.  At most mostWords words of a text count, the rest is dropped,
+and a search gives at most 100 keys.
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.SoundSearch is
+    """
+    Which codes: German names, English names, or both.
+    """
+    union SoundMode: Free is
+        case German;
+        case English;
+        case Both;
+    end;
+
+    """
+    The most words of a text that count: 16.
+    """
+    function mostWords(): Index
+        ensures result = 16;
+
+    """
+    The most bytes of a key: 256.
+    """
+    function mostKey(): Index
+        ensures result = 256;
+
+    """
+    Makes the table of sounds and its index, if they are not there.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareSounds(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Keeps the codes of the words of text under key, in place of what key
+    had, in one transaction.  Right false, and nothing changed, for a key
+    that is empty or longer than mostKey.
+    No contract: the answer is the work of the database, and a bad key is
+    refused with Right false.
+    """
+    generic [R: Region, K: Region, T: Region]
+    function indexSounds(db: &![Database[Writing], R], key: Span[Nat8, K], text: Span[Nat8, T],
+                         mode: SoundMode): Either[DbError, Bool];
+
+    """
+    indexSounds without a transaction of its own, for a caller that holds
+    one (Wolly.LogStore inside a batch): the same work and the same
+    refusal of a key; a failure leaves the rollback to the caller.
+    No contract: the answer is the work of the database, and a bad key is
+    refused with Right false.
+    """
+    generic [R: Region, K: Region, T: Region]
+    function indexSoundsWithin(db: &![Database[Writing], R], key: Span[Nat8, K], text: Span[Nat8, T],
+                               mode: SoundMode): Either[DbError, Bool];
+
+    """
+    Takes key out.  Right true when it had codes.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region]
+    function removeSounds(db: &![Database[Writing], R], key: Span[Nat8, K]): Either[DbError, Bool];
+
+    """
+    The keys that sound like text in mode, ascending, at most limit of them;
+    a limit below 1 or above 100 is taken as 100.  None of them when text
+    has no word with a code.
+    No contract: the answer is the work of the database, and limit is held
+    to its range in the body.
+    """
+    generic [M: Free, R: Region, T: Region]
+    function findBySound(db: &![Database[M], R], text: Span[Nat8, T], mode: SoundMode,
+                         limit: Int64): Either[DbError, Buffer[String]];
+
+    """
+    Gives back the keys a search found.
+    No contract: it only gives the value back.
+    """
+    function destroyKeys(keys: Buffer[String]): Unit;
+end module.

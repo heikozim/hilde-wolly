@@ -1,0 +1,80 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The lines a log file gained since they were last read, for the agent of
+Wolly's log system: where each
+file was read to is kept in SQLite, so a restart goes on where it stopped.
+
+A file is known by its first line and by its device and inode: the
+SHA-256 of the first line and the two numbers are kept with the offset.
+When the first line is another, or the file under the name is another
+(device and inode), the file was rotated and is read from its start; when
+the file is shorter than the offset, it was cut (copytruncate) and is read
+from its start too.  Until the first line of a file is complete nothing is
+read from it.  A table made before the device and inode were kept gets
+the column added; its offsets hold, and each row takes the numbers of its
+file at the next read.
+
+Only whole lines are given: what follows the last line end waits for the
+next call.  At most mostTailBytes are read in one call.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.LogTail is
+    """
+    The most bytes one call reads: 1 MiB.
+    """
+    function mostTailBytes(): Index
+        ensures result = 1048576;
+
+    """
+    The most bytes of a first line that the fingerprint takes: 4096.  A
+    first line that has no end within them counts with its first 4096.
+    """
+    function mostFirstLine(): Index
+        ensures result = 4096;
+
+    """
+    Why the new lines could not be read.
+    """
+    union TailFailure: Free is
+        """
+        The file is not there, or not a regular file, or cannot be read.
+        """
+        case Unreadable;
+        """
+        SQLite refused to read or keep the offset.
+        """
+        case Storage is
+            error: DbError;
+    end;
+
+    """
+    Makes the table of offsets, if it is not there, and adds the column of
+    device and inode to a table made without it.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [R: Region]
+    function prepareTail(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    The whole lines the file at path gained since the last call for it, each
+    with its line end, at most mostTailBytes; empty when there are none.
+    The offset kept moves past them.
+    No contract: the outcome and the length of the lines are the result of
+    I/O.
+    """
+    generic [R: Region, P: Region]
+    function readNew(db: &![Database[Writing], R], path: Span[Nat8, P]): Either[TailFailure, String];
+end module.

@@ -1,0 +1,604 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Three lines in a database in memory: found by a word with the word
+-- marked, by the sound of a name, read back, refused when a field is
+-- unfit, and pruned out of the table and both indexes; lines in the
+-- caller's transaction, taken back with it, given another level, and the
+-- rows of a store in the older layout (before its index lived in
+-- Standard.Search) taken over.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    contains,
+    equal
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nthRef
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Transaction,
+    noValues,
+    withText,
+    withInt64,
+    execute,
+    start,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    begin,
+    commit,
+    rollback,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Search (
+    SearchError,
+    SearchHit,
+    indexDocument,
+    destroyHits
+);
+import Wolly.SoundSearch (
+    destroyKeys
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.LogStore (
+    mostLineBytes,
+    isLevel,
+    isSource,
+    prepareLogStore,
+    keepLine,
+    keepLineIn,
+    setLevelIn,
+    findLines,
+    findLinesBySound,
+    lineOf,
+    pruneLines,
+    oldLinesPlanSql
+);
+
+module body Wolly.LogStore.Test is
+
+    generic [R: Region, H: Region, S: Region, L: Region, T: Region]
+    function keep(db: &![Database[Writing], R], host: Span[Nat8, H], source: Span[Nat8, S], at: Int64,
+                  level: Span[Nat8, L], line: Span[Nat8, T], wanted: Bool, message: Span[Nat8, Static]): Unit is
+        case keepLine(&~db, host, source, at, level, line) of
+            when Right(right as kept: Option[Int64]) do
+                case kept of
+                    when Some(value as id: Int64) do
+                        assertTrue(wanted, message);
+                    when None do
+                        assertFalse(wanted, message);
+                end case;
+            when Left(left as failure: SearchError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- Whether hits is one hit, of key, with marked in its snippet.
+    generic [B: Region]
+    function onlyHitIs(hits: &[Buffer[SearchHit], B], key: Span[Nat8, Static], marked: Span[Nat8, Static]): Bool is
+        if length(hits) /= 1 then
+            return false;
+        end if;
+        let hit: &[SearchHit, B] := nthRef(hits, 0);
+        return equal(asSpan(&(hit->key)), key) and contains(asSpan(&(hit->snippet)), marked);
+    end;
+
+    -- Exactly one hit, the line with key, its word marked.
+    generic [R: Region]
+    function foundOnce(db: &![Database[Writing], R], text: Span[Nat8, Static], key: Span[Nat8, Static], marked: Span[Nat8, Static],
+                       message: Span[Nat8, Static]): Unit is
+        case findLines(&~db, text, 10, 0) of
+            when Right(right as hits: Buffer[SearchHit]) do
+                assertTrue(onlyHitIs(&hits, key, marked), message);
+                destroyHits(hits);
+            when Left(left as failure: SearchError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function foundNone(db: &![Database[Writing], R], text: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case findLines(&~db, text, 10, 0) of
+            when Right(right as hits: Buffer[SearchHit]) do
+                assertTrue(length(&hits) = 0, message);
+                destroyHits(hits);
+            when Left(left as failure: SearchError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function soundsLike(db: &![Database[Writing], R], text: Span[Nat8, Static], count: Index, message: Span[Nat8, Static]): Unit is
+        case findLinesBySound(&~db, text, 10) of
+            when Right(right as keys: Buffer[String]) do
+                assertTrue(length(&keys) = count, message);
+                destroyKeys(keys);
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lineIs(db: &![Database[Writing], R], key: Span[Nat8, Static], wanted: Span[Nat8, Static], present: Bool,
+                    message: Span[Nat8, Static]): Unit is
+        case lineOf(&~db, key) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as line: String) do
+                        let fit: Bool := equal(asSpan(&line), wanted);
+                        if not fit then
+                            printLn(asSpan(&line));
+                        end if;
+                        assertTrue(present and fit, message);
+                        destroyString(line);
+                    when None do
+                        assertFalse(present, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function testRules(): Unit is
+        assertTrue(mostLineBytes() = 16384, "16 KiB a line");
+        assertTrue(isLevel("error"), "a level");
+        assertFalse(isLevel("Error"), "upper case");
+        assertFalse(isLevel(""), "empty");
+        assertFalse(isLevel("abcdefghijklmnopq"), "17 letters");
+        assertTrue(isSource("/var/log/app.log"), "a path");
+        assertFalse(isSource(""), "empty");
+        assertFalse(isSource("a\nb"), "a line end");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                assertTrue(true, "the tables");
+        end case;
+        keep(&~db, "web1.example.org", "/var/log/app.log", 100, "error", "Database connection to Meier failed", true, "line 1");
+        keep(&~db, "web1.example.org", "/var/log/app.log", 200, "info", "User Schmidt logged in", true, "line 2");
+        keep(&~db, "web2.example.org", "/var/log/x.log", 300, "warn", "disk almost full\r now", true, "line 3");
+        keep(&~db, "bad host", "/var/log/app.log", 1, "info", "x", false, "no host name");
+        keep(&~db, "web1.example.org", "", 1, "info", "x", false, "no source");
+        keep(&~db, "web1.example.org", "/a", 1, "Info", "x", false, "no level");
+        keep(&~db, "web1.example.org", "/a", 0 - 1, "info", "x", false, "a time below 0");
+        keep(&~db, "web2.example.org", "/var/log/x.log", 250, "info", "boundary line", true, "line 4, at the time of the prune");
+        foundOnce(&~db, "connection", "1", "<mark>connection</mark>", "a word, marked");
+        foundOnce(&~db, "schmidt", "2", "<mark>Schmidt</mark>", "a name in another case");
+        foundNone(&~db, "nothing", "a word no line holds");
+        soundsLike(&~db, "Mayer", 1, "Mayer sounds like Meier");
+        soundsLike(&~db, "Schmitt", 1, "Schmitt sounds like Schmidt");
+        lineIs(&~db, "1", "100\tweb1.example.org\t/var/log/app.log\terror\tDatabase connection to Meier failed\n", true, "line 1 read back");
+        lineIs(&~db, "3", "300\tweb2.example.org\t/var/log/x.log\twarn\tdisk almost full  now\n", true, "a control byte kept as a space");
+        lineIs(&~db, "5", "", false, "a refused line was not kept");
+        lineIs(&~db, "x", "", false, "a key that is no number");
+        case pruneLines(&~db, 250) of
+            when Right(right as removed: Int64) do
+                assertTrue(removed = 2, "two lines before 250");
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the prune");
+        end case;
+        foundNone(&~db, "connection", "a pruned line is not found by its words");
+        soundsLike(&~db, "Mayer", 0, "nor by its sound");
+        lineIs(&~db, "1", "", false, "nor read");
+        foundOnce(&~db, "disk", "3", "<mark>disk</mark>", "the line after 250 stays");
+        foundOnce(&~db, "boundary", "4", "<mark>boundary</mark>", "the line at 250 stays: before means before");
+        case pruneLines(&~db, 250) of
+            when Right(right as again: Int64) do
+                assertTrue(again = 0, "nothing more to prune");
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the second prune");
+        end case;
+        return nil;
+    end;
+
+    -- The count the statement sql gives, -1 when it fails.
+    generic [R: Region]
+    function countOf(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Int64 is
+        var cursor: Cursor := start(&~db, sql, noValues());
+        var found: Int64 := 0 - 1;
+        if advance(&!cursor) then
+            found := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return 0 - 1;
+            when None do
+                return found;
+        end case;
+    end;
+
+    generic [R: Region]
+    function run(db: &![Database[Writing], R], sql: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case execute(&~db, sql, noValues()) of
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+            when Right(right as done: Nat64) do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    -- Lines in the caller's transaction through indexDocumentIn,
+    -- taken back with it; keepLine refused inside one; a foreign document
+    -- kept through all; a line given another level.
+    generic [R: Region]
+    function exerciseRows(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        case indexDocument(&~db, "x", "a document", "foreign words of another table") of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the foreign document");
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        keep(&~db, "web1.example.org", "/a", 10, "info", "alpha line", true, "line 1 in a transaction of its own");
+        foundOnce(&~db, "alpha", "1", "<mark>alpha</mark>", "and found");
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                case keepLineIn(&~db, &open, "web1.example.org", "/a", 20, "info", "beta line") of
+                    when Right(right as kept: Option[Int64]) do
+                        assertTrue(true, "line 2 in the caller's transaction");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "line 2 in the caller's transaction");
+                end case;
+                case keepLineIn(&~db, &open, "web1.example.org", "/a", 30, "info", "gamma line") of
+                    when Right(right as kept: Option[Int64]) do
+                        assertTrue(true, "line 3 in the same");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "line 3 in the same");
+                end case;
+                case keepLine(&~db, "web1.example.org", "/a", 35, "info", "nested line") of
+                    when Right(right as kept: Option[Int64]) do
+                        assertTrue(false, "keepLine inside the caller's transaction is refused");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(true, "keepLine inside the caller's transaction is refused");
+                end case;
+                case commit(&~db, open) of
+                    when Right(right as committed: Unit) do
+                        assertTrue(true, "the transaction of the caller commits");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the transaction of the caller commits");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction of the caller");
+        end case;
+        foundOnce(&~db, "gamma", "3", "<mark>gamma</mark>", "a line of the transaction is found");
+        foundNone(&~db, "nested", "the refused line is not");
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                case keepLineIn(&~db, &open, "web1.example.org", "/a", 40, "info", "delta line") of
+                    when Right(right as kept: Option[Int64]) do
+                        assertTrue(true, "line 4 kept, then taken back");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "line 4 kept, then taken back");
+                end case;
+                rollback(&~db, open);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction to take back");
+        end case;
+        foundNone(&~db, "delta", "a line taken back is not in the index");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM wolly_log_lines WHERE line = 'delta line'") = 0, "nor in the table");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search_keys") = 4, "the keys: x and three lines");
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                case setLevelIn(&~db, &open, 3, "error") of
+                    when Right(right as set: Bool) do
+                        assertTrue(set, "line 3 given the level error");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "line 3 given the level error");
+                end case;
+                case setLevelIn(&~db, &open, 99, "error") of
+                    when Right(right as set: Bool) do
+                        assertFalse(set, "no line 99");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "no line 99");
+                end case;
+                case setLevelIn(&~db, &open, 2, "Error") of
+                    when Right(right as set: Bool) do
+                        assertFalse(set, "no level");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "no level");
+                end case;
+                case commit(&~db, open) of
+                    when Right(right as committed: Unit) do
+                        skip;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the levels commit");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction for the levels");
+        end case;
+        lineIs(&~db, "3", "30\tweb1.example.org\t/a\terror\tgamma line\n", true, "the level in the table");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search WHERE key = '3' AND title = 'web1.example.org /a error'") = 1, "and in the title of its document");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search WHERE key = '3'") = 1, "one document of the line, not two");
+        lineIs(&~db, "2", "20\tweb1.example.org\t/a\tinfo\tbeta line\n", true, "line 2 kept its level");
+        foundOnce(&~db, "gamma", "3", "<mark>gamma</mark>", "the line is found by its words as before");
+        case pruneLines(&~db, 25) of
+            when Right(right as removed: Int64) do
+                assertTrue(removed = 2, "two lines before 25");
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the prune");
+        end case;
+        foundNone(&~db, "alpha", "a pruned line is out of the index");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search_keys") = 2, "and out of the keys");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search WHERE key = 'x'") = 1, "the foreign document is not pruned");
+        foundOnce(&~db, "gamma", "3", "<mark>gamma</mark>", "the line after 25 stays");
+        return nil;
+    end;
+
+    -- A store in the older layout, before its index lived in Standard.Search: its lines written into
+    -- hilde_search by LogStore itself under the rowid of their id, with no
+    -- keys.  prepareLogStore takes them over once; then they are found,
+    -- given a level and pruned through Standard.Search, and a new line
+    -- takes no rowid of theirs.
+    generic [R: Region]
+    function exerciseInStep(db: &![Database[Writing], R]): Unit is
+        run(&~db, "CREATE TABLE wolly_log_lines (id INTEGER PRIMARY KEY, host TEXT NOT NULL, source TEXT NOT NULL, at INTEGER NOT NULL CHECK (at >= 0), level TEXT NOT NULL, line TEXT NOT NULL) STRICT", "the table of before");
+        run(&~db, "CREATE VIRTUAL TABLE hilde_search USING fts5(key UNINDEXED, title, body, tokenize = 'unicode61 remove_diacritics 2')", "the index of before");
+        run(&~db, "INSERT INTO wolly_log_lines (id, host, source, at, level, line) VALUES (1, 'web1.example.org', '/a', 10, 'error', 'old one'), (2, 'web1.example.org', '/a', 20, 'info', 'old two')", "two lines of before");
+        run(&~db, "INSERT INTO hilde_search (rowid, key, title, body) VALUES (1, '1', 'web1.example.org /a error', 'old one'), (2, '2', 'web1.example.org /a info', 'old two')", "their rows under the rowids of their ids");
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search_keys WHERE (key = '1' AND id = 1) OR (key = '2' AND id = 2)") = 2, "both rows taken over under their rowids");
+        foundOnce(&~db, "one", "1", "<mark>one</mark>", "an old line found");
+        keep(&~db, "web1.example.org", "/a", 30, "info", "new three", true, "line 3 after the change");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search WHERE rowid IN (1, 2) AND key IN ('1', '2')") = 2, "the old rows keep their rowids");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search WHERE key = '3'") = 1, "the new line one document");
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                case setLevelIn(&~db, &open, 2, "warn") of
+                    when Right(right as set: Bool) do
+                        assertTrue(set, "an old line given another level");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "an old line given another level");
+                end case;
+                rollback(&~db, open);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction for the level");
+        end case;
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search WHERE key = '2' AND title = 'web1.example.org /a info'") = 1, "taken back: the title as it was");
+        lineIs(&~db, "2", "20\tweb1.example.org\t/a\tinfo\told two\n", true, "and the level");
+        case pruneLines(&~db, 25) of
+            when Right(right as removed: Int64) do
+                assertTrue(removed = 2, "the two old lines pruned");
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the prune");
+        end case;
+        foundNone(&~db, "old", "out of the index");
+        assertTrue(countOf(&~db, "SELECT count(*) FROM hilde_search") = 1, "one row left, the new line's");
+        foundOnce(&~db, "three", "3", "<mark>three</mark>", "the new line stays");
+        return nil;
+    end;
+
+    -- Standard.Search's tables of SQLite (hilde_search, hilde_search_keys): SQLite only.
+    function testInStep(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseInStep(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    -- The plan of the prune's query: it searches the index on at and scans
+    -- no table, so a prune with nothing old reads nothing (SQLite only).
+    generic [R: Region]
+    function exercisePlan(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        var rows: Int64 := 0;
+        var indexed: Bool := false;
+        var scanned: Bool := false;
+        var cursor: Cursor := start(&~db, oldLinesPlanSql(), withInt64(withInt64(noValues(), 100), 1000));
+        while advance(&!cursor) do
+            rows := rows + 1;
+            if contains(columnText(&cursor, 3), "INDEX wolly_log_lines_at") then
+                indexed := true;
+            end if;
+            if contains(columnText(&cursor, 3), "SCAN wolly_log_lines") then
+                scanned := true;
+            end if;
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the plan is read");
+            when None do
+                skip;
+        end case;
+        assertTrue(rows > 0, "the plan has a row");
+        assertTrue(indexed, "the prune searches the index on at");
+        assertFalse(scanned, "the prune scans no table");
+        return nil;
+    end;
+
+    function testPrunePlan(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercisePlan(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    -- Standard.Search's tables of SQLite (hilde_search, hilde_search_keys): SQLite only.
+    function testRows(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseRows(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+
+    -- The lines of exerciseRows without Standard.Search's tables, so on both backends: lines in the caller's
+    -- transaction, keepLine refused inside one, a level set and one taken back, the prune, all through findLines.
+    generic [R: Region]
+    function exerciseRowsEverywhere(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        keep(&~db, "web1.example.org", "/a", 10, "info", "alpha line", true, "line 1 in a transaction of its own");
+        foundOnce(&~db, "alpha", "1", "<mark>alpha</mark>", "and found");
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                case keepLineIn(&~db, &open, "web1.example.org", "/a", 20, "info", "beta line") of
+                    when Right(right as kept: Option[Int64]) do
+                        assertTrue(true, "line 2 in the caller's transaction");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "line 2 in the caller's transaction");
+                end case;
+                case keepLineIn(&~db, &open, "web1.example.org", "/a", 30, "info", "gamma line") of
+                    when Right(right as kept: Option[Int64]) do
+                        assertTrue(true, "line 3 in the same");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "line 3 in the same");
+                end case;
+                case commit(&~db, open) of
+                    when Right(right as committed: Unit) do
+                        skip;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the transaction commits");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction of the caller");
+        end case;
+        foundOnce(&~db, "beta", "2", "<mark>beta</mark>", "line 2 found after the commit");
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                case setLevelIn(&~db, &open, 3, "error") of
+                    when Right(right as set: Bool) do
+                        assertTrue(set, "line 3 given the level error");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "line 3 given the level error");
+                end case;
+                case setLevelIn(&~db, &open, 99, "error") of
+                    when Right(right as set: Bool) do
+                        assertFalse(set, "no line 99");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "no line 99");
+                end case;
+                case commit(&~db, open) of
+                    when Right(right as committed: Unit) do
+                        skip;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the level commits");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction for the level");
+        end case;
+        lineIs(&~db, "3", "30\tweb1.example.org\t/a\terror\tgamma line\n", true, "the level in the table");
+        foundOnce(&~db, "error", "3", "gamma line", "and in the title the search weighs");
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                case setLevelIn(&~db, &open, 2, "warn") of
+                    when Right(right as set: Bool) do
+                        assertTrue(set, "line 2 given the level warn");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(false, "line 2 given the level warn");
+                end case;
+                rollback(&~db, open);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction to take back");
+        end case;
+        lineIs(&~db, "2", "20\tweb1.example.org\t/a\tinfo\tbeta line\n", true, "taken back: line 2 kept its level");
+        foundNone(&~db, "warn", "nor is it found by the level taken back");
+        keep(&~db, "web1.example.org", "/a", 40, "info", "tag <b>bold</b> & co", true, "line 4 with markup");
+        foundOnce(&~db, "bold", "4", "&lt;b&gt;<mark>bold</mark>&lt;/b&gt; &amp; co", "its markup escaped in the snippet, the word marked");
+        keep(&~db, "web1.example.org", "/a", 50, "info", "a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30", true, "line 5 of 30 words");
+        foundOnce(&~db, "a20", "5", "<mark>a20</mark>", "a word of a long line marked");
+        foundOnce(&~db, "a20", "5", "...", "the snippet cut before a word late in the line");
+        foundOnce(&~db, "a3", "5", "<mark>a3</mark>", "a word early in the line marked");
+        foundOnce(&~db, "a3", "5", "...", "the snippet cut after a word early in the line");
+        foundNone(&~db, "a31", "a word the line has not");
+        case pruneLines(&~db, 25) of
+            when Right(right as removed: Int64) do
+                assertTrue(removed = 2, "two lines before 25");
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the prune");
+        end case;
+        foundNone(&~db, "alpha", "a pruned line is out of the index");
+        foundOnce(&~db, "gamma", "3", "<mark>gamma</mark>", "the line after 25 stays");
+        return nil;
+    end;
+
+    function testRowsEverywhere(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseRowsEverywhere(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "the test database");
+        end case;
+        return nil;
+    end;
+
+    function testStore(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database in memory");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,54 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Documents both ways between HTML and the Markdown of Wolly.Markdown:
+HTML from elsewhere -- an old page, a paste from a
+word processor -- becomes Markdown that an author can edit, and Markdown
+becomes the plain text a search index takes.
+
+htmlToMarkdown reads HTML with the tokenizer of Standard.Html and keeps
+what Wolly.Markdown can say: headings, paragraphs, lists (flat: an inner
+list goes on as items of the outer one), a quote, code blocks and code,
+strong and emphasis, links whose target Wolly.Markdown.isSafeLink takes
+and that hold no closing parenthesis, and rules.  Everything else gives its
+text: an unknown element, a table (a row is a line), an image (its alt
+text).  Scripts, styles, titles and text areas give nothing.  Text is
+escaped with backslashes where Wolly.Markdown would read a mark in it, so
+markdownToHtml of the result shows the text as it was; white space runs
+become one space, as in HTML.
+
+For HTML made by Wolly.Markdown.markdownToHtml the way back is exact:
+markdownToHtml(htmlToMarkdown(markdownToHtml(m))) is markdownToHtml(m).
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Doc is
+    """
+    The most bytes htmlToMarkdown reads: 1048576.  Longer HTML is read
+    to there.
+    """
+    function mostHtmlBytes(): Index
+        ensures result = 1048576;
+
+    """
+    html as Markdown.
+    No contract: the length depends on the text, and what holds of the
+    result costs more than O(1) to state.
+    """
+    generic [H: Region]
+    function htmlToMarkdown(html: Span[Nat8, H]): String;
+
+    """
+    The text of Markdown without its marks, for a search index: the text of
+    markdownToHtml of it.
+    No contract: what holds of the result costs more than O(1) to state.
+    """
+    generic [M: Region]
+    function markdownText(markdown: Span[Nat8, M]): String;
+end module.

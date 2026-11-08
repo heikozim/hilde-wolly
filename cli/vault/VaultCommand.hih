@@ -1,0 +1,26 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The vault command of Wolly: converts a vault of Wolly.Vault into one of Standard.Vault.
+
+    vault convert OLD_VAULT OLD_KEY NEW_ENV NEW_PEPPER KEY_NAME
+
+It takes paths and the name of the key line, never a secret: the secrets are read from the old
+vault with its key and written into the new one, each read back and compared.  It prints the
+number of secrets converted and every name refused (a name that starts with a digit, which
+Standard.Vault does not take), and exits 0; it prints why not and exits 1 when there is no old
+vault at its path (nothing is written then), it does not open under its key, or the new one cannot
+be written.  The old files stay; the caller removes
+them after.
+"""
+module Wolly.Example.VaultCommand is
+    """
+    The command of the arguments.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

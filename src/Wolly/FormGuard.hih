@@ -1,0 +1,164 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Passive protection of a public form against automated posts, in the order
+a submission is checked:
+
+- a honeypot: a field a person does not see and leaves empty;
+- a stamp: the time the form was made and a random nonce, signed with
+  HMAC-SHA256 under a key of the server; a submission sooner than
+  fastestSeconds after it, or later than slowestSeconds, or with a stamp
+  the server did not sign, is refused;
+- a limit per client: at most limit submissions in a window, counted by
+  Wolly.Limit in the scope "form";
+- single use: a stamp that passed once is kept until it expires, and a
+  second submission with it is refused.
+
+A stamp is only used up when every check passed, so a refusal does not
+spend a form a person still has open.  The checks say why they refused;
+what the application answers is its own choice, and for a honeypot or a
+submission too fast the usual answer is the one of a success, so that a
+robot learns nothing.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.FormGuard is
+    """
+    The verdict on one submission.
+    """
+    union FormCheck: Free is
+        """
+        Every check passed; the stamp is used up.
+        """
+        case Passed;
+        """
+        The honeypot field was filled.
+        """
+        case Honeypot;
+        """
+        The stamp is missing, malformed or not signed by this key.
+        """
+        case BadStamp;
+        """
+        The form came back sooner than fastestSeconds after its stamp.
+        """
+        case TooFast;
+        """
+        The form came back later than slowestSeconds after its stamp, or
+        its stamp lies in the future.
+        """
+        case Expired;
+        """
+        The client is over its limit; retryAfter seconds until it may post
+        again.
+        """
+        case TooMany is
+            retryAfter: Int64;
+        """
+        The stamp was used before.
+        """
+        case Replayed;
+    end;
+
+    """
+    The stamp of a form, in three parts that the form carries in hidden
+    fields: time, the seconds of the wall clock when the form was made in
+    decimal; nonce, 16 random bytes in hexadecimal; mac, the HMAC-SHA256
+    of time, a bar and nonce under the key, in hexadecimal.  Linear:
+    destroyStamp frees it.
+    """
+    record Stamp: Linear is
+        time: String;
+        nonce: String;
+        mac: String;
+    end;
+
+    """
+    The name of the honeypot field: website.
+    """
+    function honeypotField(): Span[Nat8, Static]
+        ensures spanLength(result) = 7;
+
+    """
+    The name of the hidden field with the time of the stamp: form_time.
+    """
+    function timeField(): Span[Nat8, Static]
+        ensures spanLength(result) = 9;
+
+    """
+    The name of the hidden field with the nonce of the stamp: form_nonce.
+    """
+    function nonceField(): Span[Nat8, Static]
+        ensures spanLength(result) = 10;
+
+    """
+    The name of the hidden field with the signature of the stamp: form_mac.
+    """
+    function macField(): Span[Nat8, Static]
+        ensures spanLength(result) = 8;
+
+    """
+    The shortest time a person takes for a form: 3 seconds.
+    """
+    function fastestSeconds(): Int64
+        ensures result = 3;
+
+    """
+    The longest time a form stays good: 1800 seconds.
+    """
+    function slowestSeconds(): Int64
+        ensures result = 1800;
+
+    """
+    The fewest bytes a key may have: 32.
+    """
+    function formKeyBytes(): Index
+        ensures result = 32;
+
+    """
+    A new stamp for a form made at now under key.  None when key is
+    shorter than formKeyBytes or libcrypto fails.
+    """
+    generic [K: Region]
+    function makeStamp(key: Span[Nat8, K], now: Int64): Option[Stamp]
+        requires now >= 0;
+
+    """
+    Frees the three parts of a stamp.
+    No contract: it only gives the value back.
+    """
+    function destroyStamp(stamp: Stamp): Unit;
+
+    """
+    Makes the table of used stamps and the table of Wolly.Limit, if they
+    are not there.  None when both exist afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareFormGuard(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    The verdict on a submission at now from client, whose hidden fields
+    held honeypot, time, nonce and mac, under key and with at most limit
+    submissions of client in window seconds.  Fails with the error of
+    SQLite; then the stamp is not used up.
+    """
+    generic [R: Region, K: Region, H: Region, T: Region, N: Region, M: Region, C: Region]
+    function checkSubmission(db: &![Database[Writing], R], key: Span[Nat8, K], honeypot: Span[Nat8, H],
+                             time: Span[Nat8, T], nonce: Span[Nat8, N], mac: Span[Nat8, M], client: Span[Nat8, C],
+                             now: Int64, limit: Int64, window: Int64): Either[DbError, FormCheck]
+        requires now >= 0
+        requires limit > 0
+        requires window > 0;
+end module.

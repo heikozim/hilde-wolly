@@ -1,0 +1,130 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    writeByte,
+    writeString
+);
+import Standard.Calendar (
+    Instant,
+    formatRfc3339
+);
+import Wolly.Markdown (
+    isSafeLink
+);
+
+module body Wolly.Feed is
+    function feedType(): Span[Nat8, Static] is
+        return "application/atom+xml; charset=utf-8";
+    end;
+
+    -- Writes span with & < > " ' as entities.
+    generic [B: Region, S: Region]
+    function writeXml(out: &![StringBuilder, B], span: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(span) do
+            let byte: Nat8 := span[i];
+            if byte = '&' then
+                writeString(&~out, "&amp;");
+            else
+                if byte = '<' then
+                    writeString(&~out, "&lt;");
+                else
+                    if byte = '>' then
+                        writeString(&~out, "&gt;");
+                    else
+                        if byte = '"' then
+                            writeString(&~out, "&quot;");
+                        else
+                            if byte = 39 then
+                                writeString(&~out, "&apos;");
+                            else
+                                writeByte(&~out, byte);
+                            end if;
+                        end if;
+                    end if;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- An element of text: <name>escaped text</name> and a line feed.
+    generic [B: Region, S: Region]
+    function element(out: &![StringBuilder, B], name: Span[Nat8, Static], text: Span[Nat8, S]): Unit is
+        writeByte(&~out, '<');
+        writeString(&~out, name);
+        writeByte(&~out, '>');
+        writeXml(&~out, text);
+        writeString(&~out, "</");
+        writeString(&~out, name);
+        writeString(&~out, ">\n");
+        return nil;
+    end;
+
+    -- <link href="link"/> when link is safe, else nothing.
+    generic [B: Region, L: Region]
+    function linkElement(out: &![StringBuilder, B], link: Span[Nat8, L]): Unit is
+        if isSafeLink(link) then
+            writeString(&~out, "<link href=\"");
+            writeXml(&~out, link);
+            writeString(&~out, "\"/>\n");
+        end if;
+        return nil;
+    end;
+
+    -- <updated>RFC 3339 in UTC</updated>.
+    generic [B: Region]
+    function updatedElement(out: &![StringBuilder, B], seconds: Int64): Unit is
+        let at: Instant := Instant(seconds => seconds, nanos => 0);
+        case formatRfc3339(at, 0) of
+            when Some(value as text: String) do
+                element(&~out, "updated", asSpan(&text));
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [B: Region, I: Region, T: Region, L: Region]
+    function beginFeed(out: &![StringBuilder, B], id: Span[Nat8, I], title: Span[Nat8, T], link: Span[Nat8, L],
+                       updated: Int64): Unit is
+        writeString(&~out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+        writeString(&~out, "<feed xmlns=\"http://www.w3.org/2005/Atom\">\n");
+        element(&~out, "id", id);
+        element(&~out, "title", title);
+        linkElement(&~out, link);
+        updatedElement(&~out, updated);
+        return nil;
+    end;
+
+    generic [B: Region, I: Region, T: Region, L: Region, S: Region]
+    function writeEntry(out: &![StringBuilder, B], id: Span[Nat8, I], title: Span[Nat8, T], link: Span[Nat8, L],
+                        updated: Int64, summary: Span[Nat8, S]): Unit is
+        writeString(&~out, "<entry>\n");
+        element(&~out, "id", id);
+        element(&~out, "title", title);
+        linkElement(&~out, link);
+        updatedElement(&~out, updated);
+        element(&~out, "summary", summary);
+        writeString(&~out, "</entry>\n");
+        return nil;
+    end;
+
+    generic [B: Region]
+    function endFeed(out: &![StringBuilder, B]): Unit is
+        writeString(&~out, "</feed>\n");
+        return nil;
+    end;
+end module body.

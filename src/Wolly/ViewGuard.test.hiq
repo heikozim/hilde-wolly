@@ -1,0 +1,681 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Checks: View ViewCompile ViewData
+--
+-- What guards Wolly.View against the templates of a tenant: the order of
+-- the directories, the names a template may read, the limits of a load and
+-- of a render, and the reload after a change.  Each guard is asked once on
+-- each side of it.  The templates are written below view-guard-root in the
+-- working directory of the test, a directory of the tenant and a shared one;
+-- the test leaves them there.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory,
+    createSymlink
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData,
+    makeMapData,
+    rootNode,
+    putSanitizedHtml,
+    putList,
+    putText,
+    addInteger
+);
+import Wolly.ViewFunctions (
+    lucyPolicy
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty
+);
+import Wolly.ViewCompile (
+    Program,
+    compileView,
+    destroyProgram,
+    stepCount,
+    mostSteps
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    renderView,
+    keptViews,
+    keepsViews
+);
+
+module body Wolly.ViewGuard.Test is
+    constant base: Span[Nat8, Static] := "view-guard-root";
+    constant tenant: Span[Nat8, Static] := "view-guard-root/tenant";
+    constant shared: Span[Nat8, Static] := "view-guard-root/shared";
+    constant letters: Span[Nat8, Static] := "abcdefghijklmnopqrstuvwxyz";
+
+    function prepared(): Bool is
+        let a: Bool := createDirectory(base);
+        let b: Bool := createDirectory(tenant);
+        let c: Bool := createDirectory(shared);
+        return true;
+    end;
+
+    generic [D: Region, N: Region]
+    function pathIn(directory: Span[Nat8, D], name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, directory);
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [D: Region, N: Region, T: Region]
+    function written(directory: Span[Nat8, D], name: Span[Nat8, N], text: Span[Nat8, T]): Bool is
+        let path: String := pathIn(directory, name);
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                destroyString(path);
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                destroyString(path);
+                return false;
+        end case;
+    end;
+
+    -- The template name rendered from the directory given, or from the
+    -- tenant's and the shared one when it is empty, with the JSON data.
+    generic [D: Region, N: Region, J: Region]
+    function outcomeIn(directory: Span[Nat8, D], name: Span[Nat8, N], json: Span[Nat8, J]): Either[String, String] is
+        var engine: ViewEngine := makeViewEngine();
+        if spanLength(directory) = 0 then
+            addDirectory(&!engine, tenant);
+            addDirectory(&!engine, shared);
+        else
+            addDirectory(&!engine, directory);
+        end if;
+        case readViewJson(json) of
+            when Left(left as message: String) do
+                destroyViewEngine(engine);
+                return Left(left => message);
+            when Right(right as data: ViewData) do
+                var out: StringBuilder := makeStringBuilder();
+                let result: Either[String, Unit] := renderView(&!engine, name, &data, &!out);
+                destroyViewData(data);
+                destroyViewEngine(engine);
+                let text: String := finalize(out);
+                case result of
+                    when Left(left as message: String) do
+                        destroyString(text);
+                        return Left(left => message);
+                    when Right(right as done: Unit) do
+                        return Right(right => text);
+                end case;
+        end case;
+    end;
+
+    generic [N: Region, J: Region]
+    function outcome(name: Span[Nat8, N], json: Span[Nat8, J]): Either[String, String] is
+        return outcomeIn("", name, json);
+    end;
+
+    generic [N: Region, J: Region]
+    function renders(name: Span[Nat8, N], json: Span[Nat8, J], expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case outcome(name, json) of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, message);
+            when Right(right as text: String) do
+                let same: Bool := equal(asSpan(&text), expected);
+                if not same then
+                    printLn(asSpan(&text));
+                end if;
+                destroyString(text);
+                assertTrue(same, message);
+        end case;
+        return nil;
+    end;
+
+    -- The length of the output, or the error printed and a length that no
+    -- test asks for.
+    generic [N: Region, J: Region]
+    function renderedLength(name: Span[Nat8, N], json: Span[Nat8, J]): Index is
+        case outcome(name, json) of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                return 0;
+            when Right(right as text: String) do
+                let count: Index := spanLength(asSpan(&text));
+                destroyString(text);
+                return count;
+        end case;
+    end;
+
+    generic [N: Region, J: Region]
+    function refuses(name: Span[Nat8, N], json: Span[Nat8, J], code: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case outcome(name, json) of
+            when Left(left as failure: String) do
+                let found: Bool := contains(asSpan(&failure), code);
+                if not found then
+                    printLn(asSpan(&failure));
+                end if;
+                destroyString(failure);
+                assertTrue(found, message);
+            when Right(right as text: String) do
+                destroyString(text);
+                printLn("rendered where an error was asked for");
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- count times the text.
+    generic [T: Region]
+    function repeated(text: Span[Nat8, T], count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeString(&!out, text);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The name of the i-th file of a chain or a set: prefix, two letters,
+    -- .jinja.
+    function nthName(prefix: Nat8, i: Index): String is
+        let alphabet: Span[Nat8, Static] := letters;
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, prefix);
+        var high: Index := 0;
+        var low: Index := i;
+        while low >= 26 do
+            low := low - 26;
+            high := high + 1;
+        end while;
+        writeByte(&!out, alphabet[high]);
+        writeByte(&!out, alphabet[low]);
+        writeString(&!out, ".jinja");
+        return finalize(out);
+    end;
+
+    -- {"xs": [1, ... 1], "big": "x..."} built as an application builds its
+    -- data: count elements, a text of size bytes.
+    function listData(count: Index, size: Index): ViewData is
+        var data: ViewData := makeMapData();
+        let list: Index := putList(&!data, rootNode(), "xs");
+        var i: Index := 0;
+        while i < count do
+            let added: Index := addInteger(&!data, list, 1);
+            i := i + 1;
+        end while;
+        let big: String := repeated("x", size);
+        let put: Index := putText(&!data, rootNode(), "big", asSpan(&big));
+        destroyString(big);
+        return data;
+    end;
+
+    -- The template name rendered from the tenant's directory with the data
+    -- listData gives: Right with the length of the output, Left with the
+    -- error.
+    generic [N: Region]
+    function listOutcome(name: Span[Nat8, N], count: Index, size: Index): Either[String, Index] is
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, tenant);
+        let data: ViewData := listData(count, size);
+        var out: StringBuilder := makeStringBuilder();
+        let result: Either[String, Unit] := renderView(&!engine, name, &data, &!out);
+        destroyViewData(data);
+        destroyViewEngine(engine);
+        let text: String := finalize(out);
+        let length: Index := spanLength(asSpan(&text));
+        destroyString(text);
+        case result of
+            when Left(left as message: String) do
+                return Left(left => message);
+            when Right(right as done: Unit) do
+                return Right(right => length);
+        end case;
+    end;
+
+    generic [N: Region]
+    function listLength(name: Span[Nat8, N], count: Index, size: Index, expected: Index,
+        message: Span[Nat8, Static]): Unit is
+        case listOutcome(name, count, size) of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, message);
+            when Right(right as length: Index) do
+                assertTrue(length = expected, message);
+        end case;
+        return nil;
+    end;
+
+    generic [N: Region]
+    function listRefuses(name: Span[Nat8, N], count: Index, size: Index, code: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case listOutcome(name, count, size) of
+            when Left(left as failure: String) do
+                let found: Bool := contains(asSpan(&failure), code);
+                if not found then
+                    printLn(asSpan(&failure));
+                end if;
+                destroyString(failure);
+                assertTrue(found, message);
+            when Right(right as length: Index) do
+                printLn("rendered where an error was asked for");
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function testTenantFirst(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(written(tenant, "a.jinja", "tenant {{ x }}"), "the tenant's a is written");
+        assertTrue(written(shared, "a.jinja", "shared"), "the shared a is written");
+        assertTrue(written(shared, "b.jinja", "{% include \"a.jinja\" %}/b"), "the shared b is written");
+        renders("a.jinja", "{\"x\": 1}", "tenant 1", "the tenant's template comes before the shared one");
+        renders("b.jinja", "{\"x\": 2}", "tenant 2/b", "a shared template includes the tenant's a");
+        refuses("none.jinja", "{}", "H7004", "a name no directory holds is an error");
+        return nil;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(written(tenant, "up.jinja", "{% include \"../shared/b.jinja\" %}"), "up is written");
+        assertTrue(written(tenant, "abs.jinja", "{% include \"/etc/passwd\" %}"), "abs is written");
+        assertTrue(written(tenant, "dot.jinja", "{% include \".hidden\" %}"), "dot is written");
+        assertTrue(written(tenant, "empty.jinja", "{% include \"x//a.jinja\" %}"), "empty is written");
+        refuses("up.jinja", "{}", "H7003", "a name that leaves the directory is refused");
+        refuses("abs.jinja", "{}", "H7002", "an absolute name is refused");
+        refuses("dot.jinja", "{}", "V0002", "a segment that begins with a dot is refused");
+        refuses("empty.jinja", "{}", "V0002", "an empty segment is refused");
+        refuses("../shared/b.jinja", "{}", "H7003", "the name rendered is held to the same rules");
+        return nil;
+    end;
+
+    function testLinks(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(written(tenant, "a.jinja", "tenant {{ x }}"), "the tenant's a is written");
+        assertTrue(written(shared, "a.jinja", "shared"), "the shared a is written");
+        assertTrue(written(shared, "b.jinja", "{% include \"a.jinja\" %}/b"), "the shared b is written");
+        let file: Bool := createSymlink("a.jinja", "view-guard-root/tenant/link.jinja");
+        refuses("link.jinja", "{\"x\": 1}", "V0004", "a file that is a link is refused");
+        let made: Bool := createDirectory("view-guard-root/tenant/sub");
+        assertTrue(written(tenant, "sub/s.jinja", "s"), "sub/s is written");
+        renders("sub/s.jinja", "{}", "s", "a file in a directory below is read");
+        let directory: Bool := createSymlink("sub", "view-guard-root/tenant/linked");
+        refuses("linked/s.jinja", "{}", "V0004", "a directory below that is a link is refused");
+        let alias: Bool := createSymlink("shared", "view-guard-root/alias");
+        case outcomeIn("view-guard-root/alias", "b.jinja", "{}") of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, "a directory of the templates may itself be a link");
+            when Right(right as text: String) do
+                assertTrue(equal(asSpan(&text), "shared/b"), "a directory of the templates may itself be a link");
+                destroyString(text);
+        end case;
+        return nil;
+    end;
+
+    function testFileSize(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        let most: String := repeated("x", 1048576);
+        assertTrue(written(tenant, "most.jinja", asSpan(&most)), "a file of 1 MiB is written");
+        destroyString(most);
+        let more: String := repeated("x", 1048577);
+        assertTrue(written(tenant, "more.jinja", asSpan(&more)), "a file of 1 MiB and a byte is written");
+        destroyString(more);
+        assertTrue(renderedLength("most.jinja", "{}") = 1048576, "a file of 1 MiB is read");
+        refuses("more.jinja", "{}", "V0005", "a file larger than 1 MiB is refused");
+        return nil;
+    end;
+
+    -- {% if not ... not true %}y{% endif %} with count nots: the tags, the
+    -- condition and each not nest one deeper, count + 2 in all.
+    function nots(count: Index): String is
+        let words: String := repeated("not ", count);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{% if ");
+        writeString(&!out, asSpan(&words));
+        writeString(&!out, "true %}y{% endif %}");
+        destroyString(words);
+        return finalize(out);
+    end;
+
+    function testNesting(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        let most: String := nots(62);
+        assertTrue(written(tenant, "most.jinja", asSpan(&most)), "62 nots are written");
+        destroyString(most);
+        let more: String := nots(63);
+        assertTrue(written(tenant, "more.jinja", asSpan(&more)), "63 nots are written");
+        destroyString(more);
+        renders("most.jinja", "{}", "y", "64 deep, 62 nots inside the tags, is read");
+        refuses("more.jinja", "{}", "V0001", "65 deep is refused");
+        return nil;
+    end;
+
+    -- A chain of count files from the first on, each including the next,
+    -- the last saying end.
+    function chain(count: Index): Bool is
+        var good: Bool := true;
+        var i: Index := 0;
+        while i < count do
+            let name: String := nthName('d', i);
+            var out: StringBuilder := makeStringBuilder();
+            if (i + 1) = count then
+                writeString(&!out, "end");
+            else
+                let next: String := nthName('d', i + 1);
+                writeString(&!out, "{% include \"");
+                writeString(&!out, asSpan(&next));
+                writeString(&!out, "\" %}");
+                destroyString(next);
+            end if;
+            let text: String := finalize(out);
+            good := good and written(tenant, asSpan(&name), asSpan(&text));
+            destroyString(text);
+            destroyString(name);
+            i := i + 1;
+        end while;
+        return good;
+    end;
+
+    function testDepth(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(chain(17), "a chain of 17 files is written");
+        renders("dab.jinja", "{}", "end", "16 files inside one another are read");
+        refuses("daa.jinja", "{}", "V0006", "17 files inside one another are refused");
+        return nil;
+    end;
+
+    -- A template including count files of a set, each saying x.
+    generic [N: Region]
+    function includer(name: Span[Nat8, N], count: Index): Bool is
+        var good: Bool := true;
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            let part: String := nthName('m', i);
+            good := good and written(tenant, asSpan(&part), "x");
+            writeString(&!out, "{% include \"");
+            writeString(&!out, asSpan(&part));
+            writeString(&!out, "\" %}");
+            destroyString(part);
+            i := i + 1;
+        end while;
+        let text: String := finalize(out);
+        good := good and written(tenant, name, asSpan(&text));
+        destroyString(text);
+        return good;
+    end;
+
+    function testFiles(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(includer("most.jinja", 63), "a template of 64 files is written");
+        assertTrue(includer("more.jinja", 64), "a template of 65 files is written");
+        assertTrue(renderedLength("most.jinja", "{}") = 63, "a template of 64 files is read");
+        refuses("more.jinja", "{}", "V0003", "a template of 65 files is refused");
+        return nil;
+    end;
+
+    -- Macros a to the letter levels - 1, each but a calling the one before
+    -- fan times; the last one called once: fan ^ (levels - 1) x, levels
+    -- calls inside one another.
+    function macros(levels: Index, fan: Index): String is
+        let alphabet: Span[Nat8, Static] := letters;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{% macro a() %}x{% endmacro %}");
+        var level: Index := 1;
+        while level < levels do
+            writeString(&!out, "{% macro ");
+            writeByte(&!out, alphabet[level]);
+            writeString(&!out, "() %}");
+            var i: Index := 0;
+            while i < fan do
+                writeString(&!out, "{{ ");
+                writeByte(&!out, alphabet[level - 1]);
+                writeString(&!out, "() }}");
+                i := i + 1;
+            end while;
+            writeString(&!out, "{% endmacro %}");
+            level := level + 1;
+        end while;
+        writeString(&!out, "{{ ");
+        writeByte(&!out, alphabet[levels - 1]);
+        writeString(&!out, "() }}");
+        return finalize(out);
+    end;
+
+    function testMacroDepth(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        let most: String := macros(16, 1);
+        assertTrue(written(tenant, "most.jinja", asSpan(&most)), "16 macros are written");
+        destroyString(most);
+        let more: String := macros(17, 1);
+        assertTrue(written(tenant, "more.jinja", asSpan(&more)), "17 macros are written");
+        destroyString(more);
+        assertTrue(written(tenant, "self.jinja", "{% macro r() %}{{ r() }}{% endmacro %}{{ r() }}"),
+            "a macro calling itself is written");
+        renders("most.jinja", "{}", "x", "16 calls of macros inside one another are expanded");
+        refuses("more.jinja", "{}", "V0008", "17 calls of macros inside one another are refused");
+        refuses("self.jinja", "{}", "H7090", "a macro calling itself is refused as in the dialect");
+        return nil;
+    end;
+
+    -- The steps a template of count prints of {{1}} compiles to, or 0.
+    function stepsOf(count: Index): Index is
+        let text: String := repeated("{{1}}", count);
+        let wrote: Bool := written(tenant, "probe.jinja", asSpan(&text));
+        destroyString(text);
+        var directories: Buffer[String] := allocateEmpty();
+        insertBack(&!directories, fromLiteral(tenant));
+        let functions: Buffer[String] := allocateEmpty();
+        let catalogs: Buffer[String] := allocateEmpty();
+        var steps: Index := 0;
+        case compileView(&directories, &functions, &catalogs, "probe.jinja", "", false, false) of
+            when Left(left as message: String) do
+                printLn(asSpan(&message));
+                destroyString(message);
+            when Right(right as program: Program) do
+                steps := stepCount(&program);
+                destroyProgram(program);
+        end case;
+        destroyString(removeLast(&!directories));
+        destroyEmpty(directories);
+        destroyEmpty(functions);
+        destroyEmpty(catalogs);
+        return steps;
+    end;
+
+    function testSteps(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        let one: Index := stepsOf(1);
+        let two: Index := stepsOf(2);
+        assertTrue(one > 0, "a print compiles");
+        assertTrue(two = (one + 1), "each print is one step");
+        let count: Index := mostSteps() - (one - 1);
+        let most: String := repeated("{{1}}", count);
+        assertTrue(written(tenant, "most.jinja", asSpan(&most)), "200000 steps are written");
+        destroyString(most);
+        let more: String := repeated("{{1}}", count + 1);
+        assertTrue(written(tenant, "more.jinja", asSpan(&more)), "200001 steps are written");
+        destroyString(more);
+        assertTrue(renderedLength("most.jinja", "{}") = count, "a template of 200000 steps renders");
+        refuses("more.jinja", "{}", "V0009", "a template of 200001 steps is refused");
+        return nil;
+    end;
+
+    function testTurns(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(written(tenant, "loop.jinja", "{% for a in xs %}{% endfor %}"), "a loop is written");
+        listLength("loop.jinja", 1000000, 1, 0, "1000000 turns are made");
+        listRefuses("loop.jinja", 1000001, 1, "V1012", "1000001 turns are refused");
+        return nil;
+    end;
+
+    function testOutput(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(written(tenant, "most.jinja", "{% for a in xs %}{{ big }}{% endfor %}"), "eight copies are written");
+        assertTrue(written(tenant, "more.jinja", "{% for a in xs %}{{ big }}{% endfor %}x"),
+            "eight copies and a byte are written");
+        listLength("most.jinja", 8, 2097152, 16777216, "16 MiB are written");
+        listRefuses("more.jinja", 8, 2097152, "V1013", "16 MiB and a byte are refused");
+        return nil;
+    end;
+
+    -- The template name rendered from the tenant's directory with the data
+    -- {"h": html}, the HTML cleaned with the policy of a content management system.
+    generic [N: Region]
+    function htmlOutcome(name: Span[Nat8, N]): Either[String, String] is
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, tenant);
+        var data: ViewData := makeMapData();
+        let at: Index := putSanitizedHtml(&!data, rootNode(), "h", "<b>x</b><script>alert(1)</script>", lucyPolicy());
+        var out: StringBuilder := makeStringBuilder();
+        let result: Either[String, Unit] := renderView(&!engine, name, &data, &!out);
+        destroyViewData(data);
+        destroyViewEngine(engine);
+        let text: String := finalize(out);
+        case result of
+            when Left(left as message: String) do
+                destroyString(text);
+                return Left(left => message);
+            when Right(right as done: Unit) do
+                return Right(right => text);
+        end case;
+    end;
+
+    generic [N: Region]
+    function refusesHtml(name: Span[Nat8, N], message: Span[Nat8, Static]): Unit is
+        case htmlOutcome(name) of
+            when Left(left as failure: String) do
+                let found: Bool := contains(asSpan(&failure), "V1005");
+                if not found then
+                    printLn(asSpan(&failure));
+                end if;
+                destroyString(failure);
+                assertTrue(found, message);
+            when Right(right as text: String) do
+                printLn(asSpan(&text));
+                destroyString(text);
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function testHtml(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(written(tenant, "text.jinja", "<p>{{ h }}</p>"), "HTML in text is written");
+        assertTrue(written(tenant, "attribute.jinja", "<a title=\"{{ h }}\">x</a>"), "HTML in an attribute is written");
+        assertTrue(written(tenant, "script.jinja", "<script>var h = {{ h }};</script>"), "HTML in a script is written");
+        case htmlOutcome("text.jinja") of
+            when Left(left as failure: String) do
+                printLn(asSpan(&failure));
+                destroyString(failure);
+                assertTrue(false, "HTML stands as it is in HTML text");
+            when Right(right as text: String) do
+                let kept: Bool := contains(asSpan(&text), "<p><b>x</b>");
+                let cleaned: Bool := not contains(asSpan(&text), "<script");
+                if not (kept and cleaned) then
+                    printLn(asSpan(&text));
+                end if;
+                destroyString(text);
+                assertTrue(kept, "HTML stands as it is in HTML text");
+                assertTrue(cleaned, "the HTML is cleaned with the policy: no script is left");
+        end case;
+        refusesHtml("attribute.jinja", "HTML in an attribute is an error");
+        refusesHtml("script.jinja", "HTML in a script is an error");
+        return nil;
+    end;
+
+    -- The output of name, or the error, from an engine kept between calls.
+    generic [R: Region]
+    function renderedBy(engine: &![ViewEngine, R], name: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        case readViewJson("{}") of
+            when Left(left as message: String) do
+                writeString(&!out, asSpan(&message));
+                destroyString(message);
+            when Right(right as data: ViewData) do
+                case renderView(&~engine, name, &data, &!out) of
+                    when Left(left as message: String) do
+                        writeString(&!out, asSpan(&message));
+                        destroyString(message);
+                    when Right(right as done: Unit) do
+                        skip;
+                end case;
+                destroyViewData(data);
+        end case;
+        return finalize(out);
+    end;
+
+    function testReload(): Unit is
+        assertTrue(prepared(), "the directories are made");
+        assertTrue(written(tenant, "r.jinja", "one"), "the first text is written");
+        var engine: ViewEngine := makeViewEngine();
+        addDirectory(&!engine, tenant);
+        let first: String := renderedBy(&!engine, "r.jinja");
+        assertTrue(equal(asSpan(&first), "one"), "the first text is rendered");
+        destroyString(first);
+        if keepsViews(&engine) then
+            assertTrue(keptViews(&engine) = 1, "the template is kept");
+        else
+            assertTrue(keptViews(&engine) = 0, "nothing is kept where watching is not built");
+        end if;
+        let again: String := renderedBy(&!engine, "r.jinja");
+        assertTrue(equal(asSpan(&again), "one"), "the kept template renders the same");
+        destroyString(again);
+        assertTrue(written(tenant, "r.jinja", "two"), "the second text is written");
+        let second: String := renderedBy(&!engine, "r.jinja");
+        let changed: Bool := equal(asSpan(&second), "two");
+        if not changed then
+            printLn(asSpan(&second));
+        end if;
+        destroyString(second);
+        assertTrue(changed, "the changed file is read again");
+        destroyViewEngine(engine);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,112 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The parts of Wolly.Acme that need no server.  The order itself runs
+-- against Pebble in a container (scripts/e2e-acme-live.sh).
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Time (
+    wallNanos
+);
+import Wolly.Pki (
+    newKey,
+    authorityCertificate
+);
+import Wolly.Acme (
+    mostNames,
+    renewalSeconds,
+    needsRenewal,
+    isToken,
+    usableNames,
+    challengePath
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Acme.Test is
+    function now(): Int64 is
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                abort("the clock does not fit");
+                return 0;
+        end case;
+    end;
+
+    function testToken(): Unit is
+        assertTrue(isToken("evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA"), "a token of the RFC");
+        assertTrue(isToken("a"), "one byte");
+        assertTrue(isToken("A_-9z"), "the alphabet");
+        assertFalse(isToken(""), "no token");
+        assertFalse(isToken("a/b"), "a slash would leave the directory");
+        assertFalse(isToken(".."), "dots");
+        assertFalse(isToken("a.b"), "a dot");
+        assertFalse(isToken("a b"), "a space");
+        assertFalse(isToken("a=b"), "padding is no part of base64url");
+        assertTrue(isToken("0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"), "127 bytes");
+        assertTrue(isToken("01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567"), "128 bytes");
+        assertFalse(isToken("012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678"), "129 bytes");
+        return nil;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(mostNames() = 20, "20 names");
+        assertTrue(usableNames("example.org"), "one name");
+        assertTrue(usableNames("example.org,www.example.org"), "two names");
+        assertFalse(usableNames(""), "no name");
+        assertFalse(usableNames("*.example.org"), "a wildcard needs dns-01");
+        assertFalse(usableNames("example.org,*.example.org"), "a wildcard among others");
+        assertFalse(usableNames("example.org,IP:10.0.0.1"), "another kind of name");
+        assertFalse(usableNames("bad name"), "a space");
+        assertTrue(usableNames("a.org,b.org,c.org,d.org,e.org,f.org,g.org,h.org,i.org,j.org,k.org,l.org,m.org,n.org,o.org,p.org,q.org,r.org,s.org,t.org"), "20 names");
+        assertFalse(usableNames("a.org,b.org,c.org,d.org,e.org,f.org,g.org,h.org,i.org,j.org,k.org,l.org,m.org,n.org,o.org,p.org,q.org,r.org,s.org,t.org,u.org"), "21 names");
+        return nil;
+    end;
+
+    function testPath(): Unit is
+        let path: String := challengePath("/var/www", "tok-1");
+        assertTrue(equal(asSpan(&path), "/var/www/.well-known/acme-challenge/tok-1"), "the file the web server serves");
+        destroyString(path);
+        return nil;
+    end;
+
+    -- A certificate of 60 days; the times are 31, 29 and 61 days later in
+    -- seconds (2678400, 2505600, 5270400): renewed within 30 days of its end.
+    function testRenewal(): Unit is
+        assertTrue(renewalSeconds() = 2592000, "30 days");
+        case newKey() of
+            when Some(value as key: String) do
+                case authorityCertificate(asSpan(&key), "Renewal Test", 60) of
+                    when Some(value as cert: String) do
+                        let at: Int64 := now();
+                        assertFalse(needsRenewal(asSpan(&cert), at, renewalSeconds()), "60 days left: not yet");
+                        assertTrue(needsRenewal(asSpan(&cert), at + 2678400, renewalSeconds()), "29 days left: renew");
+                        assertFalse(needsRenewal(asSpan(&cert), at + 2505600, renewalSeconds()), "31 days left: not yet");
+                        assertTrue(needsRenewal(asSpan(&cert), at + 5270400, renewalSeconds()), "expired: renew");
+                        assertTrue(needsRenewal("not a certificate", at, renewalSeconds()), "unreadable: renew");
+                        assertTrue(needsRenewal("", at, renewalSeconds()), "none: renew");
+                        destroyString(cert);
+                    when None do
+                        assertTrue(false, "a certificate");
+                end case;
+                destroyString(key);
+            when None do
+                assertTrue(false, "a key");
+        end case;
+        return nil;
+    end;
+end module body.

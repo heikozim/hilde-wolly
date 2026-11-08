@@ -1,0 +1,59 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Short secrets sealed for storage, a TOTP seed for one: encrypted and
+authenticated with ChaCha20-Poly1305 under a key of the server.
+
+The key is a machine key of at least sealKeyBytes random bytes, read by
+Wolly.Secret from a file of mode 0600; it is no password, so no Argon2id.
+What seals is not the key itself but the HMAC-SHA256 of the purpose under
+it, so that one key sealing for two purposes gives two keys, and a value
+sealed for one purpose does not open for another.  The context, a user
+name for one, is authenticated with the value: a sealed value copied to
+another user's row does not open there.  Each seal takes a new random
+nonce of 12 bytes and puts it in front of the ciphertext and the tag.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Seal is
+    """
+    The fewest bytes of a key: 32.
+    """
+    function sealKeyBytes(): Index
+        ensures result = 32;
+
+    """
+    The bytes a sealed value has more than the value: 12 of nonce and 16
+    of tag.
+    """
+    function overheadBytes(): Index
+        ensures result = 28;
+
+    """
+    value sealed under key for purpose, bound to context.  None when key
+    is shorter than sealKeyBytes, or the random source or libcrypto fails.
+    No contract: an Option over a key from outside and the random
+    source; None is its answer for a short key or a failure.
+    """
+    generic [K: Region, V: Region, C: Region]
+    function sealValue(key: Span[Nat8, K], purpose: Span[Nat8, Static], value: Span[Nat8, V],
+                       context: Span[Nat8, C]): Option[String];
+
+    """
+    The value of sealed, when it was sealed under key for purpose and bound
+    to context, and nothing in it was changed.  None otherwise, and for a
+    key shorter than sealKeyBytes or a sealed value shorter than
+    overheadBytes.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [K: Region, S: Region, C: Region]
+    function openValue(key: Span[Nat8, K], purpose: Span[Nat8, Static], sealed: Span[Nat8, S],
+                       context: Span[Nat8, C]): Option[String];
+end module.

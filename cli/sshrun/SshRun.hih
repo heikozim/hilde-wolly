@@ -1,0 +1,26 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Standard.Ssh against a real sshd: runs the remote command WORD...
+on HOST through /usr/bin/ssh, as Standard.Ssh builds it, within MILLIS
+milliseconds and MOST bytes of output and of errors.
+
+    sshrun HOST PORT USER MILLIS MOST WORD...
+
+On a run it prints code=N, then the output after a line "output:" and the
+errors after a line "errors:", and exits 0 whatever N is.  On a failure of
+Standard.Ssh it prints error=BadTarget, NotStarted, CommandTimedOut,
+OutputTooLarge or PipeFailed and exits 1; on wrong arguments the usage,
+exit 1.  It is tested against an sshd on 127.0.0.1.
+"""
+module Wolly.Example.SshRun is
+    """
+    The command of the arguments.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

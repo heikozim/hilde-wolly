@@ -1,0 +1,44 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Database (
+    Database,
+    Backend,
+    SqliteBackend,
+    SqlCipherBackend,
+    PostgresBackend,
+    MariaDBBackend,
+    backendOf
+);
+
+module body Wolly.Dialect is
+    function isPostgres(backend: Backend): Bool is
+        case backend of
+            when PostgresBackend do
+                return true;
+            when SqliteBackend do
+                return false;
+            when SqlCipherBackend do
+                return false;
+            when MariaDBBackend do
+                return false;
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function onPostgres(db: &[Database[M], R]): Bool is
+        return isPostgres(backendOf(db));
+    end;
+
+    generic [M: Free, R: Region]
+    function pick(db: &[Database[M], R], plain: Span[Nat8, Static], pg: Span[Nat8, Static]): Span[Nat8, Static] is
+        if isPostgres(backendOf(db)) then
+            return pg;
+        else
+            return plain;
+        end if;
+    end;
+end module body.

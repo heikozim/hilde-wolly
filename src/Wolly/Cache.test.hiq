@@ -1,0 +1,315 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database in memory.  A value put at 100 for 60 seconds
+-- runs out at 160: given at 159, not at 160.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    noValues,
+    start,
+    advance,
+    columnInt64,
+    finish,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Cache (
+    prepareCache,
+    cachePut,
+    cacheGet,
+    cacheDrop,
+    cacheClear
+);
+
+module body Wolly.Cache.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        if length(text) /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(expected) do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R]): Unit is
+        case prepareCache(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "the table could not be made");
+            when None do
+                skip;
+        end case;
+        case prepareCache(&~db) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a second prepareCache fails");
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function put(db: &![Database[Writing], R], scope: Span[Nat8, Static], key: Span[Nat8, Static], value: Span[Nat8, Static],
+                 now: Int64, seconds: Int64, most: Int64): Unit is
+        case cachePut(&~db, scope, key, value, now, seconds, most) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a put failed");
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function gives(db: &![Database[Writing], R], scope: Span[Nat8, Static], key: Span[Nat8, Static], now: Int64,
+                   expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case cacheGet(&~db, scope, key, now) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as text: String) do
+                        assertTrue(same(&text, expected), message);
+                        destroyString(text);
+                    when None do
+                        assertTrue(false, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function none(db: &![Database[Writing], R], scope: Span[Nat8, Static], key: Span[Nat8, Static], now: Int64,
+                  message: Span[Nat8, Static]): Unit is
+        case cacheGet(&~db, scope, key, now) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                        assertTrue(false, message);
+                    when None do
+                        assertTrue(true, message);
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runTime(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        none(&~db, "page", "home", 100, "nothing before a put");
+        put(&~db, "page", "home", "<p>hi</p>", 100, 60, 10);
+        gives(&~db, "page", "home", 100, "<p>hi</p>", "the value at once");
+        gives(&~db, "page", "home", 159, "<p>hi</p>", "a second before it runs out");
+        none(&~db, "page", "home", 160, "not when its seconds have passed");
+        var built: StringBuilder := makeStringBuilder();
+        writeByte(&!built, 'a');
+        writeByte(&!built, 0);
+        writeByte(&!built, 'b');
+        let zero: String := finalize(built);
+        case cachePut(&~db, "page", "home", asSpan(&zero), 200, 60, 10) of
+            when Some(value as error: DbError) do
+                assertTrue(false, "a put of a zero byte failed");
+            when None do
+                skip;
+        end case;
+        destroyString(zero);
+        case cacheGet(&~db, "page", "home", 200) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as text: String) do
+                        assertTrue(length(&text) = 3, "a value with a zero byte, all three bytes");
+                        assertTrue((nthByte(&text, 0) = 'a') and ((nthByte(&text, 1) = 0) and (nthByte(&text, 2) = 'b')), "the zero byte in its place");
+                        destroyString(text);
+                    when None do
+                        assertTrue(false, "a value with a zero byte is found");
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a get of a zero byte failed");
+        end case;
+        put(&~db, "page", "home", "", 201, 60, 10);
+        gives(&~db, "page", "home", 201, "", "an empty value is a value, in place of the one before");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runMost(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        put(&~db, "s", "a", "A", 100, 600, 2);
+        put(&~db, "s", "b", "B", 100, 600, 2);
+        gives(&~db, "s", "a", 101, "A", "a is used after b");
+        put(&~db, "s", "c", "C", 102, 600, 2);
+        none(&~db, "s", "b", 103, "the third put drops b, used longest ago");
+        gives(&~db, "s", "a", 103, "A", "a stays");
+        gives(&~db, "s", "c", 103, "C", "c stays");
+        put(&~db, "s", "a", "A2", 104, 600, 2);
+        gives(&~db, "s", "c", 104, "C", "a put in place of a drops nothing");
+        gives(&~db, "s", "a", 104, "A2", "and a has its new value");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runRunOutFirst(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        put(&~db, "s", "old", "O", 100, 10, 2);
+        put(&~db, "s", "kept", "K", 100, 600, 2);
+        gives(&~db, "s", "kept", 101, "K", "kept is used after old");
+        gives(&~db, "s", "old", 102, "O", "and old after kept: old is the newest use");
+        put(&~db, "s", "new", "N", 200, 600, 2);
+        gives(&~db, "s", "kept", 201, "K", "the value that ran out went first, not the one used longest ago");
+        gives(&~db, "s", "new", 201, "N", "the new one is there");
+        case cacheClear(&~db, "s") of
+            when Right(right as dropped: Int64) do
+                assertTrue(dropped = 2, "two values were left in the scope");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the clear failed");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function runApart(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        put(&~db, "one", "k", "1", 100, 600, 1);
+        put(&~db, "two", "k", "2", 100, 600, 1);
+        gives(&~db, "one", "k", 101, "1", "the same key in two scopes is two values");
+        gives(&~db, "two", "k", 101, "2", "and the other");
+        put(&~db, "two", "j", "J", 102, 600, 1);
+        gives(&~db, "one", "k", 103, "1", "the most of a scope drops nothing of another");
+        none(&~db, "two", "k", 103, "but in its own");
+        case cacheDrop(&~db, "one", "k") of
+            when Right(right as there: Bool) do
+                assertTrue(there, "a drop of a value there says so");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the drop failed");
+        end case;
+        case cacheDrop(&~db, "one", "k") of
+            when Right(right as there: Bool) do
+                assertTrue(not there, "a second drop finds nothing");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the second drop failed");
+        end case;
+        none(&~db, "one", "k", 104, "a dropped value is gone");
+        case cacheClear(&~db, "one") of
+            when Right(right as dropped: Int64) do
+                assertTrue(dropped = 0, "a clear of an empty scope drops 0");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the clear failed");
+        end case;
+        gives(&~db, "two", "j", 105, "J", "and leaves the other scope");
+        return nil;
+    end;
+
+    -- The number the statement counts, 0 when it fails.
+    generic [R: Region]
+    function counted(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Int64 is
+        var cursor: Cursor := start(&~db, sql, noValues());
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return 0;
+            when None do
+                return count;
+        end case;
+    end;
+
+    -- The use of every value of a scope is its own number, after puts and a get: two values with one
+    -- number would leave the choice of the one to drop to the order the rows lie in.
+    generic [R: Region]
+    function runDistinctUses(db: &![Database[Writing], R]): Unit is
+        prepared(&~db);
+        put(&~db, "page", "a", "A", 100, 60, 10);
+        put(&~db, "page", "b", "B", 101, 60, 10);
+        put(&~db, "page", "c", "C", 102, 60, 10);
+        gives(&~db, "page", "b", 103, "B", "a value read back");
+        assertTrue(counted(&~db, "SELECT count(*) FROM wolly_cache WHERE scope = 'page'") = 3, "three values in the scope");
+        assertTrue(counted(&~db, "SELECT count(DISTINCT used) FROM wolly_cache WHERE scope = 'page'") = 3, "each with a use of its own");
+        return nil;
+    end;
+
+    function inMemory(which: Nat8): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                if which = 0 then
+                    runTime(&!db);
+                end if;
+                if which = 1 then
+                    runMost(&!db);
+                end if;
+                if which = 2 then
+                    runRunOutFirst(&!db);
+                end if;
+                if which = 3 then
+                    runApart(&!db);
+                end if;
+                if which = 4 then
+                    runDistinctUses(&!db);
+                end if;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "no test database");
+        end case;
+        return nil;
+    end;
+
+    function testTime(): Unit is
+        inMemory(0);
+        return nil;
+    end;
+
+    function testMost(): Unit is
+        inMemory(1);
+        return nil;
+    end;
+
+    function testRunOutFirst(): Unit is
+        inMemory(2);
+        return nil;
+    end;
+
+    function testApart(): Unit is
+        inMemory(3);
+        return nil;
+    end;
+
+    function testDistinctUses(): Unit is
+        inMemory(4);
+        return nil;
+    end;
+end module body.

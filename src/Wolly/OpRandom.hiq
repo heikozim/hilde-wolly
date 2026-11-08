@@ -1,0 +1,103 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex,
+    toLower,
+    constantTimeEqual
+);
+import Standard.Base32 (
+    encodeBase32Unpadded
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha256
+);
+
+module body Wolly.OpRandom is
+    -- One base32 text of 16 random bytes, 26 characters.
+    function oneText(): Option[String] is
+        case randomBytes(16) of
+            when Some(value as raw: String) do
+                let text: String := encodeBase32Unpadded(asSpan(&raw));
+                destroyString(raw);
+                return Some(value => text);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function randomToken(): Option[String] is
+        case oneText() of
+            when Some(value as first: String) do
+                case oneText() of
+                    when Some(value as second: String) do
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, asSpan(&first));
+                        writeString(&!out, asSpan(&second));
+                        destroyString(first);
+                        destroyString(second);
+                        return Some(value => finalize(out));
+                    when None do
+                        destroyString(first);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function randomId(): Option[String] is
+        case oneText() of
+            when Some(value as text: String) do
+                let lower: String := toLower(asSpan(&text));
+                destroyString(text);
+                return Some(value => lower);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [T: Region]
+    function tokenHash(token: Span[Nat8, T]): String is
+        case sha256(token) of
+            when Some(value as sum: String) do
+                let hex: String := bytesToHex(asSpan(&sum));
+                destroyString(sum);
+                return hex;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    generic [T: Region, H: Region]
+    function tokenMatches(token: Span[Nat8, T], hash: Span[Nat8, H]): Bool is
+        if (spanLength(token) = 0) or (spanLength(hash) /= 64) then
+            return false;
+        end if;
+        let made: String := tokenHash(token);
+        let same: Bool := constantTimeEqual(asSpan(&made), hash);
+        destroyString(made);
+        return same;
+    end;
+end module body.

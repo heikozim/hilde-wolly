@@ -1,0 +1,215 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.Text (
+    contains,
+    startsWith,
+    equal
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Response (
+    makeResponse,
+    finish
+);
+import Wolly.Router (
+    Route,
+    matches,
+    param,
+    routeParam,
+    dispatch
+);
+
+module body Wolly.Router.Test is
+
+    function gives(found: Option[String], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as text: String) do
+                let same: Bool := equal(asSpan(&text), wanted);
+                if not same then
+                    printLn(asSpan(&text));
+                end if;
+                destroyString(text);
+                assertTrue(same, message);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function none(found: Option[String], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as text: String) do
+                printLn(asSpan(&text));
+                destroyString(text);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function testMatches(): Unit is
+        assertTrue(matches("/", "/"), "the root");
+        assertFalse(matches("/", "/a"), "the root is not every path");
+        assertTrue(matches("/a/b", "/a/b"), "two literal segments");
+        assertFalse(matches("/a/b", "/a/c"), "another last segment");
+        assertFalse(matches("/a/b", "/a"), "a shorter path");
+        assertFalse(matches("/a", "/a/b"), "a longer path");
+        assertFalse(matches("/a", "/a/"), "a trailing slash is another path");
+        assertTrue(matches("/a/", "/a/"), "a trailing slash on both");
+        assertTrue(matches("/user/:id", "/user/42"), "a parameter");
+        assertFalse(matches("/user/:id", "/user/"), "a parameter is never empty");
+        assertFalse(matches("/user/:id", "/user/42/x"), "a parameter is one segment");
+        assertTrue(matches("/user/:id/edit", "/user/7/edit"), "a parameter in the middle");
+        assertTrue(matches("/files/*", "/files/"), "a wildcard fits the empty rest");
+        assertTrue(matches("/files/*", "/files/a/b/c"), "a wildcard fits several segments");
+        assertFalse(matches("/files/*", "/files"), "the wildcard needs its slash");
+        assertFalse(matches("/a/*/b", "/a/x/b"), "a star inside is a literal segment");
+        assertTrue(matches("/a/*/b", "/a/*/b"), "and fits only itself");
+        assertTrue(matches("/a%2Fb", "/a%2Fb"), "an encoded slash is part of a segment");
+        assertFalse(matches("/a/b", "/a%2Fb"), "and never a separator");
+        assertFalse(matches("", "/"), "an empty pattern fits nothing");
+        assertFalse(matches("/", ""), "an empty path is fitted by nothing");
+        assertFalse(matches("a", "a"), "a pattern must begin with a slash");
+        return nil;
+    end;
+
+    function testParam(): Unit is
+        gives(param("/user/:id", "/user/42", "id"), "42", "the segment of a parameter");
+        gives(param("/a/:x/b/:y", "/a/1/b/2", "y"), "2", "the second of two");
+        gives(param("/hello/:name", "/hello/a%20b", "name"), "a b", "a parameter is decoded");
+        gives(param("/hello/:name", "/hello/a%2Fb", "name"), "a/b", "an encoded slash comes back as a slash");
+        gives(param("/files/*", "/files/x/y", "*"), "x/y", "the rest of a wildcard");
+        gives(param("/files/*", "/files/", "*"), "", "an empty rest");
+        none(param("/user/:id", "/user/42", "name"), "a name the pattern does not have");
+        none(param("/user/:id", "/team/42", "id"), "a pattern that does not fit");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, Static]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    function fakeRequest(verb: Span[Nat8, Static], uri: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        if spanLength(verb) > 0 then
+            addPair(&!params, "REQUEST_METHOD", verb);
+        end if;
+        addPair(&!params, "REQUEST_URI", uri);
+        let block: String := finalize(params);
+        var empty: StringBuilder := makeStringBuilder();
+        return makeRequest(block, finalize(empty));
+    end;
+
+    function answerList(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(200, "text/plain"), "list");
+    end;
+
+    function answerCreate(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(201, "text/plain"), "created");
+    end;
+
+    function answerItem(request: Request): String is
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, "item ");
+        case routeParam(&request, "/items/:id", "id") of
+            when Some(value as id: String) do
+                writeString(&!text, asSpan(&id));
+                destroyString(id);
+            when None do
+                writeString(&!text, "none");
+        end case;
+        destroyRequest(request);
+        let shown: String := finalize(text);
+        let output: String := finish(makeResponse(200, "text/plain"), asSpan(&shown));
+        destroyString(shown);
+        return output;
+    end;
+
+    function answerFirst(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(200, "text/plain"), "first");
+    end;
+
+    function answerSecond(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(200, "text/plain"), "second");
+    end;
+
+    function route(verb: Span[Nat8, Static], uri: Span[Nat8, Static]): String is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/items", handler => answerList));
+        insertBack(&!routes, Route(verb => "POST", pattern => "/items", handler => answerCreate));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/items/:id", handler => answerItem));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/twice", handler => answerFirst));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/twice", handler => answerSecond));
+        let output: String := dispatch(fakeRequest(verb, uri), &routes);
+        destroyFree(routes);
+        return output;
+    end;
+
+    function answers(output: String, status: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let good: Bool := startsWith(asSpan(&output), status) and contains(asSpan(&output), part);
+        if not good then
+            printLn(asSpan(&output));
+        end if;
+        destroyString(output);
+        assertTrue(good, message);
+        return nil;
+    end;
+
+    function testDispatch(): Unit is
+        answers(route("GET", "/items"), "Status: 200 ", "\r\n\r\nlist", "GET of the list");
+        answers(route("POST", "/items"), "Status: 201 ", "created", "POST to the same path, another route");
+        answers(route("GET", "/items/17?x=1"), "Status: 200 ", "item 17", "a parameter, the query cut off");
+        answers(route("HEAD", "/items"), "Status: 200 ", "list", "HEAD is answered by the GET route");
+        answers(route("GET", "/twice"), "Status: 200 ", "first", "the first route that fits wins");
+        answers(route("GET", "/nowhere"), "Status: 404 ", "not found", "no pattern fits");
+        answers(route("DELETE", "/items"), "Status: 405 ", "\r\nAllow: GET, POST\r\n", "405 with the methods that fit");
+        answers(route("PUT", "/items/3"), "Status: 405 ", "\r\nAllow: GET\r\n", "405 for a parameter route");
+        answers(route("", "/items"), "Status: 400 ", "bad request", "no method");
+        answers(route("GET", "items"), "Status: 400 ", "bad request", "a path without a slash");
+        return nil;
+    end;
+end module body.

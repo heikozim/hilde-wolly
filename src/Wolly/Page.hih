@@ -1,0 +1,109 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The arithmetic of a list shown in pages: which page is shown, how many
+there are, where the page starts in the list, and the pages before and
+after it.  Pages count from 1.  A page number from a request is never
+trusted: one that is no number, 0 or past the last page becomes the
+nearest page there is, so a request cannot ask for an offset beyond the
+list.
+"""
+module Wolly.Page is
+    """
+    One page of a list.  Free, so it copies; its slots are read through
+    the functions below.
+    """
+    type Page: Free;
+
+    """
+    The size of a page when none is given: 20.
+    """
+    function defaultSize(): Nat64
+        ensures result = 20;
+
+    """
+    The largest size of a page: 1000.  A larger one is cut to it, so that a
+    size taken from a request cannot ask for the whole list at once.
+    """
+    function largestSize(): Nat64
+        ensures result = 1000;
+
+    """
+    Page requested of a list of total items with size items a page.  A size
+    of 0 is defaultSize, one above largestSize is largestSize.  A page of 0
+    is the first page, one past the last page is the last.  An empty list
+    has one page, which is empty.
+    """
+    function makePage(requested: Nat64, total: Nat64, size: Nat64): Page
+        ensures (pageNumber(result) >= 1) and (pageNumber(result) <= pageCount(result));
+
+    """
+    The page number of a query value: its decimal number, or 1 when it is
+    empty, no number, 0 or too large for Nat64.
+    """
+    generic [R: Region]
+    function pageFrom(text: Span[Nat8, R]): Nat64
+        ensures result >= 1;
+
+    """
+    The number of the page, from 1.
+    """
+    function pageNumber(page: Page): Nat64
+        ensures (result >= 1) and (result <= pageCount(page));
+
+    """
+    The items a page holds, at most; the last page may hold fewer.
+    """
+    function pageSize(page: Page): Nat64
+        ensures (result >= 1) and (result <= largestSize());
+
+    """
+    The items of the whole list.
+    No contract: it gives back the total it was made with, any Nat64.
+    """
+    function itemCount(page: Page): Nat64;
+
+    """
+    The pages of the list, at least 1.
+    """
+    function pageCount(page: Page): Nat64
+        ensures result >= 1;
+
+    """
+    The position of the first item of the page in the list, from 0: what a
+    query takes as its offset, with pageSize as its limit.
+    No contract: the result is the product above; a bound would only
+    restate it.
+    """
+    function offset(page: Page): Nat64;
+
+    """
+    Whether there is a page before this one.
+    No contract: a comparison of two slots, which a clause would only
+    restate.
+    """
+    function hasPrevious(page: Page): Bool;
+
+    """
+    Whether there is a page after this one.
+    No contract: a comparison of two slots, which a clause would only
+    restate.
+    """
+    function hasNext(page: Page): Bool;
+
+    """
+    The number of the page before, or of this one when it is the first.
+    """
+    function previousPage(page: Page): Nat64
+        ensures (result >= 1) and (result <= pageNumber(page));
+
+    """
+    The number of the page after, or of this one when it is the last.
+    """
+    function nextPage(page: Page): Nat64
+        ensures (result >= pageNumber(page)) and (result <= pageCount(page));
+end module.

@@ -1,0 +1,144 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The lines a collector of Wolly's log system keeps, in its
+SQLite database: each with the host and the file it came from, its time
+and its level, put into the full-text index of Standard.Search and into
+the sound index of Wolly.SoundSearch.  A search gives the lines that hold
+every word searched, best first, with the words found marked; a search by
+sound gives the lines with a word that sounds like one searched (Meier
+finds Mayer).
+
+A line is kept as it came, with each control byte but the tab written as
+a space, and at most mostLineBytes of it.  The key of a line in both
+indexes is its number in decimal.  pruneLines takes old lines out of the
+table and of both indexes.
+"""
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction
+);
+import Standard.Search (
+    SearchError,
+    SearchHit
+);
+
+module Wolly.LogStore is
+    """
+    The most bytes of a line that are kept: 16384.
+    """
+    function mostLineBytes(): Index
+        ensures result = 16384;
+
+    """
+    Whether level may be the level of a line: 1 to 16 letters a to z.
+    No contract: a test of outside input; false is its answer for a bad
+    one.
+    """
+    generic [L: Region]
+    function isLevel(level: Span[Nat8, L]): Bool;
+
+    """
+    Whether source may name the file a line came from: 1 to 255 bytes, none
+    a control byte.
+    No contract: a test of outside input; false is its answer for a bad
+    one.
+    """
+    generic [S: Region]
+    function isSource(source: Span[Nat8, S]): Bool;
+
+    """
+    Makes the table of lines, the full-text index and the sound index, if
+    they are not there.  Fails when SQLite has no FTS5.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareLogStore(db: &![Database[Writing], R]): Either[SearchError, Unit];
+
+    """
+    Keeps the line and puts it into both indexes, in the caller's
+    transaction on db; Right its number.  Right None, and nothing kept,
+    when host is no host name (Wolly.Net), source no source, level no
+    level, or at below 0.  On Left the caller rolls the transaction back:
+    part of the line may be written.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, X: Region, H: Region, S: Region, L: Region, T: Region]
+    function keepLineIn(db: &![Database[Writing], R], transaction: &[Transaction, X], host: Span[Nat8, H],
+                        source: Span[Nat8, S], at: Int64, level: Span[Nat8, L], line: Span[Nat8, T]): Either[SearchError, Option[Int64]];
+
+    """
+    keepLineIn in a transaction of its own, committed when the line is
+    kept and rolled back otherwise.  Fails inside a transaction of the
+    caller.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, H: Region, S: Region, L: Region, T: Region]
+    function keepLine(db: &![Database[Writing], R], host: Span[Nat8, H], source: Span[Nat8, S], at: Int64,
+                      level: Span[Nat8, L], line: Span[Nat8, T]): Either[SearchError, Option[Int64]];
+
+    """
+    Gives line id the level level, in the table and in the title of its
+    document in the full-text index, in the caller's transaction on db;
+    Right true when it did, Right false when there is no line id or level
+    is no level.  On Left the caller rolls the transaction back.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, X: Region, L: Region]
+    function setLevelIn(db: &![Database[Writing], R], transaction: &[Transaction, X], id: Int64, level: Span[Nat8, L]): Either[SearchError, Bool];
+
+    """
+    The lines that hold every word of text, best first, at most limit after
+    offset (Standard.Search.search, limit 1 to 100), each with the key of
+    its line and the words found between <mark> and </mark>.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, T: Region]
+    function findLines(db: &![Database[Writing], R], text: Span[Nat8, T], limit: Int64, offset: Int64): Either[SearchError, Buffer[SearchHit]];
+
+    """
+    The keys of the lines with a word that sounds like a word of text in
+    German or English, ascending, at most limit (1 to 100).
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, T: Region]
+    function findLinesBySound(db: &![Database[Writing], R], text: Span[Nat8, T], limit: Int64): Either[DbError, Buffer[String]];
+
+    """
+    Line number key as one line of text: time, host, source, level and the
+    line, separated by tabs, ending in a line end; None when there is no
+    such line.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region]
+    function lineOf(db: &![Database[Writing], R], key: Span[Nat8, K]): Either[DbError, Option[String]];
+
+    """
+    Takes the lines from before the time before out of the table and both
+    indexes, at most 1000 in one call; Right how many.  A caller that has
+    more calls again until 0 comes back.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function pruneLines(db: &![Database[Writing], R], before: Int64): Either[SearchError, Int64];
+
+    """
+    The query of pruneLines with EXPLAIN QUERY PLAN in front, for SQLite:
+    its plan searches the index on the time of a line, so a prune with
+    nothing to take reads no table.
+    """
+    function oldLinesPlanSql(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+end module.

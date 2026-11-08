@@ -1,0 +1,52 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The version of a static file for its URL, so that a browser may keep the
+file for long and still fetches it again when it changes:
+/static/app.css becomes /static/app.css?v=<the first 16 hex digits of the
+SHA-256 of its content>.  The content, not the time or a build number: the
+query changes exactly when the file does.
+
+Hiawatha serves the files; Wolly
+reads them only to hash them.  A path is taken only when it names a file
+below the root without a way out: it starts with a slash, holds only
+letters, digits, dot, hyphen, underscore and slash, has no empty segment
+and no segment that starts with a dot (so neither . nor .. nor a hidden
+file), and no part of it is a symbolic link.  Hiawatha would not serve
+what is refused here either.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Asset is
+    """
+    The hex digits of the version: 16, the first 64 bits of the digest.
+    """
+    function versionDigits(): Index
+        ensures result = 16;
+
+    """
+    Whether path may name an asset below a root: 2 to 1024 bytes, a slash
+    first and no slash last, of a to z, A to Z, 0 to 9, dot, hyphen,
+    underscore and slash, without two slashes in a row and without a
+    slash followed by a dot.
+    No contract: the answer is a walk over path.
+    """
+    generic [P: Region]
+    function isAssetPath(path: Span[Nat8, P]): Bool;
+
+    """
+    The query that versions the file root followed by path: ?v= and the
+    first versionDigits hex digits of the SHA-256 of its content.  None
+    when root is empty, path is no asset path, a part of root and path is
+    a symbolic link, or the file cannot be read.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [R: Region, P: Region]
+    function assetVersion(root: Span[Nat8, R], path: Span[Nat8, P]): Option[String];
+end module.

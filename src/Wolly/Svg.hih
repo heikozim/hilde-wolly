@@ -1,0 +1,76 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Charts drawn on the server as SVG, for a page without a chart library and
+without script: a line, bars, and a tile with one number.  The arithmetic
+is that of Wolly.Chart, in integers, so the same values give the same
+picture on every machine.
+
+A chart has the size 600 by 200 in its viewBox and scales to the width the
+page gives it.  It names its parts with classes (wolly-chart, wolly-line,
+wolly-bar, wolly-axis, wolly-tile, wolly-up, wolly-down) and draws with
+currentColor, so the page's style sheet colours it, light or dark.  Every
+text in it is escaped; a chart carries its title as <title> and as the
+aria-label of role img, for a reader that cannot see it.
+
+Values are counts: 0 or more.  At most mostPoints of them are drawn; more
+are cut at the end.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Wolly.Chart (
+    mostChangeValue
+);
+
+module Wolly.Svg is
+    """
+    The most values a chart draws: 1000.
+    """
+    function mostPoints(): Index
+        ensures result = 1000;
+
+    """
+    The values as a line from left to right, scaled from the smallest to the
+    largest; one value is a dot in the middle, none an empty chart.  The
+    largest and the smallest value are written at the left edge.
+    """
+    generic [R: Region, T: Region]
+    function lineChart(values: &[Buffer[Int64], R], title: Span[Nat8, T]): String
+        ensures length(&result) > 0;
+
+    """
+    The values as bars from 0 to the largest, with the labels below them
+    when there are at most 31: labels holds one a line, in the order of the
+    values; a missing label is empty.
+    """
+    generic [R: Region, L: Region, T: Region]
+    function barChart(values: &[Buffer[Int64], R], labels: Span[Nat8, L], title: Span[Nat8, T]): String
+        ensures length(&result) > 0;
+
+    """
+    A tile: the value as people read it (Wolly.Chart.readableNumber) and the
+    label below it.
+    """
+    generic [L: Region]
+    function tile(label: Span[Nat8, L], value: Int64): String
+        requires value >= 0;
+
+    """
+    A tile that shows besides how far value lies from middle, in tenths
+    (Wolly.Chart.changeTenths), as +1.5 or -0.5 with the class wolly-up or
+    wolly-down, and nothing for no change.
+    """
+    generic [L: Region]
+    function tileWithChange(label: Span[Nat8, L], value: Int64, middle: Int64): String
+        requires (value >= 0) and (middle >= 0)
+        requires (value <= mostChangeValue()) and (middle <= mostChangeValue());
+end module.

@@ -1,0 +1,277 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Bunti, a two-dimensional colour code a camera reads, whose format is a
+sequence of the bases A, C, G and T; the colours are how it is shown
+(docs/bunti-format.md).  A cell holds one base, two bits: A 00,
+C 01, G 10, T 11, a byte four bases, the highest two bits first.
+
+A code is a square of size by size cells, size = 4 v + 17 for a version
+v from 1 to 60, with three finder patterns of black and white in three
+corners, a corner pattern in the fourth, four reference cells of the four
+bases beside each finder, and the data cells row by row from the top
+left.  The data cells begin and end with a copy of the header (version
+of the format, mode, level, length, CRC-32 of the payload, under a
+Reed-Solomon code of its own); between them lie the codewords of the
+payload, Reed-Solomon blocks of Wolly.BuntiRs at level L, M, Q or H, as
+bases of mode 1 (Plain) or mode 2 (Dna, Wolly.BuntiDna).
+
+Everything here works on bytes in and bytes out, with no file, network
+or clock: the pixels, SVG and PNG are made from the cells, and
+Wolly.BuntiScan reads the cells back from pixels.
+
+    case encodeBunti(asSpan(&text), Plain(), LevelM()) of
+        when Right(right as code: BuntiCode) do
+            let svg: String := buntiSvg(&code, 8);
+            -- ... show it; a camera's frame goes to Wolly.BuntiScan
+            destroyBunti(code);
+        when Left(left as error: BuntiError) do
+            -- TooLong, NoSeed
+    end case;
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Wolly.Bunti is
+    """
+    How the codewords become bases: Plain is mode 1, each byte its four
+    bases; Dna is mode 2, the bases a DNA synthesiser can write.
+    """
+    union BuntiMode: Free is
+        case Plain;
+        case Dna;
+    end;
+
+    """
+    The share of Reed-Solomon parity, after the levels of QR codes: a full
+    block of 255 bytes corrects 18 (L, 7 percent), 38 (M, 15), 64 (Q, 25)
+    or 77 (H, 30) wrong bytes.
+    """
+    union BuntiLevel: Free is
+        case LevelL;
+        case LevelM;
+        case LevelQ;
+        case LevelH;
+    end;
+
+    """
+    Why there is no code, or no payload.
+    """
+    union BuntiError: Free is
+        """
+        The payload does not fit a code of version 60 at this mode and
+        level, or is longer than 65535 bytes.
+        """
+        case TooLong;
+        """
+        Mode 2 found no seed that keeps its rules for a segment.
+        """
+        case NoSeed;
+        """
+        No code was found in the pixels, or not one of a size Bunti has.
+        """
+        case NotFound;
+        """
+        Neither copy of the header could be read.
+        """
+        case BadHeader;
+        """
+        A block of the payload has more wrong bytes than its parity
+        corrects.
+        """
+        case Damaged;
+        """
+        The payload does not have the CRC-32 of its header.
+        """
+        case BadChecksum;
+    end;
+
+    """
+    A code: its size and its cells.
+    """
+    type BuntiCode: Linear;
+
+    """
+    The value of a cell that is black, part of a finder or corner pattern:
+    4.  White is 5; a base is 0 to 3.
+    """
+    function blackCell(): Nat8
+        ensures result = 4;
+
+    """
+    The value of a white cell: 5.
+    """
+    function whiteCell(): Nat8
+        ensures result = 5;
+
+    """
+    Whether size is the size of a code: 4 v + 17 for v from 1 to 60.
+    No contract: any size may be asked; false is the answer for a bad one.
+    """
+    function isBuntiSize(size: Index): Bool;
+
+    """
+    The letters of the bases of bytes, four a byte: "Wolly" is
+    CCCTCGTTCGTACGTACTGC.
+    """
+    generic [R: Region]
+    function basesOfBytes(bytes: Span[Nat8, R]): String
+        ensures length(&result) = (spanLength(bytes) * 4);
+
+    """
+    The most bytes of payload a code of version can hold at mode and
+    level.
+    """
+    function buntiCapacity(version: Index, mode: BuntiMode, level: BuntiLevel): Index
+        requires (version >= 1) and (version <= 60);
+
+    """
+    The code of payload, of the smallest version it fits.
+    No contract: an Either over outside input; Left is its answer for a
+    payload that does not fit.
+    """
+    generic [R: Region]
+    function encodeBunti(payload: Span[Nat8, R], mode: BuntiMode, level: BuntiLevel): Either[BuntiError, BuntiCode];
+
+    """
+    The payload of code, checked by Reed-Solomon and the CRC-32 of its
+    header: never other bytes than were encoded, or an error.
+    No contract: an Either over cells from outside; Left is its answer for
+    a damaged code.
+    """
+    generic [C: Region]
+    function decodeBunti(code: &[BuntiCode, C]): Either[BuntiError, String];
+
+    """
+    The size of code in cells on a side.
+    No contract: it only gives the field back; what holds of it is a
+    matter of the constructors.
+    """
+    generic [C: Region]
+    function buntiSize(code: &[BuntiCode, C]): Index;
+
+    """
+    The cell at column x and row y: 0 to 3 a base, 4 black, 5 white; 5 for
+    a place outside the code.
+    No contract: the value is what the cells hold, set by more paths than
+    O(1) can follow.
+    """
+    generic [C: Region]
+    function buntiCell(code: &[BuntiCode, C], x: Index, y: Index): Nat8;
+
+    """
+    Sets the cell at column x and row y to value, 0 to 5; a place outside
+    the code is left alone.  For tests that damage a code, and for
+    Wolly.BuntiScan.
+    """
+    generic [C: Region]
+    function setBuntiCell(code: &![BuntiCode, C], x: Index, y: Index, value: Nat8): Unit
+        requires value <= 5;
+
+    """
+    A code of size cells on a side, every cell white, with its finder,
+    corner and reference cells: the frame Wolly.BuntiScan fills.  None for
+    a size that is no size of Bunti.
+    No contract: an Option over any size; None is its answer for a bad one.
+    """
+    function blankBunti(size: Index): Option[BuntiCode];
+
+    """
+    Whether the cell at column x and row y of a code of size is a data
+    cell (not a finder, corner or reference cell).
+    No contract: any place may be asked; false is the answer outside.
+    """
+    function isDataCell(size: Index, x: Index, y: Index): Bool;
+
+    """
+    The column and the row of reference cell k, 0 to 11, of a code of
+    size: k / 4 is the finder it lies beside (top left, top right, bottom
+    left), k mod 4 its base.
+    """
+    function referenceX(size: Index, k: Index): Index
+        requires k < 12;
+    function referenceY(size: Index, k: Index): Index
+        requires k < 12;
+
+    """
+    Whether one copy of the header of code reads and names its size: what
+    Wolly.BuntiScan takes as the sign that it read a code of the right size.
+    No contract: the answer is the work of decoding the header.
+    """
+    generic [C: Region]
+    function buntiHeaderReads(code: &[BuntiCode, C]): Bool;
+
+    """
+    The bases of the payload of code as letters, mode 1 or mode 2 as it was
+    made: the sequence that is the format, without the header and without
+    the cells that fill the rest.
+    No contract: what holds of the result costs more than O(1) to state.
+    """
+    generic [C: Region]
+    function buntiSequence(code: &[BuntiCode, C]): String;
+
+    """
+    The red of the colour of a cell value: A green, C blue, G yellow, T
+    red, black, white.
+    No contract: a table over every value; each Nat8 is a red.
+    """
+    function cellRed(value: Nat8): Nat8;
+
+    """
+    The green of the colour of a cell value, as cellRed.
+    No contract: a table over every value; each Nat8 is a green.
+    """
+    function cellGreen(value: Nat8): Nat8;
+
+    """
+    The blue of the colour of a cell value, as cellRed.
+    No contract: a table over every value; each Nat8 is a blue.
+    """
+    function cellBlue(value: Nat8): Nat8;
+
+    """
+    The pixels on a side of code drawn at scale pixels a cell, with the
+    quiet zone of 4 white cells around it.
+    """
+    generic [C: Region]
+    function pixelSide(code: &[BuntiCode, C], scale: Index): Index
+        requires (scale >= 1) and (scale <= 64);
+
+    """
+    The pixels of code at scale: red, green and blue of each, row by row,
+    pixelSide on a side.
+    """
+    generic [C: Region]
+    function buntiPixels(code: &[BuntiCode, C], scale: Index): String
+        requires (scale >= 1) and (scale <= 64);
+
+    """
+    The code as an SVG image, a cell scale units on a side, the quiet zone
+    included.
+    """
+    generic [C: Region]
+    function buntiSvg(code: &[BuntiCode, C], scale: Index): String
+        requires (scale >= 1) and (scale <= 64);
+
+    """
+    The code as a PNG at scale (Wolly.Image); None when it cannot be made.
+    """
+    generic [C: Region]
+    function buntiPng(code: &[BuntiCode, C], scale: Index): Option[String]
+        requires (scale >= 1) and (scale <= 64);
+
+    """
+    Frees code.
+    No contract: it only gives the value back.
+    """
+    function destroyBunti(code: BuntiCode): Unit;
+end module.

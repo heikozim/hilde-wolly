@@ -1,0 +1,24 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Wolly.Response (
+    Response,
+    addNumberHeader
+);
+
+module body Wolly.Ban is
+    function longestBanSeconds(): Int64 is
+        return 86400;
+    end;
+
+    function withBan(response: Response, seconds: Int64): Response is
+        var asked: Int64 := seconds;
+        if asked > longestBanSeconds() then
+            asked := longestBanSeconds();
+        end if;
+        return addNumberHeader(response, "X-Hiawatha-Ban", asked);
+    end;
+end module body.

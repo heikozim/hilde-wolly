@@ -1,0 +1,88 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Values an application keeps for a while, such as a page fragment that is
+costly to make, in its SQLite database, until Hilde has a
+Standard.Cache: a handler of Wolly is a function
+of its request, with no state of its own, so a cache that holds across
+requests and processes lives where Wolly.Limit keeps its counts.
+
+A value is kept under a scope and a key for some seconds; once they have
+passed it is not given out again.  A scope holds at most most values: a put
+that would hold more drops the values that have run out first, then those
+used longest ago.  A get counts as a use.  A value holds at most
+mostCacheBytes; a key at most mostKeyBytes.  Each call is one transaction.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Cache is
+    """
+    The most bytes of a value: 1 MiB.
+    """
+    function mostCacheBytes(): Index
+        ensures result = 1048576;
+
+    """
+    The most bytes of a scope or a key: 255.
+    """
+    function mostKeyBytes(): Index
+        ensures result = 255;
+
+    """
+    Makes the table of the cache and its index, if they are not there.
+    None when both exist afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareCache(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Keeps value under key in scope from now for seconds (at most 100
+    years), in place of what was there, and drops values of scope until it holds at most most.
+    Fails with the error of SQLite, and then nothing is changed.
+    """
+    generic [R: Region, S: Region, K: Region, V: Region]
+    function cachePut(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K],
+                      value: Span[Nat8, V], now: Int64, seconds: Int64, most: Int64): Option[DbError]
+        requires (spanLength(scope) > 0) and (spanLength(scope) <= mostKeyBytes())
+        requires (spanLength(key) > 0) and (spanLength(key) <= mostKeyBytes())
+        requires spanLength(value) <= mostCacheBytes()
+        requires (now >= 0) and (now <= 4611686018427387903)
+        requires (seconds > 0) and (seconds <= 3153600000)
+        requires most > 0;
+
+    """
+    The value under key in scope, Some while its seconds have not passed at
+    now, None otherwise; a value given out counts as used.
+    """
+    generic [R: Region, S: Region, K: Region]
+    function cacheGet(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K],
+                      now: Int64): Either[DbError, Option[String]]
+        requires now >= 0;
+
+    """
+    Drops the value under key in scope; Right whether there was one.
+    """
+    generic [R: Region, S: Region, K: Region]
+    function cacheDrop(db: &![Database[Writing], R], scope: Span[Nat8, S], key: Span[Nat8, K]): Either[DbError, Bool]
+        requires (spanLength(scope) > 0) and (spanLength(scope) <= mostKeyBytes())
+        requires (spanLength(key) > 0) and (spanLength(key) <= mostKeyBytes());
+
+    """
+    Drops every value of scope; Right how many.
+    """
+    generic [R: Region, S: Region]
+    function cacheClear(db: &![Database[Writing], R], scope: Span[Nat8, S]): Either[DbError, Int64]
+        requires (spanLength(scope) > 0) and (spanLength(scope) <= mostKeyBytes());
+end module.

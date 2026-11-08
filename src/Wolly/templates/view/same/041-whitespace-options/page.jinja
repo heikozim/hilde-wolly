@@ -1,0 +1,17 @@
+<ul>
+  {% for i in items %}
+  <li>{{ i }}</li>
+  {% endfor %}
+</ul>
+  {# a comment on its own line #}
+<p>
+    {% if n > 3 %}
+    big
+    {% else %}
+    small
+    {% endif %}
+</p>
+  {%+ if true %}kept{% endif +%}
+after
+{% raw %}{{ raw }}{% endraw %}
+end

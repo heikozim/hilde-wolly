@@ -1,0 +1,26 @@
+# The mutations of Wolly.Vp8 and of lossy WebP with alpha in Wolly.Webp,
+# sourced by scripts/mutate.sh and scripts/mutate-target.sh.
+mutations+=(
+	"Vp8.hiq|s/        let split: Index := ((span \* prob) \/ 256) + 1;/        let split: Index := ((span * prob) \/ 256) + 2;/|the boolean decoder splits its range one too high"
+	"Vp8.hiq|s/        while span < 127 do/        while span < 126 do/|the range normalised one step short"
+	"Vp8.hiq|s/        let table: Span\[Nat8, Static\] := \"0001040805020306090c0d0a070b0e0f\";/        let table: Span[Nat8, Static] := \"0001040805020306090c0d0a070b0f0e\";/|the last two coefficients of the zigzag swapped"
+	"Vp8.hiq|s/            var y2: Index := (dequantAc(clip127(q + y2Ac)) \* 155) \/ 100;/            var y2: Index := (dequantAc(clip127(q + y2Ac)) * 156) \/ 100;/|the Y2 AC factor 156 \/ 100"
+	"Vp8.hiq|s/                segment := readUint(data, \&~parts, 0, p2, 1) + 2;/                segment := readUint(data, \&~parts, 0, p2, 1) + 1;/|segments 2 and 3 read as 1 and 2"
+	"Vp8.hiq|s/            quiet := readBit(data, \&~parts, 0, nth(\&head, skipProbAt));/            quiet := false;/|the skip flag of a macroblock not read"
+	"Vp8.hiq|s/                            v := (v + 3) + (power(category) \* 8);/                            v := (v + 3) + (power(category) * 4);/|the large coefficient categories with half their base"
+	"Vp8.hiq|s/            let dc: Int64 := nth(\&m, i \* 4) + (3 : Int64);/            let dc: Int64 := nth(\&m, i * 4) + (4 : Int64);/|the WHT rounded with 4"
+	"Vp8.hiq|s/            let dc: Int64 := nth(\&m, j) + (4 : Int64);/            let dc: Int64 := nth(\&m, j) + (3 : Int64);/|the inverse DCT rounded with 3"
+	"Vp8.hiq|s/        let c1: Int64 := 85627;/        let c1: Int64 := 85626;/|the DCT constant c1 one less"
+	"Vp8.hiq|s/                let l: Int64 := signed(get(\&work, y + j, x - 1)) - signed(a);/                let l: Int64 := signed(get(\&work, y + j, x - 1)) - signed(b);/|TM of a 4x4 block from the pixel above, not above left"
+	"Vp8.hiq|s/            let v0: Index := avg3(a, b, c);/            let v0: Index := avg3(b, b, c);/|VE of a 4x4 block without the corner"
+	"Vp8.hiq|s/            fill4(\&~work, y, x, pq, pqr, qr, qrs, qr, qrs, rs, rss, rs, rss, s, s, s, s, s, s);/            fill4(\&~work, y, x, pqr, pq, qr, qrs, qr, qrs, rs, rss, rs, rss, s, s, s, s, s, s);/|HU with its first two pixels swapped"
+	"Vp8.hiq|s/                return predDcTopLeft;/                return predDcLeft;/|the top left macroblock predicted from a left it does not have"
+	"Vp8.hiq|s/                        let a1: Int64 := shift((a \* (27 : Int64)) + (63 : Int64), 7);/                        let a1: Int64 := shift((a * (26 : Int64)) + (63 : Int64), 7);/|the 6-pixel filter weights 26 for p0 and q0"
+	"Vp8.hiq|s/                            filter2(\&~planeY, 16, level + 4, y, strideY, 1);/                            filter2(\&~planeY, 16, level + 3, y, strideY, 1);/|the simple filter at a macroblock edge one level weaker"
+	"Vp8.hiq|s/        storeNth(\&~out, at, clip8(luma, multHigh(v, 26149), 14234));/        storeNth(\&~out, at, clip8(luma, multHigh(v, 26149), 14235));/|red one sixty-fourth level darker"
+	"Vp8.hiq|s/        let diagonal: Index := (average + ((b + c) \* 2)) \/ 8;/        let diagonal: Index := (average + ((a + d) * 2)) \/ 8;/|chroma upsampled along the other diagonal"
+	"Webp.hiq|s/                hasAlpha := true;/                hasAlpha := false;/|the ALPH chunk ignored"
+	"Webp.hiq|s/                let green: Index := channel(nth(\&alpha, i), 1);/                let green: Index := channel(nth(\&alpha, i), 0);/|the alpha taken from the blue of its image stream"
+	"Webp.hiq|s/                                prediction := sum - aboveLeft;/                                prediction := sum;/|the gradient filter without the pixel above left"
+	"Webp.hiq|s/                            prediction := above;/                            prediction := left;/|the vertical filter from the left"
+)

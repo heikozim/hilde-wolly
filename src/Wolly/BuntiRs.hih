@@ -1,0 +1,112 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Reed-Solomon codes over GF(256) for Wolly.Bunti (docs/bunti-format.md):
+the field of the polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11D), the
+primitive element 2, the generator polynomial with the roots 2^0 to
+2^(parity - 1), as QR codes have them.  A block is its data bytes followed
+by parity bytes, at most 255 bytes in all; the first byte is the
+coefficient of the highest power.
+
+rsCorrect finds and corrects up to parity / 2 wrong bytes of a block
+(Berlekamp-Massey, Chien search, Forney); a block whose locator does not
+have as many roots in the block as it says errors is left as it was and
+answered None.  Beyond parity / 2 a block may be taken for another one, as
+with every code of that distance: two parity bytes do so often, Wolly.Bunti
+puts a CRC-32 over the payload for that.
+
+    var block: Buffer[Nat8] := ...;  -- data bytes
+    let parity: Buffer[Nat8] := rsParity(&block, 0, length(&block), 10);
+    -- append parity to block, send it, damage up to 5 bytes
+    case rsCorrect(&!block, 10) of
+        when Some(value as fixed: Index) do ...  -- block is whole again
+        when None do ...                         -- too many errors
+    end case;
+"""
+import Standard.Buffer (
+    Buffer,
+    length
+);
+
+module Wolly.BuntiRs is
+    """
+    The most bytes of a block: 255.
+    """
+    function mostBlockBytes(): Index
+        ensures result = 255;
+
+    """
+    The product of a and b in GF(256), each from 0 to 255.
+    """
+    function gfMultiply(a: Index, b: Index): Index
+        requires (a <= 255) and (b <= 255)
+        ensures result <= 255;
+
+    """
+    The parity bytes of the count bytes of data from first on: the
+    remainder of the data times x^parity divided by the generator
+    polynomial.  first + count is at most the length of data.
+    """
+    generic [R: Region]
+    function rsParity(data: &[Buffer[Nat8], R], first: Index, count: Index, parity: Index): Buffer[Nat8]
+        requires (parity >= 1) and ((count + parity) <= 255)
+        requires (first + count) <= length(data)
+        ensures length(&result) = parity;
+
+    """
+    The tables of the field and the generator polynomial of one parity,
+    made once for all the blocks of a code: rsParityWith and rsCorrectWith
+    do what rsParity and rsCorrect do, without making them again for
+    every block.
+    """
+    type RsCoder: Linear;
+
+    function makeRsCoder(parity: Index): RsCoder
+        requires (parity >= 1) and (parity <= 255)
+        ensures rsCoderParity(&result) = parity;
+
+    """
+    Frees the tables and the polynomial of coder.
+    No contract: it only gives the value back.
+    """
+    function destroyRsCoder(coder: RsCoder): Unit;
+
+    """
+    The parity coder was made for.
+    """
+    generic [C: Region]
+    function rsCoderParity(coder: &[RsCoder, C]): Index
+        ensures (result >= 1) and (result <= 255);
+
+    """
+    rsParity with the parity of coder.
+    """
+    generic [C: Region, R: Region]
+    function rsParityWith(coder: &[RsCoder, C], data: &[Buffer[Nat8], R], first: Index, count: Index): Buffer[Nat8]
+        requires (count + rsCoderParity(coder)) <= 255
+        requires (first + count) <= length(data)
+        ensures length(&result) = rsCoderParity(coder);
+
+    """
+    rsCorrect with the parity of coder.
+    No contract: the answer is an Option whose number is bounded only by
+    what the block held; the block itself is the result, and the tests
+    check it.
+    """
+    generic [C: Region, R: Region]
+    function rsCorrectWith(coder: &[RsCoder, C], block: &![Buffer[Nat8], R]): Option[Index];
+
+    """
+    Corrects block, its data followed by parity parity bytes, in place;
+    Some the number of bytes it changed (0 for a whole block), None when
+    the block holds more wrong bytes than it can find, and then block is
+    as it was.
+    """
+    generic [R: Region]
+    function rsCorrect(block: &![Buffer[Nat8], R], parity: Index): Option[Index]
+        requires (parity >= 1) and (parity < 255);
+end module.

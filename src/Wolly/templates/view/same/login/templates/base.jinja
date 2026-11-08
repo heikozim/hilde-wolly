@@ -1,0 +1,19 @@
+{#
+Part of Wolly, a web framework in Hilde.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The layout of every page of the example.  The compiler resolves extends
+and the blocks when the programme is built; nothing is read at run time.
+-#}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}Wolly{% endblock %}</title>
+</head>
+<body>
+{% block content %}{% endblock %}
+</body>
+</html>

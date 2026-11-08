@@ -1,0 +1,87 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Wolly.Page (
+    Page,
+    defaultSize,
+    largestSize,
+    makePage,
+    pageFrom,
+    pageNumber,
+    pageSize,
+    itemCount,
+    pageCount,
+    offset,
+    hasPrevious,
+    hasNext,
+    previousPage,
+    nextPage
+);
+
+module body Wolly.Page.Test is
+    function testCounts(): Unit is
+        let empty: Page := makePage(1, 0, 20);
+        assertTrue((pageCount(empty) = 1) and (pageNumber(empty) = 1), "an empty list has one page");
+        assertTrue(offset(empty) = 0, "which starts at 0");
+        assertFalse(hasPrevious(empty) or hasNext(empty), "and has no neighbours");
+        let full: Page := makePage(1, 20, 20);
+        assertTrue(pageCount(full) = 1, "20 items of 20 a page are one page");
+        let over: Page := makePage(1, 21, 20);
+        assertTrue(pageCount(over) = 2, "21 items are two");
+        assertTrue(itemCount(over) = 21, "the items are kept");
+        return nil;
+    end;
+
+    function testRequestedPage(): Unit is
+        let zero: Page := makePage(0, 45, 20);
+        assertTrue(pageNumber(zero) = 1, "page 0 is the first");
+        let past: Page := makePage(4, 45, 20);
+        assertTrue(pageNumber(past) = 3, "a page past the last is the last");
+        assertTrue(offset(past) = 40, "the last page starts at 40");
+        let second: Page := makePage(2, 45, 20);
+        assertTrue(offset(second) = 20, "the second page starts at 20");
+        assertTrue(hasPrevious(second) and hasNext(second), "and has both neighbours");
+        assertTrue((previousPage(second) = 1) and (nextPage(second) = 3), "1 and 3");
+        let first: Page := makePage(1, 45, 20);
+        assertTrue(previousPage(first) = 1, "before the first is the first");
+        assertFalse(hasPrevious(first), "which has none before it");
+        assertTrue(nextPage(past) = 3, "after the last is the last");
+        assertFalse(hasNext(past), "which has none after it");
+        return nil;
+    end;
+
+    function testSizes(): Unit is
+        assertTrue(pageSize(makePage(1, 100, 0)) = defaultSize(), "size 0 is the default");
+        assertTrue(defaultSize() = 20, "which is 20");
+        assertTrue(pageSize(makePage(1, 5000, 1000)) = 1000, "the largest size stays");
+        assertTrue(pageSize(makePage(1, 5000, 1001)) = largestSize(), "one more is cut to it");
+        assertTrue(pageCount(makePage(1, 5000, 1001)) = 5, "and the pages follow the cut size");
+        return nil;
+    end;
+
+    function testLargestList(): Unit is
+        let most: Nat64 := 18446744073709551615;
+        let last: Page := makePage(most, most, 1000);
+        assertTrue(pageCount(last) = ((most / 1000) + 1), "the largest list counts its pages without overflow");
+        assertTrue(pageNumber(last) = pageCount(last), "its last page");
+        assertTrue(offset(last) <= most, "starts inside the list");
+        return nil;
+    end;
+
+    function testPageFrom(): Unit is
+        assertTrue(pageFrom("7") = 7, "a number");
+        assertTrue(pageFrom("") = 1, "empty is 1");
+        assertTrue(pageFrom("0") = 1, "0 is 1");
+        assertTrue(pageFrom("abc") = 1, "no number is 1");
+        assertTrue(pageFrom("-3") = 1, "a negative is 1");
+        assertTrue(pageFrom("99999999999999999999999") = 1, "too large is 1");
+        return nil;
+    end;
+end module body.

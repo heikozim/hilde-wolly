@@ -1,0 +1,72 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The audit log of Wolly.Auth, a file of JSON lines, rewritten in two cases.
+
+When a user is removed, every line whose user is that name gets a random
+pseudonym, deleted- and 16 hexadecimal digits, as its user and as its
+client; the event, the time and the outcome stay.  No table keeps which
+name a pseudonym stood for.  A retention run removes the lines that are
+older than retentionSeconds.
+
+Both read the whole log, write the new one beside it and rename it over
+the old one.  The caller holds a writing transaction of the database while
+it does, and Wolly.Auth writes each line only under one as well, waiting
+for it as long as it takes, so no line written in between is lost.  A line that is no JSON object is kept as it
+is.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.AuditLog is
+    """
+    How long a line is kept: 12 months, taken as 365 days, 31536000
+    seconds.
+    """
+    function retentionSeconds(): Int64
+        ensures result = 31536000;
+
+    """
+    A new pseudonym: deleted- and 16 lowercase hexadecimal digits from 8
+    random bytes.  None when the random source failed.
+    No contract: the outcome is the result of I/O, the random source.
+    """
+    function newPseudonym(): Option[String];
+
+    """
+    Writes pseudonym as the user and the client of every line of the log
+    at path whose user is name.  Some with the number of lines changed, 0
+    when there is no log or no such line; None when the log could not be
+    read, written or renamed, and then the log is as it was.  A line whose
+    user is name but that holds a value other than a string, a number, true,
+    false or null is not kept as it is: the whole call fails.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [P: Region, N: Region, S: Region]
+    function pseudonymize(path: Span[Nat8, P], name: Span[Nat8, N], pseudonym: Span[Nat8, S]): Option[Int64];
+
+    """
+    Removes from the log at path every line whose time lies more than
+    retentionSeconds before now.  Some with the number of lines removed, 0
+    when there is no log; None as for pseudonymize.  A line without a time
+    that can be read stays.
+    """
+    generic [P: Region]
+    function prune(path: Span[Nat8, P], now: Int64): Option[Int64]
+        requires now >= 0;
+
+    """
+    Appends one line of event to the log at path: the user, the client -,
+    the outcome and the number of lines it concerned.  Its own lines,
+    audit-pseudonymize and audit-prune, are written with it.  False when
+    the log could not be written.
+    No contract: the outcome is the result of I/O.
+    """
+    generic [P: Region, U: Region]
+    function note(path: Span[Nat8, P], event: Span[Nat8, Static], user: Span[Nat8, U], lines: Int64): Bool;
+end module.

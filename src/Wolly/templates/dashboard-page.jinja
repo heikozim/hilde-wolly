@@ -1,0 +1,37 @@
+{#
+Part of Wolly, a web framework in Hilde.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The page of Wolly.Dashboard: the fragments of the panels, made by
+dashboard-panel.jinja and escaped there, and top, HTML the caller made
+and escaped.  With refresh above 0 the browser loads the page again by
+itself.  With a script (liveDashboardPage) the page loads htmx
+from it, told by htmx-config to add no style of its own and to evaluate
+nothing, so that script-src 'self' and style-src 'self' hold; without
+script the browser loads the page again after quiet seconds.
+-#}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{% if refresh > 0 %}<meta http-equiv="refresh" content="{{ refresh }}">
+{% endif %}{% if script %}<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false}'>
+<script src="{{ script }}"></script>
+<noscript><meta http-equiv="refresh" content="{{ quiet }}"></noscript>
+{% endif %}<title>{{ title }}</title>
+<link rel="stylesheet" href="{{ style }}">
+</head>
+<body class="wolly-dashboard">
+<header class="wolly-head">
+<h1>{{ title }}</h1>
+<p>as of <time datetime="{{ generated }}">{{ generated }}</time></p>
+</header>
+{{ top|safe }}
+<main class="wolly-panels">
+{% for panel in panels %}{{ panel|safe }}
+{% endfor %}</main>
+</body>
+</html>

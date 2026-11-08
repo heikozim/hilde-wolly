@@ -1,0 +1,115 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    asSpan
+);
+import Standard.Cookie (
+    strictOptions
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    addCookie,
+    wasRefused,
+    finish,
+    isHeaderValue
+);
+
+import Standard.Text (
+    equal
+);
+
+module body Wolly.Response.Test is
+
+    function gives(output: String, wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let same: Bool := equal(asSpan(&output), wanted);
+        if not same then
+            printLn(asSpan(&output));
+        end if;
+        destroyString(output);
+        assertTrue(same, message);
+        return nil;
+    end;
+
+    function testPlain(): Unit is
+        gives(finish(makeResponse(200, "text/plain"), "hi"),
+              "Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nhi", "status, type, empty line, body");
+        gives(finish(makeResponse(404, "text/plain"), ""),
+              "Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\n", "an empty body");
+        return nil;
+    end;
+
+    function testHeaders(): Unit is
+        let one: Response := addHeader(makeResponse(200, "text/html"), "X-Frame-Options", "DENY");
+        let two: Response := addHeader(one, "Cache-Control", "no-store");
+        assertFalse(wasRefused(&two), "two good headers");
+        gives(finish(two, "<p>"),
+              "Status: 200 OK\r\nContent-Type: text/html\r\nX-Frame-Options: DENY\r\nCache-Control: no-store\r\n\r\n<p>",
+              "the headers between the type and the empty line");
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        let failed: Span[Nat8, Static] := "Status: 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\ninternal server error\n";
+        let crlf: Response := addHeader(makeResponse(200, "text/plain"), "X-A", "a\r\nSet-Cookie: evil=1");
+        assertTrue(wasRefused(&crlf), "CR LF in a value is refused");
+        gives(finish(crlf, "secret"), failed, "a refused header gives 500 and no body");
+        gives(finish(addHeader(makeResponse(200, "text/plain"), "X-A", "a\nb"), "x"), failed, "a bare LF");
+        gives(finish(addHeader(makeResponse(200, "text/plain"), "X A", "b"), "x"), failed, "a name with a space");
+        gives(finish(addHeader(makeResponse(200, "text/plain"), "X:A", "b"), "x"), failed, "a name with a colon");
+        gives(finish(addHeader(makeResponse(200, "text/plain"), "", "b"), "x"), failed, "an empty name");
+        gives(finish(addHeader(makeResponse(200, "text/plain"), "status", "302"), "x"), failed, "a second Status");
+        gives(finish(addHeader(makeResponse(200, "text/plain"), "Content-TYPE", "text/html"), "x"), failed,
+              "a second Content-Type");
+        -- One refused header spoils the response, whatever came after it.
+        let spoiled: Response := addHeader(addHeader(makeResponse(200, "text/plain"), "X-A", "a\rb"), "X-B", "fine");
+        assertTrue(wasRefused(&spoiled), "a refusal stays");
+        gives(finish(spoiled, "x"), failed, "the later good header does not repair it");
+        return nil;
+    end;
+
+    function oneByte(byte: Nat8, message: Span[Nat8, Static]): Unit is
+        let text: String := makeString(1, byte);
+        let accepted: Bool := isHeaderValue(asSpan(&text));
+        destroyString(text);
+        assertFalse(accepted, message);
+        return nil;
+    end;
+
+    function testValues(): Unit is
+        assertTrue(isHeaderValue(""), "empty");
+        assertTrue(isHeaderValue("a\tb ~"), "tab, space, tilde");
+        oneByte(127, "DEL");
+        oneByte(0, "NUL");
+        oneByte(31, "unit separator");
+        oneByte(128, "a byte above 126");
+        oneByte(255, "the last byte");
+        let tilde: String := makeString(1, 126);
+        assertTrue(isHeaderValue(asSpan(&tilde)), "126, the last printable byte");
+        destroyString(tilde);
+        return nil;
+    end;
+
+    function testCookie(): Unit is
+        gives(finish(addCookie(makeResponse(200, "text/plain"), "visits", "3", "/", strictOptions()), ""),
+              "Status: 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: visits=3; Path=/; Secure; HttpOnly; SameSite=Strict\r\n\r\n",
+              "a Set-Cookie line");
+        let bad: Response := addCookie(makeResponse(200, "text/plain"), "visits", "3; Domain=evil.example", "/", strictOptions());
+        assertTrue(wasRefused(&bad), "a cookie value that starts an attribute is refused");
+        let output: String := finish(bad, "");
+        destroyString(output);
+        return nil;
+    end;
+end module body.

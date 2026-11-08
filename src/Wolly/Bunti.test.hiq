@@ -1,0 +1,676 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The bases of the vectors of docs/bunti-format.md; every payload length
+-- from 0 to 4096 with all 256 byte values, in both modes and at all four
+-- levels, encoded and decoded again; cells damaged at random up to the
+-- capacity of each block and corrected exactly, one byte more refused;
+-- the header read from its second copy; the drawing.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    contains
+);
+import Wolly.Bunti (
+    BuntiCode,
+    BuntiMode,
+    Plain,
+    Dna,
+    BuntiLevel,
+    LevelL,
+    LevelM,
+    LevelQ,
+    LevelH,
+    BuntiError,
+    TooLong,
+    NoSeed,
+    NotFound,
+    BadHeader,
+    Damaged,
+    BadChecksum,
+    blackCell,
+    whiteCell,
+    isBuntiSize,
+    basesOfBytes,
+    buntiCapacity,
+    encodeBunti,
+    decodeBunti,
+    buntiSize,
+    buntiCell,
+    setBuntiCell,
+    isDataCell,
+    referenceX,
+    referenceY,
+    buntiSequence,
+    pixelSide,
+    buntiPixels,
+    buntiSvg,
+    buntiPng,
+    destroyBunti
+);
+import Wolly.BuntiDna (
+    segmentBytes,
+    longestRun
+);
+
+module body Wolly.Bunti.Test is
+    function next(state: Nat32): Nat32 is
+        return modularAdd(modularMultiply(state, (1664525 : Nat32)), (1013904223 : Nat32));
+    end;
+
+    function below(state: Nat32, bound: Index): Index is
+        case toIndex(state / 65536) of
+            when Some(value as high: Index) do
+                return high - ((high / bound) * bound);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [S: Region]
+    function byteIn(text: &[String, S], at: Index): Nat8 is
+        let all: Span[Nat8, S] := asSpan(text);
+        return all[at];
+    end;
+
+    function basesAre(text: Span[Nat8, Static], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let bases: String := basesOfBytes(text);
+        assertTrue(equal(asSpan(&bases), wanted), message);
+        destroyString(bases);
+        return nil;
+    end;
+
+    function testVectors(): Unit is
+        basesAre("Wolly", "CCCTCGTTCGTACGTACTGC", "Wolly");
+        basesAre("Hilde", "CAGACGGCCGTACGCACGCC", "Hilde");
+        basesAre("W", "CCCT", "W");
+        basesAre("w", "CTCT", "w");
+        basesAre("", "", "nothing");
+        assertTrue(isBuntiSize(21) and isBuntiSize(257), "the smallest and the largest size");
+        assertFalse(isBuntiSize(22) or isBuntiSize(261), "no other");
+        assertTrue((blackCell() = 4) and (whiteCell() = 5), "black and white");
+        return nil;
+    end;
+
+    -- The payload of length count: byte i is (7 i + count) mod 256, so a
+    -- payload of 256 bytes and more holds every byte value.
+    function payloadOf(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            let value: Index := (i * 7) + count;
+            writeByte(&!out, narrow(value - ((value / 256) * 256)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Whether payload comes back from its code at mode and level.
+    function roundTrip(count: Index, mode: BuntiMode, level: BuntiLevel): Bool is
+        let payload: String := payloadOf(count);
+        var good: Bool := false;
+        case encodeBunti(asSpan(&payload), mode, level) of
+            when Right(right as code: BuntiCode) do
+                case decodeBunti(&code) of
+                    when Right(right as back: String) do
+                        good := equal(asSpan(&back), asSpan(&payload));
+                        destroyString(back);
+                    when Left(left as error: BuntiError) do
+                        skip;
+                end case;
+                destroyBunti(code);
+            when Left(left as error: BuntiError) do
+                skip;
+        end case;
+        destroyString(payload);
+        return good;
+    end;
+
+    -- The lengths of the fast round trip: 0 to 40, the edges of a block
+    -- and of a segment, and 4096.
+    function roundTripsChosen(mode: BuntiMode, level: BuntiLevel, message: Span[Nat8, Static]): Unit is
+        var good: Index := 0;
+        var cases: Index := 0;
+        var count: Index := 0;
+        while count <= 40 do
+            cases := cases + 1;
+            if roundTrip(count, mode, level) then
+                good := good + 1;
+            end if;
+            count := count + 1;
+        end while;
+        var more: Index := 0;
+        while more < 9 do
+            var n: Index := 100;
+            if more = 1 then
+                n := (101 : Index);
+            end if;
+            if more = 2 then
+                n := (127 : Index);
+            end if;
+            if more = 3 then
+                n := (128 : Index);
+            end if;
+            if more = 4 then
+                n := (179 : Index);
+            end if;
+            if more = 5 then
+                n := (219 : Index);
+            end if;
+            if more = 6 then
+                n := (220 : Index);
+            end if;
+            if more = 7 then
+                n := (1000 : Index);
+            end if;
+            if more = 8 then
+                n := (4096 : Index);
+            end if;
+            cases := cases + 1;
+            if roundTrip(n, mode, level) then
+                good := good + 1;
+            end if;
+            more := more + 1;
+        end while;
+        assertTrue((cases = 50) and (good = cases), message);
+        return nil;
+    end;
+
+    function testRoundTrips(): Unit is
+        roundTripsChosen(Plain(), LevelL(), "mode 1 level L");
+        roundTripsChosen(Plain(), LevelM(), "mode 1 level M");
+        roundTripsChosen(Plain(), LevelQ(), "mode 1 level Q");
+        roundTripsChosen(Plain(), LevelH(), "mode 1 level H");
+        roundTripsChosen(Dna(), LevelL(), "mode 2 level L");
+        roundTripsChosen(Dna(), LevelM(), "mode 2 level M");
+        roundTripsChosen(Dna(), LevelQ(), "mode 2 level Q");
+        roundTripsChosen(Dna(), LevelH(), "mode 2 level H");
+        return nil;
+    end;
+
+    ---
+    --- Reed-Solomon in the code
+    ---
+
+    -- The parity bytes of each block, the blocks and the codewords, as
+    -- docs/bunti-format.md gives them, computed here once more.
+    function fullParity(level: Index): Index is
+        if level = 0 then
+            return 36;
+        end if;
+        if level = 1 then
+            return 76;
+        end if;
+        if level = 2 then
+            return 128;
+        end if;
+        return 154;
+    end;
+
+    function blocksOf(count: Index, level: Index): Index is
+        let most: Index := (255 : Index) - fullParity(level);
+        return (count + (most - 1)) / most;
+    end;
+
+    function parityOf(count: Index, level: Index): Index is
+        let blocks: Index := blocksOf(count, level);
+        let longest: Index := (count + (blocks - 1)) / blocks;
+        let full: Index := fullParity(level);
+        let most: Index := (255 : Index) - full;
+        var parity: Index := ((longest * full) + (most - 1)) / most;
+        if (parity - ((parity / 2) * 2)) = 1 then
+            parity := parity + 1;
+        end if;
+        if parity < 2 then
+            parity := (2 : Index);
+        end if;
+        return parity;
+    end;
+
+    -- The place in the codewords of byte j of block i (data first, then
+    -- parity).
+    function placeOf(count: Index, level: Index, i: Index, j: Index): Index is
+        let blocks: Index := blocksOf(count, level);
+        let short: Index := count / blocks;
+        let longer: Index := count - (short * blocks);
+        var size: Index := short;
+        if i < longer then
+            size := size + 1;
+        end if;
+        if j < size then
+            if j < short then
+                return (j * blocks) + i;
+            end if;
+            return (short * blocks) + i;
+        end if;
+        return (count + ((j - size) * blocks)) + i;
+    end;
+
+    -- The base of the payload that holds base k of codeword c, in mode 2 or not.
+    function baseOf(dna: Bool, codewords: Index, c: Index, k: Index): Index is
+        if not dna then
+            return (c * 4) + k;
+        end if;
+        let segment: Index := c / 32;
+        let j: Index := c - (segment * 32);
+        var size: Index := codewords - (segment * 32);
+        if size > 32 then
+            size := (32 : Index);
+        end if;
+        var place: Index := ((segment * 140) + 4) + (j * 4);
+        if j >= (size / 2) then
+            place := place + 4;
+        end if;
+        return place + k;
+    end;
+
+    -- code with data cell n (counted from the first) changed to another base.
+    function changeDataCell(code: BuntiCode, n: Index, by: Index): BuntiCode is
+        var changing: BuntiCode := code;
+        let size: Index := buntiSize(&changing);
+        var seen: Index := 0;
+        var y: Index := 0;
+        while y < size do
+            var x: Index := 0;
+            while x < size do
+                if isDataCell(size, x, y) then
+                    if seen = n then
+                        case toIndex(buntiCell(&changing, x, y)) of
+                            when Some(value as old: Index) do
+                                let changed: Index := old + by;
+                                setBuntiCell(&!changing, x, y, narrow(changed - ((changed / 4) * 4)));
+                            when None do
+                                skip;
+                        end case;
+                    end if;
+                    seen := seen + 1;
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return changing;
+    end;
+
+    -- For a payload of count bytes at mode and level: wrong bases in parity
+    -- / 2 bytes of every block corrected to the payload; one byte more in
+    -- the first block refused.  Each byte gets one wrong base, at random.
+    function exerciseCapacity(count: Index, dna: Bool, mode: BuntiMode, level: BuntiLevel, l: Index, message: Span[Nat8, Static]): Unit is
+        let payload: String := payloadOf(count);
+        let blocks: Index := blocksOf(count, l);
+        let parity: Index := parityOf(count, l);
+        let codewords: Index := count + (blocks * parity);
+        let short: Index := count / blocks;
+        var state: Nat32 := 4242;
+        case encodeBunti(asSpan(&payload), mode, level) of
+            when Right(right as made: BuntiCode) do
+                var code: BuntiCode := made;
+                var first: Index := 0;
+                var i: Index := 0;
+                while i < blocks do
+                    -- parity / 2 bytes of block i, every other byte from a
+                    -- random start, so that they are distinct.
+                    let size: Index := short + parity;
+                    state := next(state);
+                    let start: Index := below(state, size);
+                    if i = 0 then
+                        first := start;
+                    end if;
+                    var e: Index := 0;
+                    while e < (parity / 2) do
+                        let j: Index := (start + (e * 2)) - (((start + (e * 2)) / size) * size);
+                        state := next(state);
+                        let c: Index := placeOf(count, l, i, j);
+                        code := changeDataCell(code, (64 : Index) + baseOf(dna, codewords, c, below(state, 4)), (1 : Index) + below(state, 3));
+                        e := e + 1;
+                    end while;
+                    i := i + 1;
+                end while;
+                case decodeBunti(&code) of
+                    when Right(right as back: String) do
+                        assertTrue(equal(asSpan(&back), asSpan(&payload)), message);
+                        destroyString(back);
+                    when Left(left as error: BuntiError) do
+                        assertTrue(false, message);
+                end case;
+                -- One byte more in block 0, one the changes left out: the byte
+                -- after the first changed, at an odd distance from all of them.
+                let size0: Index := short + parity;
+                let j0: Index := (first + 1) - (((first + 1) / size0) * size0);
+                let c0: Index := placeOf(count, l, 0, j0);
+                code := changeDataCell(code, (64 : Index) + baseOf(dna, codewords, c0, 0), 2);
+                case decodeBunti(&code) of
+                    when Right(right as back: String) do
+                        destroyString(back);
+                        assertTrue(false, "one wrong byte beyond the capacity: an error, never bytes");
+                    when Left(left as error: BuntiError) do
+                        assertTrue(true, "one wrong byte beyond the capacity: an error, never bytes");
+                end case;
+                destroyBunti(code);
+            when Left(left as error: BuntiError) do
+                assertTrue(false, message);
+        end case;
+        destroyString(payload);
+        return nil;
+    end;
+
+    function testCapacity(): Unit is
+        exerciseCapacity(500, false, Plain(), LevelL(), 0, "mode 1 L: parity / 2 wrong bytes in every block corrected");
+        exerciseCapacity(500, false, Plain(), LevelM(), 1, "mode 1 M");
+        exerciseCapacity(500, false, Plain(), LevelQ(), 2, "mode 1 Q");
+        exerciseCapacity(500, false, Plain(), LevelH(), 3, "mode 1 H");
+        exerciseCapacity(500, true, Dna(), LevelL(), 0, "mode 2 L");
+        exerciseCapacity(500, true, Dna(), LevelM(), 1, "mode 2 M");
+        exerciseCapacity(500, true, Dna(), LevelQ(), 2, "mode 2 Q");
+        exerciseCapacity(500, true, Dna(), LevelH(), 3, "mode 2 H");
+        exerciseCapacity(7, false, Plain(), LevelL(), 0, "a short payload, one block of two parity bytes");
+        return nil;
+    end;
+
+    ---
+    --- Header, sequence, drawing, density
+    ---
+
+    function testHeaderCopies(): Unit is
+        let payload: Span[Nat8, Static] := "Hilde";
+        case encodeBunti(payload, Plain(), LevelM()) of
+            when Right(right as made: BuntiCode) do
+                var code: BuntiCode := made;
+                var n: Index := 0;
+                while n < 64 do
+                    code := changeDataCell(code, n, 1);
+                    n := n + 1;
+                end while;
+                case decodeBunti(&code) of
+                    when Right(right as back: String) do
+                        assertTrue(equal(asSpan(&back), payload), "the first header broken: the second copy reads");
+                        destroyString(back);
+                    when Left(left as error: BuntiError) do
+                        assertTrue(false, "the first header broken: the second copy reads");
+                end case;
+                let size: Index := buntiSize(&code);
+                let total: Index := (size * size) - 240;
+                var m: Index := total - 64;
+                while m < total do
+                    code := changeDataCell(code, m, 1);
+                    m := m + 1;
+                end while;
+                case decodeBunti(&code) of
+                    when Right(right as back: String) do
+                        destroyString(back);
+                        assertTrue(false, "both headers broken: BadHeader");
+                    when Left(left as error: BuntiError) do
+                        case error of
+                            when BadHeader do
+                                assertTrue(true, "both headers broken: BadHeader");
+                            when TooLong do
+                                assertTrue(false, "both headers broken: BadHeader");
+                            when NoSeed do
+                                assertTrue(false, "both headers broken: BadHeader");
+                            when NotFound do
+                                assertTrue(false, "both headers broken: BadHeader");
+                            when Damaged do
+                                assertTrue(false, "both headers broken: BadHeader");
+                            when BadChecksum do
+                                assertTrue(false, "both headers broken: BadHeader");
+                        end case;
+                end case;
+                destroyBunti(code);
+            when Left(left as error: BuntiError) do
+                assertTrue(false, "a code of Hilde");
+        end case;
+        return nil;
+    end;
+
+    function testSequence(): Unit is
+        case encodeBunti("Wolly", Plain(), LevelL()) of
+            when Right(right as code: BuntiCode) do
+                let sequence: String := buntiSequence(&code);
+                -- One block: the data first, then two parity bytes.
+                assertTrue(length(&sequence) = 28, "5 data and 2 parity bytes, 28 bases");
+                let all: Span[Nat8, Static] := "CCCTCGTTCGTACGTACTGC";
+                var same: Bool := true;
+                var i: Index := 0;
+                while i < 20 do
+                    same := same and (byteIn(&sequence, i) = all[i]);
+                    i := i + 1;
+                end while;
+                assertTrue(same, "the sequence of the code begins with the bases of Wolly");
+                assertTrue(buntiSize(&code) = 21, "the smallest code");
+                destroyString(sequence);
+                destroyBunti(code);
+            when Left(left as error: BuntiError) do
+                assertTrue(false, "a code of Wolly");
+        end case;
+        let long: String := payloadOf(1000);
+        case encodeBunti(asSpan(&long), Dna(), LevelQ()) of
+            when Right(right as code: BuntiCode) do
+                let sequence: String := buntiSequence(&code);
+                var run: Index := 1;
+                var longest: Index := 1;
+                var j: Index := 1;
+                while j < length(&sequence) do
+                    if byteIn(&sequence, j) = byteIn(&sequence, j - 1) then
+                        run := run + 1;
+                    else
+                        run := (1 : Index);
+                    end if;
+                    if run > longest then
+                        longest := run;
+                    end if;
+                    j := j + 1;
+                end while;
+                assertTrue(longest <= 3, "the sequence of mode 2 has no run of four");
+                destroyString(sequence);
+                destroyBunti(code);
+            when Left(left as error: BuntiError) do
+                assertTrue(false, "1000 bytes in mode 2");
+        end case;
+        destroyString(long);
+        return nil;
+    end;
+
+    function testDrawing(): Unit is
+        case encodeBunti("Wolly", Plain(), LevelL()) of
+            when Right(right as code: BuntiCode) do
+                assertTrue(pixelSide(&code, 4) = 116, "29 cells of 4 pixels: 21 and the quiet zone");
+                let pixels: String := buntiPixels(&code, 4);
+                assertTrue(length(&pixels) = ((116 * 116) * 3), "three bytes a pixel");
+                -- The quiet zone is white, the corner of the finder black.
+                assertTrue(byteIn(&pixels, 0) = 255, "white in the quiet zone");
+                let corner: Index := (((16 * 116) + 16) * 3);
+                assertTrue(((byteIn(&pixels, corner) = 0) and (byteIn(&pixels, corner + 1) = 0)) and (byteIn(&pixels, corner + 2) = 0), "black at the corner of the finder");
+                destroyString(pixels);
+                let svg: String := buntiSvg(&code, 4);
+                assertTrue(contains(asSpan(&svg), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"116\" height=\"116\""), "an SVG of 116");
+                assertTrue(contains(asSpan(&svg), "fill=\"#000000\""), "black rectangles");
+                assertTrue(contains(asSpan(&svg), "fill=\"#00aa46\"") and contains(asSpan(&svg), "fill=\"#dc1e1e\""), "green and red of A and T");
+                destroyString(svg);
+                case buntiPng(&code, 2) of
+                    when Some(value as png: String) do
+                        assertTrue((byteIn(&png, 1) = 'P') and (byteIn(&png, 2) = 'N'), "a PNG");
+                        destroyString(png);
+                    when None do
+                        assertTrue(false, "a PNG");
+                end case;
+                assertTrue(buntiCell(&code, 0, 0) = blackCell(), "the finder at the top left");
+                assertTrue(buntiCell(&code, 7, 7) = whiteCell(), "its separator");
+                assertTrue(buntiCell(&code, 18, 18) = blackCell(), "the middle of the corner pattern");
+                assertTrue(buntiCell(&code, referenceX(21, 6), referenceY(21, 6)) = 2, "reference G beside the top right finder");
+                assertTrue(buntiCell(&code, 99, 0) = whiteCell(), "outside the code: white");
+                assertTrue(buntiCell(&code, 15, 15) = whiteCell(), "the separator of the corner pattern");
+                assertTrue(buntiCell(&code, 7, 13) = whiteCell(), "the separator of the bottom left finder");
+                assertTrue(buntiCell(&code, referenceX(21, 10), referenceY(21, 10)) = 2, "reference G beside the bottom left finder");
+                assertTrue((referenceX(21, 10) = 2) and (referenceY(21, 10) = 12), "at column 2, row 12");
+                assertTrue((referenceX(21, 5) = 18) and (referenceY(21, 5) = 8), "reference C of the top right at 18, 8");
+                destroyBunti(code);
+            when Left(left as error: BuntiError) do
+                assertTrue(false, "a code of Wolly");
+        end case;
+        return nil;
+    end;
+
+    function testTooLong(): Unit is
+        let huge: String := payloadOf(20000);
+        case encodeBunti(asSpan(&huge), Plain(), LevelH()) of
+            when Right(right as code: BuntiCode) do
+                destroyBunti(code);
+                assertTrue(false, "20000 bytes at H do not fit");
+            when Left(left as error: BuntiError) do
+                assertTrue(true, "20000 bytes at H do not fit");
+        end case;
+        destroyString(huge);
+        assertTrue(buntiCapacity(60, Plain(), LevelL()) > buntiCapacity(60, Plain(), LevelH()), "L holds more than H");
+        assertTrue(buntiCapacity(60, Plain(), LevelH()) > buntiCapacity(60, Dna(), LevelH()), "mode 1 more than mode 2");
+        assertTrue(buntiCapacity(60, Plain(), LevelH()) >= 4096, "4096 bytes fit at H");
+        assertTrue(buntiCapacity(60, Dna(), LevelH()) >= 4096, "and in mode 2");
+        return nil;
+    end;
+
+    -- Measured: bits of payload a cell of the whole code, at versions 1, 10,
+    -- 30 and 60, each mode and level.
+    function densityOf(version: Index, mode: BuntiMode, level: BuntiLevel, name: Span[Nat8, Static]): Unit is
+        let size: Index := (version * 4) + 17;
+        let bytes: Index := buntiCapacity(version, mode, level);
+        let milli: Index := ((bytes * 8) * 1000) / (size * size);
+        print("density ");
+        print(name);
+        print(" version ");
+        print(version);
+        print(": ");
+        print(bytes);
+        print(" bytes, ");
+        print(milli);
+        printLn(" thousandths of a bit a cell");
+        return nil;
+    end;
+
+    function testDensity(): Unit is
+        var k: Index := 0;
+        while k < 4 do
+            var version: Index := 1;
+            if k = 1 then
+                version := (10 : Index);
+            end if;
+            if k = 2 then
+                version := (30 : Index);
+            end if;
+            if k = 3 then
+                version := (60 : Index);
+            end if;
+            densityOf(version, Plain(), LevelL(), "mode 1 L");
+            densityOf(version, Plain(), LevelM(), "mode 1 M");
+            densityOf(version, Plain(), LevelQ(), "mode 1 Q");
+            densityOf(version, Plain(), LevelH(), "mode 1 H");
+            densityOf(version, Dna(), LevelL(), "mode 2 L");
+            densityOf(version, Dna(), LevelM(), "mode 2 M");
+            densityOf(version, Dna(), LevelQ(), "mode 2 Q");
+            densityOf(version, Dna(), LevelH(), "mode 2 H");
+            k := k + 1;
+        end while;
+        assertTrue(buntiCapacity(1, Plain(), LevelL()) > 0, "version 1 holds a payload");
+        return nil;
+    end;
+
+    -- The payload cells of one code holding the codewords of another of the
+    -- same length: Reed-Solomon finds whole blocks, the CRC-32 of the header
+    -- refuses them.
+    function testChecksum(): Unit is
+        let a: Span[Nat8, Static] := "first payload";
+        let b: Span[Nat8, Static] := "other payload";
+        case encodeBunti(a, Plain(), LevelM()) of
+            when Right(right as one: BuntiCode) do
+                case encodeBunti(b, Plain(), LevelM()) of
+                    when Right(right as two: BuntiCode) do
+                        var mixed: BuntiCode := one;
+                        let size: Index := buntiSize(&mixed);
+                        let total: Index := (size * size) - 240;
+                        var n: Index := 0;
+                        var y: Index := 0;
+                        while y < size do
+                            var x: Index := 0;
+                            while x < size do
+                                -- every cell between the two copies of the header
+                                if isDataCell(size, x, y) then
+                                    if (n >= 64) and ((n + 64) < total) then
+                                        setBuntiCell(&!mixed, x, y, buntiCell(&two, x, y));
+                                    end if;
+                                    n := n + 1;
+                                end if;
+                                x := x + 1;
+                            end while;
+                            y := y + 1;
+                        end while;
+                        case decodeBunti(&mixed) of
+                            when Right(right as back: String) do
+                                destroyString(back);
+                                assertTrue(false, "blocks of another payload: BadChecksum");
+                            when Left(left as error: BuntiError) do
+                                case error of
+                                    when BadChecksum do
+                                        assertTrue(true, "blocks of another payload: BadChecksum");
+                                    when TooLong do
+                                        assertTrue(false, "blocks of another payload: BadChecksum");
+                                    when NoSeed do
+                                        assertTrue(false, "blocks of another payload: BadChecksum");
+                                    when NotFound do
+                                        assertTrue(false, "blocks of another payload: BadChecksum");
+                                    when BadHeader do
+                                        assertTrue(false, "blocks of another payload: BadChecksum");
+                                    when Damaged do
+                                        assertTrue(false, "blocks of another payload: BadChecksum");
+                                end case;
+                        end case;
+                        destroyBunti(mixed);
+                        destroyBunti(two);
+                    when Left(left as error: BuntiError) do
+                        destroyBunti(one);
+                        assertTrue(false, "a code of the other payload");
+                end case;
+            when Left(left as error: BuntiError) do
+                assertTrue(false, "a code of the first payload");
+        end case;
+        return nil;
+    end;
+end module body.

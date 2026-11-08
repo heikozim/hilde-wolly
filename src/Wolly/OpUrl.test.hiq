@@ -1,0 +1,194 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    equal
+);
+import Wolly.OpUrl (
+    UrlParts,
+    QueryPair,
+    destroyUrlParts,
+    parseUrl,
+    queryEscape,
+    pathEscape,
+    queryUnescape,
+    destroyPairs,
+    parseQuery,
+    encodeQuery,
+    setPair,
+    withQuery
+);
+
+module body Wolly.OpUrl.Test is
+    generic [P: Region]
+    function hostIs(parts: &[UrlParts, P], host: Span[Nat8, Static]): Bool is
+        return equal(asSpan(&(parts->host)), host);
+    end;
+
+    generic [P: Region]
+    function portIs(parts: &[UrlParts, P], port: Span[Nat8, Static]): Bool is
+        return equal(asSpan(&(parts->port)), port);
+    end;
+
+    generic [P: Region]
+    function pathIs(parts: &[UrlParts, P], path: Span[Nat8, Static]): Bool is
+        return equal(asSpan(&(parts->path)), path);
+    end;
+
+    generic [P: Region]
+    function schemeIs(parts: &[UrlParts, P], scheme: Span[Nat8, Static]): Bool is
+        return equal(asSpan(&(parts->scheme)), scheme);
+    end;
+
+    generic [P: Region]
+    function userOf(parts: &[UrlParts, P]): Bool is
+        return parts->hasUser;
+    end;
+
+    generic [P: Region]
+    function fragmentOf(parts: &[UrlParts, P]): Bool is
+        return parts->hasFragment;
+    end;
+
+    function testParse(): Unit is
+        case parseUrl("HTTPS://lucy.example.com:8443/oidc/callback?x=1#top") of
+            when Some(value as parts: UrlParts) do
+                assertTrue(schemeIs(&parts, "https"), "the scheme is lowercase");
+                assertTrue(hostIs(&parts, "lucy.example.com"), "the host");
+                assertTrue(portIs(&parts, "8443"), "the port");
+                assertTrue(pathIs(&parts, "/oidc/callback"), "the path");
+                assertTrue(fragmentOf(&parts), "a fragment");
+                assertFalse(userOf(&parts), "no userinfo");
+                destroyUrlParts(parts);
+            when None do
+                assertTrue(false, "a URL is read");
+        end case;
+        case parseUrl("http://[::1]:7000/cb") of
+            when Some(value as parts: UrlParts) do
+                assertTrue(hostIs(&parts, "::1"), "an IPv6 host without brackets");
+                assertTrue(portIs(&parts, "7000"), "its port");
+                destroyUrlParts(parts);
+            when None do
+                assertTrue(false, "an IPv6 URL is read");
+        end case;
+        case parseUrl("https://me@evil.example/x") of
+            when Some(value as parts: UrlParts) do
+                assertTrue(userOf(&parts), "userinfo is seen");
+                assertTrue(hostIs(&parts, "evil.example"), "the host after it");
+                destroyUrlParts(parts);
+            when None do
+                assertTrue(false, "a URL with userinfo is read");
+        end case;
+        case parseUrl("com.example.app:/cb") of
+            when Some(value as parts: UrlParts) do
+                assertTrue(hostIs(&parts, ""), "a private-use scheme has no host");
+                assertTrue(pathIs(&parts, "/cb"), "its path");
+                destroyUrlParts(parts);
+            when None do
+                assertTrue(false, "a private-use scheme is read");
+        end case;
+        case parseUrl("no scheme here") of
+            when Some(value as parts: UrlParts) do
+                assertTrue(false, "a blank is refused");
+                destroyUrlParts(parts);
+            when None do
+                skip;
+        end case;
+        case parseUrl("/relative") of
+            when Some(value as parts: UrlParts) do
+                assertTrue(false, "a relative path is no URL");
+                destroyUrlParts(parts);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function testEscape(): Unit is
+        let q: String := queryEscape("https://auth.example.com/a b?c=d&e~");
+        assertTrue(equal(asSpan(&q), "https%3A%2F%2Fauth.example.com%2Fa+b%3Fc%3Dd%26e~"), "a value as Go's QueryEscape writes it");
+        destroyString(q);
+        let p: String := pathEscape("RAMBO:alice+x@example.com/\u{e4}");
+        assertTrue(equal(asSpan(&p), "RAMBO:alice+x@example.com%2F%C3%A4"), "a segment as Go's PathEscape writes it");
+        destroyString(p);
+        case queryUnescape("a+b%2Fc%3d") of
+            when Some(value as u: String) do
+                assertTrue(equal(asSpan(&u), "a b/c="), "a value is decoded");
+                destroyString(u);
+            when None do
+                assertTrue(false, "a value decodes");
+        end case;
+        case queryUnescape("bad%2") of
+            when Some(value as u: String) do
+                assertTrue(false, "a short escape is refused");
+                destroyString(u);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function testQuery(): Unit is
+        case parseQuery("b=2&a=1&&b=1&flag") of
+            when Some(value as found: Buffer[QueryPair]) do
+                var pairs: Buffer[QueryPair] := found;
+                assertTrue(bufferLength(&pairs) = 4, "four pairs, the empty part left out");
+                let encoded: String := encodeQuery(&pairs);
+                assertTrue(equal(asSpan(&encoded), "a=1&b=2&b=1&flag="), "sorted by name, values in their order");
+                destroyString(encoded);
+                setPair(&!pairs, "b", "x y");
+                let again: String := encodeQuery(&pairs);
+                assertTrue(equal(asSpan(&again), "a=1&b=x+y&flag="), "set replaces every pair of the name");
+                destroyString(again);
+                destroyPairs(pairs);
+            when None do
+                assertTrue(false, "a query is read");
+        end case;
+        return nil;
+    end;
+
+    function testWithQuery(): Unit is
+        var set: Buffer[QueryPair] := allocateEmpty();
+        insertBack(&!set, QueryPair(name => fromSpan("code"), value => fromSpan("C0DE")));
+        insertBack(&!set, QueryPair(name => fromSpan("state"), value => fromSpan("s t")));
+        insertBack(&!set, QueryPair(name => fromSpan("iss"), value => fromSpan("https://auth.example.com")));
+        case withQuery("https://lucy.example.com/cb?z=9&a=1", &set) of
+            when Some(value as url: String) do
+                assertTrue(equal(asSpan(&url), "https://lucy.example.com/cb?a=1&code=C0DE&iss=https%3A%2F%2Fauth.example.com&state=s+t&z=9"),
+                    "the redirect as Go writes it");
+                destroyString(url);
+            when None do
+                assertTrue(false, "a redirect is made");
+        end case;
+        case withQuery("https://lucy.example.com/cb", &set) of
+            when Some(value as url: String) do
+                assertTrue(equal(asSpan(&url), "https://lucy.example.com/cb?code=C0DE&iss=https%3A%2F%2Fauth.example.com&state=s+t"),
+                    "a redirect without a query of its own");
+                destroyString(url);
+            when None do
+                assertTrue(false, "a plain redirect is made");
+        end case;
+        destroyPairs(set);
+        return nil;
+    end;
+end module body.

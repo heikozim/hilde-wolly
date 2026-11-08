@@ -1,0 +1,88 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The network checks of a web application:
+the address of the client behind proxies that are trusted, the host name,
+and the address that an outbound request may go to.
+
+clientAddress starts from the peer, the address the web server names in
+REMOTE_ADDR, and believes a forwarding header only when the peer is itself
+in the list of trusted proxies.  With an empty list the peer is the client
+and every header is ignored: a client that forges X-Forwarded-For changes
+nothing.  The list must name the direct hop only, never a whole chain such
+as the ranges of a CDN, and it is worth anything only while that hop cannot
+be reached from the internet; behind Hiawatha over a Unix socket REMOTE_ADDR
+is what Hiawatha resolved already, and the list stays empty.
+
+The result is an address in the canonical text of Standard.Ip, or, when
+the peer is no address, the peer as it came.
+"""
+import Standard.String (
+    String
+);
+
+module Wolly.Net is
+    """
+    The most bytes of a host name: 253.
+    """
+    function mostHostnameBytes(): Index
+        ensures result = 253;
+
+    """
+    Whether text is a host name: labels of letters, digits and hyphens, none
+    empty, none longer than 63 bytes, none with a hyphen first or last,
+    separated by dots, at most 253 bytes in all.  No trailing dot (it would
+    have to be cut by everyone who puts the name in a URL, and two
+    spellings of one host invite a cache keyed twice), no star, no
+    underscore, no address (an address is no name; see isPublicAddress),
+    no Unicode (punycode first).
+    No contract: a test of outside input; false is its answer for a bad
+    one.
+    """
+    generic [T: Region]
+    function validHostname(text: Span[Nat8, T]): Bool;
+
+    """
+    Whether text is an address that a request of the server may go to: an
+    IPv4 or IPv6 address that Standard.Ip.isPrivateOrReserved does not
+    name.  False for text that is no address, for a name (resolving it is
+    for the caller, and every address it resolves to must pass), and for the
+    empty text.
+    No contract: a test of outside input; false is its answer for a bad
+    one.
+    """
+    generic [T: Region]
+    function isPublicAddress(text: Span[Nat8, T]): Bool;
+
+    """
+    Whether trusted is a list of trusted proxies: addresses or prefixes in
+    the form address/bits, separated by commas, with spaces around an
+    entry allowed.  An empty list is a list (it trusts nobody).  False for
+    an entry that is no address, a number of bits that is no number or too
+    large, an empty entry, and a prefix of 0 bits, which would trust every
+    peer.
+    No contract: a test of outside input; false is its answer for a bad
+    one.
+    """
+    generic [T: Region]
+    function validTrustedProxies(trusted: Span[Nat8, T]): Bool;
+
+    """
+    The address of the client.  peer is REMOTE_ADDR, forwarded is the value
+    of X-Forwarded-For (may be empty), trusted a list as validTrustedProxies
+    says.  When the list is empty or invalid, or the peer is not in it, or
+    is no address: the peer.  Otherwise the forwarded addresses are walked
+    from the right, the last the proxy appended first, and the first one
+    that is not trusted is the client; a part that is no address ends the
+    walk, and a chain that is empty, wholly trusted or ends so gives the
+    peer.
+    No contract: the length of the result depends on the text, and the
+    peer it may give back may be empty.
+    """
+    generic [P: Region, F: Region, T: Region]
+    function clientAddress(peer: Span[Nat8, P], forwarded: Span[Nat8, F], trusted: Span[Nat8, T]): String;
+end module.

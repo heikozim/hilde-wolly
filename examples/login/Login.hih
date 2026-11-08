@@ -1,0 +1,42 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A login behind Hiawatha: sessions in SQLite, a token against forgery in
+every form, passwords as Argon2id hashes, an audit log.
+
+In its working directory it keeps wolly.db (users, failures, sessions),
+csrf.key (made on the first start, mode 0600) and audit.log, and serves
+on the socket login.sock.
+
+    login                 serves until SIGTERM or SIGINT
+    login adduser name    adds the user name; the password is read from the
+                          standard input, never taken as an argument
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Example.Login is
+    """
+    The answer to every request: GET / greets the user who is logged in
+    and sends anyone else to the login, GET /login shows the form, POST
+    /login logs in, POST /logout logs out; anything else gets 404 or 405.
+    """
+    function handle(request: Request): String
+        ensures length(&result) > 0;
+
+    """
+    Serves handle, or adds a user.  Success when a signal ended the
+    server or the user was added; failure otherwise.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

@@ -1,0 +1,201 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Payload lengths from 0 to 4096 in both modes and at all four levels,
+-- encoded by Wolly.Bunti and decoded again: every length to 32, then every
+-- 61st, and 4096 itself, 100 lengths a mode and level.  Every length is
+-- the sweep of sweep/BuntiSweepAll.test.hiq (scripts/bunti-sweep.sh), which
+-- takes most of an hour and a half and so is no part of scripts/test.sh.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    contains
+);
+import Wolly.Bunti (
+    BuntiCode,
+    BuntiMode,
+    Plain,
+    Dna,
+    BuntiLevel,
+    LevelL,
+    LevelM,
+    LevelQ,
+    LevelH,
+    BuntiError,
+    TooLong,
+    NoSeed,
+    NotFound,
+    BadHeader,
+    Damaged,
+    BadChecksum,
+    blackCell,
+    whiteCell,
+    isBuntiSize,
+    basesOfBytes,
+    buntiCapacity,
+    encodeBunti,
+    decodeBunti,
+    buntiSize,
+    buntiCell,
+    setBuntiCell,
+    isDataCell,
+    referenceX,
+    referenceY,
+    buntiSequence,
+    pixelSide,
+    buntiPixels,
+    buntiSvg,
+    buntiPng,
+    destroyBunti
+);
+import Wolly.BuntiDna (
+    segmentBytes,
+    longestRun
+);
+
+module body Wolly.BuntiSweep.Test is
+    function next(state: Nat32): Nat32 is
+        return modularAdd(modularMultiply(state, (1664525 : Nat32)), (1013904223 : Nat32));
+    end;
+
+    function below(state: Nat32, bound: Index): Index is
+        case toIndex(state / 65536) of
+            when Some(value as high: Index) do
+                return high - ((high / bound) * bound);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [A: Region, B: Region]
+    function equal(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The payload of length count: byte i is (7 i + count) mod 256, so a
+    -- payload of 256 bytes and more holds every byte value.
+    function payloadOf(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            let value: Index := (i * 7) + count;
+            writeByte(&!out, narrow(value - ((value / 256) * 256)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Whether payload comes back from its code at mode and level.
+    function roundTrip(count: Index, mode: BuntiMode, level: BuntiLevel): Bool is
+        let payload: String := payloadOf(count);
+        var good: Bool := false;
+        case encodeBunti(asSpan(&payload), mode, level) of
+            when Right(right as code: BuntiCode) do
+                case decodeBunti(&code) of
+                    when Right(right as back: String) do
+                        good := equal(asSpan(&back), asSpan(&payload));
+                        destroyString(back);
+                    when Left(left as error: BuntiError) do
+                        skip;
+                end case;
+                destroyBunti(code);
+            when Left(left as error: BuntiError) do
+                skip;
+        end case;
+        destroyString(payload);
+        return good;
+    end;
+
+    -- The lengths of the sample: 0 to 32, every 61st after that, and 4096.
+    function nextLength(count: Index): Index is
+        if count < 32 then
+            return count + 1;
+        end if;
+        if count = 4096 then
+            return (4097 : Index);
+        end if;
+        if (count + 61) > 4096 then
+            return (4096 : Index);
+        end if;
+        return count + 61;
+    end;
+
+    function roundTrips(mode: BuntiMode, level: BuntiLevel, message: Span[Nat8, Static]): Unit is
+        var good: Index := 0;
+        var tried: Index := 0;
+        var count: Index := 0;
+        while count <= 4096 do
+            if roundTrip(count, mode, level) then
+                good := good + 1;
+            end if;
+            tried := tried + 1;
+            count := nextLength(count);
+        end while;
+        if good /= 100 then
+            print(message);
+            print(": ");
+            print(good);
+            print(" of ");
+            printLn(tried);
+        end if;
+        assertTrue(tried = 100, message);
+        assertTrue(good = 100, message);
+        return nil;
+    end;
+
+    function testPlainL(): Unit is
+        roundTrips(Plain(), LevelL(), "mode 1 level L: 100 lengths from 0 to 4096");
+        return nil;
+    end;
+
+    function testPlainM(): Unit is
+        roundTrips(Plain(), LevelM(), "mode 1 level M: 100 lengths from 0 to 4096");
+        return nil;
+    end;
+
+    function testPlainQ(): Unit is
+        roundTrips(Plain(), LevelQ(), "mode 1 level Q: 100 lengths from 0 to 4096");
+        return nil;
+    end;
+
+    function testPlainH(): Unit is
+        roundTrips(Plain(), LevelH(), "mode 1 level H: 100 lengths from 0 to 4096");
+        return nil;
+    end;
+end module body.
