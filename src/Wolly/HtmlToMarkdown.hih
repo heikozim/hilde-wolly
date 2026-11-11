@@ -1,0 +1,86 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+HTML (HyperText Markup Language) read back as Markdown: CommonMark with the
+tables, strikethrough and task lists of GFM (GitHub Flavored Markdown), in
+the form the editor writes.  The input is the HTML that Wolly.Markdown
+writes or that the editor CKEditor 5 stores.
+
+The tokens come from parseHtml of Standard.Html; a tree of the elements is
+built from them with the end tags that HTML implies (a new paragraph, list
+item, row or cell closes the open one), then written out without recursion.
+
+Mapping: p is a paragraph, h1 to h6 an ATX heading (after atx, the format of
+Aaron Swartz: number signs before the text), strong and b strong emphasis, em and i emphasis, del, s and strike
+strikethrough, code a code span, pre a fenced code block whose info string
+is the language-x class of pre or of its code, a with href a link, img an
+image, ul and ol (with start) lists, li an item, blockquote a quote, hr a
+thematic break, br a hard break, table a pipe table of GFM with the first
+row as its header and the alignment of the classes text-left, text-center
+and text-right or of the style text-align.  A list item whose first content
+is a checkbox input (checked for done), or whose class names task (and done),
+is a task item.  u, sub, sup, mark, kbd and a span without attributes stay
+as raw inline HTML.  div, figure, section, article and the like are block
+boundaries, label and unknown elements are transparent, figcaption is a
+paragraph of its own.  script, style, template, iframe, object, embed, svg,
+math, form and the form controls go with their content; comments and the
+doctype are dropped.
+
+Text: runs of white space outside pre are one space, cut at block edges;
+the backslash, asterisk, underscore, backtick, brackets, angle brackets,
+tilde, pipe and ampersand get a backslash, and so do a number sign, plus,
+minus and equals sign at the start of a line and the dot or parenthesis
+after digits there.  A URL (Uniform Resource Locator) of a link or an image
+is kept only when isSafeLink of Wolly.Markdown accepts it; otherwise the
+link is its text and the image its alt text.
+
+Output form: blocks are separated by one blank line (the items of a list
+whose items hold no paragraph by none), bullets are minus signs, numbers
+count up from the start, every line ends with a line feed and no space
+except inside a fenced code block, and the text ends with one line feed;
+empty input gives the empty text.
+
+Limits: the first mostHtmlBytes bytes are read.  Lists and quotes nested
+deeper than mostHtmlDepth are written into the deepest level, and so are
+inline marks.  Elements nested deeper than 256 are read as if their tags
+were not there, their content kept.  A dropped element that is never
+closed takes the rest of the input with it.  Not mapped: definition lists
+(their parts are paragraphs), colspan and rowspan, a table in a table
+cell (its cells run into the cell), blocks in a cell (one line), inline
+styles, the adoption of misnested inline tags that HTML does, and a link
+or image whose URL isSafeLink refuses.
+
+    let markdown: String := htmlToMarkdown("<h1>Title</h1><p><strong>Hello</strong></p>");
+"""
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.HtmlToMarkdown is
+    """
+    The most bytes of HTML that htmlToMarkdown reads: 1048576.  Longer
+    input is cut there.
+    """
+    function mostHtmlBytes(): Index
+        ensures result = 1048576;
+
+    """
+    The deepest nesting of lists and quotes written: 16.  What lies deeper
+    is written into the deepest level.
+    """
+    function mostHtmlDepth(): Index
+        ensures result = 16;
+
+    """
+    The Markdown of html, after the rules of the module head.  Any bytes
+    give a text; empty input gives the empty text.
+    """
+    generic [R: Region]
+    function htmlToMarkdown(html: Span[Nat8, R]): String
+        ensures (spanLength(html) > 0) or (length(&result) = 0);
+end module.

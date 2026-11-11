@@ -1,0 +1,255 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam
+);
+import Wolly.Request (
+    query
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish
+);
+import Wolly.Bundle (
+    Asset,
+    asset
+);
+
+module body Wolly.Fragment is
+    function fragmentParameter(): Span[Nat8, Static] is
+        return "fragment";
+    end;
+
+    function fragmentVary(): Span[Nat8, Static] is
+        return "HX-Request, HX-Target";
+    end;
+
+    function idLimit(): Index is
+        return 64;
+    end;
+
+    function isLetter(byte: Nat8): Bool is
+        return ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    generic [N: Region]
+    function isFragmentId(id: Span[Nat8, N]): Bool is
+        let size: Index := spanLength(id);
+        if (size < 1) or (size > idLimit()) then
+            return false;
+        end if;
+        if not isLetter(id[0]) then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < size do
+            let byte: Nat8 := id[i];
+            if not (((isLetter(byte) or isDigit(byte)) or (byte = '-')) or (byte = '_')) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The marks a fragment URL may hold besides letters and digits; none
+    -- of them ends an attribute value or starts a tag.
+    function isUrlMark(byte: Nat8): Bool is
+        let path: Bool := ((((byte = '-') or (byte = '.')) or (byte = '_')) or (byte = '~')) or (byte = '/');
+        let query: Bool := ((((byte = '?') or (byte = '=')) or (byte = '&')) or (byte = '%')) or (byte = '+');
+        let sub: Bool := ((((byte = ',') or (byte = ';')) or (byte = ':')) or (byte = '@')) or (byte = '!');
+        let rest: Bool := (((byte = '$') or (byte = '*')) or (byte = '(')) or (byte = ')');
+        return ((path or query) or sub) or rest;
+    end;
+
+    generic [U: Region]
+    function isFragmentUrl(url: Span[Nat8, U]): Bool is
+        let size: Index := spanLength(url);
+        if (size < 1) or (size > 512) then
+            return false;
+        end if;
+        if url[0] /= '/' then
+            return false;
+        end if;
+        -- //host would leave the site; a backslash is no URL byte at all.
+        if (size > 1) and (url[1] = '/') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := url[i];
+            if not ((isLetter(byte) or isDigit(byte)) or isUrlMark(byte)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- found when it is a fragment id, else None; found is taken either way.
+    function checkedId(found: Option[String]): Option[String] is
+        case found of
+            when Some(value as id: String) do
+                if isFragmentId(asSpan(&id)) then
+                    return Some(value => id);
+                end if;
+                destroyString(id);
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Whether HX-Request is the four bytes true.
+    generic [R: Region]
+    function isHtmx(request: &[Request, R]): Bool is
+        case requestParam(request, "HTTP_HX_REQUEST") of
+            when Some(value as flag: String) do
+                let htmx: Bool := equal(asSpan(&flag), "true");
+                destroyString(flag);
+                return htmx;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function requestedFragment(request: &[Request, R]): Option[String] is
+        if isHtmx(request) then
+            case checkedId(requestParam(request, "HTTP_HX_TARGET")) of
+                when Some(value as id: String) do
+                    return Some(value => id);
+                when None do
+                    skip;
+            end case;
+        end if;
+        return checkedId(query(request, fragmentParameter()));
+    end;
+
+    generic [R: Region, N: Region]
+    function wantsFragment(request: &[Request, R], id: Span[Nat8, N]): Bool is
+        case requestedFragment(request) of
+            when Some(value as asked: String) do
+                let same: Bool := equal(asSpan(&asked), id);
+                destroyString(asked);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [B: Region, N: Region, I: Region]
+    function writeFragment(out: &![StringBuilder, B], id: Span[Nat8, N], inner: Span[Nat8, I]): Unit is
+        writeString(&~out, "<div id=\"");
+        writeString(&~out, id);
+        writeString(&~out, "\" data-wolly-fragment>");
+        writeString(&~out, inner);
+        writeString(&~out, "</div>");
+        return nil;
+    end;
+
+    generic [B: Region, U: Region, N: Region]
+    function writeTrigger(out: &![StringBuilder, B], url: Span[Nat8, U], id: Span[Nat8, N]): Unit is
+        writeString(&~out, " data-wolly-get=\"");
+        var i: Index := 0;
+        while i < spanLength(url) do
+            if url[i] = '&' then
+                writeString(&~out, "&amp;");
+            else
+                writeByte(&~out, url[i]);
+            end if;
+            i := i + 1;
+        end while;
+        writeString(&~out, "\" data-wolly-target=\"");
+        writeString(&~out, id);
+        writeByte(&~out, '"');
+        return nil;
+    end;
+
+    -- The number in decimal, no sign and no leading zero.
+    generic [B: Region]
+    function writeDecimal(out: &![StringBuilder, B], number: Index): Unit is
+        let ten: Index := 10;
+        if number >= ten then
+            writeDecimal(&~out, number / ten);
+        end if;
+        case toNat8(number - ((number / ten) * ten)) of
+            when Some(value as digit: Nat8) do
+                writeByte(&~out, digit + 48);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [B: Region, N: Region]
+    function writePoll(out: &![StringBuilder, B], seconds: Index, id: Span[Nat8, N]): Unit is
+        writeString(&~out, " data-wolly-poll=\"");
+        writeDecimal(&~out, seconds);
+        writeString(&~out, "\" data-wolly-target=\"");
+        writeString(&~out, id);
+        writeByte(&~out, '"');
+        return nil;
+    end;
+
+    -- An HTML answer that is a fragment or a page by the request: Vary
+    -- names the headers that tell them apart.
+    function htmlAnswer(): Response is
+        let html: Response := makeResponse(200, "text/html; charset=utf-8");
+        let varied: Response := addHeader(html, "Vary", fragmentVary());
+        let fresh: Response := addHeader(varied, "Cache-Control", "no-cache");
+        return addHeader(fresh, "X-Content-Type-Options", "nosniff");
+    end;
+
+    generic [N: Region, I: Region]
+    function fragmentResponse(id: Span[Nat8, N], inner: Span[Nat8, I]): String is
+        var selector: StringBuilder := makeStringBuilder();
+        writeByte(&!selector, '#');
+        writeString(&!selector, id);
+        let target: String := finalize(selector);
+        let retargeted: Response := addHeader(htmlAnswer(), "HX-Retarget", asSpan(&target));
+        destroyString(target);
+        let response: Response := addHeader(retargeted, "HX-Reswap", "outerHTML");
+        var content: StringBuilder := makeStringBuilder();
+        writeFragment(&!content, id, inner);
+        let html: String := finalize(content);
+        let output: String := finish(response, asSpan(&html));
+        destroyString(html);
+        return output;
+    end;
+
+    generic [P: Region]
+    function pageResponse(html: Span[Nat8, P]): String is
+        return finish(htmlAnswer(), html);
+    end;
+
+    function fragmentScript(): Asset is
+        return asset("wolly-fragment.js", @bytes("static/wolly-fragment.js"));
+    end;
+end module body.

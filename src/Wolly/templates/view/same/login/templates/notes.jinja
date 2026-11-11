@@ -1,0 +1,19 @@
+{#
+Part of Wolly, a web framework in Hilde.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+The notes of the user who is logged in, newest first, one a line, and the
+form to add one.  The notes arrive as one text, which the template escapes.
+-#}
+{% extends "templates/view/same/login/templates/base.jinja" %}
+{% block title %}Notes{% endblock %}
+{% block content %}
+<form method="post" action="/notes">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input name="content" maxlength="500" required>
+<button>Add</button>
+</form>
+<pre class="notes">{{ notes }}</pre>
+{% endblock %}

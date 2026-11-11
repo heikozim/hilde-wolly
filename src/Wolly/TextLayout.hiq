@@ -1,0 +1,967 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    nth,
+    insertBack,
+    destroyFree
+);
+import Standard.Grapheme (
+    clusterEnd
+);
+import Standard.Utf8 (
+    Decoded,
+    decodeAt,
+    decodedPoint,
+    codePointValue
+);
+import Standard.UnicodeProperties (
+    generalCategory
+);
+
+module body Wolly.TextLayout is
+    -- No code point: what pointOf gives where no well-formed UTF-8 begins.
+    constant no_point: Index := 1114112;
+
+    -- One line of a layout: the bytes start to stop of the text, its width,
+    -- the line of the text it comes from and whether a hard break ends it.
+    record Line: Free is
+        start: Index;
+        stop: Index;
+        width: Index;
+        source: Index;
+        hard: Bool;
+    end;
+
+    record Layout: Linear is
+        lines: Buffer[Line];
+        invariant length(&lines) >= 1;
+    end;
+
+    function mostTabSize(): Index is
+        return 64;
+    end;
+
+    function mostLineWidth(): Index is
+        return 65536;
+    end;
+
+    -- Whether point is of the class W or F of East-Asian-Width, or an emoji
+    -- of Emoji_Presentation: the ranges in order, generated once from
+    -- go-lea width.go, emoji-data.txt of Unicode 17.0.0 and the CJK, Kana
+    -- and Tangut blocks of the planes 1 to 3.
+    function isWidePoint(point: Index): Bool is
+        if point < #x1100 then
+            return false;
+        end if;
+        if point <= #x115F then
+            return true;
+        end if;
+        if point < #x231A then
+            return false;
+        end if;
+        if point <= #x231B then
+            return true;
+        end if;
+        if point < #x2329 then
+            return false;
+        end if;
+        if point <= #x232A then
+            return true;
+        end if;
+        if point < #x23E9 then
+            return false;
+        end if;
+        if point <= #x23EC then
+            return true;
+        end if;
+        if point < #x23F0 then
+            return false;
+        end if;
+        if point <= #x23F0 then
+            return true;
+        end if;
+        if point < #x23F3 then
+            return false;
+        end if;
+        if point <= #x23F3 then
+            return true;
+        end if;
+        if point < #x25FD then
+            return false;
+        end if;
+        if point <= #x25FE then
+            return true;
+        end if;
+        if point < #x2614 then
+            return false;
+        end if;
+        if point <= #x2615 then
+            return true;
+        end if;
+        if point < #x2648 then
+            return false;
+        end if;
+        if point <= #x2653 then
+            return true;
+        end if;
+        if point < #x267F then
+            return false;
+        end if;
+        if point <= #x267F then
+            return true;
+        end if;
+        if point < #x2693 then
+            return false;
+        end if;
+        if point <= #x2693 then
+            return true;
+        end if;
+        if point < #x26A1 then
+            return false;
+        end if;
+        if point <= #x26A1 then
+            return true;
+        end if;
+        if point < #x26AA then
+            return false;
+        end if;
+        if point <= #x26AB then
+            return true;
+        end if;
+        if point < #x26BD then
+            return false;
+        end if;
+        if point <= #x26BE then
+            return true;
+        end if;
+        if point < #x26C4 then
+            return false;
+        end if;
+        if point <= #x26C5 then
+            return true;
+        end if;
+        if point < #x26CE then
+            return false;
+        end if;
+        if point <= #x26CE then
+            return true;
+        end if;
+        if point < #x26D4 then
+            return false;
+        end if;
+        if point <= #x26D4 then
+            return true;
+        end if;
+        if point < #x26EA then
+            return false;
+        end if;
+        if point <= #x26EA then
+            return true;
+        end if;
+        if point < #x26F2 then
+            return false;
+        end if;
+        if point <= #x26F3 then
+            return true;
+        end if;
+        if point < #x26F5 then
+            return false;
+        end if;
+        if point <= #x26F5 then
+            return true;
+        end if;
+        if point < #x26FA then
+            return false;
+        end if;
+        if point <= #x26FA then
+            return true;
+        end if;
+        if point < #x26FD then
+            return false;
+        end if;
+        if point <= #x26FD then
+            return true;
+        end if;
+        if point < #x2705 then
+            return false;
+        end if;
+        if point <= #x2705 then
+            return true;
+        end if;
+        if point < #x270A then
+            return false;
+        end if;
+        if point <= #x270B then
+            return true;
+        end if;
+        if point < #x2728 then
+            return false;
+        end if;
+        if point <= #x2728 then
+            return true;
+        end if;
+        if point < #x274C then
+            return false;
+        end if;
+        if point <= #x274C then
+            return true;
+        end if;
+        if point < #x274E then
+            return false;
+        end if;
+        if point <= #x274E then
+            return true;
+        end if;
+        if point < #x2753 then
+            return false;
+        end if;
+        if point <= #x2755 then
+            return true;
+        end if;
+        if point < #x2757 then
+            return false;
+        end if;
+        if point <= #x2757 then
+            return true;
+        end if;
+        if point < #x2795 then
+            return false;
+        end if;
+        if point <= #x2797 then
+            return true;
+        end if;
+        if point < #x27B0 then
+            return false;
+        end if;
+        if point <= #x27B0 then
+            return true;
+        end if;
+        if point < #x27BF then
+            return false;
+        end if;
+        if point <= #x27BF then
+            return true;
+        end if;
+        if point < #x2B1B then
+            return false;
+        end if;
+        if point <= #x2B1C then
+            return true;
+        end if;
+        if point < #x2B50 then
+            return false;
+        end if;
+        if point <= #x2B50 then
+            return true;
+        end if;
+        if point < #x2B55 then
+            return false;
+        end if;
+        if point <= #x2B55 then
+            return true;
+        end if;
+        if point < #x2E80 then
+            return false;
+        end if;
+        if point <= #x303E then
+            return true;
+        end if;
+        if point < #x3040 then
+            return false;
+        end if;
+        if point <= #x4DBF then
+            return true;
+        end if;
+        if point < #x4E00 then
+            return false;
+        end if;
+        if point <= #xA4CF then
+            return true;
+        end if;
+        if point < #xA960 then
+            return false;
+        end if;
+        if point <= #xA97C then
+            return true;
+        end if;
+        if point < #xAC00 then
+            return false;
+        end if;
+        if point <= #xD7A3 then
+            return true;
+        end if;
+        if point < #xF900 then
+            return false;
+        end if;
+        if point <= #xFAFF then
+            return true;
+        end if;
+        if point < #xFE10 then
+            return false;
+        end if;
+        if point <= #xFE19 then
+            return true;
+        end if;
+        if point < #xFE30 then
+            return false;
+        end if;
+        if point <= #xFE6B then
+            return true;
+        end if;
+        if point < #xFF01 then
+            return false;
+        end if;
+        if point <= #xFF60 then
+            return true;
+        end if;
+        if point < #xFFE0 then
+            return false;
+        end if;
+        if point <= #xFFE6 then
+            return true;
+        end if;
+        if point < #x16FE0 then
+            return false;
+        end if;
+        if point <= #x16FE4 then
+            return true;
+        end if;
+        if point < #x16FF0 then
+            return false;
+        end if;
+        if point <= #x16FF1 then
+            return true;
+        end if;
+        if point < #x17000 then
+            return false;
+        end if;
+        if point <= #x187F7 then
+            return true;
+        end if;
+        if point < #x18800 then
+            return false;
+        end if;
+        if point <= #x18CD5 then
+            return true;
+        end if;
+        if point < #x18D00 then
+            return false;
+        end if;
+        if point <= #x18D08 then
+            return true;
+        end if;
+        if point < #x1AFF0 then
+            return false;
+        end if;
+        if point <= #x1B2FB then
+            return true;
+        end if;
+        if point < #x1F004 then
+            return false;
+        end if;
+        if point <= #x1F004 then
+            return true;
+        end if;
+        if point < #x1F0CF then
+            return false;
+        end if;
+        if point <= #x1F0CF then
+            return true;
+        end if;
+        if point < #x1F18E then
+            return false;
+        end if;
+        if point <= #x1F18E then
+            return true;
+        end if;
+        if point < #x1F191 then
+            return false;
+        end if;
+        if point <= #x1F19A then
+            return true;
+        end if;
+        if point < #x1F1E6 then
+            return false;
+        end if;
+        if point <= #x1F202 then
+            return true;
+        end if;
+        if point < #x1F210 then
+            return false;
+        end if;
+        if point <= #x1F23B then
+            return true;
+        end if;
+        if point < #x1F240 then
+            return false;
+        end if;
+        if point <= #x1F248 then
+            return true;
+        end if;
+        if point < #x1F250 then
+            return false;
+        end if;
+        if point <= #x1F251 then
+            return true;
+        end if;
+        if point < #x1F260 then
+            return false;
+        end if;
+        if point <= #x1F265 then
+            return true;
+        end if;
+        if point < #x1F300 then
+            return false;
+        end if;
+        if point <= #x1F320 then
+            return true;
+        end if;
+        if point < #x1F32D then
+            return false;
+        end if;
+        if point <= #x1F335 then
+            return true;
+        end if;
+        if point < #x1F337 then
+            return false;
+        end if;
+        if point <= #x1F37C then
+            return true;
+        end if;
+        if point < #x1F37E then
+            return false;
+        end if;
+        if point <= #x1F393 then
+            return true;
+        end if;
+        if point < #x1F3A0 then
+            return false;
+        end if;
+        if point <= #x1F3CA then
+            return true;
+        end if;
+        if point < #x1F3CF then
+            return false;
+        end if;
+        if point <= #x1F3D3 then
+            return true;
+        end if;
+        if point < #x1F3E0 then
+            return false;
+        end if;
+        if point <= #x1F3F0 then
+            return true;
+        end if;
+        if point < #x1F3F4 then
+            return false;
+        end if;
+        if point <= #x1F3F4 then
+            return true;
+        end if;
+        if point < #x1F3F8 then
+            return false;
+        end if;
+        if point <= #x1F43E then
+            return true;
+        end if;
+        if point < #x1F440 then
+            return false;
+        end if;
+        if point <= #x1F440 then
+            return true;
+        end if;
+        if point < #x1F442 then
+            return false;
+        end if;
+        if point <= #x1F4FC then
+            return true;
+        end if;
+        if point < #x1F4FF then
+            return false;
+        end if;
+        if point <= #x1F53D then
+            return true;
+        end if;
+        if point < #x1F54B then
+            return false;
+        end if;
+        if point <= #x1F54E then
+            return true;
+        end if;
+        if point < #x1F550 then
+            return false;
+        end if;
+        if point <= #x1F567 then
+            return true;
+        end if;
+        if point < #x1F57A then
+            return false;
+        end if;
+        if point <= #x1F57A then
+            return true;
+        end if;
+        if point < #x1F595 then
+            return false;
+        end if;
+        if point <= #x1F596 then
+            return true;
+        end if;
+        if point < #x1F5A4 then
+            return false;
+        end if;
+        if point <= #x1F5A4 then
+            return true;
+        end if;
+        if point < #x1F5FB then
+            return false;
+        end if;
+        if point <= #x1F64F then
+            return true;
+        end if;
+        if point < #x1F680 then
+            return false;
+        end if;
+        if point <= #x1F6C5 then
+            return true;
+        end if;
+        if point < #x1F6CC then
+            return false;
+        end if;
+        if point <= #x1F6CC then
+            return true;
+        end if;
+        if point < #x1F6D0 then
+            return false;
+        end if;
+        if point <= #x1F6D2 then
+            return true;
+        end if;
+        if point < #x1F6D5 then
+            return false;
+        end if;
+        if point <= #x1F6D8 then
+            return true;
+        end if;
+        if point < #x1F6DC then
+            return false;
+        end if;
+        if point <= #x1F6DF then
+            return true;
+        end if;
+        if point < #x1F6EB then
+            return false;
+        end if;
+        if point <= #x1F6EC then
+            return true;
+        end if;
+        if point < #x1F6F4 then
+            return false;
+        end if;
+        if point <= #x1F6FC then
+            return true;
+        end if;
+        if point < #x1F7E0 then
+            return false;
+        end if;
+        if point <= #x1F7EB then
+            return true;
+        end if;
+        if point < #x1F7F0 then
+            return false;
+        end if;
+        if point <= #x1F7F0 then
+            return true;
+        end if;
+        if point < #x1F90C then
+            return false;
+        end if;
+        if point <= #x1F93A then
+            return true;
+        end if;
+        if point < #x1F93C then
+            return false;
+        end if;
+        if point <= #x1F945 then
+            return true;
+        end if;
+        if point < #x1F947 then
+            return false;
+        end if;
+        if point <= #x1F9FF then
+            return true;
+        end if;
+        if point < #x1FA70 then
+            return false;
+        end if;
+        if point <= #x1FA7C then
+            return true;
+        end if;
+        if point < #x1FA80 then
+            return false;
+        end if;
+        if point <= #x1FA8A then
+            return true;
+        end if;
+        if point < #x1FA8E then
+            return false;
+        end if;
+        if point <= #x1FAC6 then
+            return true;
+        end if;
+        if point < #x1FAC8 then
+            return false;
+        end if;
+        if point <= #x1FAC8 then
+            return true;
+        end if;
+        if point < #x1FACD then
+            return false;
+        end if;
+        if point <= #x1FADC then
+            return true;
+        end if;
+        if point < #x1FADF then
+            return false;
+        end if;
+        if point <= #x1FAEA then
+            return true;
+        end if;
+        if point < #x1FAEF then
+            return false;
+        end if;
+        if point <= #x1FAF8 then
+            return true;
+        end if;
+        if point < #x20000 then
+            return false;
+        end if;
+        if point <= #x2FFFD then
+            return true;
+        end if;
+        if point < #x30000 then
+            return false;
+        end if;
+        if point <= #x3FFFD then
+            return true;
+        end if;
+        return false;
+    end;
+
+    function pointWidth(point: Index): Index is
+        if point < 32 then
+            return 0;
+        end if;
+        if point < 127 then
+            return 1;
+        end if;
+        if point < 160 then
+            return 0;
+        end if;
+        if point < 768 then
+            return 1;
+        end if;
+        -- The vowels and finals of Hangul join the initial before them.
+        if ((point >= #x1160) and (point <= #x11FF)) or ((point >= #xD7B0) and (point <= #xD7FF)) then
+            return 0;
+        end if;
+        let category: Span[Nat8, Static] := generalCategory(point);
+        let mark: Bool := (category[0] = 'M') and ((category[1] = 'n') or (category[1] = 'e'));
+        let format: Bool := (category[0] = 'C') and (category[1] = 'f');
+        if mark or format then
+            return 0;
+        end if;
+        if isWidePoint(point) then
+            return 2;
+        end if;
+        return 1;
+    end;
+
+    -- The code point that starts at at of text, no_point where no
+    -- well-formed UTF-8 begins.
+    generic [R: Region]
+    function pointOf(text: Span[Nat8, R], at: Index): Index is
+        case decodeAt(text, at) of
+            when Some(value as decoded: Decoded) do
+                case toIndex(codePointValue(decodedPoint(decoded))) of
+                    when Some(value as point: Index) do
+                        return point;
+                    when None do
+                        return no_point;
+                end case;
+            when None do
+                return no_point;
+        end case;
+    end;
+
+    generic [R: Region]
+    function clusterEndAt(text: Span[Nat8, R], start: Index): Index is
+        case clusterEnd(text, start) of
+            when Some(value as stop: Index) do
+                if (stop > start) and (stop <= spanLength(text)) then
+                    return stop;
+                end if;
+                return start + 1;
+            when None do
+                return start + 1;
+        end case;
+    end;
+
+    -- The bytes a code point takes in UTF-8.
+    function encodedSize(point: Index): Index is
+        if point < 128 then
+            return 1;
+        end if;
+        if point < 2048 then
+            return 2;
+        end if;
+        if point < 65536 then
+            return 3;
+        end if;
+        return 4;
+    end;
+
+    generic [R: Region]
+    function clusterWidth(text: Span[Nat8, R], start: Index): Index is
+        let stop: Index := clusterEndAt(text, start);
+        let first: Index := pointOf(text, start);
+        if first = no_point then
+            return 1;
+        end if;
+        var width: Index := 0;
+        var at: Index := start;
+        var point: Index := first;
+        while (at < stop) and (point /= no_point) do
+            if point = #xFE0F then
+                return 2;
+            end if;
+            if point = #xFE0E then
+                if width > 0 then
+                    return 1;
+                end if;
+            end if;
+            if width = 0 then
+                width := pointWidth(point);
+            end if;
+            at := at + encodedSize(point);
+            if at < stop then
+                point := pointOf(text, at);
+            end if;
+        end while;
+        return width;
+    end;
+
+    -- Whether the cluster start to stop of text is a hard break: LF, CR,
+    -- CR LF, U+0085, U+2028 or U+2029.
+    generic [R: Region]
+    function isHardBreak(text: Span[Nat8, R], start: Index, stop: Index): Bool is
+        let byte: Nat8 := text[start];
+        if (byte = 10) or (byte = 13) then
+            return true;
+        end if;
+        let point: Index := pointOf(text, start);
+        return ((point = #x85) or (point = #x2028)) or (point = #x2029);
+    end;
+
+    -- The columns a tab takes at column col.
+    function tabAdvance(col: Index, tab_size: Index): Index is
+        return tab_size - (col - ((col / tab_size) * tab_size));
+    end;
+
+    generic [R: Region]
+    function displayWidth(text: Span[Nat8, R], tab_size: Index): Index is
+        let size: Index := spanLength(text);
+        var widest: Index := 0;
+        var col: Index := 0;
+        var pos: Index := 0;
+        while pos < size do
+            let stop: Index := clusterEndAt(text, pos);
+            if isHardBreak(text, pos, stop) then
+                col := 0;
+            else
+                if text[pos] = 9 then
+                    col := col + tabAdvance(col, tab_size);
+                else
+                    col := col + clusterWidth(text, pos);
+                end if;
+            end if;
+            if col > widest then
+                widest := col;
+            end if;
+            pos := stop;
+        end while;
+        return widest;
+    end;
+
+    generic [R: Region]
+    function fittingBytes(text: Span[Nat8, R], width: Index, tab_size: Index): Index is
+        let size: Index := spanLength(text);
+        var col: Index := 0;
+        var pos: Index := 0;
+        while pos < size do
+            let stop: Index := clusterEndAt(text, pos);
+            if isHardBreak(text, pos, stop) then
+                return pos;
+            end if;
+            var step: Index := 0;
+            if text[pos] = 9 then
+                step := tabAdvance(col, tab_size);
+            else
+                step := clusterWidth(text, pos);
+            end if;
+            if (col + step) > width then
+                return pos;
+            end if;
+            col := col + step;
+            pos := stop;
+        end while;
+        return size;
+    end;
+
+    -- The state of wrapText between two clusters: where the open line
+    -- starts and how wide it is up to pos; the last place it may break (cut,
+    -- with the width up to it) and where the next line would then start
+    -- (resume, with the width of the open line up to there); whether the
+    -- cluster before was blank or wide.
+    record Wrap: Free is
+        start: Index;
+        col: Index;
+        source: Index;
+        hasCut: Bool;
+        cut: Index;
+        cutWidth: Index;
+        resume: Index;
+        resumeCol: Index;
+        inSpace: Bool;
+        lastWide: Bool;
+    end;
+
+    -- A new line at start of the text line source.
+    function freshWrap(start: Index, source: Index): Wrap is
+        return Wrap(start => start, col => 0, source => source, hasCut => false, cut => start, cutWidth => 0, resume => start, resumeCol => 0, inSpace => false, lastWide => false);
+    end;
+
+    -- The state with a break allowed before pos.
+    function cutAt(state: Wrap, pos: Index): Wrap is
+        return Wrap(start => state.start, col => state.col, source => state.source, hasCut => true, cut => pos, cutWidth => state.col, resume => pos, resumeCol => state.col, inSpace => state.inSpace, lastWide => state.lastWide);
+    end;
+
+    -- Ends the open line at stop with width columns; the state of the line
+    -- that starts at next, where the columns from next to pos are col.
+    generic [B: Region]
+    function breakLine(lines: &![Buffer[Line], B], state: Wrap, stop: Index, width: Index, next: Index, col: Index): Wrap is
+        insertBack(&~lines, Line(start => state.start, stop => stop, width => width, source => state.source, hard => false));
+        return Wrap(start => next, col => col, source => state.source, hasCut => false, cut => next, cutWidth => 0, resume => next, resumeCol => 0, inSpace => false, lastWide => false);
+    end;
+
+    generic [R: Region, B: Region]
+    function wrapCluster(lines: &![Buffer[Line], B], state: Wrap, text: Span[Nat8, R], pos: Index, stop: Index, width: Index, tab_size: Index): Wrap is
+        let byte: Nat8 := text[pos];
+        if (byte = 32) or (byte = 9) then
+            var blank: Wrap := state;
+            if (not state.inSpace) and (pos > state.start) then
+                blank := cutAt(state, pos);
+            end if;
+            var step: Index := 1;
+            if byte = 9 then
+                step := tabAdvance(state.col, tab_size);
+            end if;
+            let col: Index := blank.col + step;
+            return Wrap(start => blank.start, col => col, source => blank.source, hasCut => blank.hasCut, cut => blank.cut, cutWidth => blank.cutWidth, resume => stop, resumeCol => col, inSpace => true, lastWide => false);
+        end if;
+        let step: Index := clusterWidth(text, pos);
+        let wide: Bool := step = 2;
+        var now: Wrap := state;
+        if (wide or state.lastWide) and ((not state.inSpace) and (pos > state.start)) then
+            now := cutAt(state, pos);
+        end if;
+        if ((now.col + step) > width) and (pos > now.start) then
+            if now.hasCut then
+                now := breakLine(&~lines, now, now.cut, now.cutWidth, now.resume, now.col - now.resumeCol);
+            end if;
+            if ((now.col + step) > width) and (pos > now.start) then
+                now := breakLine(&~lines, now, pos, now.col, pos, 0);
+            end if;
+        end if;
+        let col: Index := now.col + step;
+        let after: Wrap := Wrap(start => now.start, col => col, source => now.source, hasCut => now.hasCut, cut => now.cut, cutWidth => now.cutWidth, resume => now.resume, resumeCol => now.resumeCol, inSpace => false, lastWide => wide);
+        if pointOf(text, pos) = #x200B then
+            return cutAt(after, stop);
+        end if;
+        return after;
+    end;
+
+    generic [R: Region]
+    function wrapText(text: Span[Nat8, R], width: Index, tab_size: Index): Layout is
+        var lines: Buffer[Line] := allocateEmpty();
+        let size: Index := spanLength(text);
+        var state: Wrap := freshWrap(0, 0);
+        var pos: Index := 0;
+        while pos < size do
+            let stop: Index := clusterEndAt(text, pos);
+            if isHardBreak(text, pos, stop) then
+                insertBack(&!lines, Line(start => state.start, stop => pos, width => state.col, source => state.source, hard => true));
+                state := freshWrap(stop, state.source + 1);
+            else
+                state := wrapCluster(&!lines, state, text, pos, stop, width, tab_size);
+            end if;
+            pos := stop;
+        end while;
+        if (state.start < size) or (length(&lines) = 0) then
+            insertBack(&!lines, Line(start => state.start, stop => size, width => state.col, source => state.source, hard => false));
+        end if;
+        return Layout(lines => lines);
+    end;
+
+    function destroyLayout(layout: Layout): Unit is
+        let { lines: Buffer[Line] } := layout;
+        destroyFree(lines);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lineCount(layout: &[Layout, R]): Index is
+        return length(&(layout->lines));
+    end;
+
+    generic [R: Region]
+    function lineAt(layout: &[Layout, R], i: Index): Line is
+        return nth(&(layout->lines), i);
+    end;
+
+    generic [R: Region]
+    function lineStart(layout: &[Layout, R], i: Index): Index is
+        let line: Line := lineAt(layout, i);
+        return line.start;
+    end;
+
+    generic [R: Region]
+    function lineEnd(layout: &[Layout, R], i: Index): Index is
+        let line: Line := lineAt(layout, i);
+        return line.stop;
+    end;
+
+    generic [R: Region]
+    function lineWidth(layout: &[Layout, R], i: Index): Index is
+        let line: Line := lineAt(layout, i);
+        return line.width;
+    end;
+
+    generic [R: Region]
+    function lineSource(layout: &[Layout, R], i: Index): Index is
+        let line: Line := lineAt(layout, i);
+        return line.source;
+    end;
+
+    generic [R: Region]
+    function endsHard(layout: &[Layout, R], i: Index): Bool is
+        let line: Line := lineAt(layout, i);
+        return line.hard;
+    end;
+end module body.

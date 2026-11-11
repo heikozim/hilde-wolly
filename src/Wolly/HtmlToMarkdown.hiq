@@ -1,0 +1,2222 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromByteBuffer
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    insertBack,
+    removeLast,
+    storeNth,
+    destroyFree
+);
+import Standard.Text (
+    substring,
+    equal,
+    indexOf
+);
+import Standard.Html (
+    Document,
+    TokenKind,
+    TextToken,
+    StartTag,
+    EndTag,
+    CommentToken,
+    DoctypeToken,
+    parseHtml,
+    destroyDocument,
+    tokenCount,
+    tokenKind,
+    tokenText,
+    tokenSelfClosing,
+    attributeCount,
+    attributeName,
+    attributeValue
+);
+import Wolly.Markdown (
+    isSafeLink
+);
+
+module body Wolly.HtmlToMarkdown is
+    -- The kinds of element in the tree.
+    constant e_root: Index := 0;
+    constant e_text: Index := 1;
+    constant e_p: Index := 2;
+    constant e_h1: Index := 3;
+    constant e_h6: Index := 8;
+    constant e_strong: Index := 9;
+    constant e_em: Index := 10;
+    constant e_code: Index := 11;
+    constant e_pre: Index := 12;
+    constant e_a: Index := 13;
+    constant e_img: Index := 14;
+    constant e_ul: Index := 15;
+    constant e_ol: Index := 16;
+    constant e_li: Index := 17;
+    constant e_quote: Index := 18;
+    constant e_hr: Index := 19;
+    constant e_br: Index := 20;
+    constant e_table: Index := 21;
+    constant e_group: Index := 22;
+    constant e_tr: Index := 23;
+    constant e_th: Index := 24;
+    constant e_td: Index := 25;
+    constant e_del: Index := 26;
+    constant e_raw: Index := 27;
+    constant e_span: Index := 28;
+    constant e_block: Index := 29;
+    constant e_caption: Index := 30;
+    constant e_drop: Index := 31;
+    constant e_input: Index := 32;
+    constant e_other: Index := 33;
+    constant e_void: Index := 34;
+
+    -- The kinds of a container frame.
+    constant f_quote: Index := 1;
+    constant f_list: Index := 2;
+    constant f_item: Index := 3;
+
+    -- How far the search for an open element to close goes: to a table
+    -- or cell, to a list as well, to a table only, to a row.
+    constant scope_button: Index := 1;
+    constant scope_item: Index := 2;
+    constant scope_table: Index := 3;
+    constant scope_row: Index := 4;
+
+    -- The deepest the tree is built; deeper tags are read as absent.
+    constant most_tree: Index := 256;
+
+    -- The backslash.
+    constant backslash: Nat8 := 92;
+
+    -- One element or text of the tree: its kind, its token and its
+    -- relatives, 0 for none (node 0 is the root and nobody's child).
+    record Elem: Free is
+        code: Index;
+        token: Index;
+        parent: Index;
+        first: Index;
+        last: Index;
+        next: Index;
+    end;
+
+    -- A quote, a list or a list item being written.  number is the next
+    -- number of a list and the number of an item, mark its bullet or the
+    -- byte after its number, width the columns of the marker of an item.
+    -- written: a line of the frame has been written.
+    record Frame: Free is
+        kind: Index;
+        node: Index;
+        number: Index;
+        mark: Nat8;
+        ordered: Bool;
+        width: Index;
+        tight: Bool;
+        written: Bool;
+    end;
+
+    -- A cell of the table being read: its row, its bytes in the pool and
+    -- its alignment (0 none, 1 left, 2 center, 3 right).
+    record Cell: Free is
+        row: Index;
+        at: Index;
+        size: Index;
+        align: Index;
+    end;
+
+    -- The state of the writing.  out is the Markdown, line the inline
+    -- text of the block or cell being read, frames the open containers,
+    -- marks the open inline elements (emitted of them are written), cells
+    -- and pool the table being read.  spaced and broken: a space or a hard
+    -- break waits for the next content; task: a task box waits (1 open,
+    -- 2 done).  list_end is the length of out plus one where the last
+    -- list ended, with its depth, bullet and kind.
+    record Work: Linear is
+        out: Buffer[Nat8];
+        line: Buffer[Nat8];
+        frames: Buffer[Frame];
+        marks: Buffer[Index];
+        cells: Buffer[Cell];
+        pool: Buffer[Nat8];
+        emitted: Index;
+        spaced: Bool;
+        broken: Bool;
+        task: Index;
+        heading: Index;
+        in_cell: Bool;
+        cell_node: Index;
+        cell_align: Index;
+        table: Index;
+        rows: Index;
+        list_end: Index;
+        list_depth: Index;
+        list_mark: Nat8;
+        list_ordered: Bool;
+    end;
+
+    function mostHtmlBytes(): Index is
+        return 1048576;
+    end;
+
+    function mostHtmlDepth(): Index is
+        return 16;
+    end;
+
+    ---
+    --- Bytes and names
+    ---
+
+    function isWhite(byte: Nat8): Bool is
+        return ((byte = 32) or (byte = 9)) or (((byte = 10) or (byte = 13)) or (byte = 12));
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    -- Whether byte gets a backslash wherever it stands in text.
+    function isSpecial(byte: Nat8): Bool is
+        let a: Bool := ((byte = backslash) or (byte = '*')) or ((byte = '_') or (byte = '`'));
+        let b: Bool := ((byte = '[') or (byte = ']')) or ((byte = '<') or (byte = '>'));
+        let c: Bool := ((byte = '~') or (byte = '|')) or (byte = '&');
+        return (a or b) or c;
+    end;
+
+    -- Whether byte gets a backslash at the start of a line.
+    function isStartSpecial(byte: Nat8): Bool is
+        return ((byte = '#') or (byte = '+')) or ((byte = '-') or (byte = '='));
+    end;
+
+    -- The value of byte as an Index.
+    function valueOf(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The digit byte of v, for v below 10.
+    function digitByte(v: Index): Nat8 is
+        case toNat8(v + 48) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                return '0';
+        end case;
+    end;
+
+    -- Whether text holds nothing but white space.
+    generic [S: Region]
+    function isBlank(text: Span[Nat8, S]): Bool is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if not isWhite(text[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether word is one of the words of text separated by white space.
+    generic [S: Region, W: Region]
+    function hasWord(text: Span[Nat8, S], word: Span[Nat8, W]): Bool is
+        var i: Index := 0;
+        let size: Index := spanLength(text);
+        while i < size do
+            while (i < size) and isWhite(text[i]) do
+                i := i + 1;
+            end while;
+            var stop: Index := i;
+            while (stop < size) and (not isWhite(text[stop])) do
+                stop := stop + 1;
+            end while;
+            if (stop > i) and equal(substring(text, i, stop), word) then
+                return true;
+            end if;
+            i := stop;
+        end while;
+        return false;
+    end;
+
+    -- The heading elements h1 to h6 as e_h1 to e_h6, 0 for another name.
+    generic [S: Region]
+    function headingCode(name: Span[Nat8, S]): Index is
+        if spanLength(name) /= 2 then
+            return 0;
+        end if;
+        if (name[0] /= 'h') or ((name[1] < '1') or (name[1] > '6')) then
+            return 0;
+        end if;
+        return (e_h1 + valueOf(name[1])) - 49;
+    end;
+
+    -- The kind of the element called name.
+    generic [S: Region]
+    function codeOf(name: Span[Nat8, S]): Index is
+        let level: Index := headingCode(name);
+        if level /= 0 then
+            return level;
+        end if;
+        if equal(name, "p") then
+            return e_p;
+        end if;
+        if equal(name, "strong") or equal(name, "b") then
+            return e_strong;
+        end if;
+        if equal(name, "em") or equal(name, "i") then
+            return e_em;
+        end if;
+        if equal(name, "code") then
+            return e_code;
+        end if;
+        if equal(name, "pre") then
+            return e_pre;
+        end if;
+        if equal(name, "a") then
+            return e_a;
+        end if;
+        if equal(name, "img") then
+            return e_img;
+        end if;
+        if equal(name, "ul") then
+            return e_ul;
+        end if;
+        if equal(name, "ol") then
+            return e_ol;
+        end if;
+        if equal(name, "li") then
+            return e_li;
+        end if;
+        if equal(name, "blockquote") then
+            return e_quote;
+        end if;
+        if equal(name, "hr") then
+            return e_hr;
+        end if;
+        if equal(name, "br") then
+            return e_br;
+        end if;
+        if equal(name, "table") then
+            return e_table;
+        end if;
+        if (equal(name, "thead") or equal(name, "tbody")) or equal(name, "tfoot") then
+            return e_group;
+        end if;
+        if equal(name, "tr") then
+            return e_tr;
+        end if;
+        if equal(name, "th") then
+            return e_th;
+        end if;
+        if equal(name, "td") then
+            return e_td;
+        end if;
+        if (equal(name, "del") or equal(name, "s")) or equal(name, "strike") then
+            return e_del;
+        end if;
+        let raw: Bool := (equal(name, "u") or equal(name, "sub")) or ((equal(name, "sup") or equal(name, "mark")) or equal(name, "kbd"));
+        if raw then
+            return e_raw;
+        end if;
+        if equal(name, "span") then
+            return e_span;
+        end if;
+        if equal(name, "figcaption") then
+            return e_caption;
+        end if;
+        if equal(name, "input") then
+            return e_input;
+        end if;
+        if isBlockName(name) then
+            return e_block;
+        end if;
+        if isDropName(name) then
+            return e_drop;
+        end if;
+        if isVoidName(name) then
+            return e_void;
+        end if;
+        return e_other;
+    end;
+
+    -- The elements that are block boundaries and nothing else.
+    generic [S: Region]
+    function isBlockName(name: Span[Nat8, S]): Bool is
+        let a: Bool := (equal(name, "div") or equal(name, "figure")) or (equal(name, "section") or equal(name, "article"));
+        let b: Bool := (equal(name, "header") or equal(name, "footer")) or (equal(name, "main") or equal(name, "nav"));
+        let c: Bool := (equal(name, "aside") or equal(name, "address")) or (equal(name, "details") or equal(name, "summary"));
+        let d: Bool := (equal(name, "dl") or equal(name, "dt")) or (equal(name, "dd") or equal(name, "caption"));
+        let e: Bool := equal(name, "center") or equal(name, "hgroup");
+        return ((a or b) or (c or d)) or e;
+    end;
+
+    -- The elements that go with their content.
+    generic [S: Region]
+    function isDropName(name: Span[Nat8, S]): Bool is
+        let a: Bool := (equal(name, "script") or equal(name, "style")) or (equal(name, "template") or equal(name, "iframe"));
+        let b: Bool := (equal(name, "object") or equal(name, "embed")) or (equal(name, "svg") or equal(name, "math"));
+        let c: Bool := (equal(name, "form") or equal(name, "button")) or (equal(name, "select") or equal(name, "textarea"));
+        let d: Bool := (equal(name, "option") or equal(name, "optgroup")) or (equal(name, "fieldset") or equal(name, "legend"));
+        let e: Bool := (equal(name, "datalist") or equal(name, "output")) or (equal(name, "title") or equal(name, "noscript"));
+        let f: Bool := (equal(name, "canvas") or equal(name, "audio")) or (equal(name, "video") or equal(name, "colgroup"));
+        let g: Bool := (equal(name, "frameset") or equal(name, "frame")) or (equal(name, "applet") or equal(name, "noembed"));
+        return (((a or b) or (c or d)) or (e or f)) or g;
+    end;
+
+    -- The elements without content besides br, hr, img and input.
+    generic [S: Region]
+    function isVoidName(name: Span[Nat8, S]): Bool is
+        let a: Bool := (equal(name, "wbr") or equal(name, "meta")) or (equal(name, "link") or equal(name, "area"));
+        let b: Bool := (equal(name, "base") or equal(name, "col")) or (equal(name, "param") or equal(name, "source"));
+        let c: Bool := equal(name, "track") or equal(name, "keygen");
+        return (a or b) or c;
+    end;
+
+    function isHeading(code: Index): Bool is
+        return (code >= e_h1) and (code <= e_h6);
+    end;
+
+    function isVoid(code: Index): Bool is
+        return ((code = e_br) or (code = e_hr)) or (((code = e_img) or (code = e_input)) or (code = e_void));
+    end;
+
+    -- Whether the start of an element of this kind closes an open p.
+    function closesParagraph(code: Index): Bool is
+        let a: Bool := ((code = e_p) or isHeading(code)) or ((code = e_pre) or (code = e_ul));
+        let b: Bool := ((code = e_ol) or (code = e_quote)) or ((code = e_hr) or (code = e_table));
+        let c: Bool := (code = e_block) or (code = e_caption);
+        return (a or b) or c;
+    end;
+
+    ---
+    --- Attributes
+    ---
+
+    -- The place of the attribute called name of token n plus one, 0 when
+    -- it has none.
+    generic [D: Region, S: Region]
+    function attributeAt(doc: &[Document, D], n: Index, name: Span[Nat8, S]): Index is
+        let total: Index := attributeCount(doc, n);
+        var a: Index := 0;
+        while a < total do
+            if equal(attributeName(doc, n, a), name) then
+                return a + 1;
+            end if;
+            a := a + 1;
+        end while;
+        return 0;
+    end;
+
+    -- The value of the attribute called name of token n, empty when it has
+    -- none.
+    generic [D: Region, S: Region]
+    function attributeText(doc: &[Document, D], n: Index, name: Span[Nat8, S]): Span[Nat8, D] is
+        let at: Index := attributeAt(doc, n, name);
+        if at = 0 then
+            return substring(tokenText(doc, n), 0, 0);
+        end if;
+        return attributeValue(doc, n, at - 1);
+    end;
+
+    -- The alignment that the class or the style of token n gives a cell.
+    generic [D: Region]
+    function alignOf(doc: &[Document, D], n: Index): Index is
+        let class: Span[Nat8, D] := attributeText(doc, n, "class");
+        if hasWord(class, "text-left") then
+            return 1;
+        end if;
+        if hasWord(class, "text-center") then
+            return 2;
+        end if;
+        if hasWord(class, "text-right") then
+            return 3;
+        end if;
+        let style: Span[Nat8, D] := attributeText(doc, n, "style");
+        case indexOf(style, "text-align") of
+            when Some(value as at: Index) do
+                var i: Index := at + 10;
+                while (i < spanLength(style)) and ((style[i] = ':') or isWhite(style[i])) do
+                    i := i + 1;
+                end while;
+                let rest: Span[Nat8, D] := substring(style, i, spanLength(style));
+                if spanLength(rest) >= 4 then
+                    if equal(substring(rest, 0, 4), "left") then
+                        return 1;
+                    end if;
+                end if;
+                if spanLength(rest) >= 6 then
+                    if equal(substring(rest, 0, 6), "center") then
+                        return 2;
+                    end if;
+                end if;
+                if spanLength(rest) >= 5 then
+                    if equal(substring(rest, 0, 5), "right") then
+                        return 3;
+                    end if;
+                end if;
+                return 0;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The start number of the list at token n: its start attribute when
+    -- that is a number of at most nine digits, else 1.
+    generic [D: Region]
+    function startOf(doc: &[Document, D], n: Index): Index is
+        let text: Span[Nat8, D] := attributeText(doc, n, "start");
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > 9) then
+            return 1;
+        end if;
+        var number: Index := 0;
+        var i: Index := 0;
+        while i < size do
+            if not isDigit(text[i]) then
+                return 1;
+            end if;
+            number := (number * 10) + (valueOf(text[i]) - 48);
+            i := i + 1;
+        end while;
+        return number;
+    end;
+
+    -- The info string of a code block: the rest of the first class of
+    -- token n that begins with language-, empty when there is none or it
+    -- holds a backtick.
+    generic [D: Region]
+    function languageOf(doc: &[Document, D], n: Index): Span[Nat8, D] is
+        let class: Span[Nat8, D] := attributeText(doc, n, "class");
+        case indexOf(class, "language-") of
+            when Some(value as at: Index) do
+                var stop: Index := at + 9;
+                while (stop < spanLength(class)) and (not isWhite(class[stop])) do
+                    if class[stop] = '`' then
+                        return substring(class, 0, 0);
+                    end if;
+                    stop := stop + 1;
+                end while;
+                return substring(class, at + 9, stop);
+            when None do
+                return substring(class, 0, 0);
+        end case;
+    end;
+
+    ---
+    --- The tree
+    ---
+
+    generic [T: Region]
+    function elemAt(tree: &[Buffer[Elem], T], n: Index): Elem is
+        return nth(tree, n);
+    end;
+
+    generic [N: Region]
+    function elemMut(nodes: &![Buffer[Elem], N], n: Index): Elem is
+        return nthMut(nodes, n);
+    end;
+
+    -- A new node of kind code for token, the last child of parent.
+    generic [N: Region]
+    function addNode(nodes: &![Buffer[Elem], N], parent: Index, code: Index, token: Index): Index is
+        let id: Index := lengthMut(&~nodes);
+        insertBack(&~nodes, Elem(code => code, token => token, parent => parent, first => 0, last => 0, next => 0));
+        var mother: Elem := elemMut(&~nodes, parent);
+        if mother.last /= 0 then
+            var before: Elem := elemMut(&~nodes, mother.last);
+            before.next := id;
+            storeNth(&~nodes, mother.last, before);
+        else
+            mother.first := id;
+        end if;
+        mother.last := id;
+        storeNth(&~nodes, parent, mother);
+        return id;
+    end;
+
+    generic [S: Region]
+    function topOf(stack: &![Buffer[Index], S]): Index is
+        let size: Index := lengthMut(&~stack);
+        return nthMut(&~stack, size - 1);
+    end;
+
+    -- Pops the stack down to its first size entries.
+    generic [S: Region]
+    function popTo(stack: &![Buffer[Index], S], size: Index): Unit is
+        while lengthMut(&~stack) > size do
+            let gone: Index := removeLast(&~stack);
+        end while;
+        return nil;
+    end;
+
+    -- Whether an open element of kind code satisfies a search for want.
+    function sameKind(code: Index, want: Index): Bool is
+        if want = e_td then
+            return (code = e_td) or (code = e_th);
+        end if;
+        return code = want;
+    end;
+
+    -- Whether the search of scope stops at an open element of kind code.
+    function stopsAt(code: Index, scope: Index): Bool is
+        let cell: Bool := ((code = e_table) or (code = e_td)) or (code = e_th);
+        if scope = scope_button then
+            return cell;
+        end if;
+        if scope = scope_item then
+            return (cell or (code = e_quote)) or ((code = e_ul) or (code = e_ol));
+        end if;
+        if scope = scope_table then
+            return code = e_table;
+        end if;
+        return (code = e_tr) or (code = e_table);
+    end;
+
+    -- Closes the nearest open element of kind want, when the search of
+    -- scope reaches it, with every element opened after it.
+    generic [N: Region, S: Region]
+    function closeTo(nodes: &![Buffer[Elem], N], stack: &![Buffer[Index], S], want: Index, scope: Index): Unit is
+        var k: Index := lengthMut(&~stack) - 1;
+        while k > 0 do
+            let id: Index := nthMut(&~stack, k);
+            let e: Elem := elemMut(&~nodes, id);
+            if sameKind(e.code, want) then
+                popTo(&~stack, k);
+                return nil;
+            end if;
+            if stopsAt(e.code, scope) then
+                return nil;
+            end if;
+            k := k - 1;
+        end while;
+        return nil;
+    end;
+
+    -- Closes what the start of an element of kind code closes in HTML.
+    generic [N: Region, S: Region]
+    function closeImplied(nodes: &![Buffer[Elem], N], stack: &![Buffer[Index], S], code: Index): Unit is
+        if closesParagraph(code) then
+            closeTo(&~nodes, &~stack, e_p, scope_button);
+        end if;
+        if code = e_li then
+            closeTo(&~nodes, &~stack, e_li, scope_item);
+        end if;
+        if (code = e_td) or (code = e_th) then
+            closeTo(&~nodes, &~stack, e_td, scope_row);
+        end if;
+        if code = e_tr then
+            closeTo(&~nodes, &~stack, e_tr, scope_table);
+        end if;
+        if code = e_group then
+            closeTo(&~nodes, &~stack, e_group, scope_table);
+        end if;
+        if code = e_a then
+            closeTo(&~nodes, &~stack, e_a, scope_button);
+        end if;
+        if isHeading(code) then
+            let top: Index := topOf(&~stack);
+            let e: Elem := elemMut(&~nodes, top);
+            if isHeading(e.code) then
+                let size: Index := lengthMut(&~stack);
+                popTo(&~stack, size - 1);
+            end if;
+        end if;
+        return nil;
+    end;
+
+    -- The last token of the element dropped at token n: its end tag, the
+    -- end of the input when it has none.
+    generic [D: Region]
+    function skipDropped(doc: &[Document, D], n: Index): Index is
+        if tokenSelfClosing(doc, n) then
+            return n;
+        end if;
+        let name: Span[Nat8, D] := tokenText(doc, n);
+        let total: Index := tokenCount(doc);
+        var depth: Index := 1;
+        var j: Index := n + 1;
+        while j < total do
+            case tokenKind(doc, j) of
+                when Some(value as kind: TokenKind) do
+                    case kind of
+                        when StartTag do
+                            if equal(tokenText(doc, j), name) then
+                                depth := depth + 1;
+                            end if;
+                        when EndTag do
+                            if equal(tokenText(doc, j), name) then
+                                depth := depth - 1;
+                                if depth = 0 then
+                                    return j;
+                                end if;
+                            end if;
+                        when TextToken do
+                            skip;
+                        when CommentToken do
+                            skip;
+                        when DoctypeToken do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+            j := j + 1;
+        end while;
+        return total;
+    end;
+
+    -- Reads the start tag at token n into the tree; the last token it
+    -- takes.
+    generic [N: Region, S: Region, D: Region]
+    function startTag(nodes: &![Buffer[Elem], N], stack: &![Buffer[Index], S], doc: &[Document, D], n: Index): Index is
+        let code: Index := codeOf(tokenText(doc, n));
+        if code = e_drop then
+            return skipDropped(doc, n);
+        end if;
+        closeImplied(&~nodes, &~stack, code);
+        let parent: Index := topOf(&~stack);
+        let id: Index := addNode(&~nodes, parent, code, n);
+        if not isVoid(code) then
+            if lengthMut(&~stack) < most_tree then
+                insertBack(&~stack, id);
+            end if;
+        end if;
+        return n;
+    end;
+
+    -- Reads the end tag at token n: closes the nearest open element of its
+    -- name, unless a table or a cell lies between.
+    generic [N: Region, S: Region, D: Region]
+    function endTag(nodes: &![Buffer[Elem], N], stack: &![Buffer[Index], S], doc: &[Document, D], n: Index): Unit is
+        let name: Span[Nat8, D] := tokenText(doc, n);
+        let code: Index := codeOf(name);
+        let tabular: Bool := (((code = e_td) or (code = e_th)) or (code = e_tr)) or ((code = e_group) or (code = e_table));
+        var k: Index := lengthMut(&~stack) - 1;
+        while k > 0 do
+            let id: Index := nthMut(&~stack, k);
+            let e: Elem := elemMut(&~nodes, id);
+            if equal(tokenText(doc, e.token), name) then
+                popTo(&~stack, k);
+                return nil;
+            end if;
+            if ((e.code = e_td) or (e.code = e_th)) and (not tabular) then
+                return nil;
+            end if;
+            if (e.code = e_table) and (code /= e_table) then
+                return nil;
+            end if;
+            k := k - 1;
+        end while;
+        return nil;
+    end;
+
+    -- The tree of the elements and texts of doc; node 0 is the root.
+    generic [D: Region]
+    function buildTree(doc: &[Document, D]): Buffer[Elem] is
+        var nodes: Buffer[Elem] := allocateEmpty();
+        insertBack(&!nodes, Elem(code => e_root, token => 0, parent => 0, first => 0, last => 0, next => 0));
+        var stack: Buffer[Index] := allocateEmpty();
+        insertBack(&!stack, 0);
+        let total: Index := tokenCount(doc);
+        var i: Index := 0;
+        while i < total do
+            case tokenKind(doc, i) of
+                when Some(value as kind: TokenKind) do
+                    case kind of
+                        when TextToken do
+                            let parent: Index := topOf(&!stack);
+                            let id: Index := addNode(&!nodes, parent, e_text, i);
+                        when StartTag do
+                            i := startTag(&!nodes, &!stack, doc, i);
+                        when EndTag do
+                            endTag(&!nodes, &!stack, doc, i);
+                        when CommentToken do
+                            skip;
+                        when DoctypeToken do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        destroyFree(stack);
+        return nodes;
+    end;
+
+    -- The text under node n, br as a line feed, into buf.
+    generic [T: Region, D: Region, B: Region]
+    function gatherText(tree: &[Buffer[Elem], T], doc: &[Document, D], n: Index, buf: &![Buffer[Nat8], B]): Unit is
+        let top: Elem := elemAt(tree, n);
+        var cur: Index := top.first;
+        while cur /= 0 do
+            let e: Elem := elemAt(tree, cur);
+            if e.code = e_text then
+                let text: Span[Nat8, D] := tokenText(doc, e.token);
+                var i: Index := 0;
+                while i < spanLength(text) do
+                    insertBack(&~buf, text[i]);
+                    i := i + 1;
+                end while;
+            end if;
+            if e.code = e_br then
+                insertBack(&~buf, 10);
+            end if;
+            if e.first /= 0 then
+                cur := e.first;
+            else
+                var up: Index := cur;
+                var here: Elem := e;
+                while (here.next = 0) and (here.parent /= n) do
+                    up := here.parent;
+                    here := elemAt(tree, up);
+                end while;
+                cur := here.next;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    -- The longest run of backticks in buf.
+    generic [B: Region]
+    function longestTicks(buf: &[Buffer[Nat8], B]): Index is
+        var most: Index := 0;
+        var run: Index := 0;
+        var i: Index := 0;
+        while i < length(buf) do
+            if nth(buf, i) = '`' then
+                run := run + 1;
+                if run > most then
+                    most := run;
+                end if;
+            else
+                run := 0;
+            end if;
+            i := i + 1;
+        end while;
+        return most;
+    end;
+
+    -- Whether the list n has no item that holds a paragraph.
+    generic [T: Region]
+    function isTight(tree: &[Buffer[Elem], T], n: Index): Bool is
+        let list: Elem := elemAt(tree, n);
+        var item: Index := list.first;
+        while item /= 0 do
+            let li: Elem := elemAt(tree, item);
+            if li.code = e_li then
+                var child: Index := li.first;
+                while child /= 0 do
+                    let c: Elem := elemAt(tree, child);
+                    if c.code = e_p then
+                        return false;
+                    end if;
+                    child := c.next;
+                end while;
+            end if;
+            item := li.next;
+        end while;
+        return true;
+    end;
+
+    -- The task state of item n: 2 done, 1 open, 0 no task item.
+    generic [T: Region, D: Region]
+    function taskOf(tree: &[Buffer[Elem], T], doc: &[Document, D], n: Index): Index is
+        let li: Elem := elemAt(tree, n);
+        let class: Span[Nat8, D] := attributeText(doc, li.token, "class");
+        if hasWord(class, "task") then
+            if hasWord(class, "done") then
+                return 2;
+            end if;
+            return 1;
+        end if;
+        var cur: Index := li.first;
+        var steps: Index := 0;
+        while (cur /= 0) and (steps < 64) do
+            let e: Elem := elemAt(tree, cur);
+            if e.code = e_input then
+                if not equal(attributeText(doc, e.token, "type"), "checkbox") then
+                    return 0;
+                end if;
+                if attributeAt(doc, e.token, "checked") /= 0 then
+                    return 2;
+                end if;
+                return 1;
+            end if;
+            if e.code = e_text then
+                if not isBlank(tokenText(doc, e.token)) then
+                    return 0;
+                end if;
+                cur := e.next;
+            else
+                let inside: Bool := ((e.code = e_other) or (e.code = e_span)) or ((e.code = e_p) or (e.code = e_block));
+                if inside and (e.first /= 0) then
+                    cur := e.first;
+                else
+                    return 0;
+                end if;
+            end if;
+            steps := steps + 1;
+        end while;
+        return 0;
+    end;
+
+    -- The table node that n lies in, 0 for none.
+    generic [T: Region]
+    function tableOf(tree: &[Buffer[Elem], T], n: Index): Index is
+        let start: Elem := elemAt(tree, n);
+        var cur: Index := start.parent;
+        while cur /= 0 do
+            let e: Elem := elemAt(tree, cur);
+            if e.code = e_table then
+                return cur;
+            end if;
+            cur := e.parent;
+        end while;
+        return 0;
+    end;
+
+    ---
+    --- The state of the writing
+    ---
+
+    generic [R: Region]
+    function outLength(w: &![Work, R]): Index is
+        return length(&(w->out));
+    end;
+
+    generic [R: Region]
+    function outByte(w: &![Work, R], i: Index): Nat8 is
+        return nth(&(w->out), i);
+    end;
+
+    generic [R: Region]
+    function putOut(w: &![Work, R], byte: Nat8): Unit is
+        insertBack(&!(w->out), byte);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function dropOut(w: &![Work, R]): Unit is
+        let gone: Nat8 := removeLast(&!(w->out));
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeOut(w: &![Work, R], text: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            putOut(&~w, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lineLength(w: &![Work, R]): Index is
+        return length(&(w->line));
+    end;
+
+    generic [R: Region]
+    function lineByte(w: &![Work, R], i: Index): Nat8 is
+        return nth(&(w->line), i);
+    end;
+
+    generic [R: Region]
+    function putLine(w: &![Work, R], byte: Nat8): Unit is
+        insertBack(&!(w->line), byte);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function dropLine(w: &![Work, R]): Unit is
+        let gone: Nat8 := removeLast(&!(w->line));
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeLine(w: &![Work, R], text: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            putLine(&~w, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function clearLine(w: &![Work, R]): Unit is
+        while lineLength(&~w) > 0 do
+            dropLine(&~w);
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function frameCount(w: &![Work, R]): Index is
+        return length(&(w->frames));
+    end;
+
+    generic [R: Region]
+    function frameAt(w: &![Work, R], i: Index): Frame is
+        return nth(&(w->frames), i);
+    end;
+
+    generic [R: Region]
+    function setFrame(w: &![Work, R], i: Index, frame: Frame): Unit is
+        storeNth(&!(w->frames), i, frame);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushFrame(w: &![Work, R], frame: Frame): Unit is
+        insertBack(&!(w->frames), frame);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function popFrame(w: &![Work, R]): Unit is
+        let gone: Frame := removeLast(&!(w->frames));
+        return nil;
+    end;
+
+    -- Whether the innermost frame is the one of node n.
+    generic [R: Region]
+    function isTopFrame(w: &![Work, R], n: Index): Bool is
+        let total: Index := frameCount(&~w);
+        if total = 0 then
+            return false;
+        end if;
+        let top: Frame := frameAt(&~w, total - 1);
+        return top.node = n;
+    end;
+
+    generic [R: Region]
+    function markCount(w: &![Work, R]): Index is
+        return length(&(w->marks));
+    end;
+
+    generic [R: Region]
+    function markAt(w: &![Work, R], i: Index): Index is
+        return nth(&(w->marks), i);
+    end;
+
+    generic [R: Region]
+    function pushMark(w: &![Work, R], n: Index): Unit is
+        insertBack(&!(w->marks), n);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function popMark(w: &![Work, R]): Unit is
+        let gone: Index := removeLast(&!(w->marks));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function cellCount(w: &![Work, R]): Index is
+        return length(&(w->cells));
+    end;
+
+    generic [R: Region]
+    function cellAt(w: &![Work, R], i: Index): Cell is
+        return nth(&(w->cells), i);
+    end;
+
+    generic [R: Region]
+    function pushCell(w: &![Work, R], cell: Cell): Unit is
+        insertBack(&!(w->cells), cell);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function popCell(w: &![Work, R]): Unit is
+        let gone: Cell := removeLast(&!(w->cells));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function poolLength(w: &![Work, R]): Index is
+        return length(&(w->pool));
+    end;
+
+    generic [R: Region]
+    function poolByte(w: &![Work, R], i: Index): Nat8 is
+        return nth(&(w->pool), i);
+    end;
+
+    generic [R: Region]
+    function putPool(w: &![Work, R], byte: Nat8): Unit is
+        insertBack(&!(w->pool), byte);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function dropPool(w: &![Work, R]): Unit is
+        let gone: Nat8 := removeLast(&!(w->pool));
+        return nil;
+    end;
+
+    ---
+    --- Lines of the output
+    ---
+
+    -- Writes n in decimal to out.
+    generic [R: Region]
+    function writeNumber(w: &![Work, R], n: Index): Unit is
+        var step: Index := 1;
+        while (n / step) >= 10 do
+            step := step * 10;
+        end while;
+        while step > 0 do
+            putOut(&~w, digitByte((n / step) - (((n / step) / 10) * 10)));
+            step := step / 10;
+        end while;
+        return nil;
+    end;
+
+    -- How many digits n has in decimal.
+    function digitCount(n: Index): Index is
+        var count: Index := 1;
+        var rest: Index := n;
+        while rest >= 10 do
+            rest := rest / 10;
+            count := count + 1;
+        end while;
+        return count;
+    end;
+
+    -- Ends the line of out, without its trailing spaces when trim is true.
+    generic [R: Region]
+    function endLine(w: &![Work, R], trim: Bool): Unit is
+        if trim then
+            var size: Index := outLength(&~w);
+            while (size > 0) and (outByte(&~w, size - 1) = 32) do
+                dropOut(&~w);
+                size := size - 1;
+            end while;
+        end if;
+        putOut(&~w, 10);
+        return nil;
+    end;
+
+    -- Writes the marker of an item frame.
+    generic [R: Region]
+    function writeMarker(w: &![Work, R], frame: Frame): Unit is
+        if frame.ordered then
+            writeNumber(&~w, frame.number);
+        end if;
+        putOut(&~w, frame.mark);
+        putOut(&~w, 32);
+        return nil;
+    end;
+
+    -- Writes the start of a line of content: a quote mark for every quote,
+    -- the marker of an item on its first line and spaces of its width on
+    -- the others.  Every frame counts as written after it.
+    generic [R: Region]
+    function writePrefix(w: &![Work, R]): Unit is
+        let total: Index := frameCount(&~w);
+        var i: Index := 0;
+        while i < total do
+            var frame: Frame := frameAt(&~w, i);
+            if frame.kind = f_quote then
+                writeOut(&~w, "> ");
+            else
+                if frame.kind = f_item then
+                    if frame.written then
+                        var k: Index := 0;
+                        while k < frame.width do
+                            putOut(&~w, 32);
+                            k := k + 1;
+                        end while;
+                    else
+                        writeMarker(&~w, frame);
+                    end if;
+                end if;
+            end if;
+            frame.written := true;
+            setFrame(&~w, i, frame);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Writes a blank line inside the frames that hold written lines.
+    generic [R: Region]
+    function writeBlank(w: &![Work, R]): Unit is
+        let total: Index := frameCount(&~w);
+        var i: Index := 0;
+        while i < total do
+            let frame: Frame := frameAt(&~w, i);
+            if (frame.kind /= f_list) and (not frame.written) then
+                i := total;
+            else
+                if frame.kind = f_quote then
+                    writeOut(&~w, "> ");
+                end if;
+                if frame.kind = f_item then
+                    var k: Index := 0;
+                    while k < frame.width do
+                        putOut(&~w, 32);
+                        k := k + 1;
+                    end while;
+                end if;
+                i := i + 1;
+            end if;
+        end while;
+        endLine(&~w, true);
+        return nil;
+    end;
+
+    -- Whether the next block follows the last without a blank line: inside
+    -- a list without paragraphs that holds a written line, with no quote
+    -- between.
+    generic [R: Region]
+    function followsClose(w: &![Work, R]): Bool is
+        var k: Index := frameCount(&~w);
+        while k > 0 do
+            let frame: Frame := frameAt(&~w, k - 1);
+            if frame.kind = f_quote then
+                return false;
+            end if;
+            if frame.kind = f_list then
+                return frame.tight and frame.written;
+            end if;
+            k := k - 1;
+        end while;
+        return false;
+    end;
+
+    -- Writes what goes before a new block: a blank line unless it is the
+    -- first block or follows close.
+    generic [R: Region]
+    function startBlock(w: &![Work, R]): Unit is
+        if outLength(&~w) = 0 then
+            return nil;
+        end if;
+        if followsClose(&~w) then
+            return nil;
+        end if;
+        writeBlank(&~w);
+        return nil;
+    end;
+
+    -- How many lists and quotes are open.
+    generic [R: Region]
+    function nestDepth(w: &![Work, R]): Index is
+        let total: Index := frameCount(&~w);
+        var depth: Index := 0;
+        var i: Index := 0;
+        while i < total do
+            let frame: Frame := frameAt(&~w, i);
+            if frame.kind /= f_item then
+                depth := depth + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return depth;
+    end;
+
+    ---
+    --- Inline text
+    ---
+
+    -- Writes the opening of the inline element n into line.
+    generic [R: Region, D: Region, T: Region]
+    function writeOpener(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        let e: Elem := elemAt(tree, n);
+        if e.code = e_strong then
+            writeLine(&~w, "**");
+        end if;
+        if e.code = e_em then
+            putLine(&~w, '*');
+        end if;
+        if e.code = e_del then
+            writeLine(&~w, "~~");
+        end if;
+        if (e.code = e_raw) or (e.code = e_span) then
+            putLine(&~w, '<');
+            writeLine(&~w, tokenText(doc, e.token));
+            putLine(&~w, '>');
+        end if;
+        if e.code = e_a then
+            putLine(&~w, '[');
+        end if;
+        return nil;
+    end;
+
+    -- Writes url as the destination of a link: in angle brackets when it
+    -- holds a parenthesis.
+    generic [R: Region, S: Region]
+    function writeUrl(w: &![Work, R], url: Span[Nat8, S]): Unit is
+        var odd: Bool := false;
+        var i: Index := 0;
+        while i < spanLength(url) do
+            if (url[i] = '(') or (url[i] = ')') then
+                odd := true;
+            end if;
+            i := i + 1;
+        end while;
+        if odd then
+            putLine(&~w, '<');
+        end if;
+        writeLine(&~w, url);
+        if odd then
+            putLine(&~w, '>');
+        end if;
+        return nil;
+    end;
+
+    -- Writes title, when there is one, as the title of a link: a space and
+    -- the title in double quotes, its quotes and backslashes escaped.
+    generic [R: Region, S: Region]
+    function writeTitle(w: &![Work, R], title: Span[Nat8, S]): Unit is
+        if spanLength(title) = 0 then
+            return nil;
+        end if;
+        writeLine(&~w, " \"");
+        var i: Index := 0;
+        while i < spanLength(title) do
+            let byte: Nat8 := title[i];
+            if isWhite(byte) then
+                putLine(&~w, 32);
+            else
+                if ((byte = '"') or (byte = backslash)) or (byte = '|') then
+                    putLine(&~w, backslash);
+                end if;
+                putLine(&~w, byte);
+            end if;
+            i := i + 1;
+        end while;
+        putLine(&~w, '"');
+        return nil;
+    end;
+
+    -- Writes the closing of the inline element n into line.
+    generic [R: Region, D: Region, T: Region]
+    function writeCloser(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        let e: Elem := elemAt(tree, n);
+        if e.code = e_strong then
+            writeLine(&~w, "**");
+        end if;
+        if e.code = e_em then
+            putLine(&~w, '*');
+        end if;
+        if e.code = e_del then
+            writeLine(&~w, "~~");
+        end if;
+        if (e.code = e_raw) or (e.code = e_span) then
+            writeLine(&~w, "</");
+            writeLine(&~w, tokenText(doc, e.token));
+            putLine(&~w, '>');
+        end if;
+        if e.code = e_a then
+            writeLine(&~w, "](");
+            writeUrl(&~w, attributeText(doc, e.token, "href"));
+            writeTitle(&~w, attributeText(doc, e.token, "title"));
+            putLine(&~w, ')');
+        end if;
+        return nil;
+    end;
+
+    -- Writes what waits before the next content: a hard break or a space,
+    -- the task box, the openings of the marks not yet written.
+    generic [R: Region, D: Region, T: Region]
+    function emitPending(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T]): Unit is
+        if w->broken then
+            putLine(&~w, backslash);
+            putLine(&~w, 10);
+        else
+            if w->spaced then
+                putLine(&~w, 32);
+            end if;
+        end if;
+        w->broken := false;
+        w->spaced := false;
+        let task: Index := w->task;
+        if task = 1 then
+            writeLine(&~w, "[ ] ");
+        end if;
+        if task = 2 then
+            writeLine(&~w, "[x] ");
+        end if;
+        let none: Index := 0;
+        w->task := none;
+        let total: Index := markCount(&~w);
+        var i: Index := w->emitted;
+        while i < total do
+            let mark: Index := markAt(&~w, i);
+            writeOpener(&~w, doc, tree, mark);
+            i := i + 1;
+        end while;
+        w->emitted := total;
+        return nil;
+    end;
+
+    -- Notes white space: one space waits when the line holds content.
+    generic [R: Region]
+    function noteSpace(w: &![Work, R]): Unit is
+        if w->broken then
+            return nil;
+        end if;
+        let size: Index := lineLength(&~w);
+        if size > 0 then
+            let last: Nat8 := lineByte(&~w, size - 1);
+            if (last /= 32) and (last /= 10) then
+                w->spaced := true;
+            end if;
+        end if;
+        return nil;
+    end;
+
+    -- Whether the next byte of line starts a line of the block.
+    generic [R: Region]
+    function atLineStart(w: &![Work, R]): Bool is
+        if w->in_cell then
+            return false;
+        end if;
+        let size: Index := lineLength(&~w);
+        if size = 0 then
+            return true;
+        end if;
+        return lineByte(&~w, size - 1) = 10;
+    end;
+
+    -- Appends text to line: white space collapsed, the marks of Markdown
+    -- escaped.
+    generic [R: Region, D: Region, T: Region, S: Region]
+    function appendText(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], text: Span[Nat8, S]): Unit is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if isWhite(byte) then
+                noteSpace(&~w);
+                i := i + 1;
+            else
+                emitPending(&~w, doc, tree);
+                let start: Bool := atLineStart(&~w);
+                if start and isDigit(byte) then
+                    var j: Index := i;
+                    while (j < size) and isDigit(text[j]) do
+                        putLine(&~w, text[j]);
+                        j := j + 1;
+                    end while;
+                    if (j < size) and ((text[j] = '.') or (text[j] = ')')) then
+                        putLine(&~w, backslash);
+                        putLine(&~w, text[j]);
+                        j := j + 1;
+                    end if;
+                    i := j;
+                else
+                    if (start and isStartSpecial(byte)) or isSpecial(byte) then
+                        putLine(&~w, backslash);
+                    end if;
+                    putLine(&~w, byte);
+                    i := i + 1;
+                end if;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    -- Appends text as the alt text of an image: white space collapsed,
+    -- the marks escaped.
+    generic [R: Region, S: Region]
+    function appendAlt(w: &![Work, R], text: Span[Nat8, S]): Unit is
+        var space: Bool := false;
+        var any: Bool := false;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if isWhite(byte) then
+                space := any;
+            else
+                if space then
+                    putLine(&~w, 32);
+                    space := false;
+                end if;
+                if isSpecial(byte) then
+                    putLine(&~w, backslash);
+                end if;
+                putLine(&~w, byte);
+                any := true;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Writes the closings of the marks written so far into line; their
+    -- openings wait again.
+    generic [R: Region, D: Region, T: Region]
+    function closeEmitted(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T]): Unit is
+        var i: Index := w->emitted;
+        while i > 0 do
+            let mark: Index := markAt(&~w, i - 1);
+            writeCloser(&~w, doc, tree, mark);
+            i := i - 1;
+        end while;
+        let none: Index := 0;
+        w->emitted := none;
+        return nil;
+    end;
+
+    -- Opens the inline element n as a mark, below the depth limit.
+    generic [R: Region]
+    function openMark(w: &![Work, R], n: Index): Unit is
+        if markCount(&~w) < mostHtmlDepth() then
+            pushMark(&~w, n);
+        end if;
+        return nil;
+    end;
+
+    -- Closes the mark of node n when it is the innermost one; a link is
+    -- written even when it holds nothing.
+    generic [R: Region, D: Region, T: Region]
+    function closeMark(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        let total: Index := markCount(&~w);
+        if total = 0 then
+            return nil;
+        end if;
+        if markAt(&~w, total - 1) /= n then
+            return nil;
+        end if;
+        let e: Elem := elemAt(tree, n);
+        if (total > w->emitted) and (e.code = e_a) then
+            emitPending(&~w, doc, tree);
+        end if;
+        if total <= w->emitted then
+            writeCloser(&~w, doc, tree, n);
+            w->emitted := total - 1;
+        end if;
+        popMark(&~w);
+        return nil;
+    end;
+
+    -- Writes a code span of the text under node n.
+    generic [R: Region, D: Region, T: Region]
+    function codeSpan(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        var buf: Buffer[Nat8] := allocateEmpty();
+        gatherText(tree, doc, n, &!buf);
+        let size: Index := length(&buf);
+        if size = 0 then
+            destroyFree(buf);
+            return nil;
+        end if;
+        var spaces: Bool := true;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := nth(&buf, i);
+            if (byte = 10) or (byte = 13) then
+                storeNth(&!buf, i, 32);
+            end if;
+            if nth(&buf, i) /= 32 then
+                spaces := false;
+            end if;
+            i := i + 1;
+        end while;
+        let first: Nat8 := nth(&buf, 0);
+        let last: Nat8 := nth(&buf, size - 1);
+        let ticked: Bool := (first = '`') or (last = '`');
+        let padded: Bool := ticked or (((first = 32) and (last = 32)) and (not spaces));
+        let ticks: Index := longestTicks(&buf) + 1;
+        emitPending(&~w, doc, tree);
+        var k: Index := 0;
+        while k < ticks do
+            putLine(&~w, '`');
+            k := k + 1;
+        end while;
+        if padded then
+            putLine(&~w, 32);
+        end if;
+        i := 0;
+        while i < size do
+            let byte: Nat8 := nth(&buf, i);
+            if (byte = '|') and w->in_cell then
+                putLine(&~w, backslash);
+            end if;
+            putLine(&~w, byte);
+            i := i + 1;
+        end while;
+        if padded then
+            putLine(&~w, 32);
+        end if;
+        k := 0;
+        while k < ticks do
+            putLine(&~w, '`');
+            k := k + 1;
+        end while;
+        destroyFree(buf);
+        return nil;
+    end;
+
+    -- Writes the image of token n, or its alt text when its source is not
+    -- a safe link.
+    generic [R: Region, D: Region, T: Region]
+    function writeImage(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        let image: Elem := elemAt(tree, n);
+        let token: Index := image.token;
+        let source: Span[Nat8, D] := attributeText(doc, token, "src");
+        let alt: Span[Nat8, D] := attributeText(doc, token, "alt");
+        if not isSafeLink(source) then
+            appendText(&~w, doc, tree, alt);
+            return nil;
+        end if;
+        emitPending(&~w, doc, tree);
+        writeLine(&~w, "![");
+        appendAlt(&~w, alt);
+        writeLine(&~w, "](");
+        writeUrl(&~w, source);
+        writeTitle(&~w, attributeText(doc, token, "title"));
+        putLine(&~w, ')');
+        return nil;
+    end;
+
+    ---
+    --- Blocks
+    ---
+
+    -- Writes the inline text read so far as a block: a paragraph, or a
+    -- heading when one is open.  In a cell it is a space.
+    generic [R: Region, D: Region, T: Region]
+    function flush(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T]): Unit is
+        if w->in_cell then
+            noteSpace(&~w);
+            return nil;
+        end if;
+        closeEmitted(&~w, doc, tree);
+        var trail: Index := lineLength(&~w);
+        while (trail > 0) and (lineByte(&~w, trail - 1) = 32) do
+            dropLine(&~w);
+            trail := trail - 1;
+        end while;
+        let none: Index := 0;
+        let level: Index := w->heading;
+        w->heading := none;
+        w->spaced := false;
+        w->broken := false;
+        let size: Index := lineLength(&~w);
+        if size = 0 then
+            return nil;
+        end if;
+        startBlock(&~w);
+        writePrefix(&~w);
+        if level > 0 then
+            var k: Index := 0;
+            while k < level do
+                putOut(&~w, '#');
+                k := k + 1;
+            end while;
+            putOut(&~w, 32);
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := lineByte(&~w, i);
+            if byte = 10 then
+                endLine(&~w, true);
+                writePrefix(&~w);
+            else
+                putOut(&~w, byte);
+            end if;
+            i := i + 1;
+        end while;
+        endLine(&~w, true);
+        clearLine(&~w);
+        return nil;
+    end;
+
+    -- Writes a thematic break.
+    generic [R: Region]
+    function writeRule(w: &![Work, R]): Unit is
+        startBlock(&~w);
+        writePrefix(&~w);
+        writeOut(&~w, "---");
+        endLine(&~w, true);
+        return nil;
+    end;
+
+    -- Writes the pre element n as a fenced code block.
+    generic [R: Region, D: Region, T: Region]
+    function writeFence(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        let pre: Elem := elemAt(tree, n);
+        var info: Span[Nat8, D] := languageOf(doc, pre.token);
+        var child: Index := pre.first;
+        while child /= 0 do
+            let c: Elem := elemAt(tree, child);
+            if c.code = e_code then
+                if spanLength(info) = 0 then
+                    info := languageOf(doc, c.token);
+                end if;
+                child := 0;
+            else
+                child := c.next;
+            end if;
+        end while;
+        var buf: Buffer[Nat8] := allocateEmpty();
+        gatherText(tree, doc, n, &!buf);
+        var start: Index := 0;
+        if pre.first /= 0 then
+            let first: Elem := elemAt(tree, pre.first);
+            if ((first.code = e_text) and (first.token = (pre.token + 1))) and (length(&buf) > 0) then
+                if nth(&buf, 0) = 10 then
+                    start := 1;
+                end if;
+            end if;
+        end if;
+        var ticks: Index := longestTicks(&buf) + 1;
+        if ticks < 3 then
+            ticks := 3;
+        end if;
+        startBlock(&~w);
+        writePrefix(&~w);
+        var k: Index := 0;
+        while k < ticks do
+            putOut(&~w, '`');
+            k := k + 1;
+        end while;
+        writeOut(&~w, info);
+        endLine(&~w, true);
+        let size: Index := length(&buf);
+        var fresh: Bool := true;
+        var i: Index := start;
+        while i < size do
+            let byte: Nat8 := nth(&buf, i);
+            if fresh then
+                writePrefix(&~w);
+            end if;
+            if byte = 10 then
+                endLine(&~w, fresh);
+                fresh := true;
+            else
+                putOut(&~w, byte);
+                fresh := false;
+            end if;
+            i := i + 1;
+        end while;
+        if not fresh then
+            endLine(&~w, false);
+        end if;
+        writePrefix(&~w);
+        k := 0;
+        while k < ticks do
+            putOut(&~w, '`');
+            k := k + 1;
+        end while;
+        endLine(&~w, true);
+        destroyFree(buf);
+        return nil;
+    end;
+
+    -- Opens the list n, below the depth limit.
+    generic [R: Region, D: Region, T: Region]
+    function openList(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index, ordered: Bool): Unit is
+        let none: Index := 0;
+        w->task := none;
+        if nestDepth(&~w) >= mostHtmlDepth() then
+            return nil;
+        end if;
+        var number: Index := 1;
+        var mark: Nat8 := '-';
+        if ordered then
+            let list: Elem := elemAt(tree, n);
+            number := startOf(doc, list.token);
+            mark := '.';
+        end if;
+        let total: Index := frameCount(&~w);
+        let here: Index := outLength(&~w) + 1;
+        let adjacent: Bool := ((w->list_end = here) and (w->list_depth = total)) and (w->list_ordered = ordered);
+        if adjacent and (w->list_mark = mark) then
+            if ordered then
+                mark := ')';
+            else
+                mark := '*';
+            end if;
+        end if;
+        var written: Bool := false;
+        if total >= 2 then
+            let top: Frame := frameAt(&~w, total - 1);
+            let below: Frame := frameAt(&~w, total - 2);
+            if ((top.kind = f_item) and top.written) and (below.kind = f_list) then
+                written := below.tight;
+            end if;
+        end if;
+        pushFrame(&~w, Frame(kind => f_list, node => n, number => number, mark => mark, ordered => ordered, width => 0, tight => isTight(tree, n), written => written));
+        return nil;
+    end;
+
+    -- Closes the list frame on top.
+    generic [R: Region]
+    function closeList(w: &![Work, R]): Unit is
+        let total: Index := frameCount(&~w);
+        let frame: Frame := frameAt(&~w, total - 1);
+        popFrame(&~w);
+        let here: Index := outLength(&~w) + 1;
+        w->list_end := here;
+        w->list_depth := total - 1;
+        w->list_mark := frame.mark;
+        w->list_ordered := frame.ordered;
+        return nil;
+    end;
+
+    -- Opens the item n when the innermost frame is a list.
+    generic [R: Region, D: Region, T: Region]
+    function openItem(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        let none: Index := 0;
+        w->task := none;
+        let total: Index := frameCount(&~w);
+        if total = 0 then
+            return nil;
+        end if;
+        var list: Frame := frameAt(&~w, total - 1);
+        if list.kind /= f_list then
+            return nil;
+        end if;
+        var width: Index := 2;
+        if list.ordered then
+            width := digitCount(list.number) + 2;
+        end if;
+        let item: Frame := Frame(kind => f_item, node => n, number => list.number, mark => list.mark, ordered => list.ordered, width => width, tight => false, written => false);
+        list.number := list.number + 1;
+        setFrame(&~w, total - 1, list);
+        pushFrame(&~w, item);
+        w->task := taskOf(tree, doc, n);
+        return nil;
+    end;
+
+    -- Closes the item frame on top; an item that wrote nothing is its
+    -- marker alone.
+    generic [R: Region]
+    function closeItem(w: &![Work, R]): Unit is
+        let total: Index := frameCount(&~w);
+        let frame: Frame := frameAt(&~w, total - 1);
+        if not frame.written then
+            startBlock(&~w);
+            writePrefix(&~w);
+            if w->task = 1 then
+                writeOut(&~w, "[ ]");
+            end if;
+            if w->task = 2 then
+                writeOut(&~w, "[x]");
+            end if;
+            endLine(&~w, true);
+        end if;
+        let none: Index := 0;
+        w->task := none;
+        popFrame(&~w);
+        return nil;
+    end;
+
+    -- Opens the quote n, below the depth limit.
+    generic [R: Region]
+    function openQuote(w: &![Work, R], n: Index): Unit is
+        if nestDepth(&~w) >= mostHtmlDepth() then
+            return nil;
+        end if;
+        let none: Index := 0;
+        let dash: Nat8 := '-';
+        pushFrame(&~w, Frame(kind => f_quote, node => n, number => none, mark => dash, ordered => false, width => none, tight => false, written => false));
+        return nil;
+    end;
+
+    ---
+    --- Tables
+    ---
+
+    -- Starts the cell n of the active table.
+    generic [R: Region, D: Region, T: Region]
+    function openCell(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        flush(&~w, doc, tree);
+        if w->rows = 0 then
+            let one: Index := 1;
+            w->rows := one;
+        end if;
+        w->in_cell := true;
+        w->cell_node := n;
+        let cell: Elem := elemAt(tree, n);
+        w->cell_align := alignOf(doc, cell.token);
+        return nil;
+    end;
+
+    -- Ends the cell being read: its text goes into the pool.
+    generic [R: Region, D: Region, T: Region]
+    function closeCell(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T]): Unit is
+        closeEmitted(&~w, doc, tree);
+        let at: Index := poolLength(&~w);
+        let size: Index := lineLength(&~w);
+        var stop: Index := size;
+        while (stop > 0) and (lineByte(&~w, stop - 1) = 32) do
+            stop := stop - 1;
+        end while;
+        var i: Index := 0;
+        while i < stop do
+            let byte: Nat8 := lineByte(&~w, i);
+            if byte = 10 then
+                putPool(&~w, 32);
+            else
+                putPool(&~w, byte);
+            end if;
+            i := i + 1;
+        end while;
+        let cell: Cell := Cell(row => w->rows - 1, at => at, size => stop, align => w->cell_align);
+        pushCell(&~w, cell);
+        clearLine(&~w);
+        let none: Index := 0;
+        w->in_cell := false;
+        w->cell_node := none;
+        w->spaced := false;
+        w->broken := false;
+        return nil;
+    end;
+
+    -- Writes the cells of row of the table being read, padded to columns.
+    generic [R: Region]
+    function writeRow(w: &![Work, R], row: Index, columns: Index): Unit is
+        writePrefix(&~w);
+        putOut(&~w, '|');
+        var column: Index := 0;
+        let total: Index := cellCount(&~w);
+        var c: Index := 0;
+        while c < total do
+            let cell: Cell := cellAt(&~w, c);
+            if (cell.row = row) and (column < columns) then
+                putOut(&~w, 32);
+                var i: Index := 0;
+                while i < cell.size do
+                    let byte: Nat8 := poolByte(&~w, cell.at + i);
+                    putOut(&~w, byte);
+                    i := i + 1;
+                end while;
+                if cell.size > 0 then
+                    putOut(&~w, 32);
+                end if;
+                putOut(&~w, '|');
+                column := column + 1;
+            end if;
+            c := c + 1;
+        end while;
+        while column < columns do
+            writeOut(&~w, " |");
+            column := column + 1;
+        end while;
+        endLine(&~w, true);
+        return nil;
+    end;
+
+    -- The alignment of column of the table being read: that of the first
+    -- cell in it that has one.
+    generic [R: Region]
+    function columnAlign(w: &![Work, R], column: Index): Index is
+        let total: Index := cellCount(&~w);
+        var row: Index := 0;
+        var place: Index := 0;
+        var c: Index := 0;
+        while c < total do
+            let cell: Cell := cellAt(&~w, c);
+            if cell.row /= row then
+                row := cell.row;
+                place := 0;
+            end if;
+            if (place = column) and (cell.align /= 0) then
+                return cell.align;
+            end if;
+            place := place + 1;
+            c := c + 1;
+        end while;
+        return 0;
+    end;
+
+    -- Writes the table being read as a pipe table and forgets it.
+    generic [R: Region]
+    function finishTable(w: &![Work, R]): Unit is
+        let total: Index := cellCount(&~w);
+        if total > 0 then
+            var columns: Index := 0;
+            let head: Cell := cellAt(&~w, 0);
+            var row: Index := head.row;
+            let first_row: Index := row;
+            var count: Index := 0;
+            var c: Index := 0;
+            while c < total do
+                let cell: Cell := cellAt(&~w, c);
+                if cell.row /= row then
+                    row := cell.row;
+                    count := 0;
+                end if;
+                count := count + 1;
+                if count > columns then
+                    columns := count;
+                end if;
+                c := c + 1;
+            end while;
+            startBlock(&~w);
+            writeRow(&~w, first_row, columns);
+            writePrefix(&~w);
+            putOut(&~w, '|');
+            var column: Index := 0;
+            while column < columns do
+                let align: Index := columnAlign(&~w, column);
+                putOut(&~w, 32);
+                if (align = 1) or (align = 2) then
+                    putOut(&~w, ':');
+                end if;
+                writeOut(&~w, "---");
+                if (align = 2) or (align = 3) then
+                    putOut(&~w, ':');
+                end if;
+                writeOut(&~w, " |");
+                column := column + 1;
+            end while;
+            endLine(&~w, true);
+            var last: Index := first_row;
+            c := 0;
+            while c < total do
+                let cell: Cell := cellAt(&~w, c);
+                if cell.row /= last then
+                    writeRow(&~w, cell.row, columns);
+                    last := cell.row;
+                end if;
+                c := c + 1;
+            end while;
+        end if;
+        while cellCount(&~w) > 0 do
+            popCell(&~w);
+        end while;
+        while poolLength(&~w) > 0 do
+            dropPool(&~w);
+        end while;
+        let none: Index := 0;
+        w->table := none;
+        w->rows := none;
+        return nil;
+    end;
+
+    ---
+    --- The walk
+    ---
+
+    -- Writes the start of node n; whether its children are to be walked.
+    generic [R: Region, D: Region, T: Region]
+    function enter(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Bool is
+        let e: Elem := elemAt(tree, n);
+        let code: Index := e.code;
+        if code = e_text then
+            appendText(&~w, doc, tree, tokenText(doc, e.token));
+            return false;
+        end if;
+        if ((code = e_p) or (code = e_block)) or (code = e_caption) then
+            flush(&~w, doc, tree);
+            return true;
+        end if;
+        if isHeading(code) then
+            flush(&~w, doc, tree);
+            if not w->in_cell then
+                w->heading := (code - e_h1) + 1;
+            end if;
+            return true;
+        end if;
+        if code = e_hr then
+            flush(&~w, doc, tree);
+            if not w->in_cell then
+                writeRule(&~w);
+            end if;
+            return false;
+        end if;
+        if code = e_br then
+            if (w->heading > 0) or w->in_cell then
+                noteSpace(&~w);
+            else
+                if lineLength(&~w) > 0 then
+                    w->broken := true;
+                end if;
+            end if;
+            return false;
+        end if;
+        if code = e_pre then
+            if w->in_cell then
+                codeSpan(&~w, doc, tree, n);
+            else
+                flush(&~w, doc, tree);
+                writeFence(&~w, doc, tree, n);
+            end if;
+            return false;
+        end if;
+        if code = e_code then
+            codeSpan(&~w, doc, tree, n);
+            return false;
+        end if;
+        if code = e_img then
+            writeImage(&~w, doc, tree, n);
+            return false;
+        end if;
+        if (((code = e_strong) or (code = e_em)) or (code = e_del)) or (code = e_raw) then
+            openMark(&~w, n);
+            return true;
+        end if;
+        if code = e_span then
+            if attributeCount(doc, e.token) = 0 then
+                openMark(&~w, n);
+            end if;
+            return true;
+        end if;
+        if code = e_a then
+            if isSafeLink(attributeText(doc, e.token, "href")) then
+                openMark(&~w, n);
+            end if;
+            return true;
+        end if;
+        if (code = e_ul) or (code = e_ol) then
+            flush(&~w, doc, tree);
+            if not w->in_cell then
+                openList(&~w, doc, tree, n, code = e_ol);
+            end if;
+            return true;
+        end if;
+        if code = e_li then
+            flush(&~w, doc, tree);
+            if not w->in_cell then
+                openItem(&~w, doc, tree, n);
+            end if;
+            return true;
+        end if;
+        if code = e_quote then
+            flush(&~w, doc, tree);
+            if not w->in_cell then
+                openQuote(&~w, n);
+            end if;
+            return true;
+        end if;
+        if code = e_table then
+            if w->table = 0 then
+                flush(&~w, doc, tree);
+                w->table := n;
+            end if;
+            return true;
+        end if;
+        if code = e_tr then
+            if (w->table /= 0) and (tableOf(tree, n) = w->table) then
+                w->rows := w->rows + 1;
+            end if;
+            return true;
+        end if;
+        if (code = e_th) or (code = e_td) then
+            if ((w->table /= 0) and (not w->in_cell)) and (tableOf(tree, n) = w->table) then
+                openCell(&~w, doc, tree, n);
+            end if;
+            return true;
+        end if;
+        if (code = e_input) or (code = e_void) then
+            return false;
+        end if;
+        return true;
+    end;
+
+    -- Writes the end of node n.
+    generic [R: Region, D: Region, T: Region]
+    function leave(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T], n: Index): Unit is
+        let e: Elem := elemAt(tree, n);
+        let code: Index := e.code;
+        if (((code = e_p) or (code = e_block)) or (code = e_caption)) or isHeading(code) then
+            flush(&~w, doc, tree);
+            return nil;
+        end if;
+        let inline: Bool := (((code = e_strong) or (code = e_em)) or ((code = e_del) or (code = e_raw))) or ((code = e_span) or (code = e_a));
+        if inline then
+            closeMark(&~w, doc, tree, n);
+            return nil;
+        end if;
+        if (code = e_ul) or (code = e_ol) then
+            flush(&~w, doc, tree);
+            if isTopFrame(&~w, n) then
+                closeList(&~w);
+            end if;
+            return nil;
+        end if;
+        if code = e_li then
+            flush(&~w, doc, tree);
+            if isTopFrame(&~w, n) then
+                closeItem(&~w);
+            end if;
+            return nil;
+        end if;
+        if code = e_quote then
+            flush(&~w, doc, tree);
+            if isTopFrame(&~w, n) then
+                popFrame(&~w);
+            end if;
+            return nil;
+        end if;
+        if (code = e_th) or (code = e_td) then
+            if w->in_cell and (w->cell_node = n) then
+                closeCell(&~w, doc, tree);
+            end if;
+            return nil;
+        end if;
+        if code = e_table then
+            if w->table = n then
+                flush(&~w, doc, tree);
+                finishTable(&~w);
+            end if;
+            return nil;
+        end if;
+        return nil;
+    end;
+
+    -- Walks the tree without recursion: down by first, along by next, up
+    -- by parent.
+    generic [R: Region, D: Region, T: Region]
+    function convert(w: &![Work, R], doc: &[Document, D], tree: &[Buffer[Elem], T]): Unit is
+        let root: Elem := elemAt(tree, 0);
+        var cur: Index := root.first;
+        while cur /= 0 do
+            let down: Bool := enter(&~w, doc, tree, cur);
+            let e: Elem := elemAt(tree, cur);
+            if down and (e.first /= 0) then
+                cur := e.first;
+            else
+                leave(&~w, doc, tree, cur);
+                var here: Elem := e;
+                while (here.next = 0) and (here.parent /= 0) do
+                    cur := here.parent;
+                    leave(&~w, doc, tree, cur);
+                    here := elemAt(tree, cur);
+                end while;
+                cur := here.next;
+            end if;
+        end while;
+        flush(&~w, doc, tree);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function htmlToMarkdown(html: Span[Nat8, R]): String is
+        let doc: Document := parseHtml(substring(html, 0, mostHtmlBytes()));
+        let tree: Buffer[Elem] := buildTree(&doc);
+        let dash: Nat8 := '-';
+        var work: Work := Work(out => allocateEmpty(), line => allocateEmpty(), frames => allocateEmpty(), marks => allocateEmpty(), cells => allocateEmpty(), pool => allocateEmpty(), emitted => 0, spaced => false, broken => false, task => 0, heading => 0, in_cell => false, cell_node => 0, cell_align => 0, table => 0, rows => 0, list_end => 0, list_depth => 0, list_mark => dash, list_ordered => false);
+        convert(&!work, &doc, &tree);
+        let { out: Buffer[Nat8], line: Buffer[Nat8], frames: Buffer[Frame], marks: Buffer[Index], cells: Buffer[Cell], pool: Buffer[Nat8], emitted: Index, spaced: Bool, broken: Bool, task: Index, heading: Index, in_cell: Bool, cell_node: Index, cell_align: Index, table: Index, rows: Index, list_end: Index, list_depth: Index, list_mark: Nat8, list_ordered: Bool } := work;
+        destroyFree(line);
+        destroyFree(frames);
+        destroyFree(marks);
+        destroyFree(cells);
+        destroyFree(pool);
+        destroyFree(tree);
+        destroyDocument(doc);
+        return fromByteBuffer(out);
+    end;
+end module body.

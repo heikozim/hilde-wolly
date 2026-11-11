@@ -1,0 +1,38 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Pages from a tree of route modules behind Hiawatha: the routes of
+routes/, written into Wolly.Example.Pages.Routes when the programme is
+built, after one route set by hand, on the socket pages.sock in the
+working directory until SIGTERM or SIGINT.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Example.Pages is
+    """
+    The answer to every request: GET /health, set by hand, says ok; the
+    tree gives GET /, /about, /docs/intro, /post/new, /post/:id and
+    /post/:id/comments/:n, and inside the admin layout GET /users, GET and
+    POST /settings and, inside the panel too, GET /audit; anything else
+    gets 404 or 405.
+    """
+    function handle(request: Request): String
+        ensures length(&result) > 0;
+
+    """
+    Serves handle on pages.sock.  Success when a signal ended the server,
+    failure otherwise.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(): ExitCode;
+end module.

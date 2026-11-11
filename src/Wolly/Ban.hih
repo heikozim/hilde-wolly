@@ -1,0 +1,40 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A request to the Hiawatha in front to ban the client of this request for
+some seconds: the header X-Hiawatha-Ban on the answer.  Hiawatha reads it
+only where its host says BanByCGI = yes, cuts the seconds to the second
+value of that line when there is one, removes the header before the answer
+leaves, and from then on drops every connection of the client until the
+ban ends.  It logs the ban in its system log.
+
+The client is what Hiawatha names in REMOTE_ADDR: behind a CDN or another
+proxy only HideProxy makes that the client and not the proxy, and an
+address the BanlistMask allows is never banned.  Without BanByCGI the
+header is a string nobody reads; nothing in the answer tells.
+
+What earns a ban is the application's: a filled honeypot, or a limit of
+Wolly.Limit run over many times.
+"""
+import Wolly.Response (
+    Response
+);
+
+module Wolly.Ban is
+    """
+    The longest ban withBan asks for: 86400 seconds, a day.
+    """
+    function longestBanSeconds(): Int64
+        ensures result = 86400;
+
+    """
+    The response with the header X-Hiawatha-Ban: seconds, cut to
+    longestBanSeconds.
+    """
+    function withBan(response: Response, seconds: Int64): Response
+        requires seconds > 0;
+end module.

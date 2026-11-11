@@ -1,0 +1,961 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test opens a database of Wolly.TestDb and plays the browser: it
+-- makes a key, signs the proofs of the draft by hand and posts them as
+-- Hiawatha would pass them on.  Every refusal has its control, the same
+-- request with the one part right, which passes.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    contains,
+    indexOf,
+    startsWith,
+    substring
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    environmentValue,
+    removeFileIfThere
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.X509 (
+    PrivateKey,
+    KeyKind,
+    EcP256,
+    Rsa2048,
+    generateKey,
+    publicKeyDer,
+    signMessage,
+    destroyPrivateKey
+);
+import Standard.Jws (
+    base64UrlEncode,
+    jwkOfPublicKey
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Response (
+    makeResponse,
+    finish
+);
+import Wolly.Auth (
+    AuthError,
+    LoginResult,
+    LoggedIn,
+    CodeNeeded,
+    Refused,
+    Throttled,
+    LoginFailed,
+    prepareAuth,
+    addUser,
+    startSession,
+    login,
+    sessionUser,
+    unboundUser,
+    logout,
+    removeUser,
+    registerBinding,
+    refreshBinding,
+    withBoundCookie
+);
+import Wolly.Dbsc (
+    boundSeconds,
+    challengeSeconds,
+    boundLifeSeconds,
+    cookieAttributes,
+    isEndpointPath,
+    offerRegistration,
+    instructions,
+    headerString,
+    sessionIdOf
+);
+
+module body Wolly.Dbsc.Test is
+    constant good_password: Span[Nat8, Static] := "correct horse battery";
+    constant start_at: Int64 := 100000;
+    constant register_path: Span[Nat8, Static] := "/dbsc/register";
+    constant refresh_path: Span[Nat8, Static] := "/dbsc/refresh";
+
+    function nothing(): String is
+        var empty: StringBuilder := makeStringBuilder();
+        return finalize(empty);
+    end;
+
+    function pathOf(name: Span[Nat8, Static]): String is
+        var path: StringBuilder := makeStringBuilder();
+        case environmentValue("TMPDIR") of
+            when Some(value as dir: String) do
+                writeString(&!path, asSpan(&dir));
+                writeString(&!path, "/");
+                destroyString(dir);
+            when None do
+                skip;
+        end case;
+        writeString(&!path, name);
+        return finalize(path);
+    end;
+
+    generic [A: Region, B: Region]
+    function sameText(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        return contains(a, b) and (spanLength(a) = spanLength(b));
+    end;
+
+    generic [R: Region, N: Region, C: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, N], content: Span[Nat8, C]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    -- text in the quotes of an sf-string.
+    generic [T: Region]
+    function quoted(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "\"");
+        writeString(&!out, text);
+        writeString(&!out, "\"");
+        return finalize(out);
+    end;
+
+    -- A POST as Hiawatha passes it on: the session cookie, the proof and
+    -- the session id, each only when it is not empty.
+    generic [T: Region, P: Region, I: Region]
+    function postOf(token: Span[Nat8, T], proof: Span[Nat8, P], id: Span[Nat8, I]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", "POST");
+        addPair(&!params, "REQUEST_URI", "/dbsc");
+        if spanLength(token) > 0 then
+            var cookie: StringBuilder := makeStringBuilder();
+            writeString(&!cookie, "__Host-wolly=");
+            writeString(&!cookie, token);
+            let header: String := finalize(cookie);
+            addPair(&!params, "HTTP_COOKIE", asSpan(&header));
+            destroyString(header);
+        end if;
+        if spanLength(proof) > 0 then
+            let header: String := quoted(proof);
+            addPair(&!params, "HTTP_SECURE_SESSION_RESPONSE", asSpan(&header));
+            destroyString(header);
+        end if;
+        if spanLength(id) > 0 then
+            let header: String := quoted(id);
+            addPair(&!params, "HTTP_SEC_SECURE_SESSION_ID", asSpan(&header));
+            destroyString(header);
+        end if;
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(""));
+    end;
+
+    -- The bytes of text after marker up to the byte stop, or empty when
+    -- marker is not there.
+    generic [T: Region]
+    function after(text: Span[Nat8, T], marker: Span[Nat8, Static], stop: Nat8): String is
+        case indexOf(text, marker) of
+            when Some(value as at: Index) do
+                let first: Index := at + spanLength(marker);
+                var i: Index := first;
+                while (i < spanLength(text)) and (text[i] /= stop) do
+                    i := i + 1;
+                end while;
+                return fromSpan(substring(text, first, i));
+            when None do
+                return nothing();
+        end case;
+    end;
+
+    -- The token the Set-Cookie of output gives.
+    generic [O: Region]
+    function cookieOf(output: Span[Nat8, O]): String is
+        return after(output, "Set-Cookie: __Host-wolly=", ';');
+    end;
+
+    -- The JWK of the public key of key.
+    generic [K: Region]
+    function jwkOf(key: &[PrivateKey, K]): String is
+        case publicKeyDer(key) of
+            when Some(value as der: String) do
+                case jwkOfPublicKey(asSpan(&der)) of
+                    when Some(value as jwk: String) do
+                        destroyString(der);
+                        return jwk;
+                    when None do
+                        destroyString(der);
+                        assertTrue(false, "the JWK of the key");
+                        return nothing();
+                end case;
+            when None do
+                assertTrue(false, "the DER of the key");
+                return nothing();
+        end case;
+    end;
+
+    function widen(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The DER integer of n bytes at first of der as 32 bytes, padded on
+    -- the left.
+    generic [R: Region, D: Region]
+    function writeNumber32(out: &![StringBuilder, R], der: Span[Nat8, D], first: Index, n: Index): Unit is
+        var at: Index := first;
+        var left: Index := n;
+        while (left > 32) and (der[at] = 0) do
+            at := at + 1;
+            left := left - 1;
+        end while;
+        var pad: Index := 0;
+        if left < 32 then
+            pad := 32 - left;
+        end if;
+        while pad > 0 do
+            writeByte(&~out, 0);
+            pad := pad - 1;
+        end while;
+        var i: Index := at;
+        while i < (at + left) do
+            writeByte(&~out, der[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- An ECDSA signature of P-256 in DER (30 L 02 lr r 02 ls s) as the 64
+    -- bytes of RFC 7518.
+    generic [D: Region]
+    function rawOfDer(der: Span[Nat8, D]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let r_length: Index := widen(der[3]);
+        writeNumber32(&!out, der, 4, r_length);
+        let s_at: Index := 4 + r_length;
+        writeNumber32(&!out, der, s_at + 2, widen(der[s_at + 1]));
+        return finalize(out);
+    end;
+
+    -- The signature of message under key in the form of JWS, base64url.
+    generic [K: Region, M: Region]
+    function signatureOf(key: &[PrivateKey, K], message: Span[Nat8, M], elliptic: Bool): String is
+        case signMessage(key, message) of
+            when Some(value as der: String) do
+                if elliptic then
+                    let raw: String := rawOfDer(asSpan(&der));
+                    destroyString(der);
+                    let text: String := base64UrlEncode(asSpan(&raw));
+                    destroyString(raw);
+                    return text;
+                end if;
+                let text: String := base64UrlEncode(asSpan(&der));
+                destroyString(der);
+                return text;
+            when None do
+                assertTrue(false, "the key signs");
+                return nothing();
+        end case;
+    end;
+
+    -- A proof as the browser makes it: header with alg, typ and, when jwk
+    -- is not empty, jwk; payload with jti; signed with key.
+    generic [K: Region, J: Region, T: Region]
+    function makeProof(key: &[PrivateKey, K], alg: Span[Nat8, Static], typ: Span[Nat8, Static], jwk: Span[Nat8, J],
+        jti: Span[Nat8, T]): String is
+        var header: StringBuilder := makeStringBuilder();
+        writeString(&!header, "{\"alg\":\"");
+        writeString(&!header, alg);
+        writeString(&!header, "\",\"typ\":\"");
+        writeString(&!header, typ);
+        writeString(&!header, "\"");
+        if spanLength(jwk) > 0 then
+            writeString(&!header, ",\"jwk\":");
+            writeString(&!header, jwk);
+        end if;
+        writeString(&!header, "}");
+        let header_text: String := finalize(header);
+        var payload: StringBuilder := makeStringBuilder();
+        writeString(&!payload, "{\"jti\":\"");
+        writeString(&!payload, jti);
+        writeString(&!payload, "\",\"iat\":1}");
+        let payload_text: String := finalize(payload);
+        var signed: StringBuilder := makeStringBuilder();
+        let header_part: String := base64UrlEncode(asSpan(&header_text));
+        let payload_part: String := base64UrlEncode(asSpan(&payload_text));
+        destroyString(header_text);
+        destroyString(payload_text);
+        writeString(&!signed, asSpan(&header_part));
+        writeString(&!signed, ".");
+        writeString(&!signed, asSpan(&payload_part));
+        destroyString(header_part);
+        destroyString(payload_part);
+        let message: String := finalize(signed);
+        let elliptic: Bool := sameText(alg, "ES256");
+        let signature: String := signatureOf(key, asSpan(&message), elliptic);
+        var token: StringBuilder := makeStringBuilder();
+        writeString(&!token, asSpan(&message));
+        writeString(&!token, ".");
+        writeString(&!token, asSpan(&signature));
+        destroyString(message);
+        destroyString(signature);
+        return finalize(token);
+    end;
+
+    -- The path of a list of known passwords, written, which addUser reads.
+    function listWritten(): String is
+        let path: String := pathOf("wolly-dbsc-known-passwords.txt");
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let done: Bool := writeAll(&!file, "passwordpassword\n");
+                let closed: Bool := closeFile(file);
+                assertTrue(done and closed, "the list is written");
+            when None do
+                assertTrue(false, "the list is written");
+        end case;
+        return path;
+    end;
+
+    -- The tables and the user ann.
+    generic [R: Region]
+    function setUp(db: &![Database[Writing], R]): Unit is
+        case prepareAuth(&~db) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as error: AuthError) do
+                assertTrue(false, "the tables are made");
+        end case;
+        let list_path: String := listWritten();
+        case addUser(&~db, "ann", good_password, asSpan(&list_path)) of
+            when Right(right as done: Bool) do
+                assertTrue(done, "the user of the tests");
+            when Left(left as error: AuthError) do
+                assertTrue(false, "the user of the tests");
+        end case;
+        destroyString(list_path);
+        return nil;
+    end;
+
+    -- The token of a login of ann at now.
+    generic [R: Region, A: Region]
+    function loginAnn(db: &![Database[Writing], R], now: Int64, audit_path: Span[Nat8, A]): String is
+        case startSession(&~db, now) of
+            when Right(right as visitor: String) do
+                let result: LoginResult := login(&~db, asSpan(&visitor), "ann", good_password, "10.0.0.1", now, audit_path);
+                destroyString(visitor);
+                case result of
+                    when LoggedIn(token as renewed: String) do
+                        return renewed;
+                    when CodeNeeded(token as waiting: String) do
+                        destroyString(waiting);
+                    when Refused do
+                        skip;
+                    when Throttled do
+                        skip;
+                    when LoginFailed(error as failure: AuthError) do
+                        skip;
+                end case;
+                assertTrue(false, "ann logs in");
+                return nothing();
+            when Left(left as error: AuthError) do
+                assertTrue(false, "a visitor gets a session");
+                return nothing();
+        end case;
+    end;
+
+    -- The challenge of a registration offered to ann at now.
+    generic [R: Region]
+    function offerToAnn(db: &![Database[Writing], R], now: Int64): String is
+        case offerRegistration(&~db, "ann", register_path, now) of
+            when Right(right as made: Option[String]) do
+                case made of
+                    when Some(value as header: String) do
+                        assertTrue(startsWith(asSpan(&header), "(ES256 RS256);path=\"/dbsc/register\";challenge=\""), "the registration header");
+                        let challenge: String := after(asSpan(&header), "challenge=\"", '"');
+                        destroyString(header);
+                        assertTrue(spanLength(asSpan(&challenge)) = 43, "a challenge of 32 bytes");
+                        return challenge;
+                    when None do
+                        assertTrue(false, "an offer is made");
+                        return nothing();
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "an offer is made");
+                return nothing();
+        end case;
+    end;
+
+    function userIs(result: Either[AuthError, Option[String]], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case result of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as user: String) do
+                        let same: Bool := sameText(asSpan(&user), wanted);
+                        destroyString(user);
+                        assertTrue(same, message);
+                    when None do
+                        assertTrue(spanLength(wanted) = 0, message);
+                end case;
+            when Left(left as error: AuthError) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- The answer of a registration with proof in the session of token.
+    generic [R: Region, T: Region, P: Region, A: Region]
+    function registered(db: &![Database[Writing], R], token: Span[Nat8, T], proof: Span[Nat8, P], now: Int64,
+        audit_path: Span[Nat8, A]): String is
+        let request: Request := postOf(token, proof, "");
+        let output: String := registerBinding(&~db, &request, refresh_path, "10.0.0.1", now, audit_path);
+        destroyRequest(request);
+        return output;
+    end;
+
+    -- The answer of a refresh of id with proof.
+    generic [R: Region, I: Region, P: Region, A: Region]
+    function refreshed(db: &![Database[Writing], R], id: Span[Nat8, I], proof: Span[Nat8, P], now: Int64,
+        audit_path: Span[Nat8, A]): String is
+        let request: Request := postOf("", proof, id);
+        let output: String := refreshBinding(&~db, &request, refresh_path, "10.0.0.1", now, audit_path);
+        destroyRequest(request);
+        return output;
+    end;
+
+    generic [O: Region]
+    function statusIs(output: Span[Nat8, O], status: Span[Nat8, Static]): Bool is
+        return startsWith(output, status);
+    end;
+
+    function testConstants(): Unit is
+        assertTrue(boundSeconds() = 600, "the bound cookie lives 600 seconds");
+        assertTrue(challengeSeconds() = 300, "a challenge 300");
+        assertTrue(boundLifeSeconds() = 43200, "a binding 12 hours");
+        assertTrue(sameText(cookieAttributes(), "Secure; HttpOnly; SameSite=Strict; Path=/"), "the attributes");
+        -- withBoundCookie writes Max-Age as boundSeconds says, with the
+        -- attributes the instructions name.
+        let output: String := finish(withBoundCookie(makeResponse(200, "text/plain"), "token"), "x");
+        assertTrue(contains(asSpan(&output), "Max-Age=600"), "Max-Age is boundSeconds");
+        assertTrue(contains(asSpan(&output), "Secure"), "Secure");
+        assertTrue(contains(asSpan(&output), "HttpOnly"), "HttpOnly");
+        assertTrue(contains(asSpan(&output), "SameSite=Strict"), "SameSite=Strict");
+        assertTrue(contains(asSpan(&output), "Path=/"), "Path=/");
+        destroyString(output);
+        return nil;
+    end;
+
+    function stringIs(read: Option[String], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case read of
+            when Some(value as text: String) do
+                let same: Bool := sameText(asSpan(&text), wanted);
+                destroyString(text);
+                assertTrue(same and (spanLength(wanted) > 0), message);
+            when None do
+                assertTrue(spanLength(wanted) = 0, message);
+        end case;
+        return nil;
+    end;
+
+    function testHeaderString(): Unit is
+        stringIs(headerString("\"abc.DEF-9_x\""), "abc.DEF-9_x", "an sf-string loses its quotes");
+        stringIs(headerString("abc.DEF-9_x"), "abc.DEF-9_x", "a bare token stays");
+        stringIs(headerString(""), "", "empty is none");
+        stringIs(headerString("\"\""), "", "empty quotes are none");
+        stringIs(headerString("\"a\"b\""), "", "an inner quote is none");
+        stringIs(headerString("\"a b\""), "", "a blank is none");
+        stringIs(headerString("\"abc"), "", "an open quote is none");
+        stringIs(headerString("abc;id=x"), "", "a parameter is none");
+        let request: Request := postOf("", "", "the-id");
+        stringIs(sessionIdOf(&request), "the-id", "the session id of the request");
+        destroyRequest(request);
+        let bare: Request := postOf("", "", "");
+        stringIs(sessionIdOf(&bare), "", "no header, no id");
+        destroyRequest(bare);
+        return nil;
+    end;
+
+    function testEndpointPath(): Unit is
+        assertTrue(isEndpointPath("/dbsc/register"), "a path");
+        assertTrue(isEndpointPath("/a"), "a short path");
+        assertFalse(isEndpointPath("/"), "the slash alone");
+        assertFalse(isEndpointPath("dbsc"), "no slash first");
+        assertFalse(isEndpointPath("/a b"), "a blank");
+        assertFalse(isEndpointPath("/a\"b"), "a quote");
+        assertFalse(isEndpointPath("/a;b"), "a semicolon");
+        return nil;
+    end;
+
+    function testInstructions(): Unit is
+        case instructions("the-id", refresh_path, "__Host-wolly") of
+            when Some(value as json: String) do
+                assertTrue(contains(asSpan(&json), "\"session_identifier\":\"the-id\""), "the id");
+                assertTrue(contains(asSpan(&json), "\"refresh_url\":\"/dbsc/refresh\""), "the refresh path");
+                assertTrue(contains(asSpan(&json), "\"include_site\":false"), "the origin alone");
+                assertTrue(contains(asSpan(&json), "\"type\":\"cookie\",\"name\":\"__Host-wolly\""), "the cookie");
+                assertTrue(contains(asSpan(&json), "\"attributes\":\"Secure; HttpOnly; SameSite=Strict; Path=/\""), "its attributes");
+                destroyString(json);
+            when None do
+                assertTrue(false, "the instructions are written");
+        end case;
+        return nil;
+    end;
+
+    function testOfferNeedsAPath(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                case offerRegistration(&!db, "ann", "no path", start_at) of
+                    when Right(right as made: Option[String]) do
+                        case made of
+                            when Some(value as header: String) do
+                                destroyString(header);
+                                assertTrue(false, "no offer for a path that is none");
+                            when None do
+                                skip;
+                        end case;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "no offer for a path that is none");
+                end case;
+                -- Control: the same with a path.
+                let challenge: String := offerToAnn(&!db, start_at);
+                destroyString(challenge);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database opens");
+        end case;
+        return nil;
+    end;
+
+    function testBindingWithEs256(): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                bindingRoundTrip(&key, "ES256", "wolly-dbsc-es256.log");
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key of P-256");
+        end case;
+        return nil;
+    end;
+
+    function testBindingWithRs256(): Unit is
+        case generateKey(Rsa2048()) of
+            when Some(value as key: PrivateKey) do
+                bindingRoundTrip(&key, "RS256", "wolly-dbsc-rs256.log");
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key of RSA");
+        end case;
+        return nil;
+    end;
+
+    -- Login, offer, registration, refresh with and without a proof, the
+    -- life of the cookie, logout: the way of one browser.
+    generic [K: Region]
+    function bindingRoundTrip(key: &[PrivateKey, K], alg: Span[Nat8, Static], log_name: Span[Nat8, Static]): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                let audit_path: String := pathOf(log_name);
+                let cleared: Bool := removeFileIfThere(asSpan(&audit_path));
+                let jwk: String := jwkOf(key);
+                let token: String := loginAnn(&!db, start_at, asSpan(&audit_path));
+                userIs(unboundUser(&!db, asSpan(&token), start_at), "ann", "control: the session before the binding gets the offer");
+                let challenge: String := offerToAnn(&!db, start_at);
+                let proof: String := makeProof(key, alg, "dbsc+jwt", asSpan(&jwk), asSpan(&challenge));
+                let output: String := registered(&!db, asSpan(&token), asSpan(&proof), start_at + 1, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&output), "Status: 200"), "the registration is taken");
+                assertTrue(contains(asSpan(&output), "Max-Age=600"), "the cookie lives boundSeconds");
+                assertTrue(contains(asSpan(&output), "\"refresh_url\":\"/dbsc/refresh\""), "the instructions");
+                let id: String := after(asSpan(&output), "\"session_identifier\":\"", '"');
+                let bound: String := cookieOf(asSpan(&output));
+                destroyString(output);
+                assertTrue(spanLength(asSpan(&id)) = 43, "an id of 32 bytes");
+                userIs(sessionUser(&!db, asSpan(&bound), start_at + 2), "ann", "the bound token names ann");
+                userIs(unboundUser(&!db, asSpan(&bound), start_at + 2), "", "a bound session gets no offer");
+                userIs(sessionUser(&!db, asSpan(&token), start_at + 2), "", "the token before the binding opens nothing");
+                -- The same proof again: the offer is used up, and the
+                -- session is bound now.
+                let again: String := registered(&!db, asSpan(&bound), asSpan(&proof), start_at + 2, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&again), "Status: 401"), "a bound session registers no second key");
+                destroyString(again);
+                destroyString(proof);
+                destroyString(challenge);
+                destroyString(token);
+                -- The life of the cookie on the server, with its control.
+                userIs(sessionUser(&!db, asSpan(&bound), (start_at + 1) + 600), "ann", "alive up to boundSeconds");
+                userIs(sessionUser(&!db, asSpan(&bound), (start_at + 1) + 601), "", "dead after boundSeconds");
+                -- A refresh without a proof gets a challenge.
+                let asked: String := refreshed(&!db, asSpan(&id), "", start_at + 100, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&asked), "Status: 403"), "a refresh without a proof is a 403");
+                let id_back: String := after(asSpan(&asked), ";id=\"", '"');
+                assertTrue(sameText(asSpan(&id_back), asSpan(&id)), "the challenge names the session");
+                destroyString(id_back);
+                let refresh_challenge: String := after(asSpan(&asked), "Secure-Session-Challenge: \"", '"');
+                destroyString(asked);
+                assertTrue(spanLength(asSpan(&refresh_challenge)) = 43, "a refresh challenge");
+                -- With a jwk the refresh proof is refused, which ends the
+                -- binding; so this comes last below, and first the one that
+                -- fits.
+                let refresh_proof: String := makeProof(key, alg, "dbsc+jwt", "", asSpan(&refresh_challenge));
+                let renewed: String := refreshed(&!db, asSpan(&id), asSpan(&refresh_proof), start_at + 101, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&renewed), "Status: 200"), "the refresh is taken");
+                assertTrue(contains(asSpan(&renewed), "Max-Age=600"), "a new cookie of boundSeconds");
+                let next: String := cookieOf(asSpan(&renewed));
+                destroyString(renewed);
+                userIs(sessionUser(&!db, asSpan(&next), start_at + 102), "ann", "the new token names ann");
+                userIs(sessionUser(&!db, asSpan(&bound), start_at + 102), "", "the token of the generation before opens nothing");
+                userIs(sessionUser(&!db, asSpan(&next), start_at + 101 + 600), "ann", "the new token lives boundSeconds from the refresh");
+                -- The challenge is used up.
+                let replayed: String := refreshed(&!db, asSpan(&id), asSpan(&refresh_proof), start_at + 103, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&replayed), "Status: 403"), "a proof used once gets a new challenge");
+                destroyString(replayed);
+                destroyString(refresh_proof);
+                destroyString(refresh_challenge);
+                -- Logout drops the binding: a refresh then ends it.
+                case logout(&!db, asSpan(&next), "10.0.0.1", start_at + 104, asSpan(&audit_path)) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as error: AuthError) do
+                        assertTrue(false, "the logout");
+                end case;
+                let gone: String := refreshed(&!db, asSpan(&id), "", start_at + 105, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&gone), "Status: 401"), "after the logout the binding is none");
+                destroyString(gone);
+                destroyString(next);
+                destroyString(bound);
+                destroyString(id);
+                destroyString(jwk);
+                destroyString(audit_path);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database opens");
+        end case;
+        return nil;
+    end;
+
+    -- A registration of key in a fresh login of ann; the
+    -- id when it was taken, else empty.
+    generic [R: Region, K: Region, A: Region]
+    function boundAnn(db: &![Database[Writing], R], key: &[PrivateKey, K], now: Int64, audit_path: Span[Nat8, A]): String is
+        let jwk: String := jwkOf(key);
+        let token: String := loginAnn(&~db, now, audit_path);
+        let challenge: String := offerToAnn(&~db, now);
+        let proof: String := makeProof(key, "ES256", "dbsc+jwt", asSpan(&jwk), asSpan(&challenge));
+        let output: String := registered(&~db, asSpan(&token), asSpan(&proof), now, audit_path);
+        assertTrue(statusIs(asSpan(&output), "Status: 200"), "the registration of the control");
+        let id: String := after(asSpan(&output), "\"session_identifier\":\"", '"');
+        destroyString(output);
+        destroyString(proof);
+        destroyString(challenge);
+        destroyString(token);
+        destroyString(jwk);
+        return id;
+    end;
+
+    function testRegistrationRefusals(): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                case generateKey(EcP256()) of
+                    when Some(value as other: PrivateKey) do
+                        registrationRefusals(&key, &other);
+                        destroyPrivateKey(other);
+                    when None do
+                        assertTrue(false, "a second key");
+                end case;
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key");
+        end case;
+        return nil;
+    end;
+
+    -- One registration that must be refused with 400, with a fresh login
+    -- and offer each.
+    generic [R: Region, K: Region, J: Region, A: Region]
+    function refusedRegistration(db: &![Database[Writing], R], signer: &[PrivateKey, K], alg: Span[Nat8, Static],
+        typ: Span[Nat8, Static], jwk: Span[Nat8, J], wrong_challenge: Bool, late: Int64, audit_path: Span[Nat8, A],
+        message: Span[Nat8, Static]): Unit is
+        let token: String := loginAnn(&~db, start_at, audit_path);
+        let challenge: String := offerToAnn(&~db, start_at);
+        var jti: String := fromSpan(asSpan(&challenge));
+        if wrong_challenge then
+            destroyString(jti);
+            jti := fromSpan("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        end if;
+        let proof: String := makeProof(signer, alg, typ, jwk, asSpan(&jti));
+        let output: String := registered(&~db, asSpan(&token), asSpan(&proof), start_at + late, audit_path);
+        assertTrue(statusIs(asSpan(&output), "Status: 400"), message);
+        userIs(sessionUser(&~db, asSpan(&token), start_at + late), "ann", "a refused registration leaves the session as it was");
+        destroyString(output);
+        destroyString(proof);
+        destroyString(jti);
+        destroyString(challenge);
+        destroyString(token);
+        return nil;
+    end;
+
+    generic [K: Region, O: Region]
+    function registrationRefusals(key: &[PrivateKey, K], other: &[PrivateKey, O]): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                let audit_path: String := pathOf("wolly-dbsc-refusals.log");
+                let cleared: Bool := removeFileIfThere(asSpan(&audit_path));
+                let jwk: String := jwkOf(key);
+                refusedRegistration(&!db, other, "ES256", "dbsc+jwt", asSpan(&jwk), false, 1, asSpan(&audit_path), "signed by another key than the jwk");
+                refusedRegistration(&!db, key, "ES256", "JWT", asSpan(&jwk), false, 1, asSpan(&audit_path), "a typ other than dbsc+jwt");
+                refusedRegistration(&!db, key, "ES256", "dbsc+jwt", "", false, 1, asSpan(&audit_path), "no jwk");
+                refusedRegistration(&!db, key, "ES256", "dbsc+jwt", asSpan(&jwk), true, 1, asSpan(&audit_path), "a jti that was not offered");
+                refusedRegistration(&!db, key, "ES256", "dbsc+jwt", asSpan(&jwk), false, 301, asSpan(&audit_path), "an offer that ran out");
+                refusedRegistration(&!db, key, "EdDSA", "dbsc+jwt", asSpan(&jwk), false, 1, asSpan(&audit_path), "an algorithm not offered");
+                -- alg none, unsigned.
+                let token: String := loginAnn(&!db, start_at, asSpan(&audit_path));
+                let challenge: String := offerToAnn(&!db, start_at);
+                var unsigned: StringBuilder := makeStringBuilder();
+                let header: String := base64UrlEncode("{\"alg\":\"none\",\"typ\":\"dbsc+jwt\"}");
+                writeString(&!unsigned, asSpan(&header));
+                destroyString(header);
+                writeString(&!unsigned, ".");
+                let payload: String := base64UrlEncode("{\"jti\":\"x\"}");
+                writeString(&!unsigned, asSpan(&payload));
+                destroyString(payload);
+                writeString(&!unsigned, ".");
+                let none_proof: String := finalize(unsigned);
+                let none_output: String := registered(&!db, asSpan(&token), asSpan(&none_proof), start_at + 1, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&none_output), "Status: 400"), "alg none is never taken");
+                destroyString(none_output);
+                destroyString(none_proof);
+                -- No proof, no cookie.
+                let bare: String := registered(&!db, asSpan(&token), "", start_at + 1, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&bare), "Status: 400"), "no proof");
+                destroyString(bare);
+                let good: String := makeProof(key, "ES256", "dbsc+jwt", asSpan(&jwk), asSpan(&challenge));
+                let anonymous: String := registered(&!db, "", asSpan(&good), start_at + 1, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&anonymous), "Status: 401"), "no session cookie");
+                destroyString(anonymous);
+                -- Control: the same proof in the session is taken.
+                let taken: String := registered(&!db, asSpan(&token), asSpan(&good), start_at + 1, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&taken), "Status: 200"), "the control is taken");
+                destroyString(taken);
+                destroyString(good);
+                destroyString(challenge);
+                destroyString(token);
+                -- An offer to ann is not one to bob.
+                let list_path: String := listWritten();
+                case addUser(&!db, "bob", good_password, asSpan(&list_path)) of
+                    when Right(right as done: Bool) do
+                        assertTrue(done, "bob");
+                    when Left(left as error: AuthError) do
+                        assertTrue(false, "bob");
+                end case;
+                destroyString(list_path);
+                case startSession(&!db, start_at) of
+                    when Right(right as visitor: String) do
+                        let result: LoginResult := login(&!db, asSpan(&visitor), "bob", good_password, "10.0.0.2", start_at, asSpan(&audit_path));
+                        destroyString(visitor);
+                        case result of
+                            when LoggedIn(token as bob_token: String) do
+                                let offered: String := offerToAnn(&!db, start_at);
+                                let for_ann: String := makeProof(key, "ES256", "dbsc+jwt", asSpan(&jwk), asSpan(&offered));
+                                let output: String := registered(&!db, asSpan(&bob_token), asSpan(&for_ann), start_at + 1, asSpan(&audit_path));
+                                assertTrue(statusIs(asSpan(&output), "Status: 400"), "an offer to ann does not bind bob");
+                                destroyString(output);
+                                destroyString(for_ann);
+                                destroyString(offered);
+                                destroyString(bob_token);
+                            when CodeNeeded(token as waiting: String) do
+                                destroyString(waiting);
+                                assertTrue(false, "bob logs in");
+                            when Refused do
+                                assertTrue(false, "bob logs in");
+                            when Throttled do
+                                assertTrue(false, "bob logs in");
+                            when LoginFailed(error as failure: AuthError) do
+                                assertTrue(false, "bob logs in");
+                        end case;
+                    when Left(left as error: AuthError) do
+                        assertTrue(false, "bob gets a session");
+                end case;
+                destroyString(jwk);
+                destroyString(audit_path);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database opens");
+        end case;
+        return nil;
+    end;
+
+    function testRefreshRefusals(): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                case generateKey(EcP256()) of
+                    when Some(value as other: PrivateKey) do
+                        refreshRefusals(&key, &other);
+                        destroyPrivateKey(other);
+                    when None do
+                        assertTrue(false, "a second key");
+                end case;
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key");
+        end case;
+        return nil;
+    end;
+
+    -- The challenge of a refresh of id at now.
+    generic [R: Region, I: Region, A: Region]
+    function refreshChallenge(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64, audit_path: Span[Nat8, A]): String is
+        let asked: String := refreshed(&~db, id, "", now, audit_path);
+        assertTrue(statusIs(asSpan(&asked), "Status: 403"), "a challenge");
+        let challenge: String := after(asSpan(&asked), "Secure-Session-Challenge: \"", '"');
+        destroyString(asked);
+        return challenge;
+    end;
+
+    -- The status line of a refresh of id at now with a proof made by
+    -- signer over a new challenge, at later.
+    generic [R: Region, I: Region, K: Region, J: Region, A: Region]
+    function refreshWith(db: &![Database[Writing], R], id: Span[Nat8, I], signer: &[PrivateKey, K], jwk: Span[Nat8, J],
+        now: Int64, later: Int64, audit_path: Span[Nat8, A]): String is
+        let challenge: String := refreshChallenge(&~db, id, now, audit_path);
+        let proof: String := makeProof(signer, "ES256", "dbsc+jwt", jwk, asSpan(&challenge));
+        let output: String := refreshed(&~db, id, asSpan(&proof), later, audit_path);
+        destroyString(proof);
+        destroyString(challenge);
+        let status: String := fromSpan(substring(asSpan(&output), 0, 11));
+        destroyString(output);
+        return status;
+    end;
+
+    function statusOf(status: String, wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let same: Bool := sameText(asSpan(&status), wanted);
+        destroyString(status);
+        assertTrue(same, message);
+        return nil;
+    end;
+
+    generic [K: Region, O: Region]
+    function refreshRefusals(key: &[PrivateKey, K], other: &[PrivateKey, O]): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                setUp(&!db);
+                let audit_path: String := pathOf("wolly-dbsc-refresh.log");
+                let cleared: Bool := removeFileIfThere(asSpan(&audit_path));
+                let jwk: String := jwkOf(key);
+                -- A late proof: the challenge ran out, a new one comes;
+                -- the binding stays, so the control after it passes.
+                let first: String := boundAnn(&!db, key, start_at, asSpan(&audit_path));
+                statusOf(refreshWith(&!db, asSpan(&first), key, "", start_at + 10, start_at + 311, asSpan(&audit_path)), "Status: 403", "late");
+                statusOf(refreshWith(&!db, asSpan(&first), key, "", start_at + 400, start_at + 401, asSpan(&audit_path)), "Status: 200", "control after late");
+                -- A jwk at a refresh ends the binding.
+                statusOf(refreshWith(&!db, asSpan(&first), key, asSpan(&jwk), start_at + 500, start_at + 501, asSpan(&audit_path)), "Status: 401", "a jwk at a refresh");
+                let ended: String := refreshed(&!db, asSpan(&first), "", start_at + 502, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&ended), "Status: 200") or statusIs(asSpan(&ended), "Status: 403"), "the binding with the jwk is still there");
+                destroyString(ended);
+                destroyString(first);
+                -- Another key.
+                let second: String := boundAnn(&!db, key, start_at, asSpan(&audit_path));
+                statusOf(refreshWith(&!db, asSpan(&second), other, "", start_at + 10, start_at + 11, asSpan(&audit_path)), "Status: 401", "signed by another key");
+                statusOf(refreshWith(&!db, asSpan(&second), key, "", start_at + 12, start_at + 13, asSpan(&audit_path)), "Status: 200", "control: the key of the binding");
+                destroyString(second);
+                -- A challenge stays until it is used or runs out: asking again without a proof gives
+                -- the same one, so whoever knows the id cannot replace the one the browser signs.
+                let fifth: String := boundAnn(&!db, key, start_at, asSpan(&audit_path));
+                let one: String := refreshChallenge(&!db, asSpan(&fifth), start_at + 30, asSpan(&audit_path));
+                let two: String := refreshChallenge(&!db, asSpan(&fifth), start_at + 31, asSpan(&audit_path));
+                assertTrue(sameText(asSpan(&one), asSpan(&two)), "the open challenge is given again");
+                let proof_of_one: String := makeProof(key, "ES256", "dbsc+jwt", "", asSpan(&one));
+                let signed_one: String := refreshed(&!db, asSpan(&fifth), asSpan(&proof_of_one), start_at + 32, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&signed_one), "Status: 200"), "the proof of the first challenge holds after a second ask");
+                let three: String := refreshChallenge(&!db, asSpan(&fifth), start_at + 40, asSpan(&audit_path));
+                assertFalse(sameText(asSpan(&one), asSpan(&three)), "a used challenge is not given again (control)");
+                let four: String := refreshChallenge(&!db, asSpan(&fifth), start_at + 400, asSpan(&audit_path));
+                assertFalse(sameText(asSpan(&three), asSpan(&four)), "nor one that ran out (control)");
+                destroyString(signed_one);
+                destroyString(proof_of_one);
+                destroyString(one);
+                destroyString(two);
+                destroyString(three);
+                destroyString(four);
+                destroyString(fifth);
+                -- The life of a binding.
+                let third: String := boundAnn(&!db, key, start_at, asSpan(&audit_path));
+                statusOf(refreshWith(&!db, asSpan(&third), key, "", (start_at + 43200) - 1, (start_at + 43200) - 1, asSpan(&audit_path)), "Status: 200", "control: within its life");
+                let past: String := refreshed(&!db, asSpan(&third), "", (start_at + 43200) + 1, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&past), "Status: 401"), "past its life");
+                destroyString(past);
+                destroyString(third);
+                -- An id that is none.
+                let unknown: String := refreshed(&!db, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "", start_at + 1, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&unknown), "Status: 401"), "an id that is none");
+                destroyString(unknown);
+                let no_id: String := refreshed(&!db, "", "", start_at + 1, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&no_id), "Status: 400"), "no id");
+                destroyString(no_id);
+                -- A user removed since.
+                let fourth: String := boundAnn(&!db, key, start_at, asSpan(&audit_path));
+                statusOf(refreshWith(&!db, asSpan(&fourth), key, "", start_at + 20, start_at + 21, asSpan(&audit_path)), "Status: 200", "control: ann is there");
+                case removeUser(&!db, "ann") of
+                    when Right(right as removed: Bool) do
+                        assertTrue(removed, "ann is removed");
+                    when Left(left as error: AuthError) do
+                        assertTrue(false, "ann is removed");
+                end case;
+                let orphan: String := refreshed(&!db, asSpan(&fourth), "", start_at + 22, asSpan(&audit_path));
+                assertTrue(statusIs(asSpan(&orphan), "Status: 401"), "the binding of a removed user is none");
+                destroyString(orphan);
+                destroyString(fourth);
+                destroyString(jwk);
+                destroyString(audit_path);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database opens");
+        end case;
+        return nil;
+    end;
+end module body.

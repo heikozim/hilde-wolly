@@ -1,0 +1,404 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromLiteral,
+    asSpan,
+    destroyString
+);
+import Standard.Sandbox (
+    Policy,
+    allowPath
+);
+import Wolly.Confine (
+    sandboxAsked,
+    toolPolicy,
+    confineTool,
+    printToolSandbox
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    nthRef,
+    insertBack,
+    removeLast,
+    destroyEmpty
+);
+import Standard.Text (
+    endsWith,
+    equal
+);
+import Standard.Sort (
+    sort
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.File (
+    FileDescriptor,
+    Directory,
+    openRead,
+    readAll,
+    closeFile,
+    openDirectory,
+    nextEntry,
+    closeDirectory
+);
+import Wolly.ViewData (
+    ViewData,
+    readViewJson,
+    destroyViewData,
+    makeTextData,
+    isTextual,
+    textOf,
+    rootNode,
+    elementAt,
+    makeMapData,
+    isMap,
+    firstChild,
+    nextSibling,
+    keyOf,
+    memberNamed,
+    putCopy,
+    putSanitizedHtml
+);
+import Wolly.View (
+    ViewEngine,
+    makeViewEngine,
+    destroyViewEngine,
+    addDirectory,
+    addFunction,
+    loadView,
+    renderView,
+    renderPage
+);
+import Wolly.ViewFunctions (
+    addStandardFunctions,
+    assetWith,
+    lucyPolicy
+);
+
+import Wolly.Version (
+    answerAbout,
+    library,
+    destroyLibraries
+);
+import Standard.Libcrypto (
+    libraryVersion as cryptoVersion
+);
+
+module body Wolly.Example.ViewTool is
+    -- asset without a directory: the path as it is.
+    function asset(call: ViewData): Either[String, ViewData] is
+        return assetWith("", call);
+    end;
+
+    -- The message "$catalog" in the data file holds for a key, as the
+    -- data tool writes it from a catalog; a key it does not hold stands
+    -- for itself, as there.  The file is read again for each call, since a
+    -- function value holds no state.
+    generic [K: Region]
+    function messageOf(key: Span[Nat8, K]): ViewData is
+        case readFile(nthArgument(2)) of
+            when Some(value as json: String) do
+                case readViewJson(asSpan(&json)) of
+                    when Right(right as data: ViewData) do
+                        destroyString(json);
+                        case memberNamed(&data, rootNode(), "$catalog") of
+                            when Some(value as catalog: Index) do
+                                case memberNamed(&data, catalog, key) of
+                                    when Some(value as message: Index) do
+                                        if isTextual(&data, message) then
+                                            let made: ViewData := makeTextData(textOf(&data, message));
+                                            destroyViewData(data);
+                                            return made;
+                                        end if;
+                                    when None do
+                                        skip;
+                                end case;
+                            when None do
+                                skip;
+                        end case;
+                        destroyViewData(data);
+                    when Left(left as message: String) do
+                        destroyString(message);
+                        destroyString(json);
+                end case;
+            when None do
+                skip;
+        end case;
+        return makeTextData(key);
+    end;
+
+    -- t of the template functions: the message for the key, the second argument.
+    function translated(call: ViewData): Either[String, ViewData] is
+        case elementAt(&call, rootNode(), 1) of
+            when Some(value as key: Index) do
+                if isTextual(&call, key) then
+                    let made: ViewData := messageOf(textOf(&call, key));
+                    destroyViewData(call);
+                    return Right(right => made);
+                end if;
+            when None do
+                skip;
+        end case;
+        destroyViewData(call);
+        return Left(left => fromLiteral("t: takes a language and a key"));
+    end;
+
+    -- An engine of the directories given from the argument first on.
+    function engineFrom(first: Index): ViewEngine is
+        var engine: ViewEngine := makeViewEngine();
+        var i: Index := first;
+        while i < argumentCount() do
+            addDirectory(&!engine, nthArgument(i));
+            i := i + 1;
+        end while;
+        addStandardFunctions(&!engine);
+        addFunction(&!engine, "asset", asset);
+        addFunction(&!engine, "t", translated);
+        return engine;
+    end;
+
+    -- The names of the templates of a directory, in order.
+    generic [D: Region]
+    function namesIn(directory: Span[Nat8, D]): Buffer[String] is
+        var names: Buffer[String] := allocateEmpty();
+        case openDirectory(directory) of
+            when Some(value as opened: Directory) do
+                var listing: Directory := opened;
+                var going: Bool := true;
+                while going do
+                    case nextEntry(&!listing) of
+                        when Some(value as name: String) do
+                            if endsWith(asSpan(&name), ".html") or endsWith(asSpan(&name), ".jinja") then
+                                insertBack(&!names, name);
+                            else
+                                destroyString(name);
+                            end if;
+                        when None do
+                            going := false;
+                    end case;
+                end while;
+                let closed: Bool := closeDirectory(listing);
+            when None do
+                skip;
+        end case;
+        return sort(names);
+    end;
+
+    function check(): ExitCode is
+        var engine: ViewEngine := engineFrom(2);
+        var names: Buffer[String] := namesIn(nthArgument(2));
+        let total: Index := length(&names);
+        var loaded: Index := 0;
+        while length(&names) > 0 do
+            let name: String := removeLast(&!names);
+            case loadView(&!engine, asSpan(&name)) of
+                when Left(left as message: String) do
+                    print("error ");
+                    printLn(asSpan(&message));
+                    destroyString(message);
+                when Right(right as done: Unit) do
+                    print("ok ");
+                    printLn(asSpan(&name));
+                    loaded := loaded + 1;
+            end case;
+            destroyString(name);
+        end while;
+        destroyEmpty(names);
+        destroyViewEngine(engine);
+        print("loaded ");
+        print(loaded);
+        print(" of ");
+        printLn(total);
+        if (loaded = total) and (total > 0) then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+
+    -- Whether the list "$html" of the data names key.
+    generic [D: Region, K: Region]
+    function namedHtml(data: &[ViewData, D], key: Span[Nat8, K]): Bool is
+        case memberNamed(data, rootNode(), "$html") of
+            when Some(value as list: Index) do
+                var element: Option[Index] := firstChild(data, list);
+                var going: Bool := true;
+                while going do
+                    case element of
+                        when Some(value as at: Index) do
+                            if isTextual(data, at) then
+                                if equal(textOf(data, at), key) then
+                                    return true;
+                                end if;
+                            end if;
+                            element := nextSibling(data, at);
+                        when None do
+                            going := false;
+                    end case;
+                end while;
+                return false;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The data again, the fields "$html" names cleaned as HTML with
+    -- the sanitize allowlist, as a Go template engine holds them as
+    -- template.HTML, and "$html" and "$catalog" themselves left out.
+    function withHtml(data: ViewData): ViewData is
+        if not isMap(&data, rootNode()) then
+            return data;
+        end if;
+        var made: ViewData := makeMapData();
+        var member: Option[Index] := firstChild(&data, rootNode());
+        var going: Bool := true;
+        while going do
+            case member of
+                when Some(value as at: Index) do
+                    if equal(keyOf(&data, at), "$html") or equal(keyOf(&data, at), "$catalog") then
+                        skip;
+                    else if namedHtml(&data, keyOf(&data, at)) and isTextual(&data, at) then
+                        let put: Index := putSanitizedHtml(&!made, rootNode(), keyOf(&data, at), textOf(&data, at),
+                            lucyPolicy());
+                    else
+                        let put: Index := putCopy(&!made, rootNode(), keyOf(&data, at), &data, at);
+                    end if;
+                    member := nextSibling(&data, at);
+                when None do
+                    going := false;
+            end case;
+        end while;
+        destroyViewData(data);
+        return made;
+    end;
+
+    generic [P: Region]
+    function readFile(path: Span[Nat8, P]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return None();
+        end case;
+    end;
+
+    function render(): ExitCode is
+        var engine: ViewEngine := engineFrom(5);
+        case readFile(nthArgument(2)) of
+            when None do
+                destroyViewEngine(engine);
+                printLn("view: the data cannot be read");
+                return ExitFailure();
+            when Some(value as json: String) do
+                case readViewJson(asSpan(&json)) of
+                    when Left(left as message: String) do
+                        print("view: the data is no JSON for a view: ");
+                        printLn(asSpan(&message));
+                        destroyString(message);
+                        destroyString(json);
+                        destroyViewEngine(engine);
+                        return ExitFailure();
+                    when Right(right as read: ViewData) do
+                        destroyString(json);
+                        let data: ViewData := withHtml(read);
+                        var out: StringBuilder := makeStringBuilder();
+                        let result: Either[String, Unit] := renderPage(&!engine, nthArgument(4), nthArgument(3), &data,
+                            &!out);
+                        destroyViewData(data);
+                        destroyViewEngine(engine);
+                        let text: String := finalize(out);
+                        case result of
+                            when Left(left as message: String) do
+                                destroyString(text);
+                                print("view: ");
+                                printLn(asSpan(&message));
+                                destroyString(message);
+                                return ExitFailure();
+                            when Right(right as done: Unit) do
+                                print(asSpan(&text));
+                                destroyString(text);
+                                return ExitSuccess();
+                        end case;
+                end case;
+        end case;
+    end;
+
+    constant promises: Span[Nat8, Static] := "stdio rpath";
+
+    -- The policy of a run: data, when given, and the directories from the argument first on, to read.
+    function viewPolicy(data: Bool, first: Index): Policy is
+        var policy: Policy := toolPolicy(promises);
+        if data then
+            policy := allowPath(policy, nthArgument(2), "r");
+        end if;
+        var i: Index := first;
+        while i < argumentCount() do
+            policy := allowPath(policy, nthArgument(i), "r");
+            i := i + 1;
+        end while;
+        return policy;
+    end;
+
+    function confined(data: Bool, first: Index): Bool is
+        if confineTool(viewPolicy(data, first)) then
+            return true;
+        end if;
+        printLn("view: the sandbox was refused");
+        return false;
+    end;
+
+    function command(): ExitCode is
+        var libraries: Buffer[String] := allocateEmpty();
+        insertBack(&!libraries, library("libcrypto", cryptoVersion()));
+        let answered: Bool := answerAbout("view", &libraries);
+        destroyLibraries(libraries);
+        if answered then
+            return ExitSuccess();
+        end if;
+        if sandboxAsked() then
+            printToolSandbox("view", promises, allowPath(allowPath(toolPolicy(promises), "<DATA>", "r"), "<DIRECTORY>", "r"));
+            return ExitSuccess();
+        end if;
+        if argumentCount() >= 3 then
+            if equal(nthArgument(1), "check") then
+                if not confined(false, 2) then
+                    return ExitFailure();
+                end if;
+                return check();
+            end if;
+        end if;
+        if argumentCount() >= 6 then
+            if equal(nthArgument(1), "render") then
+                if not confined(true, 5) then
+                    return ExitFailure();
+                end if;
+                return render();
+            end if;
+        end if;
+        printLn("usage: view check DIRECTORY [DIRECTORY...]");
+        printLn("       view render DATA LAYOUT PAGE DIRECTORY [DIRECTORY...]");
+        return ExitFailure();
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var power: RootCapability := root;
+        let code: ExitCode := command();
+        surrenderRoot(power);
+        return code;
+    end;
+end module body.

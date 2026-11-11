@@ -1,0 +1,101 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Device Bound Session Credentials for the sessions of an OpenID provider (Wolly.Op), after the protocol of Wolly.Dbsc.
+
+offer gives the value of Secure-Session-Registration for a live session
+that holds no binding yet.  register takes the proof the browser posts,
+keeps its key under the owner Wolly.OpBase.bindingOwner names, and gives
+the session cookie a new value that lives Wolly.Dbsc.boundSeconds.
+refresh gives a new value for each proof over a fresh challenge; the value
+before opens nothing from then on, and Wolly.OpBase.cookieSession counts
+a bound session only while its last refresh is no older than
+Wolly.Dbsc.boundSeconds.  A session that ended, ran past its limits, or
+whose account is locked or gone ends its binding at the next refresh.
+
+The form tokens of Wolly.Op.csrfToken hang on the cookie value, so a form
+shown before a refresh is refused once after it.
+
+Every registration and refresh with a proof is a line of the audit log:
+dbsc-register and dbsc-refresh, with the subject, the session and the
+outcome.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.OpBase (
+    OpSettings
+);
+import Wolly.Op (
+    Handover
+);
+
+module Wolly.OpDbsc is
+    """
+    The value of Secure-Session-Registration for the session of the cookie
+    of request at now, with a new challenge and path: Right None when the
+    browser holds no live session, the session is bound already, or path
+    is no endpoint path of Wolly.Dbsc.
+    No contract on the result: it is the work of the database.
+    """
+    generic [Q: Region, R: Region, S: Region, P: Region]
+    function offer(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], path: Span[Nat8, P],
+        now: Int64): Either[DbError, Option[String]]
+        requires now > 0;
+
+    """
+    The value of Secure-Session-Registration for the session that step
+    gives the browser, with a new challenge and path: the session of the
+    session cookie among its cookies, when it lives and holds no binding.
+    Right None otherwise.  For the answer of a login, whose request
+    carries no session cookie yet.
+    No contract on the result: it is the work of the database.
+    """
+    generic [R: Region, S: Region, H: Region, P: Region]
+    function offerAfter(db: &![Database[Writing], R], settings: &[OpSettings, S], step: &[Handover, H], path: Span[Nat8, P],
+        now: Int64): Either[DbError, Option[String]]
+        requires now > 0;
+
+    """
+    The registration of the proof of request at now for the live session
+    of its cookie, which holds no binding yet: 200 with the session
+    instructions (refresh at refresh_path) and the cookie with its new
+    value; 401 without such a session, 400 for a proof that does not hold,
+    500 when the work could not be done.  ip goes to the audit line.
+    """
+    generic [Q: Region, R: Region, S: Region, L: Region, P: Region, A: Region]
+    function register(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+
+    """
+    The refresh of the binding of Sec-Secure-Session-Id in request at now:
+    403 with a new Secure-Session-Challenge without a proof or with one of
+    a challenge that is not open; 200 with the instructions and a new
+    cookie value for a proof that holds while the session lives and its
+    account is active; 401 otherwise, which ends the session in the
+    browser; 400 without an id.  ip goes to the audit line.
+    """
+    generic [Q: Region, R: Region, S: Region, L: Region, P: Region, A: Region]
+    function refresh(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64): String
+        requires now > 0
+        ensures length(&result) > 0;
+end module.

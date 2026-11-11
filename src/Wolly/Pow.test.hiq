@@ -1,0 +1,161 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    formatInt,
+    substring
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Pow (
+    Puzzle,
+    PowCheck,
+    PowMalformed,
+    PowForged,
+    PowExpired,
+    PowOtherFlow,
+    PowTooEasy,
+    PowWrong,
+    PowReused,
+    PowSolved,
+    destroyPuzzle,
+    issuePuzzle,
+    powReason,
+    solves,
+    preparePow,
+    checkPuzzle,
+    prunePow
+);
+
+module body Wolly.Pow.Test is
+    constant key: Span[Nat8, Static] := "0123456789abcdef0123456789abcdef";
+    constant now: Int64 := 1800000000;
+
+    function puzzleOf(binding: Span[Nat8, Static], bits: Int64): Puzzle is
+        case issuePuzzle(key, binding, bits, now, 600) of
+            when Some(value as puzzle: Puzzle) do
+                return puzzle;
+            when None do
+                abort("no puzzle");
+        end case;
+    end;
+
+    generic [P: Region]
+    function tokenOf(puzzle: &[Puzzle, P]): Span[Nat8, P] is
+        return asSpan(&(puzzle->token));
+    end;
+
+    -- The first number that solves token for bits.
+    generic [T: Region]
+    function answer(token: Span[Nat8, T], bits: Int64): String is
+        var n: Int64 := 0;
+        while n < 1000000 do
+            let text: String := formatInt(n);
+            if solves(token, asSpan(&text), bits) then
+                return text;
+            end if;
+            destroyString(text);
+            n := n + 1;
+        end while;
+        abort("no answer within a million tries");
+    end;
+
+    function reasonIs(result: Either[DbError, PowCheck], reason: Span[Nat8, Static]): Bool is
+        case result of
+            when Right(right as check: PowCheck) do
+                let word: Span[Nat8, Static] := powReason(check);
+                return (spanLength(word) = spanLength(reason)) and isSame(word, reason);
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function isSame(a: Span[Nat8, Static], b: Span[Nat8, Static]): Bool is
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function testPuzzle(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case preparePow(&!db) of
+                    when Some(value as error: DbError) do
+                        assertTrue(false, "the table is made");
+                    when None do
+                        skip;
+                end case;
+                let puzzle: Puzzle := puzzleOf("request-1", 8);
+                let token: Span[Nat8, Static] := "";
+                let found: String := answer(tokenOf(&puzzle), 8);
+                assertTrue(reasonIs(checkPuzzle(&!db, key, tokenOf(&puzzle), "x1", "request-1", 8, now), "wrong"), "a nonce that is no number");
+                assertTrue(reasonIs(checkPuzzle(&!db, key, tokenOf(&puzzle), asSpan(&found), "request-2", 8, now), "other_flow"), "another flow");
+                assertTrue(reasonIs(checkPuzzle(&!db, key, tokenOf(&puzzle), asSpan(&found), "request-1", 9, now), "too_easy"), "harder now");
+                assertTrue(reasonIs(checkPuzzle(&!db, key, tokenOf(&puzzle), asSpan(&found), "request-1", 8, now + 600), "expired"), "too late");
+                assertTrue(reasonIs(checkPuzzle(&!db, "another key of thirty-two bytes!", tokenOf(&puzzle), asSpan(&found), "request-1", 8, now), "forged"), "another key");
+                assertTrue(reasonIs(checkPuzzle(&!db, key, "1.a.b", asSpan(&found), "request-1", 8, now), "malformed"), "three parts");
+                assertTrue(reasonIs(checkPuzzle(&!db, key, tokenOf(&puzzle), asSpan(&found), "request-1", 8, now), ""), "solved");
+                assertTrue(reasonIs(checkPuzzle(&!db, key, tokenOf(&puzzle), asSpan(&found), "request-1", 8, now), "reused"), "once");
+                case prunePow(&!db, now + 601) of
+                    when Right(right as n: Int64) do
+                        assertTrue(n = 1, "the spent puzzle goes after its end");
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "pruned");
+                end case;
+                destroyString(found);
+                destroyPuzzle(puzzle);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a database");
+        end case;
+        case issuePuzzle("short", "request-1", 8, now, 600) of
+            when Some(value as p: Puzzle) do
+                assertTrue(false, "a short key makes no puzzle");
+                destroyPuzzle(p);
+            when None do
+                skip;
+        end case;
+        case issuePuzzle(key, "request-1", 33, now, 600) of
+            when Some(value as p: Puzzle) do
+                assertTrue(false, "33 bits are too many");
+                destroyPuzzle(p);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+end module body.

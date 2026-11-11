@@ -1,0 +1,793 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQL of its own over Standard.Database: every statement is a constant,
+-- every value is bound.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    equal,
+    constantTimeEqual
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonWriter,
+    readJson,
+    destroyJson,
+    stringAt,
+    kindAt,
+    JsonKind,
+    valueTextAt,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeBool,
+    finishJson
+);
+import Standard.Json (
+    writeString as writeJsonString
+);
+import Standard.Jws (
+    base64UrlEncode,
+    base64UrlDecode,
+    verifyCompact,
+    publicKeyFromJwk
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    Values,
+    noValues,
+    withInt64,
+    withText,
+    withBytes,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    columnBytes,
+    finish
+);
+import Standard.FcgiServer (
+    Request,
+    requestParam
+);
+import Wolly.Response (
+    Response,
+    addHeader
+);
+import Wolly.Dialect (
+    pick
+);
+
+module body Wolly.Dbsc is
+    constant make_offers: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_dbsc_offers (challenge TEXT PRIMARY KEY, name TEXT NOT NULL, expires_at INTEGER NOT NULL) STRICT";
+    constant make_offers_pg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_dbsc_offers (challenge TEXT PRIMARY KEY, name TEXT NOT NULL, expires_at BIGINT NOT NULL)";
+    constant make_bindings: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_dbsc_sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, public_key BLOB NOT NULL, generation INTEGER NOT NULL CHECK (generation > 0), fresh_until INTEGER NOT NULL, created_at INTEGER NOT NULL, challenge TEXT NOT NULL, challenge_until INTEGER NOT NULL) STRICT";
+    constant make_bindings_pg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_dbsc_sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, public_key BYTEA NOT NULL, generation BIGINT NOT NULL CHECK (generation > 0), fresh_until BIGINT NOT NULL, created_at BIGINT NOT NULL, challenge TEXT NOT NULL, challenge_until BIGINT NOT NULL)";
+    constant make_bindings_index: Span[Nat8, Static] := "CREATE INDEX IF NOT EXISTS wolly_dbsc_sessions_name ON wolly_dbsc_sessions (name)";
+    -- The names that held a binding once: when the binding is gone, dropped or past its life, the
+    -- name does not count as one that never had one.  A row is kept remember_seconds.
+    constant make_names: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_dbsc_names (name TEXT PRIMARY KEY, bound_at INTEGER NOT NULL) STRICT";
+    constant make_names_pg: Span[Nat8, Static] := "CREATE TABLE IF NOT EXISTS wolly_dbsc_names (name TEXT PRIMARY KEY, bound_at BIGINT NOT NULL)";
+    constant put_name: Span[Nat8, Static] := "INSERT INTO wolly_dbsc_names (name, bound_at) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET bound_at = excluded.bound_at";
+    constant name_known: Span[Nat8, Static] := "SELECT count(*) FROM wolly_dbsc_names WHERE name = ?";
+    constant drop_old_names: Span[Nat8, Static] := "DELETE FROM wolly_dbsc_names WHERE bound_at < ?";
+    constant remember_seconds: Int64 := 34560000;
+    constant drop_stale_offers: Span[Nat8, Static] := "DELETE FROM wolly_dbsc_offers WHERE expires_at < ?";
+    constant drop_old_bindings: Span[Nat8, Static] := "DELETE FROM wolly_dbsc_sessions WHERE created_at < ?";
+    constant drop_offers_of: Span[Nat8, Static] := "DELETE FROM wolly_dbsc_offers WHERE name = ?";
+    constant drop_bindings_of: Span[Nat8, Static] := "DELETE FROM wolly_dbsc_sessions WHERE name = ?";
+    constant drop_one: Span[Nat8, Static] := "DELETE FROM wolly_dbsc_sessions WHERE id = ?";
+    constant put_offer: Span[Nat8, Static] := "INSERT INTO wolly_dbsc_offers (challenge, name, expires_at) VALUES (?, ?, ?)";
+    constant take_offer: Span[Nat8, Static] := "DELETE FROM wolly_dbsc_offers WHERE challenge = ? RETURNING name, expires_at";
+    constant put_binding: Span[Nat8, Static] := "INSERT INTO wolly_dbsc_sessions (id, name, public_key, generation, fresh_until, created_at, challenge, challenge_until) VALUES (?, ?, ?, 1, ?, ?, '', 0)";
+    -- A new challenge only where none is open: whoever knows the id cannot replace the challenge
+    -- the browser is about to sign.
+    constant set_challenge: Span[Nat8, Static] := "UPDATE wolly_dbsc_sessions SET challenge = ?, challenge_until = ? WHERE id = ? AND created_at >= ? AND (challenge = '' OR challenge_until < ?)";
+    constant open_challenge: Span[Nat8, Static] := "SELECT challenge FROM wolly_dbsc_sessions WHERE id = ? AND created_at >= ? AND challenge <> '' AND challenge_until >= ?";
+    constant binding_of: Span[Nat8, Static] := "SELECT public_key, challenge, challenge_until, created_at, generation FROM wolly_dbsc_sessions WHERE id = ?";
+    constant move_on: Span[Nat8, Static] := "UPDATE wolly_dbsc_sessions SET generation = generation + 1, fresh_until = ?, challenge = '', challenge_until = 0 WHERE id = ? AND generation = ?";
+    constant name_of: Span[Nat8, Static] := "SELECT name FROM wolly_dbsc_sessions WHERE id = ? AND generation = ? AND fresh_until >= ?";
+    constant freshest_of: Span[Nat8, Static] := "SELECT fresh_until FROM wolly_dbsc_sessions WHERE name = ? ORDER BY fresh_until DESC LIMIT 1";
+    constant registration_algorithms: Span[Nat8, Static] := "(ES256 RS256);path=\"";
+    constant proof_type: Span[Nat8, Static] := "dbsc+jwt";
+    constant attributes: Span[Nat8, Static] := "Secure; HttpOnly; SameSite=Strict; Path=/";
+
+    function boundSeconds(): Int64 is
+        return 600;
+    end;
+
+    function challengeSeconds(): Int64 is
+        return 300;
+    end;
+
+    function boundLifeSeconds(): Int64 is
+        return 43200;
+    end;
+
+    function cookieAttributes(): Span[Nat8, Static] is
+        return attributes;
+    end;
+
+    -- Runs one statement; None when it went through.
+    generic [R: Region]
+    function run(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Option[DbError] is
+        case execute(&~db, sql, noValues()) of
+            when Right(right as changed: Nat64) do
+                return None();
+            when Left(left as error: DbError) do
+                return Some(value => error);
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepareDbsc(db: &![Database[Writing], R]): Option[DbError] is
+        let offers_sql: Span[Nat8, Static] := pick(&db, make_offers, make_offers_pg);
+        case run(&~db, offers_sql) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        let bindings_sql: Span[Nat8, Static] := pick(&db, make_bindings, make_bindings_pg);
+        case run(&~db, bindings_sql) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        let names_sql: Span[Nat8, Static] := pick(&db, make_names, make_names_pg);
+        case run(&~db, names_sql) of
+            when Some(value as error: DbError) do
+                return Some(value => error);
+            when None do
+                skip;
+        end case;
+        return run(&~db, make_bindings_index);
+    end;
+
+    -- Whether byte is a letter, a digit, a dot, a hyphen or an underscore.
+    function isPlainByte(byte: Nat8): Bool is
+        let lower: Bool := (byte >= 'a') and (byte <= 'z');
+        let upper: Bool := (byte >= 'A') and (byte <= 'Z');
+        let digit: Bool := (byte >= '0') and (byte <= '9');
+        let mark: Bool := ((byte = '.') or (byte = '-')) or (byte = '_');
+        return ((lower or upper) or digit) or mark;
+    end;
+
+    generic [P: Region]
+    function isEndpointPath(path: Span[Nat8, P]): Bool is
+        if (spanLength(path) < 2) or (spanLength(path) > 201) then
+            return false;
+        end if;
+        if path[0] /= '/' then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < spanLength(path) do
+            let byte: Nat8 := path[i];
+            if not (isPlainByte(byte) or (byte = '/')) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- 32 random bytes in base64url; None when the random source failed.
+    function randomText(): Option[String] is
+        case randomBytes(32) of
+            when Some(value as raw: String) do
+                let text: String := base64UrlEncode(asSpan(&raw));
+                destroyString(raw);
+                return Some(value => text);
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, N: Region, P: Region]
+    function offerRegistration(db: &![Database[Writing], R], name: Span[Nat8, N], path: Span[Nat8, P], now: Int64): Either[DbError, Option[String]] is
+        if not isEndpointPath(path) then
+            return Right(right => None());
+        end if;
+        case execute(&~db, drop_stale_offers, withInt64(noValues(), now)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, drop_old_bindings, withInt64(noValues(), now - boundLifeSeconds())) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, drop_old_names, withInt64(noValues(), now - remember_seconds)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, drop_offers_of, withText(noValues(), name)) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        case randomText() of
+            when Some(value as challenge: String) do
+                let values: Values := withInt64(withText(withText(noValues(), asSpan(&challenge)), name), now + challengeSeconds());
+                case execute(&~db, put_offer, values) of
+                    when Left(left as error: DbError) do
+                        destroyString(challenge);
+                        return Left(left => error);
+                    when Right(right as put: Nat64) do
+                        var header: StringBuilder := makeStringBuilder();
+                        writeString(&!header, registration_algorithms);
+                        writeString(&!header, path);
+                        writeString(&!header, "\";challenge=\"");
+                        writeString(&!header, asSpan(&challenge));
+                        writeString(&!header, "\"");
+                        destroyString(challenge);
+                        let value: String := finalize(header);
+                        return Right(right => Some(value => value));
+                end case;
+            when None do
+                return Right(right => None());
+        end case;
+    end;
+
+    generic [R: Region, N: Region, P: Region]
+    function withOffer(db: &![Database[Writing], R], response: Response, name: Span[Nat8, N], path: Span[Nat8, P], now: Int64): Response is
+        case offerRegistration(&~db, name, path, now) of
+            when Right(right as made: Option[String]) do
+                case made of
+                    when Some(value as header: String) do
+                        let offered: Response := addHeader(response, "Secure-Session-Registration", asSpan(&header));
+                        destroyString(header);
+                        return offered;
+                    when None do
+                        return response;
+                end case;
+            when Left(left as error: DbError) do
+                return response;
+        end case;
+    end;
+
+    -- The header of a compact JWS, decoded: None when it has no dot or its
+    -- first part is not base64url of JSON.
+    generic [T: Region]
+    function headerOf(token: Span[Nat8, T]): Option[Json] is
+        var dot: Index := 0;
+        var found: Bool := false;
+        while (dot < spanLength(token)) and (not found) do
+            if token[dot] = '.' then
+                found := true;
+            else
+                dot := dot + 1;
+            end if;
+        end while;
+        if not found then
+            return None();
+        end if;
+        case base64UrlDecode(substring(token, 0, dot)) of
+            when Some(value as text: String) do
+                let read: Either[JsonError, Json] := readJson(asSpan(&text));
+                destroyString(text);
+                case read of
+                    when Right(right as document: Json) do
+                        return Some(value => document);
+                    when Left(left as error: JsonError) do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Whether the string at pointer of document is wanted.
+    generic [D: Region]
+    function stringIs(document: &[Json, D], pointer: Span[Nat8, Static], wanted: Span[Nat8, Static]): Bool is
+        case stringAt(document, pointer) of
+            when Some(value as text: String) do
+                let same: Bool := equal(asSpan(&text), wanted);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether header is one of a proof: typ dbsc+jwt, alg ES256 or RS256,
+    -- and a jwk when registering, none at a refresh.
+    generic [D: Region]
+    function headerFits(header: &[Json, D], registering: Bool): Bool is
+        if not stringIs(header, "/typ", proof_type) then
+            return false;
+        end if;
+        if not (stringIs(header, "/alg", "ES256") or stringIs(header, "/alg", "RS256")) then
+            return false;
+        end if;
+        case kindAt(header, "/jwk") of
+            when Some(value as kind: JsonKind) do
+                return registering;
+            when None do
+                return not registering;
+        end case;
+    end;
+
+    -- The DER public key of the jwk of header.
+    generic [D: Region]
+    function jwkDer(header: &[Json, D]): Option[String] is
+        case valueTextAt(header, "/jwk") of
+            when Some(value as jwk: String) do
+                let der: Option[String] := publicKeyFromJwk(asSpan(&jwk));
+                destroyString(jwk);
+                return der;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The jti of the payload of a proof.
+    generic [P: Region]
+    function jtiOf(payload: Span[Nat8, P]): Option[String] is
+        case readJson(payload) of
+            when Right(right as document: Json) do
+                let jti: Option[String] := stringAt(&document, "/jti");
+                destroyJson(document);
+                return jti;
+            when Left(left as error: JsonError) do
+                return None();
+        end case;
+    end;
+
+    -- The jti of proof when its signature holds under public_der.
+    generic [T: Region, K: Region]
+    function signedJti(proof: Span[Nat8, T], public_der: Span[Nat8, K]): Option[String] is
+        case verifyCompact(proof, public_der) of
+            when Some(value as payload: String) do
+                let jti: Option[String] := jtiOf(asSpan(&payload));
+                destroyString(payload);
+                return jti;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The public key of a registration proof whose header fits.
+    generic [T: Region]
+    function registrationKey(proof: Span[Nat8, T]): Option[String] is
+        case headerOf(proof) of
+            when Some(value as header: Json) do
+                if not headerFits(&header, true) then
+                    destroyJson(header);
+                    return None();
+                end if;
+                let der: Option[String] := jwkDer(&header);
+                destroyJson(header);
+                return der;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Takes the offer of challenge out of the table: Right true when it
+    -- was offered to name and is still open.
+    generic [R: Region, C: Region, N: Region]
+    function offerTaken(db: &![Database[Writing], R], challenge: Span[Nat8, C], name: Span[Nat8, N], now: Int64): Either[DbError, Bool] is
+        var cursor: Cursor := start(&~db, take_offer, withText(noValues(), challenge));
+        var fits: Bool := false;
+        if advance(&!cursor) then
+            if columnInt64(&cursor, 1) >= now then
+                fits := equal(columnText(&cursor, 0), name);
+            end if;
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                return Right(right => fits);
+        end case;
+    end;
+
+    generic [R: Region, N: Region, P: Region]
+    function registerKey(db: &![Database[Writing], R], name: Span[Nat8, N], proof: Span[Nat8, P], now: Int64): Either[DbError, Option[String]] is
+        case registrationKey(proof) of
+            when Some(value as key: String) do
+                case signedJti(proof, asSpan(&key)) of
+                    when Some(value as jti: String) do
+                        let taken: Either[DbError, Bool] := offerTaken(&~db, asSpan(&jti), name, now);
+                        destroyString(jti);
+                        case taken of
+                            when Right(right as fits: Bool) do
+                                if fits then
+                                    let stored: Either[DbError, Option[String]] := storeBinding(&~db, name, asSpan(&key), now);
+                                    destroyString(key);
+                                    return stored;
+                                end if;
+                                destroyString(key);
+                                return Right(right => None());
+                            when Left(left as error: DbError) do
+                                destroyString(key);
+                                return Left(left => error);
+                        end case;
+                    when None do
+                        destroyString(key);
+                        return Right(right => None());
+                end case;
+            when None do
+                return Right(right => None());
+        end case;
+    end;
+
+    -- A new binding of name with the public key under a new id.
+    generic [R: Region, N: Region, K: Region]
+    function storeBinding(db: &![Database[Writing], R], name: Span[Nat8, N], key: Span[Nat8, K], now: Int64): Either[DbError, Option[String]] is
+        case randomText() of
+            when Some(value as id: String) do
+                let values: Values := withInt64(withInt64(withBytes(withText(withText(noValues(), asSpan(&id)), name), key), now + boundSeconds()), now);
+                case execute(&~db, put_binding, values) of
+                    when Left(left as error: DbError) do
+                        destroyString(id);
+                        return Left(left => error);
+                    when Right(right as put: Nat64) do
+                        skip;
+                end case;
+                case execute(&~db, put_name, withInt64(withText(noValues(), name), now)) of
+                    when Left(left as error: DbError) do
+                        destroyString(id);
+                        return Left(left => error);
+                    when Right(right as named: Nat64) do
+                        return Right(right => Some(value => id));
+                end case;
+            when None do
+                return Right(right => None());
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function newChallenge(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Either[DbError, Option[String]] is
+        case randomText() of
+            when Some(value as challenge: String) do
+                let values: Values := withInt64(withInt64(withText(withInt64(withText(noValues(), asSpan(&challenge)), now + challengeSeconds()), id), now - boundLifeSeconds()), now);
+                case execute(&~db, set_challenge, values) of
+                    when Left(left as error: DbError) do
+                        destroyString(challenge);
+                        return Left(left => error);
+                    when Right(right as changed: Nat64) do
+                        if changed = 0 then
+                            destroyString(challenge);
+                            return openChallenge(&~db, id, now);
+                        end if;
+                        let value: String := challengeHeader(asSpan(&challenge), id);
+                        destroyString(challenge);
+                        return Right(right => Some(value => value));
+                end case;
+            when None do
+                return Right(right => None());
+        end case;
+    end;
+
+    -- The challenge of the binding id that is still open at now, as the value of the header;
+    -- None when there is no such binding or it is past its life.
+    generic [R: Region, I: Region]
+    function openChallenge(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, open_challenge, withInt64(withInt64(withText(noValues(), id), now - boundLifeSeconds()), now));
+        var found: Option[String] := None();
+        if advance(&!cursor) then
+            dropText(found);
+            found := Some(value => challengeHeader(columnText(&cursor, 0), id));
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                dropText(found);
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    function dropText(text: Option[String]): Unit is
+        case text of
+            when Some(value as s: String) do
+                destroyString(s);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The value of Secure-Session-Challenge: the challenge and the id of the binding.
+    generic [C: Region, I: Region]
+    function challengeHeader(challenge: Span[Nat8, C], id: Span[Nat8, I]): String is
+        var header: StringBuilder := makeStringBuilder();
+        writeString(&!header, "\"");
+        writeString(&!header, challenge);
+        writeString(&!header, "\";id=\"");
+        writeString(&!header, id);
+        writeString(&!header, "\"");
+        return finalize(header);
+    end;
+
+    generic [R: Region, I: Region, P: Region]
+    function refreshKey(db: &![Database[Writing], R], id: Span[Nat8, I], proof: Span[Nat8, P], now: Int64): Either[DbError, RefreshOutcome] is
+        var cursor: Cursor := start(&~db, binding_of, withText(noValues(), id));
+        var there: Bool := false;
+        var key: String := fromSpan("");
+        var challenge: String := fromSpan("");
+        var challenge_until: Int64 := 0;
+        var created_at: Int64 := 0;
+        var generation: Int64 := 0;
+        if advance(&!cursor) then
+            there := true;
+            destroyString(key);
+            key := fromSpan(columnBytes(&cursor, 0));
+            destroyString(challenge);
+            challenge := fromSpan(columnText(&cursor, 1));
+            challenge_until := columnInt64(&cursor, 2);
+            created_at := columnInt64(&cursor, 3);
+            generation := columnInt64(&cursor, 4);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                destroyString(key);
+                destroyString(challenge);
+                return Left(left => error);
+            when None do
+                skip;
+        end case;
+        if (not there) or (created_at < (now - boundLifeSeconds())) then
+            destroyString(key);
+            destroyString(challenge);
+            return Right(right => RefreshRefused());
+        end if;
+        let fits: Bool := refreshHeaderFits(proof);
+        if not fits then
+            destroyString(key);
+            destroyString(challenge);
+            return Right(right => RefreshRefused());
+        end if;
+        let signed: Option[String] := signedJti(proof, asSpan(&key));
+        destroyString(key);
+        case signed of
+            when Some(value as jti: String) do
+                let open: Bool := (spanLength(asSpan(&challenge)) > 0) and (challenge_until >= now);
+                let same: Bool := constantTimeEqual(asSpan(&jti), asSpan(&challenge));
+                destroyString(jti);
+                destroyString(challenge);
+                if not (open and same) then
+                    return Right(right => ChallengeStale());
+                end if;
+                return movedOn(&~db, id, generation, now);
+            when None do
+                destroyString(challenge);
+                return Right(right => RefreshRefused());
+        end case;
+    end;
+
+    -- Whether the header of a refresh proof fits.
+    generic [T: Region]
+    function refreshHeaderFits(proof: Span[Nat8, T]): Bool is
+        case headerOf(proof) of
+            when Some(value as header: Json) do
+                let fits: Bool := headerFits(&header, false);
+                destroyJson(header);
+                return fits;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The binding id moved on from generation, when no other refresh came
+    -- between.
+    generic [R: Region, I: Region]
+    function movedOn(db: &![Database[Writing], R], id: Span[Nat8, I], generation: Int64, now: Int64): Either[DbError, RefreshOutcome] is
+        let values: Values := withInt64(withText(withInt64(noValues(), now + boundSeconds()), id), generation);
+        case execute(&~db, move_on, values) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as changed: Nat64) do
+                if changed = 0 then
+                    return Right(right => ChallengeStale());
+                end if;
+                return Right(right => Refreshed(generation => generation + 1));
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function boundName(db: &![Database[Writing], R], id: Span[Nat8, I], generation: Int64, now: Int64): Either[DbError, Option[String]] is
+        var cursor: Cursor := start(&~db, name_of, withInt64(withInt64(withText(noValues(), id), generation), now));
+        var found: Option[String] := None();
+        if advance(&!cursor) then
+            let name: String := fromSpan(columnText(&cursor, 0));
+            case found of
+                when Some(value as earlier: String) do
+                    destroyString(earlier);
+                when None do
+                    skip;
+            end case;
+            found := Some(value => name);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                case found of
+                    when Some(value as name: String) do
+                        destroyString(name);
+                    when None do
+                        skip;
+                end case;
+                return Left(left => error);
+            when None do
+                return Right(right => found);
+        end case;
+    end;
+
+    generic [R: Region, O: Region]
+    function bindingFresh(db: &![Database[Writing], R], owner: Span[Nat8, O], now: Int64): Either[DbError, Option[Bool]] is
+        var cursor: Cursor := start(&~db, freshest_of, withText(noValues(), owner));
+        var there: Bool := false;
+        var fresh: Bool := false;
+        if advance(&!cursor) then
+            there := true;
+            fresh := columnInt64(&cursor, 0) >= now;
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                if not there then
+                    return boundOnce(&~db, owner);
+                end if;
+                let some: Option[Bool] := Some(value => fresh);
+                return Right(right => some);
+        end case;
+    end;
+
+    -- For an owner without a binding: Some false when it held one once, None when never.
+    generic [R: Region, O: Region]
+    function boundOnce(db: &![Database[Writing], R], owner: Span[Nat8, O]): Either[DbError, Option[Bool]] is
+        var cursor: Cursor := start(&~db, name_known, withText(noValues(), owner));
+        var known: Int64 := 0;
+        if advance(&!cursor) then
+            known := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return Left(left => error);
+            when None do
+                if known = 0 then
+                    let none: Option[Bool] := None();
+                    return Right(right => none);
+                end if;
+                let stale: Option[Bool] := Some(value => false);
+                return Right(right => stale);
+        end case;
+    end;
+
+    generic [R: Region, I: Region]
+    function dropBinding(db: &![Database[Writing], R], id: Span[Nat8, I]): Option[DbError] is
+        case execute(&~db, drop_one, withText(noValues(), id)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as dropped: Nat64) do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, N: Region]
+    function dropBindingsOf(db: &![Database[Writing], R], name: Span[Nat8, N]): Option[DbError] is
+        case execute(&~db, drop_bindings_of, withText(noValues(), name)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as dropped: Nat64) do
+                skip;
+        end case;
+        case execute(&~db, drop_offers_of, withText(noValues(), name)) of
+            when Left(left as error: DbError) do
+                return Some(value => error);
+            when Right(right as dropped: Nat64) do
+                return None();
+        end case;
+    end;
+
+    generic [I: Region, P: Region, C: Region]
+    function instructions(id: Span[Nat8, I], refresh_path: Span[Nat8, P], cookie_name: Span[Nat8, C]): Option[String] is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "session_identifier");
+        writeJsonString(&!writer, id);
+        writeName(&!writer, "refresh_url");
+        writeJsonString(&!writer, refresh_path);
+        writeName(&!writer, "scope");
+        beginObject(&!writer);
+        writeName(&!writer, "include_site");
+        writeBool(&!writer, false);
+        endObject(&!writer);
+        writeName(&!writer, "credentials");
+        beginArray(&!writer);
+        beginObject(&!writer);
+        writeName(&!writer, "type");
+        writeJsonString(&!writer, "cookie");
+        writeName(&!writer, "name");
+        writeJsonString(&!writer, cookie_name);
+        writeName(&!writer, "attributes");
+        writeJsonString(&!writer, attributes);
+        endObject(&!writer);
+        endArray(&!writer);
+        endObject(&!writer);
+        return finishJson(writer);
+    end;
+
+    generic [V: Region]
+    function headerString(value: Span[Nat8, V]): Option[String] is
+        var first: Index := 0;
+        var stop: Index := spanLength(value);
+        if spanLength(value) >= 2 then
+            if (value[0] = '"') and (value[spanLength(value) - 1] = '"') then
+                first := 1;
+                stop := spanLength(value) - 1;
+            end if;
+        end if;
+        if (stop <= first) or ((stop - first) > 8192) then
+            return None();
+        end if;
+        var i: Index := first;
+        while i < stop do
+            if not isPlainByte(value[i]) then
+                return None();
+            end if;
+            i := i + 1;
+        end while;
+        return Some(value => fromSpan(substring(value, first, stop)));
+    end;
+
+    -- The header name of request, as headerString reads it.
+    generic [R: Region]
+    function headerOfRequest(request: &[Request, R], name: Span[Nat8, Static]): Option[String] is
+        case requestParam(request, name) of
+            when Some(value as raw: String) do
+                let read: Option[String] := headerString(asSpan(&raw));
+                destroyString(raw);
+                return read;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region]
+    function sessionIdOf(request: &[Request, R]): Option[String] is
+        return headerOfRequest(request, "HTTP_SEC_SECURE_SESSION_ID");
+    end;
+
+    generic [R: Region]
+    function proofOf(request: &[Request, R]): Option[String] is
+        return headerOfRequest(request, "HTTP_SECURE_SESSION_RESPONSE");
+    end;
+end module body.

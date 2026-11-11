@@ -1,0 +1,551 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    equal
+);
+import Standard.Base32 (
+    decodeBase32
+);
+import Standard.Otp (
+    OtpSha1,
+    totp
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    noValues,
+    execute,
+    closeDatabase
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Account (
+    Account,
+    AccountProblem,
+    BadEmail,
+    EmailTaken,
+    BadName,
+    PasswordProblem,
+    TooShort,
+    TooLong,
+    OnlyBlanks,
+    IsTheEmail,
+    SignIn,
+    WrongProof,
+    LockedOut,
+    Passed,
+    destroyAccount,
+    destroySignIn,
+    isAccountId,
+    newAccountId,
+    normalizeEmail,
+    cleanName,
+    prepareAccounts,
+    createAccount,
+    accountByEmail,
+    setLocked,
+    deleteAccountRow,
+    passwordProblem,
+    hashPassword,
+    checkPassword,
+    storePassword,
+    newTotpSecret,
+    confirmTotp,
+    checkTotp,
+    signIn
+);
+
+module body Wolly.Account.Test is
+    constant pepper: Span[Nat8, Static] := "a pepper of thirty-two bytes ...";
+    constant totp_key: Span[Nat8, Static] := "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_";
+    constant now: Int64 := 1800000000;
+    constant secret_word: Span[Nat8, Static] := "correct horse battery";
+
+    -- Whether text normalizes to want; an empty want stands for None.
+    function emailIs(text: Span[Nat8, Static], want: Span[Nat8, Static]): Bool is
+        case normalizeEmail(text) of
+            when Some(value as found: String) do
+                let same: Bool := equal(asSpan(&found), want) and (spanLength(want) > 0);
+                destroyString(found);
+                return same;
+            when None do
+                return spanLength(want) = 0;
+        end case;
+    end;
+
+    function nameRefused(text: Span[Nat8, Static]): Bool is
+        case cleanName(text) of
+            when Some(value as found: String) do
+                destroyString(found);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The number of the problem of password for the address, 0 for none.
+    function problemOf(password: Span[Nat8, Static], email: Span[Nat8, Static]): Int64 is
+        case passwordProblem(password, email) of
+            when None do
+                return 0;
+            when Some(value as problem: PasswordProblem) do
+                case problem of
+                    when TooShort do
+                        return 1;
+                    when TooLong do
+                        return 2;
+                    when OnlyBlanks do
+                        return 3;
+                    when IsTheEmail do
+                        return 4;
+                end case;
+        end case;
+    end;
+
+    function testAddressesAndIds(): Unit is
+        assertTrue(emailIs("  Alice@Example.COM ", "alice@example.com"), "trimmed and lowercase");
+        assertTrue(emailIs("a.b+c@sub.example.org", "a.b+c@sub.example.org"), "dots and a plus");
+        assertTrue(emailIs("alice@localhost", ""), "a domain without a dot");
+        assertTrue(emailIs("a..b@example.com", ""), "two dots");
+        assertTrue(emailIs("\"a b\"@example.com", ""), "a quoted local part");
+        assertTrue(emailIs("example.com", ""), "no at sign");
+        assertFalse(nameRefused("  Alice  "), "a plain name");
+        assertTrue(nameRefused("Al\tice"), "a control byte");
+        case newAccountId() of
+            when Some(value as id: String) do
+                assertTrue(length(&id) = 26, "26 characters");
+                assertTrue(isAccountId(asSpan(&id)), "a new ID is an ID");
+                destroyString(id);
+            when None do
+                assertTrue(false, "a new ID");
+        end case;
+        assertTrue(isAccountId("abcdefghijklmnopqrstuvwxy4"), "4 ends an ID");
+        assertTrue(isAccountId("abcdefghijklmnopqrstuvwxya"), "a ends an ID");
+        assertFalse(isAccountId("abcdefghijklmnopqrstuvwxy3"), "3 does not end an ID");
+        assertFalse(isAccountId("abcdefghijklmnopqrstuvwxyb"), "b does not end an ID");
+        var n: Int64 := 0;
+        var good: Int64 := 0;
+        while n < 64 do
+            case newAccountId() of
+                when Some(value as id: String) do
+                    if isAccountId(asSpan(&id)) then
+                        good := good + 1;
+                    end if;
+                    destroyString(id);
+                when None do
+                    skip;
+            end case;
+            n := n + 1;
+        end while;
+        assertTrue(good = 64, "64 new IDs are IDs");
+        assertFalse(isAccountId("abcdefghijklmnopqrstuvwxy1"), "1 is no base32 digit");
+        assertFalse(isAccountId("abcdefghijklmnopqrstuvwxy"), "25 characters");
+        return nil;
+    end;
+
+    function testPasswords(): Unit is
+        assertTrue(problemOf("short", "a@example.com") = 1, "too short");
+        assertTrue(problemOf("            ", "a@example.com") = 3, "only blanks");
+        assertTrue(problemOf("Alice@Example.com", "alice@example.com") = 4, "the address");
+        assertTrue(problemOf(secret_word, "alice@example.com") = 0, "a good password");
+        case hashPassword(secret_word, pepper) of
+            when Some(value as encoded: String) do
+                assertTrue(checkPassword(secret_word, asSpan(&encoded), pepper), "the password checks");
+                assertFalse(checkPassword("correct horse battery!", asSpan(&encoded), pepper), "another password");
+                assertFalse(checkPassword(secret_word, asSpan(&encoded), totp_key), "another pepper");
+                destroyString(encoded);
+            when None do
+                assertTrue(false, "a hash");
+        end case;
+        case hashPassword(secret_word, "short pepper") of
+            when Some(value as encoded: String) do
+                assertTrue(false, "a short pepper makes no hash");
+                destroyString(encoded);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The ID of the account made for email, or an abort.
+    generic [R: Region]
+    function made(db: &![Database[Writing], R], email: Span[Nat8, Static]): String is
+        case createAccount(db, email, "A person", now) of
+            when Right(right as outcome: Either[AccountProblem, Account]) do
+                case outcome of
+                    when Right(right as account: Account) do
+                        let { id: String, email as address: String, name: String, locked: Bool, lockedAt as locked_at: Int64,
+                            mustChangePassword as must_change_password: Bool, hasPassword as has_password: Bool, hasTotp as has_totp: Bool, createdAt as created_at: Int64,
+                            updatedAt as updated_at: Int64 } := account;
+                        destroyString(address);
+                        destroyString(name);
+                        return id;
+                    when Left(left as problem: AccountProblem) do
+                        abort("the account is refused");
+                end case;
+            when Left(left as error: DbError) do
+                abort("the account is not stored");
+        end case;
+    end;
+
+    -- Whether a second account for email is refused as taken.
+    generic [R: Region]
+    function taken(db: &![Database[Writing], R], email: Span[Nat8, Static]): Bool is
+        case createAccount(db, email, "Another", now) of
+            when Right(right as outcome: Either[AccountProblem, Account]) do
+                case outcome of
+                    when Right(right as account: Account) do
+                        destroyAccount(account);
+                        return false;
+                    when Left(left as problem: AccountProblem) do
+                        case problem of
+                            when EmailTaken do
+                                return true;
+                            when BadEmail do
+                                return false;
+                            when BadName do
+                                return false;
+                        end case;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    generic [A: Region]
+    function lockedOf(account: &[Account, A]): Bool is
+        return account->locked;
+    end;
+
+    -- Whether the account of email is there and locked as want says.
+    generic [R: Region]
+    function lockedIs(db: &![Database[Writing], R], email: Span[Nat8, Static], want: Bool): Bool is
+        case accountByEmail(db, email) of
+            when Right(right as found: Option[Account]) do
+                case found of
+                    when Some(value as account: Account) do
+                        let fits: Bool := lockedOf(&account) = want;
+                        destroyAccount(account);
+                        return fits;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function absent(db: &![Database[Writing], R], email: Span[Nat8, Static]): Bool is
+        case accountByEmail(db, email) of
+            when Right(right as found: Option[Account]) do
+                case found of
+                    when Some(value as account: Account) do
+                        destroyAccount(account);
+                        return false;
+                    when None do
+                        return true;
+                end case;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function isTrue(result: Either[DbError, Bool]): Bool is
+        case result of
+            when Right(right as b: Bool) do
+                return b;
+            when Left(left as error: DbError) do
+                return false;
+        end case;
+    end;
+
+    function opened(): Database[Writing] is
+        case openTestDatabase() of
+            when Right(right as db: Database[Writing]) do
+                return db;
+            when Left(left as error: DbError) do
+                abort("no test database");
+        end case;
+    end;
+
+    generic [R: Region]
+    function prepared(db: &![Database[Writing], R]): Unit is
+        case prepareAccounts(db) of
+            when Some(value as error: DbError) do
+                abort("the table accounts is not made");
+            when None do
+                return nil;
+        end case;
+    end;
+
+    function testRows(): Unit is
+        var db: Database[Writing] := opened();
+        prepared(&!db);
+        let id: String := made(&!db, "Bob@Example.com");
+        assertTrue(isAccountId(asSpan(&id)), "an ID");
+        assertTrue(taken(&!db, "bob@example.COM"), "the address in another case is taken");
+        assertTrue(lockedIs(&!db, "BOB@example.com", false), "found by address, not locked");
+        assertTrue(isTrue(setLocked(&!db, asSpan(&id), true, now)), "locked");
+        assertTrue(lockedIs(&!db, "bob@example.com", true), "the lock is stored");
+        assertFalse(isTrue(setLocked(&!db, "abcdefghijklmnopqrstuvwxyz", true, now)), "no such account");
+        assertTrue(isTrue(deleteAccountRow(&!db, asSpan(&id))), "deleted");
+        assertTrue(absent(&!db, "bob@example.com"), "gone");
+        assertFalse(isTrue(deleteAccountRow(&!db, asSpan(&id))), "deleted once");
+        destroyString(id);
+        closeDatabase(db);
+        return nil;
+    end;
+
+    -- The code of the base32 secret at seconds.
+    generic [S: Region]
+    function codeOf(secret: Span[Nat8, S], seconds: Int64): String is
+        case decodeBase32(secret) of
+            when Some(value as key: String) do
+                case totp(asSpan(&key), seconds, 30, 6, OtpSha1()) of
+                    when Some(value as code: String) do
+                        destroyString(key);
+                        return code;
+                    when None do
+                        destroyString(key);
+                        abort("no code");
+                end case;
+            when None do
+                abort("no base32 secret");
+        end case;
+    end;
+
+    -- What a sign-in came to: 0 wrong proof, 1 locked out, 2 passed but a
+    -- second factor is owed, 3 passed with password and code.
+    function outcomeOf(result: Either[DbError, SignIn]): Int64 is
+        case result of
+            when Left(left as error: DbError) do
+                return -1;
+            when Right(right as outcome: SignIn) do
+                case outcome of
+                    when WrongProof do
+                        return 0;
+                    when LockedOut do
+                        return 1;
+                    when Passed(account: String, amr: String, mustChangePassword as must_change_password: Bool, needsTotp as needs_totp: Bool) do
+                        let full: Bool := equal(asSpan(&amr), "pwd otp mfa");
+                        destroyString(account);
+                        destroyString(amr);
+                        if needs_totp then
+                            return 2;
+                        end if;
+                        if full and (not must_change_password) then
+                            return 3;
+                        end if;
+                        return 4;
+                end case;
+        end case;
+    end;
+
+    function testSignIn(): Unit is
+        var db: Database[Writing] := opened();
+        prepared(&!db);
+        let id: String := made(&!db, "carol@example.com");
+        case hashPassword(secret_word, pepper) of
+            when Some(value as encoded: String) do
+                assertTrue(isTrue(storePassword(&!db, asSpan(&id), asSpan(&encoded), false, now)), "stored");
+                destroyString(encoded);
+            when None do
+                assertTrue(false, "a hash");
+        end case;
+        assertTrue(outcomeOf(signIn(&!db, "carol@example.com", secret_word, "", pepper, totp_key, now)) = 2,
+            "without a second factor one is owed");
+        assertTrue(outcomeOf(signIn(&!db, "carol@example.com", "wrong password here", "", pepper, totp_key, now)) = 0,
+            "a wrong password");
+        assertTrue(outcomeOf(signIn(&!db, "nobody@example.com", secret_word, "", pepper, totp_key, now)) = 0,
+            "an unknown address");
+        case newTotpSecret() of
+            when Some(value as secret: String) do
+                assertTrue(length(&secret) = 32, "32 characters");
+                let first: String := codeOf(asSpan(&secret), now);
+                if not equal(asSpan(&first), "000000") then
+                    assertFalse(isTrue(confirmTotp(&!db, asSpan(&id), asSpan(&secret), "000000", totp_key, now)),
+                        "a wrong code confirms nothing");
+                end if;
+                assertTrue(isTrue(confirmTotp(&!db, asSpan(&id), asSpan(&secret), asSpan(&first), totp_key, now)),
+                    "the code confirms");
+                let later: Int64 := now + 60;
+                let second: String := codeOf(asSpan(&secret), later);
+                assertTrue(outcomeOf(signIn(&!db, "carol@example.com", secret_word, asSpan(&second), pepper, totp_key,
+                    later)) = 3, "password and code");
+                assertTrue(outcomeOf(signIn(&!db, "carol@example.com", secret_word, asSpan(&second), pepper, totp_key,
+                    later)) = 0, "a code counts once");
+                assertTrue(isTrue(setLocked(&!db, asSpan(&id), true, later)), "locked");
+                let third: String := codeOf(asSpan(&secret), later + 120);
+                assertTrue(outcomeOf(signIn(&!db, "carol@example.com", secret_word, asSpan(&third), pepper, totp_key,
+                    later + 120)) = 1, "a locked account with the right proof");
+                assertTrue(outcomeOf(signIn(&!db, "carol@example.com", "wrong password here", "123456", pepper, totp_key,
+                    later + 120)) = 1, "a locked account with a wrong proof, the same answer");
+                assertTrue(isTrue(setLocked(&!db, asSpan(&id), false, later + 120)), "unlocked");
+                assertTrue(outcomeOf(signIn(&!db, "carol@example.com", secret_word, asSpan(&third), pepper, totp_key,
+                    later + 120)) = 3, "the code given to the locked account was not taken");
+                destroyString(first);
+                destroyString(second);
+                destroyString(third);
+                destroyString(secret);
+            when None do
+                assertTrue(false, "a secret");
+        end case;
+        destroyString(id);
+        closeDatabase(db);
+        return nil;
+    end;
+
+    -- The code of the step before holds while no later code was taken; once the code of the step
+    -- at the time is taken, the one before it does not hold any more.
+    function testCodeOfTheStepBefore(): Unit is
+        var db: Database[Writing] := opened();
+        prepared(&!db);
+        let id: String := made(&!db, "gina@example.com");
+        case hashPassword(secret_word, pepper) of
+            when Some(value as encoded: String) do
+                assertTrue(isTrue(storePassword(&!db, asSpan(&id), asSpan(&encoded), false, now)), "stored");
+                destroyString(encoded);
+            when None do
+                assertTrue(false, "a hash");
+        end case;
+        case newTotpSecret() of
+            when Some(value as secret: String) do
+                let first: String := codeOf(asSpan(&secret), now);
+                assertTrue(isTrue(confirmTotp(&!db, asSpan(&id), asSpan(&secret), asSpan(&first), totp_key, now)),
+                    "the code confirms");
+                let fourth_at: Int64 := now + 600;
+                let fourth_before: String := codeOf(asSpan(&secret), fourth_at - 30);
+                assertTrue(isTrue(checkTotp(&!db, asSpan(&id), asSpan(&fourth_before), totp_key, fourth_at)),
+                    "the code of the step before holds (control)");
+                let fifth_at: Int64 := now + 900;
+                let fifth: String := codeOf(asSpan(&secret), fifth_at);
+                let fifth_before: String := codeOf(asSpan(&secret), fifth_at - 30);
+                assertTrue(isTrue(checkTotp(&!db, asSpan(&id), asSpan(&fifth), totp_key, fifth_at)), "the code of the step");
+                if not equal(asSpan(&fifth), asSpan(&fifth_before)) then
+                    assertFalse(isTrue(checkTotp(&!db, asSpan(&id), asSpan(&fifth_before), totp_key, fifth_at)),
+                        "the code of the step before, after the code of the step was taken");
+                    assertTrue(outcomeOf(signIn(&!db, "gina@example.com", secret_word, asSpan(&fifth_before), pepper,
+                        totp_key, fifth_at)) = 0, "nor in a sign-in");
+                end if;
+                destroyString(first);
+                destroyString(fourth_before);
+                destroyString(fifth);
+                destroyString(fifth_before);
+                destroyString(secret);
+            when None do
+                assertTrue(false, "a secret");
+        end case;
+        destroyString(id);
+        closeDatabase(db);
+        return nil;
+    end;
+
+    function nanosNow(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as t: Nat64) do
+                return t;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The nanoseconds three sign-ins of email with a wrong password take.
+    generic [R: Region]
+    function threeTries(db: &![Database[Writing], R], email: Span[Nat8, Static]): Nat64 is
+        let before: Nat64 := nanosNow();
+        var i: Int64 := 0;
+        while i < 3 do
+            assertTrue(outcomeOf(signIn(&~db, email, "wrong password here", "", pepper, totp_key, now)) = 0,
+                "a wrong proof");
+            i := i + 1;
+        end while;
+        let after: Nat64 := nanosNow();
+        if after < before then
+            return 0;
+        end if;
+        return after - before;
+    end;
+
+    -- An account without a password costs the Argon2id work of one with a password: a sign-in
+    -- that skipped it would take a small part of the time of the other.
+    function testNoPasswordCostsTheSame(): Unit is
+        var db: Database[Writing] := opened();
+        prepared(&!db);
+        let with_password: String := made(&!db, "dora@example.com");
+        case hashPassword(secret_word, pepper) of
+            when Some(value as encoded: String) do
+                assertTrue(isTrue(storePassword(&!db, asSpan(&with_password), asSpan(&encoded), false, now)), "stored");
+                destroyString(encoded);
+            when None do
+                assertTrue(false, "a hash");
+        end case;
+        let without_password: String := made(&!db, "emil@example.com");
+        let known: Nat64 := threeTries(&!db, "dora@example.com");
+        let bare: Nat64 := threeTries(&!db, "emil@example.com");
+        let unknown: Nat64 := threeTries(&!db, "nobody@example.com");
+        assertTrue(known > 0, "the clock answers");
+        assertTrue((unknown * 4) >= known, "an unknown address costs the work (control)");
+        assertTrue((bare * 4) >= known, "an account without a password costs the work");
+        destroyString(with_password);
+        destroyString(without_password);
+        closeDatabase(db);
+        return nil;
+    end;
+
+    -- A table of before the column totp_last_step: a code cannot be taken in it until
+    -- prepareAccounts has added the column, and preparing twice is no harm.
+    constant old_accounts: Span[Nat8, Static] := "CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL DEFAULT '', must_change_password INTEGER NOT NULL DEFAULT 1, totp_secret TEXT NOT NULL DEFAULT '', totp_last_code TEXT NOT NULL DEFAULT '', totp_last_at INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0, locked_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)";
+
+    function testLastStepAdded(): Unit is
+        var db: Database[Writing] := opened();
+        case execute(&!db, old_accounts, noValues()) of
+            when Right(right as done: Nat64) do
+                skip;
+            when Left(left as error: DbError) do
+                abort("the old table is not made");
+        end case;
+        let id: String := made(&!db, "fritz@example.com");
+        case newTotpSecret() of
+            when Some(value as secret: String) do
+                let code: String := codeOf(asSpan(&secret), now);
+                assertFalse(isTrue(confirmTotp(&!db, asSpan(&id), asSpan(&secret), asSpan(&code), totp_key, now)),
+                    "the old table has no column for the step (control)");
+                prepared(&!db);
+                prepared(&!db);
+                assertTrue(isTrue(confirmTotp(&!db, asSpan(&id), asSpan(&secret), asSpan(&code), totp_key, now)),
+                    "the column is added and the code confirms");
+                let next: String := codeOf(asSpan(&secret), now + 30);
+                assertTrue(isTrue(checkTotp(&!db, asSpan(&id), asSpan(&next), totp_key, now + 30)), "a later code");
+                assertFalse(isTrue(checkTotp(&!db, asSpan(&id), asSpan(&code), totp_key, now + 30)),
+                    "the confirming code does not follow it");
+                destroyString(code);
+                destroyString(next);
+                destroyString(secret);
+            when None do
+                assertTrue(false, "a secret");
+        end case;
+        destroyString(id);
+        closeDatabase(db);
+        return nil;
+    end;
+end module body.

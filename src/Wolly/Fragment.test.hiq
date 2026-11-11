@@ -1,0 +1,329 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The page of these tests is a heading, a fragment counter and a line under
+-- it; counterPage answers as a handler of an application would.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    contains,
+    indexOf,
+    substring
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Bundle (
+    assetName,
+    assetSize,
+    assetContent
+);
+import Wolly.Fragment (
+    fragmentParameter,
+    fragmentVary,
+    idLimit,
+    isFragmentId,
+    isFragmentUrl,
+    requestedFragment,
+    wantsFragment,
+    writeFragment,
+    writeTrigger,
+    writePoll,
+    fragmentResponse,
+    pageResponse,
+    fragmentScript
+);
+
+module body Wolly.Fragment.Test is
+    generic [R: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, Static]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    -- A GET of /counter as Hiawatha would send it: HX-Request and HX-Target
+    -- only when they are not empty.
+    function fakeRequest(query_string: Span[Nat8, Static], hx_request: Span[Nat8, Static], hx_target: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", "GET");
+        addPair(&!params, "REQUEST_URI", "/counter");
+        addPair(&!params, "QUERY_STRING", query_string);
+        if spanLength(hx_request) > 0 then
+            addPair(&!params, "HTTP_HX_REQUEST", hx_request);
+        end if;
+        if spanLength(hx_target) > 0 then
+            addPair(&!params, "HTTP_HX_TARGET", hx_target);
+        end if;
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(""));
+    end;
+
+    function asks(found: Option[String], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as id: String) do
+                assertTrue(equal(asSpan(&id), wanted), message);
+                destroyString(id);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function asksNothing(found: Option[String], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as id: String) do
+                destroyString(id);
+                assertTrue(false, message);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The inner HTML of the fragment counter.
+    function counterInner(): Span[Nat8, Static] is
+        return "<p>count 3</p>";
+    end;
+
+    -- The handler of the page: the fragment alone when it is asked for,
+    -- else the whole page around it.
+    function counterPage(request: Request): String is
+        if wantsFragment(&request, "counter") then
+            destroyRequest(request);
+            return fragmentResponse("counter", counterInner());
+        end if;
+        destroyRequest(request);
+        var page: StringBuilder := makeStringBuilder();
+        writeString(&!page, "<!doctype html><html><body><h1>Counter page</h1>");
+        writeFragment(&!page, "counter", counterInner());
+        writeString(&!page, "<footer>the rest of the page</footer></body></html>");
+        let html: String := finalize(page);
+        let output: String := pageResponse(asSpan(&html));
+        destroyString(html);
+        return output;
+    end;
+
+    -- The body of a CGI output, after its first empty line.
+    generic [R: Region]
+    function bodyOf(output: Span[Nat8, R]): Span[Nat8, R] is
+        case indexOf(output, "\r\n\r\n") of
+            when Some(value as at: Index) do
+                return substring(output, at + 4, spanLength(output));
+            when None do
+                return substring(output, 0, 0);
+        end case;
+    end;
+
+    generic [R: Region]
+    function headOf(output: Span[Nat8, R]): Span[Nat8, R] is
+        case indexOf(output, "\r\n\r\n") of
+            when Some(value as at: Index) do
+                return substring(output, 0, at + 2);
+            when None do
+                return output;
+        end case;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(equal(fragmentParameter(), "fragment"), "the query parameter");
+        assertTrue(equal(fragmentVary(), "HX-Request, HX-Target"), "the headers the answer varies by");
+        assertTrue(idLimit() = 64, "64 bytes an id");
+        assertTrue(isFragmentId("counter"), "a word");
+        assertTrue(isFragmentId("panel-2_b"), "digits, hyphen and underscore after the first letter");
+        assertTrue(isFragmentId("a234567890123456789012345678901234567890123456789012345678901234"), "64 bytes");
+        assertFalse(isFragmentId("a2345678901234567890123456789012345678901234567890123456789012345"), "65 bytes");
+        assertFalse(isFragmentId(""), "empty");
+        assertFalse(isFragmentId("2nd"), "a digit first");
+        assertFalse(isFragmentId("-x"), "a hyphen first");
+        assertFalse(isFragmentId("a b"), "a blank");
+        assertFalse(isFragmentId("a\"b"), "a quote, which would end the attribute");
+        assertFalse(isFragmentId("a>b"), "an angle bracket");
+        assertFalse(isFragmentId("a,b"), "a comma, which would make a list of selectors");
+        assertFalse(isFragmentId("a\r\nX: 1"), "a line end, which would end the header");
+        assertFalse(isFragmentId("#a"), "a selector is no id");
+        return nil;
+    end;
+
+    function testUrls(): Unit is
+        assertTrue(isFragmentUrl("/"), "the root");
+        assertTrue(isFragmentUrl("/counter?n=4&fragment=counter"), "a path with a query");
+        assertTrue(isFragmentUrl("/a%20b/c-d.e_f~g"), "percent-encoded and unreserved bytes");
+        assertFalse(isFragmentUrl(""), "empty");
+        assertFalse(isFragmentUrl("counter"), "not a path");
+        assertFalse(isFragmentUrl("//evil.example/x"), "another host");
+        assertFalse(isFragmentUrl("/\\evil.example"), "a backslash, which a browser reads as a slash");
+        assertFalse(isFragmentUrl("https://evil.example/"), "a URL with a scheme");
+        assertFalse(isFragmentUrl("javascript:alert(1)"), "a script");
+        assertFalse(isFragmentUrl("/a\"onclick=x"), "a quote");
+        assertFalse(isFragmentUrl("/a'b"), "an apostrophe");
+        assertFalse(isFragmentUrl("/a<b"), "an angle bracket");
+        assertFalse(isFragmentUrl("/a b"), "a blank");
+        assertFalse(isFragmentUrl("/a#b"), "a fragment of the URL");
+        return nil;
+    end;
+
+    function testRequested(): Unit is
+        let r1: Request := fakeRequest("", "true", "counter");
+        asks(requestedFragment(&r1), "counter", "htmx asks by HX-Request and HX-Target");
+        assertTrue(wantsFragment(&r1, "counter"), "and wants that fragment");
+        assertFalse(wantsFragment(&r1, "count"), "and no other");
+        destroyRequest(r1);
+        let r2: Request := fakeRequest("n=3&fragment=counter", "", "");
+        asks(requestedFragment(&r2), "counter", "the query parameter asks without the headers");
+        destroyRequest(r2);
+        let r3: Request := fakeRequest("", "", "counter");
+        asksNothing(requestedFragment(&r3), "HX-Target without HX-Request asks for nothing");
+        destroyRequest(r3);
+        let r4: Request := fakeRequest("", "True", "counter");
+        asksNothing(requestedFragment(&r4), "HX-Request must be the four bytes true");
+        destroyRequest(r4);
+        let r5: Request := fakeRequest("", "true", "x\"><script>alert(1)</script>");
+        asksNothing(requestedFragment(&r5), "an HX-Target that is no id is never echoed");
+        destroyRequest(r5);
+        let r6: Request := fakeRequest("fragment=%3Cscript%3E", "", "");
+        asksNothing(requestedFragment(&r6), "nor a query parameter that is no id");
+        destroyRequest(r6);
+        let r7: Request := fakeRequest("", "true", "");
+        asksNothing(requestedFragment(&r7), "htmx without a target");
+        destroyRequest(r7);
+        let r8: Request := fakeRequest("fragment=counter", "true", "not an id");
+        asks(requestedFragment(&r8), "counter", "a target that is no id leaves the query parameter");
+        destroyRequest(r8);
+        let r9: Request := fakeRequest("n=3", "", "");
+        asksNothing(requestedFragment(&r9), "a plain request");
+        assertFalse(wantsFragment(&r9, "counter"), "wants no fragment");
+        destroyRequest(r9);
+        return nil;
+    end;
+
+    function testOnlyTheFragment(): Unit is
+        let output: String := counterPage(fakeRequest("", "true", "counter"));
+        assertTrue(equal(bodyOf(asSpan(&output)), "<div id=\"counter\" data-wolly-fragment><p>count 3</p></div>"), "the body is the fragment and nothing else");
+        assertFalse(contains(asSpan(&output), "<h1>"), "no heading of the page");
+        assertFalse(contains(asSpan(&output), "<html>"), "no document");
+        assertFalse(contains(asSpan(&output), "the rest of the page"), "nothing after the fragment");
+        destroyString(output);
+        let asked: String := counterPage(fakeRequest("fragment=counter", "", ""));
+        assertTrue(equal(bodyOf(asSpan(&asked)), "<div id=\"counter\" data-wolly-fragment><p>count 3</p></div>"), "the query parameter gives the fragment as well");
+        destroyString(asked);
+        return nil;
+    end;
+
+    function testTheWholePage(): Unit is
+        let output: String := counterPage(fakeRequest("", "", ""));
+        assertTrue(contains(bodyOf(asSpan(&output)), "<!doctype html><html><body><h1>Counter page</h1>"), "the page begins with its heading");
+        assertTrue(contains(bodyOf(asSpan(&output)), "<div id=\"counter\" data-wolly-fragment><p>count 3</p></div>"), "the fragment stands in the page");
+        assertTrue(contains(bodyOf(asSpan(&output)), "<footer>the rest of the page</footer>"), "and the rest of the page after it");
+        destroyString(output);
+        let other: String := counterPage(fakeRequest("", "true", "elsewhere"));
+        assertTrue(contains(bodyOf(asSpan(&other)), "<h1>Counter page</h1>"), "a target that is no fragment of the page gets the page");
+        destroyString(other);
+        return nil;
+    end;
+
+    function testHeaders(): Unit is
+        let fragment: String := counterPage(fakeRequest("", "true", "counter"));
+        assertTrue(contains(headOf(asSpan(&fragment)), "Status: 200 OK\r\n"), "200");
+        assertTrue(contains(headOf(asSpan(&fragment)), "Content-Type: text/html; charset=utf-8\r\n"), "HTML in UTF-8");
+        assertTrue(contains(headOf(asSpan(&fragment)), "Vary: HX-Request, HX-Target\r\n"), "Vary for a cache");
+        assertTrue(contains(headOf(asSpan(&fragment)), "HX-Retarget: #counter\r\n"), "htmx swaps the fragment of the id");
+        assertTrue(contains(headOf(asSpan(&fragment)), "HX-Reswap: outerHTML\r\n"), "as a whole element");
+        assertTrue(contains(headOf(asSpan(&fragment)), "Cache-Control: no-cache\r\n"), "asked again each time");
+        assertTrue(contains(headOf(asSpan(&fragment)), "X-Content-Type-Options: nosniff\r\n"), "never sniffed");
+        destroyString(fragment);
+        let page: String := counterPage(fakeRequest("", "", ""));
+        assertTrue(contains(headOf(asSpan(&page)), "Status: 200 OK\r\n"), "the page: 200");
+        assertTrue(contains(headOf(asSpan(&page)), "Content-Type: text/html; charset=utf-8\r\n"), "the page: HTML in UTF-8");
+        assertTrue(contains(headOf(asSpan(&page)), "Vary: HX-Request, HX-Target\r\n"), "the page varies by the same headers");
+        assertFalse(contains(headOf(asSpan(&page)), "HX-Retarget"), "the page has no target for htmx");
+        assertFalse(contains(headOf(asSpan(&page)), "HX-Reswap"), "nor a swap");
+        destroyString(page);
+        return nil;
+    end;
+
+    function testTrigger(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<button");
+        writeTrigger(&!out, "/counter?n=4&fragment=counter", "counter");
+        writeString(&!out, ">+1</button>");
+        let html: String := finalize(out);
+        assertTrue(equal(asSpan(&html), "<button data-wolly-get=\"/counter?n=4&amp;fragment=counter\" data-wolly-target=\"counter\">+1</button>"),
+            "the URL and the id as attributes, the ampersand escaped");
+        destroyString(html);
+        return nil;
+    end;
+
+    function testPoll(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<div id=\"counter\"");
+        writePoll(&!out, 5, "counter");
+        writeString(&!out, "></div>");
+        let html: String := finalize(out);
+        assertTrue(equal(asSpan(&html), "<div id=\"counter\" data-wolly-poll=\"5\" data-wolly-target=\"counter\"></div>"),
+            "the seconds and the id as attributes");
+        destroyString(html);
+        var once: StringBuilder := makeStringBuilder();
+        writePoll(&!once, 1, "a-b_c2");
+        let least: String := finalize(once);
+        assertTrue(equal(asSpan(&least), " data-wolly-poll=\"1\" data-wolly-target=\"a-b_c2\""), "a poll of a second");
+        destroyString(least);
+        var long: StringBuilder := makeStringBuilder();
+        writePoll(&!long, 86400, "counter");
+        let most: String := finalize(long);
+        assertTrue(contains(asSpan(&most), "data-wolly-poll=\"86400\""), "a day in seconds, four digits and more");
+        destroyString(most);
+        return nil;
+    end;
+
+    function testScript(): Unit is
+        assertTrue(equal(assetName(fragmentScript()), "wolly-fragment.js"), "the name of the script");
+        assertTrue(assetSize(fragmentScript()) > 0, "compiled in");
+        let script: Span[Nat8, Static] := assetContent(fragmentScript());
+        assertTrue(contains(script, "\"HX-Request\"] = \"true\""), "it asks as htmx does");
+        assertTrue(contains(script, "\"HX-Target\"] = id"), "with the id of the fragment");
+        assertTrue(contains(script, "url.origin === window.location.origin"), "only of its own origin");
+        assertTrue(contains(script, "createElement(\"template\")"), "parsed inert, so no script of the answer runs");
+        assertTrue(contains(script, "nextGeneration"), "every ask carries a generation of its own");
+        assertTrue(contains(script, "generationOf(id) !== generation"), "an answer of a superseded ask is dropped");
+        assertTrue(contains(script, "AbortController"), "every ask has a deadline that aborts it");
+        assertTrue(contains(script, "data-wolly-deadline"), "the deadline is an attribute of the element");
+        assertTrue(contains(script, "getReader"), "the answer is read piece by piece");
+        assertTrue(contains(script, "answer larger than"), "over the cap the answer is rejected");
+        assertTrue(contains(script, "data-wolly-limit"), "the cap is an attribute of the element");
+        assertTrue(contains(script, "data-wolly-poll"), "an element asks for its fragment again on its own");
+        assertTrue(contains(script, "wolly:fragment-stale"), "a dropped answer is told apart from a failed one");
+        assertFalse(contains(script, "eval("), "no eval, for script-src 'self'");
+        assertFalse(contains(script, "new Function"), "no code from text");
+        assertFalse(contains(script, "import "), "no module and no framework");
+        return nil;
+    end;
+end module body.

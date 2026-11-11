@@ -1,0 +1,141 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A second factor: one-time codes of an authenticator app after RFC 6238,
+6 digits every 30 seconds, with HMAC-SHA256 (Standard.Otp) unless the
+caller names another hash.  SHA-1, what most apps take when nothing is
+said, is offered only through the functions that take a hash, for the
+seeds of an older service that used it; the otpauth URI says the hash.
+
+The seed of a user is 20 random bytes, kept in SQLite sealed by
+Wolly.Seal under a key of the server and bound to the user name, never in
+the clear.  A user turns the factor on in two steps: startEnrolment makes
+a seed and gives it out once, for the app; confirmEnrolment turns it on
+when a code of the app fits.  Until then the login asks for no code.
+
+A code fits when it is the code of the step of now or of the step before
+or after, for a clock that is off by up to 30 seconds.  A step that was
+taken once is not taken again, nor any step before it: a code seen over
+a shoulder or in a log opens nothing after it was used.  Counting and
+refusing too many tries is Wolly.Auth's, which calls checkCode.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Otp (
+    OtpHash
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Wolly.Totp is
+    """
+    The seconds of one step: 30.
+    """
+    function stepSeconds(): Int64
+        ensures result = 30;
+
+    """
+    The digits of a code: 6.
+    """
+    function codeDigits(): Index
+        ensures result = 6;
+
+    """
+    Makes the table of seeds, if it is not there.  None when it exists
+    afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareTotp(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Whether the second factor of name is on.  Right false for a name
+    without a seed or with one not yet confirmed.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function totpEnabled(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[DbError, Bool];
+
+    """
+    A new seed for name, sealed under key and kept, not yet on; a seed of
+    an earlier start that was never confirmed is replaced.  Right Some
+    holds the seed in base32 without padding, for the app and nowhere
+    else.  Right None when the factor of name is on already or the random
+    source or the seal failed.  name is taken as it is: the caller passes
+    the user of a session, never a name from a request.
+    No contract: the answer is the work of the database and of the random source.
+    """
+    generic [R: Region, K: Region, N: Region]
+    function startEnrolment(db: &![Database[Writing], R], key: Span[Nat8, K], name: Span[Nat8, N]): Either[DbError, Option[String]];
+
+    """
+    Turns the factor of name on when code fits the seed of its start at
+    now.  Right false when there is no started seed, the factor is on
+    already, or code does not fit; the step of the code counts as taken.
+    """
+    generic [R: Region, K: Region, N: Region, C: Region]
+    function confirmEnrolment(db: &![Database[Writing], R], key: Span[Nat8, K], name: Span[Nat8, N],
+        code: Span[Nat8, C], now: Int64): Either[DbError, Bool]
+        requires now >= 0;
+
+    """
+    Whether code is a code of name at now: the factor is on, code is
+    codeDigits digits and the code of the step of now, the step before or
+    the step after, and that step is later than every step taken before.
+    Right true takes the step.  Right false otherwise, also when the seed
+    does not open under key.
+    """
+    generic [R: Region, K: Region, N: Region, C: Region]
+    function checkCode(db: &![Database[Writing], R], key: Span[Nat8, K], name: Span[Nat8, N], code: Span[Nat8, C],
+        now: Int64): Either[DbError, Bool]
+        requires now >= 0;
+
+    """
+    As confirmEnrolment, with the codes made by hash.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region, N: Region, C: Region]
+    function confirmEnrolmentWith(db: &![Database[Writing], R], key: Span[Nat8, K], name: Span[Nat8, N],
+        code: Span[Nat8, C], now: Int64, hash: OtpHash): Either[DbError, Bool]
+        requires now >= 0;
+
+    """
+    As checkCode, with the codes made by hash.
+    No ensures: the answer is the work of the database.
+    """
+    generic [R: Region, K: Region, N: Region, C: Region]
+    function checkCodeWith(db: &![Database[Writing], R], key: Span[Nat8, K], name: Span[Nat8, N], code: Span[Nat8, C],
+        now: Int64, hash: OtpHash): Either[DbError, Bool]
+        requires now >= 0;
+
+    """
+    Removes the seed of name, on or not.  Right true when there was one.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function removeTotp(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[DbError, Bool];
+
+    """
+    The otpauth URI of the seed secret, in base32 as startEnrolment gave
+    it, for the account name at issuer: what the app reads from a QR code.
+    """
+    generic [I: Region, N: Region, S: Region]
+    function otpauthFor(issuer: Span[Nat8, I], name: Span[Nat8, N], secret: Span[Nat8, S]): String
+        ensures length(&result) > 0;
+
+    """
+    As otpauthFor, with the URI naming hash as its algorithm.
+    No contract: its length follows the input.
+    """
+    generic [I: Region, N: Region, S: Region]
+    function otpauthWith(issuer: Span[Nat8, I], name: Span[Nat8, N], secret: Span[Nat8, S], hash: OtpHash): String;
+end module.

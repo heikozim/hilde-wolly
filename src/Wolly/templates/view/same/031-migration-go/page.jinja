@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html>
+<head><title>{{ title }}</title></head>
+<body>
+<h1 class="{{ kind }}">{{ title }}</h1>
+<ul>
+{% for link in links %}<li><a href="{{ link.href }}" title="{{ link.name }}">{{ link.name }}</a> <a href="/go?to={{ link.name }}&amp;from=list">go</a> <img src="/img/{{ link.name }}.png" alt='{{ link.name }}'></li>
+{% endfor %}</ul>
+{% if note %}<p>{{ note }}</p>{% else %}<p>no note</p>{% endif %}
+<a href="mailto:{{ mail }}">mail</a>
+</body>
+</html>

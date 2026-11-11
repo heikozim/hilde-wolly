@@ -1,0 +1,257 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The assets come from src/Wolly/testdata/bundle through @bytes.  The
+-- digests are those of sha256sum: body{color:red} and a newline is
+-- 74d94aed..., body{color:blue} and a newline 4eb007b0...  The export goes
+-- into a directory of its own in the working directory of the test and is
+-- removed again.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan,
+    length
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileStatus,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    openRead,
+    readAll,
+    closeFile,
+    statusOf,
+    createDirectory,
+    removeDirectory,
+    removeFileIfThere,
+    createSymlink
+);
+import Wolly.Bundle (
+    Asset,
+    hashDigits,
+    assetPrefix,
+    immutableCache,
+    isAssetName,
+    asset,
+    assetName,
+    assetSize,
+    hashedName,
+    assetUrl,
+    contentTypeOf,
+    serveAsset,
+    exportAssets
+);
+
+module body Wolly.Bundle.Test is
+    function appCss(): Asset is
+        return asset("app.css", @bytes("./testdata/bundle/app.css"));
+    end;
+
+    function appCssChanged(): Asset is
+        return asset("app.css", @bytes("./testdata/bundle/app-blue.css"));
+    end;
+
+    function plain(): Asset is
+        return asset("robots", @bytes("./testdata/bundle/app.css"));
+    end;
+
+    function hashedIs(item: Asset, expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case hashedName(item) of
+            when Some(value as name: String) do
+                assertTrue(equal(asSpan(&name), expected), message);
+                destroyString(name);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function assets(): Buffer[Asset] is
+        var all: Buffer[Asset] := allocateEmpty();
+        insertBack(&!all, appCss());
+        insertBack(&!all, asset("logo.svg", @bytes("./testdata/bundle/app-blue.css")));
+        return all;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(hashDigits() = 16, "16 digits");
+        assertTrue(equal(assetPrefix(), "/assets/"), "the prefix");
+        assertTrue(isAssetName("app.css"), "a name with an extension");
+        assertTrue(isAssetName("App_1-2.min.js"), "letters of both cases, digits and marks");
+        assertTrue(isAssetName("robots"), "a name without a dot");
+        assertFalse(isAssetName(""), "empty");
+        assertFalse(isAssetName(".env"), "a hidden file");
+        assertFalse(isAssetName(".."), "the way up");
+        assertFalse(isAssetName("app."), "a dot last");
+        assertFalse(isAssetName("css/app.css"), "a slash");
+        assertFalse(isAssetName("app css"), "a space");
+        assertFalse(isAssetName("app%2ecss"), "a percent sign");
+        assertTrue(equal(assetName(appCss()), "app.css"), "the name without the hash");
+        assertTrue(assetSize(appCss()) = 16, "the bytes of the file, compiled in");
+        return nil;
+    end;
+
+    function testHashInName(): Unit is
+        hashedIs(appCss(), "app.74d94aede163ac74.css", "the first 16 hex digits of the SHA-256 before the extension");
+        hashedIs(appCssChanged(), "app.4eb007b0a6322ff3.css", "another content gives another name");
+        hashedIs(plain(), "robots.74d94aede163ac74", "a name without a dot gets the hash after it");
+        case assetUrl(appCss()) of
+            when Some(value as url: String) do
+                assertTrue(equal(asSpan(&url), "/assets/app.74d94aede163ac74.css"), "the URL is the prefix and the hashed name");
+                destroyString(url);
+            when None do
+                assertTrue(false, "the URL is the prefix and the hashed name");
+        end case;
+        return nil;
+    end;
+
+    function served(path: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let all: Buffer[Asset] := assets();
+        case serveAsset(&all, path) of
+            when Some(value as output: String) do
+                assertTrue(contains(asSpan(&output), "Status: 200"), message);
+                assertTrue(contains(asSpan(&output), "Cache-Control: public, max-age=31536000, immutable"), message);
+                assertTrue(contains(asSpan(&output), "X-Content-Type-Options: nosniff"), message);
+                destroyString(output);
+            when None do
+                assertTrue(false, message);
+        end case;
+        destroyFree(all);
+        return nil;
+    end;
+
+    function notServed(path: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let all: Buffer[Asset] := assets();
+        case serveAsset(&all, path) of
+            when Some(value as output: String) do
+                destroyString(output);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        destroyFree(all);
+        return nil;
+    end;
+
+    function testServe(): Unit is
+        assertTrue(equal(immutableCache(), "public, max-age=31536000, immutable"), "the header value");
+        served("/assets/app.74d94aede163ac74.css", "a hashed asset is served with the immutable header");
+        served("/assets/logo.4eb007b0a6322ff3.svg", "the second asset too");
+        let all: Buffer[Asset] := assets();
+        case serveAsset(&all, "/assets/app.74d94aede163ac74.css") of
+            when Some(value as output: String) do
+                assertTrue(contains(asSpan(&output), "Content-Type: text/css; charset=utf-8"), "the content type of css");
+                assertTrue(contains(asSpan(&output), "body{color:red}"), "the bytes of the file");
+                destroyString(output);
+            when None do
+                assertTrue(false, "the content type of css");
+        end case;
+        destroyFree(all);
+        notServed("/assets/app.css", "the name without the hash is not served as immutable");
+        notServed("/assets/app.4eb007b0a6322ff3.css", "an old or a foreign hash is not served");
+        notServed("/static/app.74d94aede163ac74.css", "another prefix");
+        notServed("/assets/../assets/app.74d94aede163ac74.css", "a way up and back");
+        notServed("/assets/", "the prefix alone");
+        notServed("/assets", "the prefix without its slash");
+        assertTrue(equal(contentTypeOf("a.svg"), "image/svg+xml"), "svg");
+        assertTrue(equal(contentTypeOf("a.woff2"), "font/woff2"), "woff2 is not woff");
+        assertTrue(equal(contentTypeOf("a.CSS"), "application/octet-stream"), "an extension in capitals is unknown");
+        assertTrue(equal(contentTypeOf("css"), "application/octet-stream"), "no dot, no extension");
+        return nil;
+    end;
+
+    -- The content of the file at path, or the empty string.
+    function readBack(path: Span[Nat8, Static]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case read of
+                    when Some(value as text: String) do
+                        return text;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function modeIs(path: Span[Nat8, Static], mode: Nat32): Bool is
+        case statusOf(path) of
+            when FileFound(status: FileStatus) do
+                return status.mode = mode;
+            when FileMissing do
+                return false;
+            when FileUnreadable do
+                return false;
+        end case;
+    end;
+
+    function cleared(): Unit is
+        let a: Bool := removeFileIfThere("bundle-test-out/app.74d94aede163ac74.css");
+        let b: Bool := removeFileIfThere("bundle-test-out/logo.4eb007b0a6322ff3.svg");
+        let c: Bool := removeFileIfThere("bundle-test-out/app.4eb007b0a6322ff3.css");
+        let d: Bool := removeFileIfThere("bundle-test-link");
+        let e: Bool := removeFileIfThere("bundle-test-out/victim.txt");
+        let f: Bool := removeDirectory("bundle-test-out");
+        return nil;
+    end;
+
+    function testExport(): Unit is
+        cleared();
+        var all: Buffer[Asset] := assets();
+        assertFalse(exportAssets("bundle-test-out", &all), "a directory that is not there is refused");
+        assertFalse(exportAssets("", &all), "an empty directory name is refused");
+        assertTrue(createDirectory("bundle-test-out"), "the directory is made");
+        assertTrue(exportAssets("bundle-test-out", &all), "the assets are written");
+        let css: String := readBack("bundle-test-out/app.74d94aede163ac74.css");
+        assertTrue(equal(asSpan(&css), "body{color:red}\n"), "the file under its hashed name holds the bytes");
+        destroyString(css);
+        let svg: String := readBack("bundle-test-out/logo.4eb007b0a6322ff3.svg");
+        assertTrue(length(&svg) = 17, "the second file is there");
+        destroyString(svg);
+        assertTrue(modeIs("bundle-test-out/app.74d94aede163ac74.css", 420), "mode 0644");
+        assertTrue(exportAssets("bundle-test-out", &all), "a second export over the same files");
+        assertTrue(createSymlink("bundle-test-out", "bundle-test-link"), "a link to the directory");
+        assertFalse(exportAssets("bundle-test-link", &all), "a directory through a symbolic link is refused");
+        insertBack(&!all, appCssChanged());
+        assertFalse(exportAssets("bundle-test-out", &all), "two assets of one name are refused");
+        let missing: String := readBack("bundle-test-out/app.4eb007b0a6322ff3.css");
+        assertTrue(length(&missing) = 0, "nothing of a refused export is written");
+        destroyString(missing);
+        destroyFree(all);
+        var changed: Buffer[Asset] := allocateEmpty();
+        insertBack(&!changed, appCssChanged());
+        let left: Bool := removeFileIfThere("bundle-test-out/app.4eb007b0a6322ff3.css");
+        assertTrue(createSymlink("victim.txt", "bundle-test-out/app.4eb007b0a6322ff3.css"), "a link at the name of an asset");
+        assertFalse(exportAssets("bundle-test-out", &changed), "a symbolic link at a name is not written through");
+        let victim: String := readBack("bundle-test-out/victim.txt");
+        assertTrue(length(&victim) = 0, "the target of the link stays untouched");
+        destroyString(victim);
+        destroyFree(changed);
+        cleared();
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,23 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The QR code of Wolly.Qr for a decoder: prints the data URI of
+the code of its one argument, the same as GET /qr of examples/hello.
+
+    qruri TEXT
+
+It prints the URI on one line and exits 0, or prints why not and exits 1:
+no argument, or a text that does not fit a code.  A test reads the PNG
+in it with zbarimg.
+"""
+module Wolly.Example.QrUri is
+    """
+    The command of the arguments.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

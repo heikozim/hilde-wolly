@@ -1,0 +1,28 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+
+module body Wolly.Example.Pages.Site.Admin.Panel is
+    function layout(content: String): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<section class=\"panel\">\n");
+        writeString(&!out, asSpan(&content));
+        writeString(&!out, "</section>\n");
+        destroyString(content);
+        return finalize(out);
+    end;
+end module body.

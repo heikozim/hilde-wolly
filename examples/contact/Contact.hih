@@ -1,0 +1,39 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A public contact form behind Hiawatha, without sessions, guarded by
+Wolly.FormGuard: a honeypot, a signed stamp with a time and a nonce that
+is good once, and a limit per client.
+
+In its working directory it keeps contact.db (messages, used stamps,
+counts of the limit) and form.key (made on the first start, mode 0600),
+and serves on the socket contact.sock until SIGTERM or SIGINT.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Example.Contact is
+    """
+    The answer to every request: GET /contact shows the form and how many
+    messages are kept, POST /contact takes a message; anything else gets
+    404 or 405.
+    """
+    function handle(request: Request): String
+        ensures length(&result) > 0;
+
+    """
+    Serves handle.  Success when a signal ended the server, failure
+    otherwise.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(): ExitCode;
+end module.

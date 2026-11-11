@@ -1,0 +1,968 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    makeEmpty,
+    fromSpan,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal
+);
+
+module body Wolly.ViewContext is
+    -- The states of the place.  A state uses some of the slots of a
+    -- Context; normalized sets every other slot back to its empty value,
+    -- so that two places are the same exactly when their slots are.
+    constant in_text: Nat8 := 0;
+    constant after_less: Nat8 := 1;
+    constant in_bang: Nat8 := 2;
+    constant in_comment: Nat8 := 3;
+    constant in_declaration: Nat8 := 4;
+    constant in_tag_name: Nat8 := 5;
+    constant in_tag: Nat8 := 6;
+    constant in_end_tag: Nat8 := 7;
+    constant in_attribute_name: Nat8 := 8;
+    constant after_attribute: Nat8 := 9;
+    constant before_value: Nat8 := 10;
+    constant in_value: Nat8 := 11;
+    constant in_raw: Nat8 := 12;
+    constant in_script: Nat8 := 13;
+    constant in_style: Nat8 := 14;
+
+    -- What an attribute's value holds.
+    constant plain_kind: Nat8 := 0;
+    constant url_kind: Nat8 := 1;
+    constant script_kind: Nat8 := 2;
+    constant style_kind: Nat8 := 3;
+    -- An attribute whose name reached most_name_bytes: what its value holds is
+    -- not known, and no value stands in it.
+    constant long_kind: Nat8 := 4;
+
+    -- The bytes of a tag, attribute or JavaScript name that are kept; no
+    -- name the context asks for is as long.
+    constant most_name_bytes: Index := 64;
+
+    -- JavaScript.  flag: in code, whether a slash there begins a regular
+    -- expression; after a slash, the same; in a block comment, whether
+    -- the last byte was a star; in a regular expression, whether it is
+    -- inside [ ].
+    constant js_code: Nat8 := 0;
+    constant js_word: Nat8 := 1;
+    constant js_slash: Nat8 := 2;
+    constant js_string: Nat8 := 3;
+    constant js_string_escape: Nat8 := 4;
+    constant js_template: Nat8 := 5;
+    constant js_template_escape: Nat8 := 6;
+    constant js_line_comment: Nat8 := 7;
+    constant js_block_comment: Nat8 := 8;
+    constant js_regex: Nat8 := 9;
+    constant js_regex_escape: Nat8 := 10;
+
+    -- CSS.  flag: in a comment, whether the last byte was a star.  tail:
+    -- the last four bytes of code, in small letters, to see url(.
+    constant css_code: Nat8 := 0;
+    constant css_slash: Nat8 := 1;
+    constant css_string: Nat8 := 2;
+    constant css_string_escape: Nat8 := 3;
+    constant css_comment: Nat8 := 4;
+    constant css_url: Nat8 := 5;
+
+    record Script: Linear is
+        state: Nat8;
+        flag: Bool;
+        quote: Nat8;
+        word: String;
+    end;
+
+    record Style: Linear is
+        state: Nat8;
+        flag: Bool;
+        quote: Nat8;
+        tail: String;
+    end;
+
+    -- count: the dashes seen in a declaration or a comment, or how much of
+    -- the end tag of a raw, script or style element is seen.
+    record Context: Linear is
+        state: Nat8;
+        endTag: Bool;
+        tag: String;
+        attribute: String;
+        quote: Nat8;
+        kind: Nat8;
+        part: Nat8;
+        script: Script;
+        style: Style;
+        count: Index;
+        invariant state <= 14;
+        invariant kind <= 4;
+        invariant part <= 2;
+    end;
+
+    ---
+    --- Bytes and names
+    ---
+
+    function isSpace(c: Nat8): Bool is
+        return (c = ' ') or (c = 9) or (c = 10) or (c = 13) or (c = 11) or (c = 12);
+    end;
+
+    function isLetter(c: Nat8): Bool is
+        return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'));
+    end;
+
+    function isDigit(c: Nat8): Bool is
+        return (c >= '0') and (c <= '9');
+    end;
+
+    function isNameByte(c: Nat8): Bool is
+        return isLetter(c) or isDigit(c) or (c = '_');
+    end;
+
+    function lowered(c: Nat8): Nat8 is
+        if (c >= 'A') and (c <= 'Z') then
+            return c + 32;
+        end if;
+        return c;
+    end;
+
+    function cleared(text: String): String is
+        destroyString(text);
+        return makeEmpty();
+    end;
+
+    -- text with c after it, unless text holds most_name_bytes already.
+    function appended(text: String, c: Nat8): String is
+        if spanLength(asSpan(&text)) >= most_name_bytes then
+            return text;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&text));
+        writeByte(&!out, c);
+        destroyString(text);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function byteOf(text: &[String, R], i: Index): Nat8 is
+        let bytes: Span[Nat8, R] := asSpan(text);
+        return bytes[i];
+    end;
+
+    -- text with c in small letters after it, cut to its last four bytes.
+    function lastFour(text: String, c: Nat8): String is
+        var out: StringBuilder := makeStringBuilder();
+        let n: Index := spanLength(asSpan(&text));
+        var i: Index := 0;
+        if n >= 4 then
+            i := n - 3;
+        end if;
+        while i < n do
+            writeByte(&!out, byteOf(&text, i));
+            i := i + 1;
+        end while;
+        writeByte(&!out, lowered(c));
+        destroyString(text);
+        return finalize(out);
+    end;
+
+    -- name in small letters.
+    generic [N: Region]
+    function lowercase(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(name) do
+            writeByte(&!out, lowered(name[i]));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [T: Region]
+    function endsWithUrl(tail: Span[Nat8, T]): Bool is
+        let n: Index := spanLength(tail);
+        if n < 3 then
+            return false;
+        end if;
+        return (tail[n - 3] = 'u') and (tail[n - 2] = 'r') and (tail[n - 1] = 'l');
+    end;
+
+    generic [W: Region]
+    function isKeyword(word: Span[Nat8, W]): Bool is
+        return equal(word, "return") or equal(word, "typeof") or equal(word, "void") or equal(word, "delete")
+            or equal(word, "in") or equal(word, "instanceof") or equal(word, "new") or equal(word, "throw")
+            or equal(word, "case") or equal(word, "do") or equal(word, "else") or equal(word, "yield")
+            or equal(word, "await");
+    end;
+
+    generic [N: Region, W: Region]
+    function holdsPart(name: Span[Nat8, N], part: Span[Nat8, W]): Bool is
+        let n: Index := spanLength(name);
+        let m: Index := spanLength(part);
+        if m > n then
+            return false;
+        end if;
+        var i: Index := 0;
+        while (i + m) <= n do
+            if equal(spanPart(name, i, m), part) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [N: Region]
+    function kindOfName(name: Span[Nat8, N]): Nat8 is
+        let n: Index := spanLength(name);
+        if (n > 2) and (name[0] = 'o') and (name[1] = 'n') then
+            return script_kind;
+        end if;
+        if equal(name, "style") then
+            return style_kind;
+        end if;
+        if equal(name, "action") or equal(name, "archive") or equal(name, "background") or equal(name, "cite")
+            or equal(name, "classid") or equal(name, "codebase") or equal(name, "data") or equal(name, "formaction")
+            or equal(name, "href") or equal(name, "icon") or equal(name, "longdesc") or equal(name, "manifest")
+            or equal(name, "ping") or equal(name, "poster") or equal(name, "profile") or equal(name, "src")
+            or equal(name, "srcset") or equal(name, "usemap") or equal(name, "xmlns") then
+            return url_kind;
+        end if;
+        if holdsPart(name, "src") or holdsPart(name, "uri") or holdsPart(name, "url") then
+            return url_kind;
+        end if;
+        return plain_kind;
+    end;
+
+    -- What the value of the attribute name holds: data- left out, a
+    -- prefix before the first : left out unless it is xmlns, then on...
+    -- is JavaScript, style CSS, and a URL attribute of Go's list or a
+    -- name holding src, uri or url a URL; a name of most_name_bytes or more
+    -- long_kind.
+    generic [N: Region]
+    function attributeKind(name: Span[Nat8, N]): Nat8 is
+        if spanLength(name) >= most_name_bytes then
+            return long_kind;
+        end if;
+        let small: String := lowercase(name);
+        var start: Index := 0;
+        let whole: Index := spanLength(asSpan(&small));
+        if (whole > 5) and equal(spanPart(asSpan(&small), 0, 5), "data-") then
+            start := 5;
+        end if;
+        var k: Index := start;
+        var colon: Index := whole;
+        while k < whole do
+            if (colon = whole) and (byteOf(&small, k) = ':') then
+                colon := k;
+            end if;
+            k := k + 1;
+        end while;
+        if colon < whole then
+            if not equal(spanPart(asSpan(&small), start, colon - start), "xmlns") then
+                start := colon + 1;
+            end if;
+        end if;
+        let kind: Nat8 := kindOfName(spanPart(asSpan(&small), start, whole - start));
+        destroyString(small);
+        return kind;
+    end;
+
+    -- How much of </tag is seen after c, from k seen before it; tag is in
+    -- small letters.
+    generic [T: Region]
+    function closerStep(tag: Span[Nat8, T], k: Index, c: Nat8): Index is
+        var want: Nat8 := '<';
+        if k = 1 then
+            want := '/';
+        else if k >= 2 then
+            want := tag[k - 2];
+        end if;
+        if lowered(c) = want then
+            return k + 1;
+        end if;
+        if c = '<' then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    ---
+    --- The parts
+    ---
+
+    function emptyScript(): Script is
+        return Script(state => js_code, flag => false, quote => 0, word => makeEmpty());
+    end;
+
+    -- Code, where a slash begins a regular expression.
+    function startScript(): Script is
+        return Script(state => js_code, flag => true, quote => 0, word => makeEmpty());
+    end;
+
+    function emptyStyle(): Style is
+        return Style(state => css_code, flag => false, quote => 0, tail => makeEmpty());
+    end;
+
+    function destroyScript(script: Script): Unit is
+        let { state: Nat8, flag: Bool, quote: Nat8, word: String } := script;
+        destroyString(word);
+        return nil;
+    end;
+
+    function destroyStyle(style: Style): Unit is
+        let { state: Nat8, flag: Bool, quote: Nat8, tail: String } := style;
+        destroyString(tail);
+        return nil;
+    end;
+
+    function scriptStep(script: Script, c: Nat8): Script is
+        var { state: Nat8, flag: Bool, quote: Nat8, word: String } := script;
+        var again: Bool := true;
+        while again do
+            again := false;
+            if state = js_code then
+                if (c = '"') or (c = 39) then
+                    state := js_string;
+                    quote := c;
+                    flag := false;
+                else if c = '`' then
+                    state := js_template;
+                    flag := false;
+                else if c = '/' then
+                    state := js_slash;
+                else if isSpace(c) then
+                    skip;
+                else if isNameByte(c) or (c = '$') then
+                    state := js_word;
+                    flag := false;
+                    word := appended(word, c);
+                else if (c = ')') or (c = ']') or (c = '}') or (c = '.') then
+                    flag := false;
+                else
+                    flag := true;
+                end if;
+            else if state = js_word then
+                if isNameByte(c) or (c = '$') then
+                    word := appended(word, c);
+                else
+                    flag := isKeyword(asSpan(&word));
+                    state := js_code;
+                    word := cleared(word);
+                    again := true;
+                end if;
+            else if state = js_slash then
+                if c = '/' then
+                    state := js_line_comment;
+                    flag := false;
+                else if c = '*' then
+                    state := js_block_comment;
+                    flag := false;
+                else if flag then
+                    state := js_regex;
+                    flag := false;
+                    again := true;
+                else
+                    state := js_code;
+                    flag := true;
+                    again := true;
+                end if;
+            else if state = js_string then
+                if c = 92 then
+                    state := js_string_escape;
+                else if c = quote then
+                    state := js_code;
+                    flag := false;
+                    quote := 0;
+                end if;
+            else if state = js_string_escape then
+                state := js_string;
+            else if state = js_template then
+                if c = 92 then
+                    state := js_template_escape;
+                else if c = '`' then
+                    state := js_code;
+                    flag := false;
+                end if;
+            else if state = js_template_escape then
+                state := js_template;
+            else if state = js_line_comment then
+                if c = 10 then
+                    state := js_code;
+                    flag := true;
+                end if;
+            else if state = js_block_comment then
+                if flag and (c = '/') then
+                    state := js_code;
+                    flag := true;
+                else
+                    flag := c = '*';
+                end if;
+            else if state = js_regex then
+                if c = 92 then
+                    state := js_regex_escape;
+                else if c = '[' then
+                    flag := true;
+                else if c = ']' then
+                    flag := false;
+                else if (c = '/') and (not flag) then
+                    state := js_code;
+                    flag := false;
+                end if;
+            else
+                state := js_regex;
+            end if;
+        end while;
+        return Script(state => state, flag => flag, quote => quote, word => word);
+    end;
+
+    function styleStep(style: Style, c: Nat8): Style is
+        var { state: Nat8, flag: Bool, quote: Nat8, tail: String } := style;
+        var again: Bool := true;
+        while again do
+            again := false;
+            if state = css_code then
+                if (c = '"') or (c = 39) then
+                    state := css_string;
+                    quote := c;
+                    tail := cleared(tail);
+                else if c = '/' then
+                    state := css_slash;
+                else if (c = '(') and endsWithUrl(asSpan(&tail)) then
+                    state := css_url;
+                    tail := cleared(tail);
+                else
+                    tail := lastFour(tail, c);
+                end if;
+            else if state = css_slash then
+                if c = '*' then
+                    state := css_comment;
+                    flag := false;
+                    tail := cleared(tail);
+                else
+                    state := css_code;
+                    again := true;
+                end if;
+            else if state = css_string then
+                if c = 92 then
+                    state := css_string_escape;
+                else if c = quote then
+                    state := css_code;
+                    quote := 0;
+                end if;
+            else if state = css_string_escape then
+                state := css_string;
+            else if state = css_comment then
+                if flag and (c = '/') then
+                    state := css_code;
+                    flag := false;
+                else
+                    flag := c = '*';
+                end if;
+            else
+                if c = ')' then
+                    state := css_code;
+                end if;
+            end if;
+        end while;
+        return Style(state => state, flag => flag, quote => quote, tail => tail);
+    end;
+
+    ---
+    --- The place
+    ---
+
+    function textContext(): Context is
+        return Context(state => in_text, endTag => false, tag => makeEmpty(), attribute => makeEmpty(), quote => 0,
+            kind => plain_kind, part => 0, script => emptyScript(), style => emptyStyle(), count => 0);
+    end;
+
+    function destroyContext(context: Context): Unit is
+        let { state: Nat8, endTag as end_tag: Bool, tag: String, attribute: String, quote: Nat8, kind: Nat8, part: Nat8,
+            script: Script, style: Style, count: Index } := context;
+        destroyString(tag);
+        destroyString(attribute);
+        destroyScript(script);
+        destroyStyle(style);
+        return nil;
+    end;
+
+    -- The slots the state does not use, set back to their empty values.
+    function normalized(context: Context): Context is
+        var { state: Nat8, endTag as end_tag: Bool, tag: String, attribute: String, quote: Nat8, kind: Nat8, part: Nat8,
+            script: Script, style: Style, count: Index } := context;
+        let uses_tag: Bool := (state = in_tag_name) or (state = in_tag) or (state = in_attribute_name)
+            or (state = after_attribute) or (state = before_value) or (state = in_value) or (state = in_raw);
+        let uses_attribute: Bool := (state = in_attribute_name) or (state = after_attribute) or (state = before_value)
+            or (state = in_value);
+        let uses_script: Bool := (state = in_script) or ((state = in_value) and (kind = script_kind));
+        let uses_style: Bool := (state = in_style) or ((state = in_value) and (kind = style_kind));
+        let uses_count: Bool := (state = in_bang) or (state = in_comment) or (state = in_raw) or (state = in_script)
+            or (state = in_style);
+        if state /= in_tag_name then
+            end_tag := false;
+        end if;
+        if not uses_tag then
+            tag := cleared(tag);
+        end if;
+        if not uses_attribute then
+            attribute := cleared(attribute);
+        end if;
+        if not ((state = in_value) and (kind = url_kind)) then
+            part := 0;
+        end if;
+        if state /= in_value then
+            quote := 0;
+            kind := plain_kind;
+        end if;
+        if not uses_script then
+            destroyScript(script);
+            script := emptyScript();
+        end if;
+        if not uses_style then
+            destroyStyle(style);
+            style := emptyStyle();
+        end if;
+        if not uses_count then
+            count := 0;
+        end if;
+        return Context(state => state, endTag => end_tag, tag => tag, attribute => attribute, quote => quote,
+            kind => kind, part => part, script => script, style => style, count => count);
+    end;
+
+    -- The place after the > of a start tag named tag.
+    generic [T: Region]
+    function stateAfterTag(tag: Span[Nat8, T]): Nat8 is
+        let small: String := lowercase(tag);
+        var state: Nat8 := in_text;
+        if equal(asSpan(&small), "script") then
+            state := in_script;
+        else if equal(asSpan(&small), "style") then
+            state := in_style;
+        else if equal(asSpan(&small), "title") or equal(asSpan(&small), "textarea") then
+            state := in_raw;
+        end if;
+        destroyString(small);
+        return state;
+    end;
+
+    function stepContext(context: Context, byte: Nat8): Context is
+        var { state: Nat8, endTag as end_tag: Bool, tag: String, attribute: String, quote: Nat8, kind: Nat8, part: Nat8,
+            script: Script, style: Style, count: Index } := context;
+        let c: Nat8 := byte;
+        -- Set when a start tag ends with >: the element's content follows.
+        var closing: Bool := false;
+        if state = in_text then
+            if c = '<' then
+                state := after_less;
+            end if;
+        else if state = after_less then
+            if isLetter(c) then
+                state := in_tag_name;
+                end_tag := false;
+                tag := appended(cleared(tag), c);
+            else if c = '/' then
+                state := in_tag_name;
+                end_tag := true;
+                tag := cleared(tag);
+            else if c = '!' then
+                state := in_bang;
+                count := 0;
+            else if c = '<' then
+                skip;
+            else
+                state := in_text;
+            end if;
+        else if state = in_bang then
+            if c = '-' then
+                if count = 1 then
+                    state := in_comment;
+                    count := 0;
+                else
+                    count := 1;
+                end if;
+            else if c = '>' then
+                state := in_text;
+            else
+                state := in_declaration;
+            end if;
+        else if state = in_declaration then
+            if c = '>' then
+                state := in_text;
+            end if;
+        else if state = in_comment then
+            if c = '-' then
+                if count < 2 then
+                    count := count + 1;
+                end if;
+            else if (c = '>') and (count = 2) then
+                state := in_text;
+            else
+                count := 0;
+            end if;
+        else if state = in_tag_name then
+            if isLetter(c) or isDigit(c) or (c = '-') or (c = ':') then
+                tag := appended(tag, c);
+            else if end_tag then
+                if c = '>' then
+                    state := in_text;
+                else
+                    state := in_end_tag;
+                end if;
+            else if c = '>' then
+                closing := true;
+            else
+                state := in_tag;
+            end if;
+        else if state = in_end_tag then
+            if c = '>' then
+                state := in_text;
+            end if;
+        else if state = in_tag then
+            if c = '>' then
+                closing := true;
+            else if isSpace(c) or (c = '/') then
+                skip;
+            else
+                state := in_attribute_name;
+                attribute := appended(cleared(attribute), c);
+            end if;
+        else if state = in_attribute_name then
+            if c = '=' then
+                state := before_value;
+            else if c = '>' then
+                closing := true;
+            else if isSpace(c) then
+                state := after_attribute;
+            else if c = '/' then
+                state := in_tag;
+            else
+                attribute := appended(attribute, c);
+            end if;
+        else if state = after_attribute then
+            if c = '=' then
+                state := before_value;
+            else if c = '>' then
+                closing := true;
+            else if isSpace(c) then
+                skip;
+            else if c = '/' then
+                state := in_tag;
+            else
+                state := in_attribute_name;
+                attribute := appended(cleared(attribute), c);
+            end if;
+        else if state = before_value then
+            if isSpace(c) then
+                skip;
+            else if c = '>' then
+                closing := true;
+            else
+                state := in_value;
+                if (c = '"') or (c = 39) then
+                    quote := c;
+                else
+                    quote := ' ';
+                end if;
+                kind := attributeKind(asSpan(&attribute));
+                part := 0;
+                if kind = script_kind then
+                    destroyScript(script);
+                    script := startScript();
+                end if;
+            end if;
+        else if state = in_value then
+            if quote = ' ' then
+                if isSpace(c) then
+                    state := in_tag;
+                else if c = '>' then
+                    closing := true;
+                end if;
+            else if c = quote then
+                state := in_tag;
+            else if kind = url_kind then
+                if (c = '?') or (c = '#') then
+                    part := 2;
+                else if part = 0 then
+                    part := 1;
+                end if;
+            else if kind = script_kind then
+                script := scriptStep(script, c);
+            else if kind = style_kind then
+                style := styleStep(style, c);
+            end if;
+        else if state = in_raw then
+            count := closerStep(asSpan(&tag), count, c);
+            if count = (spanLength(asSpan(&tag)) + 2) then
+                state := in_end_tag;
+            end if;
+        else if state = in_script then
+            count := closerStep("script", count, c);
+            if count = 8 then
+                state := in_end_tag;
+            else
+                script := scriptStep(script, c);
+            end if;
+        else
+            count := closerStep("style", count, c);
+            if count = 7 then
+                state := in_end_tag;
+            else
+                style := styleStep(style, c);
+            end if;
+        end if;
+        if closing then
+            state := stateAfterTag(asSpan(&tag));
+            count := 0;
+            if state = in_script then
+                destroyScript(script);
+                script := startScript();
+            else if state = in_style then
+                destroyStyle(style);
+                style := emptyStyle();
+            else if state = in_raw then
+                let small: String := lowercase(asSpan(&tag));
+                destroyString(tag);
+                tag := small;
+            end if;
+        end if;
+        return normalized(Context(state => state, endTag => end_tag, tag => tag, attribute => attribute,
+            quote => quote, kind => kind, part => part, script => script, style => style, count => count));
+    end;
+
+    generic [T: Region]
+    function advanceContext(context: Context, text: Span[Nat8, T]): Context is
+        var place: Context := context;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            place := stepContext(place, text[i]);
+            i := i + 1;
+        end while;
+        return place;
+    end;
+
+    generic [A: Region, B: Region]
+    function sameScript(left: &[Script, A], right: &[Script, B]): Bool is
+        return (left->state = right->state) and (left->flag = right->flag) and (left->quote = right->quote)
+            and equal(asSpan(&(left->word)), asSpan(&(right->word)));
+    end;
+
+    generic [A: Region, B: Region]
+    function sameStyle(left: &[Style, A], right: &[Style, B]): Bool is
+        return (left->state = right->state) and (left->flag = right->flag) and (left->quote = right->quote)
+            and equal(asSpan(&(left->tail)), asSpan(&(right->tail)));
+    end;
+
+    generic [A: Region, B: Region]
+    function sameContext(left: &[Context, A], right: &[Context, B]): Bool is
+        if (left->state /= right->state) or (left->endTag /= right->endTag) or (left->quote /= right->quote)
+            or (left->kind /= right->kind) or (left->part /= right->part) or (left->count /= right->count) then
+            return false;
+        end if;
+        if not equal(asSpan(&(left->tag)), asSpan(&(right->tag))) then
+            return false;
+        end if;
+        if not equal(asSpan(&(left->attribute)), asSpan(&(right->attribute))) then
+            return false;
+        end if;
+        return sameScript(&(left->script), &(right->script)) and sameStyle(&(left->style), &(right->style));
+    end;
+
+    generic [R: Region]
+    function copyContext(context: &[Context, R]): Context is
+        let script: Script := Script(state => context->script.state, flag => context->script.flag,
+            quote => context->script.quote, word => fromSpan(asSpan(&(context->script.word))));
+        let style: Style := Style(state => context->style.state, flag => context->style.flag,
+            quote => context->style.quote, tail => fromSpan(asSpan(&(context->style.tail))));
+        return Context(state => context->state, endTag => context->endTag, tag => fromSpan(asSpan(&(context->tag))),
+            attribute => fromSpan(asSpan(&(context->attribute))), quote => context->quote, kind => context->kind,
+            part => context->part, script => script, style => style, count => context->count);
+    end;
+
+    generic [R: Region]
+    function isHtmlText(context: &[Context, R]): Bool is
+        return context->state = in_text;
+    end;
+
+    -- Whether the script part is where an expression goes: code, or a
+    -- slash that divides.
+    function expressionAt(state: Nat8, flag: Bool): Bool is
+        return (state = js_code) or ((state = js_slash) and (not flag));
+    end;
+
+    generic [R: Region]
+    function writerOf(context: &[Context, R]): Option[Writer] is
+        let state: Nat8 := context->state;
+        if (state = in_text) or (state = in_raw) then
+            return Some(value => HtmlWriter());
+        end if;
+        let js_state: Nat8 := context->script.state;
+        let js_flag: Bool := context->script.flag;
+        let css_state: Nat8 := context->style.state;
+        if state = in_script then
+            if expressionAt(js_state, js_flag) then
+                return Some(value => ScriptWriter());
+            else if js_state = js_string then
+                return Some(value => JsStringWriter());
+            end if;
+            return None();
+        end if;
+        if state = in_style then
+            if css_state = css_code then
+                return Some(value => CssValueWriter());
+            else if css_state = css_string then
+                return Some(value => CssStringWriter());
+            end if;
+            return None();
+        end if;
+        if (state /= in_value) or (context->quote = ' ') then
+            return None();
+        end if;
+        let kind: Nat8 := context->kind;
+        if kind = plain_kind then
+            return Some(value => HtmlWriter());
+        else if kind = url_kind then
+            if context->part = 0 then
+                return Some(value => UrlWriter());
+            else if context->part = 1 then
+                return Some(value => UrlPathWriter());
+            end if;
+            return Some(value => UrlQueryWriter());
+        else if kind = script_kind then
+            if expressionAt(js_state, js_flag) then
+                return Some(value => ScriptAttributeWriter());
+            else if js_state = js_string then
+                return Some(value => JsStringAttributeWriter());
+            end if;
+            return None();
+        else if kind = long_kind then
+            return None();
+        end if;
+        if css_state = css_code then
+            return Some(value => CssValueAttributeWriter());
+        else if css_state = css_string then
+            return Some(value => CssStringAttributeWriter());
+        end if;
+        return None();
+    end;
+
+    function scriptWhere(state: Nat8, flag: Bool): Span[Nat8, Static] is
+        if (state = js_code) or ((state = js_slash) and (not flag)) then
+            return "";
+        else if state = js_slash then
+            return ", at the start of a regular expression";
+        else if state = js_word then
+            return ", right after a name or a number";
+        else if (state = js_string) or (state = js_string_escape) then
+            return ", in a string";
+        else if (state = js_template) or (state = js_template_escape) then
+            return ", in a template literal";
+        else if (state = js_line_comment) or (state = js_block_comment) then
+            return ", in a comment";
+        end if;
+        return ", in a regular expression";
+    end;
+
+    function styleWhere(state: Nat8): Span[Nat8, Static] is
+        if (state = css_code) or (state = css_slash) then
+            return "";
+        else if (state = css_string) or (state = css_string_escape) then
+            return ", in a string";
+        else if state = css_comment then
+            return ", in a comment";
+        end if;
+        return ", in url( )";
+    end;
+
+    generic [R: Region]
+    function describeContext(context: &[Context, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let state: Nat8 := context->state;
+        let attribute: Span[Nat8, R] := asSpan(&(context->attribute));
+        if state = in_text then
+            writeString(&!out, "HTML text");
+        else if state = after_less then
+            writeString(&!out, "right after <, where a tag name goes");
+        else if (state = in_bang) or (state = in_declaration) then
+            writeString(&!out, "a <! declaration");
+        else if state = in_comment then
+            writeString(&!out, "an HTML comment");
+        else if state = in_tag_name then
+            writeString(&!out, "a tag name");
+        else if state = in_tag then
+            writeString(&!out, "a tag, between its attributes");
+        else if state = in_end_tag then
+            writeString(&!out, "an end tag");
+        else if state = in_attribute_name then
+            writeString(&!out, "an attribute name");
+        else if state = after_attribute then
+            writeString(&!out, "a tag, after the attribute name ");
+            writeString(&!out, attribute);
+        else if (state = before_value) or ((state = in_value) and (context->quote = ' ')) then
+            writeString(&!out, "the unquoted value of the attribute ");
+            writeString(&!out, attribute);
+            writeString(&!out, " (quote the value)");
+        else if state = in_value then
+            let kind: Nat8 := context->kind;
+            if kind = url_kind then
+                if context->part = 0 then
+                    writeString(&!out, "the start of the URL in the attribute ");
+                else if context->part = 1 then
+                    writeString(&!out, "the path of the URL in the attribute ");
+                else
+                    writeString(&!out, "the query of the URL in the attribute ");
+                end if;
+                writeString(&!out, attribute);
+            else if kind = script_kind then
+                writeString(&!out, "the JavaScript of the attribute ");
+                writeString(&!out, attribute);
+                writeString(&!out, scriptWhere(context->script.state, context->script.flag));
+            else if kind = style_kind then
+                writeString(&!out, "the CSS of the attribute ");
+                writeString(&!out, attribute);
+                writeString(&!out, styleWhere(context->style.state));
+            else if kind = long_kind then
+                writeString(&!out, "the value of an attribute whose name is 64 bytes or longer, ");
+                writeString(&!out, attribute);
+            else
+                writeString(&!out, "the value of the attribute ");
+                writeString(&!out, attribute);
+            end if;
+        else if state = in_script then
+            writeString(&!out, "a <script> element");
+            writeString(&!out, scriptWhere(context->script.state, context->script.flag));
+        else if state = in_style then
+            writeString(&!out, "a <style> element");
+            writeString(&!out, styleWhere(context->style.state));
+        else
+            writeString(&!out, "a <");
+            writeString(&!out, asSpan(&(context->tag)));
+            writeString(&!out, "> element");
+        end if;
+        return finalize(out);
+    end;
+
+    function afterScriptValue(context: Context): Context is
+        var { state: Nat8, endTag as end_tag: Bool, tag: String, attribute: String, quote: Nat8, kind: Nat8, part: Nat8,
+            script: Script, style: Style, count: Index } := context;
+        if (state = in_script) or ((state = in_value) and (kind = script_kind)) then
+            destroyScript(script);
+            script := emptyScript();
+        end if;
+        return Context(state => state, endTag => end_tag, tag => tag, attribute => attribute, quote => quote,
+            kind => kind, part => part, script => script, style => style, count => count);
+    end;
+end module body.

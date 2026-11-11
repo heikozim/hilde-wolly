@@ -1,0 +1,286 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    nth
+);
+import Standard.Text (
+    bytesToHex,
+    substring,
+    startsWith,
+    equal
+);
+import Standard.File (
+    kindOf,
+    kind_directory,
+    sameKind,
+    containsSymlink
+);
+import Standard.AtomicFile (
+    AtomicFailure,
+    writeAtomically
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    addHeader,
+    finish
+);
+
+module body Wolly.Bundle is
+    record Asset: Free is
+        name: Span[Nat8, Static];
+        content: Span[Nat8, Static];
+        invariant spanLength(name) > 0;
+    end;
+
+    function hashDigits(): Index is
+        return 16;
+    end;
+
+    function assetPrefix(): Span[Nat8, Static] is
+        return "/assets/";
+    end;
+
+    function immutableCache(): Span[Nat8, Static] is
+        return "public, max-age=31536000, immutable";
+    end;
+
+    generic [N: Region]
+    function isAssetName(name: Span[Nat8, N]): Bool is
+        let size: Index := spanLength(name);
+        if (size < 1) or (size > 200) then
+            return false;
+        end if;
+        if (name[0] = '.') or (name[size - 1] = '.') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := name[i];
+            let lower: Bool := (byte >= 'a') and (byte <= 'z');
+            let upper: Bool := (byte >= 'A') and (byte <= 'Z');
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let mark: Bool := ((byte = '.') or (byte = '-')) or (byte = '_');
+            if not (((lower or upper) or digit) or mark) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function asset(name: Span[Nat8, Static], content: Span[Nat8, Static]): Asset is
+        return Asset(name => name, content => content);
+    end;
+
+    function assetName(item: Asset): Span[Nat8, Static] is
+        return item.name;
+    end;
+
+    function assetContent(item: Asset): Span[Nat8, Static] is
+        return item.content;
+    end;
+
+    function assetSize(item: Asset): Index is
+        return spanLength(item.content);
+    end;
+
+    -- The index of the last dot of name, or its length when it has none.
+    function lastDot(name: Span[Nat8, Static]): Index is
+        var at: Index := spanLength(name);
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if name[i] = '.' then
+                at := i;
+            end if;
+            i := i + 1;
+        end while;
+        return at;
+    end;
+
+    function hashedName(item: Asset): Option[String] is
+        case sha256(item.content) of
+            when Some(value as digest: String) do
+                let hex: String := bytesToHex(asSpan(&digest));
+                destroyString(digest);
+                let dot: Index := lastDot(item.name);
+                let size: Index := spanLength(item.name);
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, substring(item.name, 0, dot));
+                writeString(&!out, ".");
+                writeString(&!out, substring(asSpan(&hex), 0, hashDigits()));
+                writeString(&!out, substring(item.name, dot, size));
+                destroyString(hex);
+                return Some(value => finalize(out));
+            when None do
+                return None();
+        end case;
+    end;
+
+    function assetUrl(item: Asset): Option[String] is
+        case hashedName(item) of
+            when Some(value as hashed: String) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, assetPrefix());
+                writeString(&!out, asSpan(&hashed));
+                destroyString(hashed);
+                return Some(value => finalize(out));
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Whether name ends in a dot and extension.
+    generic [N: Region]
+    function endsWith(name: Span[Nat8, N], extension: Span[Nat8, Static]): Bool is
+        let size: Index := spanLength(name);
+        let tail: Index := spanLength(extension);
+        if size <= tail then
+            return false;
+        end if;
+        if name[(size - tail) - 1] /= '.' then
+            return false;
+        end if;
+        return equal(substring(name, size - tail, size), extension);
+    end;
+
+    generic [N: Region]
+    function contentTypeOf(name: Span[Nat8, N]): Span[Nat8, Static] is
+        if endsWith(name, "css") then
+            return "text/css; charset=utf-8";
+        else if endsWith(name, "js") or endsWith(name, "mjs") then
+            return "text/javascript; charset=utf-8";
+        else if endsWith(name, "json") then
+            return "application/json";
+        else if endsWith(name, "svg") then
+            return "image/svg+xml";
+        else if endsWith(name, "png") then
+            return "image/png";
+        else if endsWith(name, "jpg") or endsWith(name, "jpeg") then
+            return "image/jpeg";
+        else if endsWith(name, "gif") then
+            return "image/gif";
+        else if endsWith(name, "webp") then
+            return "image/webp";
+        else if endsWith(name, "ico") then
+            return "image/x-icon";
+        else if endsWith(name, "woff") then
+            return "font/woff";
+        else if endsWith(name, "woff2") then
+            return "font/woff2";
+        else if endsWith(name, "txt") then
+            return "text/plain; charset=utf-8";
+        else
+            return "application/octet-stream";
+        end if;
+    end;
+
+    -- The path is compared whole with the hashed name of each asset, so
+    -- nothing of it is ever taken as a name of a file.
+    generic [R: Region, P: Region]
+    function serveAsset(assets: &[Buffer[Asset], R], path: Span[Nat8, P]): Option[String] is
+        if not startsWith(path, assetPrefix()) then
+            return None();
+        end if;
+        let wanted: Span[Nat8, P] := substring(path, spanLength(assetPrefix()), spanLength(path));
+        var i: Index := 0;
+        while i < length(assets) do
+            let item: Asset := nth(assets, i);
+            case hashedName(item) of
+                when Some(value as hashed: String) do
+                    let found: Bool := equal(asSpan(&hashed), wanted);
+                    destroyString(hashed);
+                    if found then
+                        var response: Response := makeResponse(200, contentTypeOf(item.name));
+                        response := addHeader(response, "Cache-Control", immutableCache());
+                        response := addHeader(response, "X-Content-Type-Options", "nosniff");
+                        return Some(value => finish(response, item.content));
+                    end if;
+                when None do
+                    return None();
+            end case;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    -- Whether an asset after the first at has the same name.
+    generic [R: Region]
+    function nameTwice(assets: &[Buffer[Asset], R], at: Index): Bool is
+        let first: Asset := nth(assets, at);
+        var j: Index := at + 1;
+        while j < length(assets) do
+            let other: Asset := nth(assets, j);
+            if equal(other.name, first.name) then
+                return true;
+            end if;
+            j := j + 1;
+        end while;
+        return false;
+    end;
+
+    generic [D: Region, R: Region]
+    function exportAssets(directory: Span[Nat8, D], assets: &[Buffer[Asset], R]): Bool is
+        if spanLength(directory) = 0 then
+            return false;
+        end if;
+        if (not sameKind(kindOf(directory), kind_directory)) or containsSymlink(directory) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(assets) do
+            if nameTwice(assets, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        i := 0;
+        while i < length(assets) do
+            let item: Asset := nth(assets, i);
+            case hashedName(item) of
+                when Some(value as hashed: String) do
+                    var whole: StringBuilder := makeStringBuilder();
+                    writeString(&!whole, directory);
+                    writeString(&!whole, "/");
+                    writeString(&!whole, asSpan(&hashed));
+                    destroyString(hashed);
+                    let target: String := finalize(whole);
+                    -- 420 is the mode 0644: Hiawatha reads what the
+                    -- programme wrote.
+                    let mode: Nat32 := 420;
+                    let done: Either[AtomicFailure, Unit] := writeAtomically(asSpan(&target), item.content, mode);
+                    destroyString(target);
+                    case done of
+                        when Left(left as why: AtomicFailure) do
+                            return false;
+                        when Right(right as nothing: Unit) do
+                            skip;
+                    end case;
+                when None do
+                    return false;
+            end case;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+end module body.

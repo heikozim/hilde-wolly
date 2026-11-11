@@ -1,0 +1,187 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Built with the module that scripts/route-tree.py writes from routes/,
+-- as scripts/route-tree.sh does it.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    destroyFree
+);
+import Standard.Text (
+    contains,
+    startsWith
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Response (
+    makeResponse,
+    finish
+);
+import Wolly.Router (
+    Route,
+    dispatch
+);
+import Wolly.Example.Pages (
+    handle
+);
+import Wolly.Example.Pages.Routes (
+    treeRouteCount,
+    addTreeRoutes
+);
+
+module body Wolly.Example.Pages.Test is
+    generic [R: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, Static]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    function fakeRequest(verb: Span[Nat8, Static], uri: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", verb);
+        addPair(&!params, "REQUEST_URI", uri);
+        let block: String := finalize(params);
+        var empty: StringBuilder := makeStringBuilder();
+        return makeRequest(block, finalize(empty));
+    end;
+
+    function answers(output: String, status: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let good: Bool := startsWith(asSpan(&output), status) and contains(asSpan(&output), part);
+        if not good then
+            printLn(asSpan(&output));
+        end if;
+        destroyString(output);
+        assertTrue(good, message);
+        return nil;
+    end;
+
+    function lacks(output: String, part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let good: Bool := not contains(asSpan(&output), part);
+        if not good then
+            printLn(asSpan(&output));
+        end if;
+        destroyString(output);
+        assertTrue(good, message);
+        return nil;
+    end;
+
+    function ask(verb: Span[Nat8, Static], uri: Span[Nat8, Static]): String is
+        return handle(fakeRequest(verb, uri));
+    end;
+
+    function testSegment(): Unit is
+        answers(ask("GET", "/"), "Status: 200 ", "<h1>Home</h1>", "index.hih is the root");
+        answers(ask("GET", "/about"), "Status: 200 ", "<h1>About</h1>", "about.hih is /about");
+        answers(ask("GET", "/docs/intro"), "Status: 200 ", "<h1>Intro</h1>", "routes/docs/intro.hih is /docs/intro");
+        answers(ask("GET", "/docs"), "Status: 404 ", "not found", "a directory without a page has no route");
+        answers(ask("GET", "/about/"), "Status: 404 ", "not found", "a trailing slash is another path");
+        answers(ask("GET", "/About"), "Status: 404 ", "not found", "a segment is compared byte for byte");
+        answers(ask("HEAD", "/about"), "Status: 200 ", "About", "HEAD is answered by get");
+        answers(ask("DELETE", "/about"), "Status: 405 ", "\r\nAllow: GET\r\n", "405 with the methods of the page");
+        return nil;
+    end;
+
+    function testLayout(): Unit is
+        answers(ask("GET", "/users"), "Status: 200 ", "<main class=\"admin\">\n<h1>Users</h1>\n</main>\n", "_admin wraps its page");
+        answers(ask("GET", "/admin/users"), "Status: 404 ", "not found", "and adds no segment");
+        answers(ask("GET", "/audit"), "Status: 200 ", "<main class=\"admin\">\n<section class=\"panel\">\n<h1>Audit</h1>\n</section>\n</main>\n",
+            "the inner layout first, the outer around it");
+        answers(ask("GET", "/settings"), "Status: 200 ", "<main class=\"admin\">\n<h1>Settings</h1>", "get and post of one page");
+        answers(ask("POST", "/settings"), "Status: 303 ", "\r\nLocation: /settings\r\n", "a finished answer");
+        lacks(ask("POST", "/settings"), "<main", "is not wrapped");
+        lacks(ask("GET", "/about"), "<main", "a page outside _admin is not wrapped");
+        return nil;
+    end;
+
+    function testParameter(): Unit is
+        answers(ask("GET", "/post/42"), "Status: 200 ", "<h1>Post 42</h1>", "@id.hih takes its Param");
+        answers(ask("GET", "/post/new"), "Status: 200 ", "<h1>New post</h1>", "a static segment before the parameter");
+        answers(ask("GET", "/post/0"), "Status: 404 ", "not found", "a value parse refuses names nothing");
+        answers(ask("GET", "/post/-3"), "Status: 404 ", "not found", "no sign");
+        answers(ask("GET", "/post/4x"), "Status: 404 ", "not found", "no letter");
+        answers(ask("GET", "/post/%2E%2E"), "Status: 404 ", "not found", "a decoded dot segment is no number");
+        answers(ask("GET", "/post/99999999999999999999"), "Status: 404 ", "not found", "no number above an Int64");
+        answers(ask("GET", "/post/"), "Status: 404 ", "not found", "a parameter is never empty");
+        answers(ask("GET", "/post/42/comments/7"), "Status: 200 ", "<p>Comment 7 of post 42</p>", "two parameters in the order of the path");
+        answers(ask("GET", "/post/42/comments/1000"), "Status: 404 ", "not found", "the second parameter has its own type");
+        answers(ask("GET", "/post/x/comments/7"), "Status: 404 ", "not found", "and the first is read before it");
+        return nil;
+    end;
+
+    function manual(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(200, "text/plain"), "by hand");
+    end;
+
+    function testRouteCount(): Unit is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/x", handler => manual));
+        addTreeRoutes(&!routes);
+        assertTrue(length(&routes) = (1 + treeRouteCount), "the tree appends its routes after the ones there");
+        assertTrue(treeRouteCount = 10, "ten routes in routes/");
+        destroyFree(routes);
+        return nil;
+    end;
+
+    function table(withTree: Bool): Buffer[Route] is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/about", handler => manual));
+        insertBack(&!routes, Route(verb => "PUT", pattern => "/items/:id", handler => manual));
+        if withTree then
+            addTreeRoutes(&!routes);
+        end if;
+        return routes;
+    end;
+
+    function through(withTree: Bool, verb: Span[Nat8, Static], uri: Span[Nat8, Static]): String is
+        let routes: Buffer[Route] := table(withTree);
+        let output: String := dispatch(fakeRequest(verb, uri), &routes);
+        destroyFree(routes);
+        return output;
+    end;
+
+    function testManualRoutingUnchanged(): Unit is
+        answers(ask("GET", "/health"), "Status: 200 ", "\r\n\r\nok\n", "the route set by hand in the example");
+        answers(through(false, "GET", "/about"), "Status: 200 ", "by hand", "a table by hand alone");
+        answers(through(false, "PUT", "/items/3"), "Status: 200 ", "by hand", "a parameter by hand");
+        answers(through(false, "GET", "/users"), "Status: 404 ", "not found", "and nothing of the tree without it");
+        answers(through(true, "GET", "/about"), "Status: 200 ", "by hand", "the first route that fits still wins");
+        answers(through(true, "PUT", "/items/3"), "Status: 200 ", "by hand", "a route by hand beside the tree");
+        answers(through(true, "GET", "/users"), "Status: 200 ", "<h1>Users</h1>", "with the tree after it");
+        answers(through(true, "PUT", "/about"), "Status: 405 ", "\r\nAllow: GET, GET\r\n", "405 over both, as the router counts them");
+        return nil;
+    end;
+end module body.

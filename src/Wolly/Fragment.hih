@@ -1,0 +1,172 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Fragments of a page: a part of the page with an id of its own that the
+server renders alone when it is asked for, and that the page swaps in
+place, without loading itself again and without a client framework.
+
+A fragment is the element writeFragment writes, <div id="ID"
+data-wolly-fragment>.  A request asks for it in the way of htmx, with the
+headers HX-Request: true and HX-Target: ID, or with the query parameter
+fragment=ID; requestedFragment gives the id, and only one that passes
+isFragmentId.  The handler then answers fragmentResponse of that fragment
+alone and renders nothing else of the page; without such a request it
+answers pageResponse of the whole page.  Both answers carry Vary:
+HX-Request, HX-Target, so that no cache gives the one for the other.
+
+    if wantsFragment(&request, "counter") then
+        return fragmentResponse("counter", asSpan(&inner));
+    end if;
+
+The page swaps the fragment with the script of fragmentScript, an asset
+of Wolly.Bundle: an element with the attributes writeTrigger writes, or a
+form with data-wolly-target, asks for the fragment and puts the answer in
+its place, and an element with the attributes writePoll writes asks for
+it again every so many seconds.  The script tags every ask with a
+generation, one more than the ask before it for the same fragment: an
+answer whose ask a newer one has superseded is dropped and never swapped
+in.  Every ask has a deadline in milliseconds after which it is aborted
+(data-wolly-deadline, 10000 by default) and a cap in bytes over which the
+answer is rejected before it is read whole (data-wolly-limit, 1048576 by
+default).  The script asks only its own origin, runs no script it
+receives and works under script-src 'self' and connect-src 'self'.  htmx
+itself works with the same answers: they say HX-Retarget and HX-Reswap.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Bundle (
+    Asset,
+    assetSize
+);
+
+module Wolly.Fragment is
+    """
+    The name of the query parameter that asks for a fragment: fragment.
+    """
+    function fragmentParameter(): Span[Nat8, Static]
+        ensures spanLength(result) = 8;
+
+    """
+    The value of Vary of every answer that is a fragment for one request
+    and the page for another: HX-Request, HX-Target.
+    """
+    function fragmentVary(): Span[Nat8, Static]
+        ensures spanLength(result) = 21;
+
+    """
+    The most bytes of a fragment id: 64.
+    """
+    function idLimit(): Index
+        ensures result = 64;
+
+    """
+    Whether id can be the id of a fragment: 1 to idLimit bytes, a letter
+    first, then letters, digits, hyphen and underscore.  Such an id stands
+    in an attribute, after # in a selector and in a header line as it is.
+    No contract: the answer is a Bool of a walk over id.
+    """
+    generic [N: Region]
+    function isFragmentId(id: Span[Nat8, N]): Bool;
+
+    """
+    Whether url may be the address a trigger asks for a fragment: 1 to
+    512 bytes, a path of the own site, a slash first and no second slash
+    or backslash after it, and only letters, digits and - . _ ~ / ? = & %
+    + , ; : @ ! $ * ( ); so no quote, no angle bracket and no space.
+    No contract: the answer is a Bool of a walk over url.
+    """
+    generic [U: Region]
+    function isFragmentUrl(url: Span[Nat8, U]): Bool;
+
+    """
+    The id of the fragment request asks for: the value of HX-Target when
+    HX-Request is true, else the query parameter fragmentParameter.  None
+    when neither is there, and when the value does not pass isFragmentId,
+    so that a page never echoes what a client made up.
+    No contract: an Option, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function requestedFragment(request: &[Request, R]): Option[String];
+
+    """
+    Whether request asks for the fragment id, as requestedFragment reads
+    it.  No ensures: the answer is a Bool of the request.
+    """
+    generic [R: Region, N: Region]
+    function wantsFragment(request: &[Request, R], id: Span[Nat8, N]): Bool
+        requires isFragmentId(id);
+
+    """
+    Writes the fragment id with inner into out: <div id="id"
+    data-wolly-fragment>, inner, </div>.  inner is HTML the application
+    made and escaped; it is written as it is.
+    """
+    generic [B: Region, N: Region, I: Region]
+    function writeFragment(out: &![StringBuilder, B], id: Span[Nat8, N], inner: Span[Nat8, I]): Unit
+        requires isFragmentId(id);
+
+    """
+    Writes into out the attributes of an element that, on a click, asks
+    url for the fragment id and swaps the answer in its place:
+    data-wolly-get="url" data-wolly-target="id", each with a blank before
+    it, an ampersand of url written as &amp;.
+    """
+    generic [B: Region, U: Region, N: Region]
+    function writeTrigger(out: &![StringBuilder, B], url: Span[Nat8, U], id: Span[Nat8, N]): Unit
+        requires isFragmentUrl(url) and isFragmentId(id);
+
+    """
+    Writes into out the attributes of an element that asks for the fragment
+    id again every seconds, on its own: data-wolly-poll="seconds" and
+    data-wolly-target="id", each with a blank before it.  The element asks
+    the page it stands on; give it data-wolly-get as well to ask another
+    path of the site.  The script of fragmentScript ends the loop when the
+    element is no longer on the page, and the answer of a tick that a
+    newer one superseded is dropped, as the generation of the asks tells.
+    """
+    generic [B: Region, N: Region]
+    function writePoll(out: &![StringBuilder, B], seconds: Index, id: Span[Nat8, N]): Unit
+        requires (seconds >= 1) and (seconds <= 86400)
+        requires isFragmentId(id);
+
+    """
+    The CGI output of the fragment id alone, as writeFragment makes it of
+    inner: 200, Content-Type text/html with charset utf-8, Vary
+    fragmentVary, HX-Retarget #id and HX-Reswap outerHTML, so that the
+    answer replaces the fragment whatever asked for it, Cache-Control
+    no-cache and X-Content-Type-Options nosniff.
+    """
+    generic [N: Region, I: Region]
+    function fragmentResponse(id: Span[Nat8, N], inner: Span[Nat8, I]): String
+        requires isFragmentId(id)
+        ensures length(&result) > spanLength(inner);
+
+    """
+    The CGI output of the whole page html: 200, Content-Type text/html
+    with charset utf-8, Vary fragmentVary, Cache-Control no-cache and
+    X-Content-Type-Options nosniff.
+    """
+    generic [P: Region]
+    function pageResponse(html: Span[Nat8, P]): String
+        ensures length(&result) > spanLength(html);
+
+    """
+    The script that swaps fragments, wolly-fragment.js, compiled into the
+    programme: an application puts it among its assets for serveAsset and
+    links it by assetUrl.
+    """
+    function fragmentScript(): Asset
+        ensures assetSize(result) > 0;
+end module.

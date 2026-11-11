@@ -1,0 +1,98 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.FcgiServer (
+    Request,
+    defaultLimits,
+    destroyRequest
+);
+import Wolly.Response (
+    makeResponse,
+    finish
+);
+import Wolly.Router (
+    Route
+);
+import Wolly.Link (
+    NoParams,
+    Target,
+    target,
+    route
+);
+import Wolly.Middleware (
+    Step,
+    dispatchWith,
+    knownMethods,
+    securityHeaders
+);
+import Wolly.Server (
+    Outcome,
+    Stopped,
+    NoSocket,
+    NotStarted,
+    serve
+);
+import Wolly.Example.Pages.Routes (
+    addTreeRoutes
+);
+import Wolly.Confine (
+    confineServer
+);
+
+module body Wolly.Example.Pages is
+    constant socketPath: Span[Nat8, Static] := "pages.sock";
+
+    function health(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(200, "text/plain; charset=utf-8"), "ok\n");
+    end;
+
+    function healthTarget(): Target[NoParams] is
+        return target("GET", "/health", health);
+    end;
+
+    -- The route set by hand stands first, as before the tree; the routes
+    -- of the tree follow it.
+    function handle(request: Request): String is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, route(healthTarget()));
+        addTreeRoutes(&!routes);
+        var befores: Buffer[Fn[Request, Step]] := allocateEmpty();
+        insertBack(&!befores, knownMethods);
+        var afters: Buffer[Fn[String, String]] := allocateEmpty();
+        insertBack(&!afters, securityHeaders);
+        let output: String := dispatchWith(request, &routes, &befores, &afters);
+        destroyFree(routes);
+        destroyFree(befores);
+        destroyFree(afters);
+        return output;
+    end;
+
+    function main(): ExitCode is
+        confineServer("pages");
+        case serve(socketPath, handle, defaultLimits()) of
+            when Stopped(accepted: Index) do
+                print("pages: stopped, connections accepted: ");
+                printLn(accepted);
+                return ExitSuccess();
+            when NoSocket do
+                printLn("pages: the socket pages.sock could not be made");
+                return ExitFailure();
+            when NotStarted do
+                printLn("pages: the server did not start");
+                return ExitFailure();
+        end case;
+    end;
+end module body.

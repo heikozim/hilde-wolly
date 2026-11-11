@@ -1,0 +1,241 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Typed internal links: a link names the target of a handler and the values
+of its parameters, never a path written as a string.
+
+A target is the verb, the pattern and the handler of one route, made once
+by a function of the application, and it carries the type P of the values
+its pattern takes.  A link to a target asks for a value of exactly that P:
+a target that does not exist, a value of another type or no value at all
+does not compile.  The same target gives the route of the router, so the
+pattern of a link and of its route cannot drift apart.
+
+Each value goes into its segment percent-encoded after RFC 3986: every byte
+but letters, digits and - . _ ~ is written as % and two capital hex digits,
+so a slash, ?, #, % or a space in a value stays inside its segment.  A value
+that cannot stand as a segment at all, the empty one and the dot segments
+. and .. that a browser resolves, gives no link.
+
+    function showPostTarget(): Target[PostId] is
+        return target("GET", "/post/:id", showPost);
+    end;
+    ...
+    case link(showPostTarget(), &post) of
+        when Some(value as l: Link) do
+            return finish(redirect(makeResponse(303, "text/plain"), l), "moved\n");
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Router (
+    Route
+);
+import Wolly.Response (
+    Response
+);
+
+module Wolly.Link is
+    """
+    The values a pattern takes, in the order of its parameter segments
+    :name and a last *.  An instance is the duty of the record of the
+    values; Wolly encodes what segment gives back.
+    """
+    typeclass Params(T: Type) is
+        """
+        How many values params holds.
+        No contract: the count is the instance's, one for each parameter
+        segment of its patterns.
+        """
+        generic [R: Region]
+        method arity(params: &[T, R]): Index;
+
+        """
+        The value number at, counted from 0, as plain text and not yet
+        encoded.
+        No contract: the text is the instance's; Wolly asks only for at
+        below arity.
+        """
+        generic [R: Region]
+        method segment(params: &[T, R], at: Index): String;
+    end;
+
+    """
+    The values of a pattern without parameters.
+    """
+    record NoParams: Free is
+    end;
+
+    instance Params(NoParams);
+
+    """
+    The one value of NoParams.
+    No contract: the record has no field to promise anything about.
+    """
+    function noParams(): NoParams;
+
+    """
+    The verb, the pattern and the handler of one route, for the values P.
+    Linear, so that each use is a fresh call of the function of the
+    application that names the handler.
+    """
+    type Target[P: Type]: Linear;
+
+    """
+    A path inside the application, made by path or link only, so that a
+    redirect or a form never takes a string.
+    """
+    type Link: Linear;
+
+    """
+    Whether pattern can be the pattern of a target: it begins with one
+    slash, not two, and holds only bytes a path may carry as they stand, no
+    space, control byte, backslash, ?, #, quote or angle bracket.
+    No contract: a Bool of a walk over pattern.
+    """
+    generic [P: Region]
+    function isPattern(pattern: Span[Nat8, P]): Bool;
+
+    """
+    How many parameter segments pattern has: each :name and a last *.
+    """
+    generic [P: Region]
+    function paramCount(pattern: Span[Nat8, P]): Index
+        ensures result <= spanLength(pattern);
+
+    """
+    The target of handler under verb and pattern; the application writes
+    one function a handler that returns it with the type of its values.
+    """
+    generic [P: Type]
+    function target(verb: Span[Nat8, Static], pattern: Span[Nat8, Static], handler: Fn[Request, String]): Target[P]
+        requires (spanLength(verb) > 0) and isPattern(pattern);
+
+    """
+    The pattern of goal.
+    """
+    generic [P: Type, R: Region]
+    function targetPattern(goal: &[Target[P], R]): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The verb of goal.
+    """
+    generic [P: Type, R: Region]
+    function targetVerb(goal: &[Target[P], R]): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The route of goal for the table of Wolly.Router.dispatch.
+    """
+    generic [P: Type]
+    function route(goal: Target[P]): Route
+        ensures spanLength(result.pattern) > 0;
+
+    """
+    The decoded value of the segment :name of the pattern of goal in the
+    path of request, or for name * the rest that a last * fits, as
+    Wolly.Router.routeParam reads it.  A handler reads its values through
+    its own target, so that its pattern stands in one place.
+    No contract: an Option, which an ensures cannot look into.
+    """
+    generic [P: Type, R: Region, N: Region]
+    function targetParam(goal: Target[P], request: &[Request, R], name: Span[Nat8, N]): Option[String];
+
+    """
+    The link to goal with the values of params, each encoded into its
+    segment.  None when params holds another count of values than the
+    pattern has parameters, or a value is empty, . or .. (for the last *,
+    a part between two slashes of it).
+    No contract: an Option, which an ensures cannot look into.
+    """
+    generic [P: Type(Params), R: Region]
+    function link(goal: Target[P], params: &[P, R]): Option[Link];
+
+    """
+    Whether the pattern of goal has no parameter segment.
+    """
+    generic [P: Type, R: Region]
+    function isStatic(goal: &[Target[P], R]): Bool
+        ensures result = (paramCount(targetPattern(goal)) = 0);
+
+    """
+    Whether goal can be the action of a form: static, and its verb GET
+    or POST, the only two a form sends.
+    """
+    generic [P: Type, R: Region]
+    function isFormTarget(goal: &[Target[P], R]): Bool
+        ensures (not result) or isStatic(goal);
+
+    """
+    Whether name can be the name of a query value as it stands: letters,
+    digits and - . _ ~, at least one.
+    No contract: a Bool of a walk over name.
+    """
+    generic [N: Region]
+    function isQueryName(name: Span[Nat8, N]): Bool;
+
+    """
+    The link to a target without parameters, which is its pattern.
+    """
+    function path(goal: Target[NoParams]): Link
+        requires isStatic(&goal);
+
+    """
+    The path of a target without parameters for the action attribute of a
+    form, for a template that escapes it as a URL.
+    """
+    function formAction(goal: Target[NoParams]): String
+        requires isFormTarget(&goal)
+        ensures length(&result) > 0;
+
+    """
+    link with name=value added to its query, after ? the first time and
+    after and-signs then; name is a literal of the programme, value is
+    encoded as a segment is.
+    """
+    generic [V: Region]
+    function withQuery(made: Link, name: Span[Nat8, Static], value: Span[Nat8, V]): Link
+        requires isQueryName(name);
+
+    """
+    response with link as its Location, for a redirect such as 303.
+    No contract: the header lands inside the opaque response.
+    """
+    function redirect(response: Response, made: Link): Response;
+
+    """
+    The text of link, for a template or an attribute.
+    """
+    function linkString(made: Link): String
+        ensures length(&result) > 0;
+
+    """
+    How many bytes link has.
+    """
+    generic [R: Region]
+    function linkLength(made: &[Link, R]): Index
+        ensures result > 0;
+
+    """
+    Give link back.
+    No contract: it ends the link.
+    """
+    function destroyLink(made: Link): Unit;
+
+    """
+    value as one segment of a path or a value of a query: every byte but
+    letters, digits and - . _ ~ written as % and two capital hex digits.
+    """
+    generic [V: Region]
+    function encodeSegment(value: Span[Nat8, V]): String
+        ensures length(&result) >= spanLength(value);
+end module.

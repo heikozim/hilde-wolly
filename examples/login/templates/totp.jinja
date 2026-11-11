@@ -1,0 +1,26 @@
+{#
+Part of Wolly, a web framework in Hilde.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+Turning the second factor on: the QR code of the otpauth URI, the secret
+for an app that cannot read one, and the form for the first code.  The
+page is not cached (Cache-Control: no-store), since it holds the secret.
+
+qr is written with |safe: the escaping of a URL attribute turns every
+scheme but http, https and mailto into #ZgotmplZ, and qr
+is made by the server alone, data:image/png;base64, and base64 digits,
+with no quote and nothing of the request in it.
+-#}
+{% extends "templates/base.jinja" %}
+{% block title %}Two-factor{% endblock %}
+{% block content %}
+<p><img alt="QR code for the authenticator app" src="{{ qr|safe }}"></p>
+<p>secret: <code class="secret">{{ secret }}</code></p>
+<form method="post" action="/totp">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
+<button>Turn on</button>
+</form>
+{% endblock %}

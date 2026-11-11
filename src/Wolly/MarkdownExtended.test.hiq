@@ -1,0 +1,123 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    contains
+);
+import Wolly.Markdown (
+    Tree,
+    parseMarkdownWith,
+    destroyTree,
+    nodeCount,
+    nodeNumber,
+    nodeInfo,
+    firstChild,
+    markdownToHtml,
+    markdownToHtmlWith
+);
+
+module body Wolly.MarkdownExtended.Test is
+    -- text read with extended, its HTML holds part.
+    function has(text: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtmlWith(text, false, true);
+        assertTrue(contains(asSpan(&made), part), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    -- text read with extended, its HTML lacks part.
+    function hasNot(text: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtmlWith(text, false, true);
+        assertFalse(contains(asSpan(&made), part), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    -- text read without extended, its HTML holds part.
+    function plainHas(text: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtml(text);
+        assertTrue(contains(asSpan(&made), part), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    function testAnchors(): Unit is
+        has("# Titel\n", "<h1 id=\"h-titel\">Titel</h1>", "a heading gets its anchor");
+        has("# \u{dc}ber uns\n\n## \u{dc}ber uns\n", "<h1 id=\"h-ueber-uns\">", "an umlaut as two letters, a space as a hyphen");
+        has("# \u{dc}ber uns\n\n## \u{dc}ber uns\n", "<h2 id=\"h-ueber-uns-2\">", "the second heading of the same words counts on");
+        has("# Stra\u{df}e_und  Weg\n", "id=\"h-strasse-und-weg\"", "sharp s, an underscore and a run of spaces");
+        has("# !!!\n", "<h1 id=\"h-heading\">", "a heading without letters");
+        has("Siehe [oben](#Titel).\n\n# Titel\n", "<a href=\"#h-titel\"", "an internal link points to the anchor");
+        hasNot("# Titel\n", "<h1>", "no heading without its anchor");
+        plainHas("# Titel\n", "<h1>Titel</h1>", "without extended a heading stays as it was");
+        plainHas("[x](#Titel)\n", "href=\"#Titel\"", "without extended a link keeps its target");
+        return nil;
+    end;
+
+    function testFootnotes(): Unit is
+        let text: Span[Nat8, Static] := "Eins[^a] und zwei[^b] und eins[^a].\n\n[^b]: Zwei.\n[^a]: Erste\nZeile.\n";
+        has(text, "<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"fnref-1\" rel=\"nofollow noopener\">1</a></sup>", "the first reference has number 1 and the anchor back");
+        has(text, "<sup class=\"footnote-ref\"><a href=\"#fn-2\" id=\"fnref-2\" rel=\"nofollow noopener\">2</a></sup>", "the second note number 2");
+        has(text, "<sup class=\"footnote-ref\"><a href=\"#fn-1\" rel=\"nofollow noopener\">1</a></sup>", "a second reference without an anchor");
+        has(text, "<div class=\"footnotes\">", "the notes after the text");
+        has(text, "<li id=\"fn-1\">\n<p>Erste\nZeile.</p>", "a note in the order of its number, its lazy line kept");
+        has(text, "<a href=\"#fnref-2\" class=\"footnote-back\" rel=\"nofollow noopener\">", "the link back");
+        hasNot(text, "[^b]:", "no definition stays as text");
+        has("a[^n]\n\n[^n]: one\n    two\n\n    three\n", "<p>three</p>", "an indented block after a blank line belongs to the note");
+        hasNot("x\n\n[^c]: Drei.\n", "Drei", "a note no reference names is not written");
+        hasNot("x\n\n[^c]: Drei.\n", "footnotes", "nor its list");
+        has("a[^z] b\n", "a[^z] b", "a reference to no note stays text");
+        plainHas("a[^n] b\n\n[^n]: Eine Note.\n", "<p>[^n]: Eine Note.</p>", "without extended a definition of a note stays text");
+        let tree: Tree := parseMarkdownWith(text, false, true);
+        assertTrue(nodeNumber(&tree, 0) = 2, "the document counts the notes with a reference");
+        destroyTree(tree);
+        return nil;
+    end;
+
+    function testCallouts(): Unit is
+        has("> [!NOTE]\n> Achtung\n", "<div class=\"callout callout-note\">\n<p class=\"callout-title\">Note</p>\n<p>Achtung</p>\n</div>", "a note");
+        has("> [!warning]  \n> Heiss\n", "<div class=\"callout callout-warning\">", "the mark in any case, spaces after it");
+        has("> [!FOO]\n> x\n", "<blockquote>", "an unknown kind stays a quote");
+        has("> [!NOTE] und mehr\n", "<blockquote>", "a mark with words after it stays a quote");
+        plainHas("> [!NOTE]\n> Achtung\n", "<blockquote>", "without extended a quote");
+        let tree: Tree := parseMarkdownWith("> [!TIP]\n> t\n", false, true);
+        assertTrue(nodeNumber(&tree, firstChild(&tree, 0)) = 2, "the kind as the number of the quote");
+        destroyTree(tree);
+        return nil;
+    end;
+
+    function testToc(): Unit is
+        let text: Span[Nat8, Static] := "[TOC]\n\n# A\n\n## B c\n";
+        has(text, "<ul class=\"toc\">\n<li class=\"toc-h1\"><a href=\"#h-a\" rel=\"nofollow noopener\">A</a></li>\n<li class=\"toc-h2\"><a href=\"#h-b-c\" rel=\"nofollow noopener\">B c</a></li>\n</ul>", "one entry for each heading");
+        hasNot(text, "[TOC]", "the mark leaves the text");
+        plainHas("[toc]\n", "<p>[toc]</p>", "without extended a paragraph");
+        return nil;
+    end;
+
+    function testIdsStaySafe(): Unit is
+        let made: String := markdownToHtmlWith("<p id=\"location\">x</p>\n\n<p id=\"a-b\">y</p>\n", true, true);
+        assertFalse(contains(asSpan(&made), "id=\"location\""), "raw HTML brings no id without a hyphen");
+        assertTrue(contains(asSpan(&made), "id=\"a-b\""), "an id in the form of an anchor stays");
+        destroyString(made);
+        let plain: String := markdownToHtmlWith("<p id=\"a-b\">y</p>\n", true, false);
+        assertFalse(contains(asSpan(&plain), "id="), "without extended raw HTML keeps no id");
+        destroyString(plain);
+        let tree: Tree := parseMarkdownWith("# Titel\n", false, true);
+        assertTrue(nodeCount(&tree) >= 2, "a heading and its text");
+        assertTrue(contains(nodeInfo(&tree, firstChild(&tree, 0)), "h-titel"), "the anchor as the info of the heading");
+        destroyTree(tree);
+        return nil;
+    end;
+end module body.

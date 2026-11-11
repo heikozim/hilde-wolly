@@ -1,0 +1,364 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each memoized function of the tests appends one byte to a file of its
+-- own every time it runs, so how often it ran is counted outside the Memo
+-- as well as by memoRuns.  Each test removes its file first and last.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    fromSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Standard.File (
+    FileDescriptor,
+    openAppend,
+    openRead,
+    readAll,
+    writeAll,
+    closeFile,
+    removeFileIfThere
+);
+import Standard.Task (
+    Lending,
+    openLending,
+    closeLending,
+    Task,
+    spawnLending,
+    join,
+    sleepFor
+);
+import Wolly.Memo (
+    Memoized,
+    Memo,
+    mostMemoEntries,
+    defaultMemoEntries,
+    memoized,
+    openMemo,
+    memoCall,
+    memoRuns,
+    memoSize,
+    memoLimit,
+    closeMemo
+);
+
+module body Wolly.Memo.Test is
+    ---
+    --- Counting runs
+    ---
+
+    function tally(path: Span[Nat8, Static]): Unit is
+        case openAppend(path, 384) of
+            when Some(value as file: FileDescriptor) do
+                var open: FileDescriptor := file;
+                assertTrue(writeAll(&!open, "x"), "a run could not be counted");
+                assertTrue(closeFile(open), "the count could not be closed");
+            when None do
+                assertTrue(false, "the count could not be opened");
+        end case;
+        return nil;
+    end;
+
+    -- How many bytes tally wrote to path, 0 when it wrote none.
+    function tallied(path: Span[Nat8, Static]): Index is
+        case openRead(path) of
+            when Some(value as file: FileDescriptor) do
+                var open: FileDescriptor := file;
+                var count: Index := 0;
+                case readAll(&!open) of
+                    when Some(value as text: String) do
+                        count := length(&text);
+                        destroyString(text);
+                    when None do
+                        assertTrue(false, "the count could not be read");
+                end case;
+                assertTrue(closeFile(open), "the count could not be closed");
+                return count;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function fresh(path: Span[Nat8, Static]): Unit is
+        assertTrue(removeFileIfThere(path), "an old count could not be removed");
+        return nil;
+    end;
+
+    function onceFile(): Span[Nat8, Static] is
+        return "memo-once.count";
+    end;
+
+    function requestFile(): Span[Nat8, Static] is
+        return "memo-request.count";
+    end;
+
+    function flightFile(): Span[Nat8, Static] is
+        return "memo-flight.count";
+    end;
+
+    function fullFile(): Span[Nat8, Static] is
+        return "memo-full.count";
+    end;
+
+    function tenfoldOnce(n: Nat64): Nat64 is
+        tally(onceFile());
+        return n * 10;
+    end;
+
+    function tenfoldRequest(n: Nat64): Nat64 is
+        tally(requestFile());
+        return n * 10;
+    end;
+
+    -- Sleeps so that the calls of the tasks overlap while it runs.
+    function tenfoldSlow(n: Nat64): Nat64 is
+        tally(flightFile());
+        sleepFor(30);
+        return n * 10;
+    end;
+
+    function tenfoldFull(n: Nat64): Nat64 is
+        tally(fullFile());
+        return n * 10;
+    end;
+
+    function once(): Memoized[Nat64, Nat64] is
+        return memoized(tenfoldOnce);
+    end;
+
+    function perRequest(): Memoized[Nat64, Nat64] is
+        return memoized(tenfoldRequest);
+    end;
+
+    function slow(): Memoized[Nat64, Nat64] is
+        return memoized(tenfoldSlow);
+    end;
+
+    function full(): Memoized[Nat64, Nat64] is
+        return memoized(tenfoldFull);
+    end;
+
+    ---
+    --- Requests
+    ---
+
+    generic [R: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, Static]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    function fakeRequest(): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", "GET");
+        addPair(&!params, "REQUEST_URI", "/price");
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(""));
+    end;
+
+    -- A handler as an application writes it: one Memo for the request,
+    -- the price asked for three times, the Memo closed before the answer.
+    -- The answer is ok when every call gave seventy and the function ran
+    -- once.
+    function servePrice(request: Request): String is
+        destroyRequest(request);
+        case openMemo(perRequest(), defaultMemoEntries()) of
+            when Some(value as memo: Memo[Nat64, Nat64]) do
+                let a: Nat64 := memoCall(&memo, 7);
+                let b: Nat64 := memoCall(&memo, 7);
+                let c: Nat64 := memoCall(&memo, 7);
+                let runs: Nat64 := memoRuns(&memo);
+                closeMemo(memo);
+                if (a = 70) and (b = 70) and (c = 70) and (runs = 1) then
+                    return fromSpan("ok");
+                end if;
+                return fromSpan("wrong");
+            when None do
+                return fromSpan("no memo");
+        end case;
+    end;
+
+    function answered(output: String): Bool is
+        let ok: Bool := (length(&output) = 2);
+        destroyString(output);
+        return ok;
+    end;
+
+    ---
+    --- Tasks
+    ---
+
+    record Job[R: Region]: Free is
+        memo: &[Memo[Nat64, Nat64], R];
+        argument: Nat64;
+    end;
+
+    -- 1 when the task got ten times its argument, else 0.
+    generic [R: Region]
+    function ask(job: Job[R]): Int64 is
+        if memoCall(job.memo, job.argument) = (job.argument * 10) then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- left tasks, all started before any is joined; how many got their
+    -- value.  same_argument gives every task 7, else each one of its own.
+    generic [R: Region, S: Region]
+    function many(scope: &![Lending[R], S], memo: &[Memo[Nat64, Nat64], R], left: Nat64, same_argument: Bool): Int64 is
+        let zero: Nat64 := 0;
+        if left = zero then
+            return 0;
+        end if;
+        var argument: Nat64 := 7;
+        if not same_argument then
+            argument := left + 100;
+        end if;
+        let work: Fn[Job[R], Int64] := ask;
+        case spawnLending(&~scope, work, Job(memo => memo, argument => argument)) of
+            when Right(right as task: Task[Int64]) do
+                let rest: Int64 := many(&~scope, memo, left - 1, same_argument);
+                return rest + join(task);
+            when Left(left as back: Job[R]) do
+                return -100;
+        end case;
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testLimits(): Unit is
+        assertTrue(mostMemoEntries() = 65536, "the most entries");
+        assertTrue(defaultMemoEntries() = 1024, "the default entries");
+        return nil;
+    end;
+
+    function testOnceAnArgument(): Unit is
+        fresh(onceFile());
+        case openMemo(once(), defaultMemoEntries()) of
+            when Some(value as memo: Memo[Nat64, Nat64]) do
+                assertTrue(memoLimit(&memo) = 1024, "the limit it was opened with");
+                assertTrue(memoCall(&memo, 3) = 30, "the first call gives the result");
+                assertTrue(memoCall(&memo, 3) = 30, "the second call gives it again");
+                assertTrue(memoCall(&memo, 3) = 30, "the third call gives it again");
+                assertTrue(tallied(onceFile()) = 1, "the same argument runs the function once");
+                assertTrue(memoRuns(&memo) = 1, "memoRuns counts the one run");
+                assertTrue(memoCall(&memo, 4) = 40, "another argument gives its own result");
+                assertTrue(tallied(onceFile()) = 2, "another argument runs the function again");
+                assertTrue(memoCall(&memo, 4) = 40, "and keeps it");
+                assertTrue(memoCall(&memo, 3) = 30, "the first is still kept");
+                assertTrue(tallied(onceFile()) = 2, "kept results run nothing");
+                assertTrue(memoRuns(&memo) = 2, "memoRuns counts both runs");
+                assertTrue(memoSize(&memo) = 2, "two arguments are held");
+                closeMemo(memo);
+                fresh(onceFile());
+            when None do
+                assertTrue(false, "no memo");
+        end case;
+        return nil;
+    end;
+
+    function testNothingCarriedBetweenRequests(): Unit is
+        fresh(requestFile());
+        assertTrue(answered(servePrice(fakeRequest())), "the first request is answered from one run");
+        assertTrue(tallied(requestFile()) = 1, "the first request ran the function once");
+        assertTrue(answered(servePrice(fakeRequest())), "the second request is answered from one run");
+        assertTrue(tallied(requestFile()) = 2, "the second request ran it again");
+        assertTrue(answered(servePrice(fakeRequest())), "the third request is answered from one run");
+        assertTrue(tallied(requestFile()) = 3, "every request runs it once of its own");
+        fresh(requestFile());
+        return nil;
+    end;
+
+    function testConcurrentCallsShareOneRun(): Unit is
+        fresh(flightFile());
+        let tasks: Nat64 := 16;
+        case openMemo(slow(), defaultMemoEntries()) of
+            when Some(value as made: Memo[Nat64, Nat64]) do
+                var same: Int64 := 0;
+                var distinct: Int64 := 0;
+                var runs_after_same: Nat64 := 0;
+                var runs_after_distinct: Nat64 := 0;
+                var count_after_same: Index := 0;
+                var started: Bool := false;
+                borrow m: &[Memo[Nat64, Nat64], rho] := &made do
+                    case openLending(m) of
+                        when Some(value as opened: Lending[rho]) do
+                            var scope: Lending[rho] := opened;
+                            same := many(&!scope, m, tasks, true);
+                            runs_after_same := memoRuns(m);
+                            count_after_same := tallied(flightFile());
+                            distinct := many(&!scope, m, tasks, false);
+                            runs_after_distinct := memoRuns(m);
+                            closeLending(scope);
+                            started := true;
+                        when None do
+                            skip;
+                    end case;
+                end borrow;
+                assertTrue(started, "no lending scope");
+                assertTrue(same = 16, "every task of the same argument gets the result");
+                assertTrue(runs_after_same = 1, "sixteen calls of one argument at once run once");
+                assertTrue(count_after_same = 1, "the function ran once for all of them");
+                assertTrue(distinct = 16, "every task of its own argument gets its result");
+                assertTrue((runs_after_distinct - runs_after_same) = 16, "sixteen arguments run sixteen times");
+                assertTrue(tallied(flightFile()) = 17, "the control counts every run");
+                closeMemo(made);
+                fresh(flightFile());
+            when None do
+                assertTrue(false, "no memo");
+        end case;
+        return nil;
+    end;
+
+    function testFullMemoKeepsNothingNew(): Unit is
+        fresh(fullFile());
+        case openMemo(full(), 2) of
+            when Some(value as memo: Memo[Nat64, Nat64]) do
+                assertTrue(memoCall(&memo, 1) = 10, "the first argument");
+                assertTrue(memoCall(&memo, 2) = 20, "the second argument");
+                assertTrue(memoCall(&memo, 3) = 30, "a third argument still gets its result");
+                assertTrue(memoCall(&memo, 3) = 30, "and again");
+                assertTrue(tallied(fullFile()) = 4, "a full memo keeps no new argument");
+                assertTrue(memoSize(&memo) = 2, "it holds no more than its limit");
+                assertTrue(memoCall(&memo, 1) = 10, "the kept ones stay");
+                assertTrue(tallied(fullFile()) = 4, "and run nothing");
+                closeMemo(memo);
+                fresh(fullFile());
+            when None do
+                assertTrue(false, "no memo");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,359 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Markdown after CommonMark, as a tree (AST, abstract syntax tree) and as HTML
+(HyperText Markup Language) that always passes the sanitizer of
+Standard.Html and so can be put into a page without a further check.
+
+Blocks: headings (ATX, after the atx format of Aaron Swartz, with #, and
+Setext with = or - below), paragraphs, thematic breaks, quotes and lists
+(bulleted and ordered, nested in any way), indented code blocks and code
+fences (with ``` or ~~~) with a language, tables of GFM (GitHub Flavored
+Markdown) with alignment, task lists of GFM (- [ ] and - [x], as
+class="task" and class="task done" on the li, without a box, as the
+sanitizer drops input), link definitions.  Inline: emphasis (*, _, ** and
+__), strikethrough of GFM (~~, as del; a single ~ stays text and is free
+for subscript), code, links (inline, by reference, as an autolink in angle
+brackets), images, hard and soft breaks, backslash escapes and entities.
+
+Only what is harmless is set: raw HTML is not passed on but shown as text,
+every <, >, &, " and ' appears as an entity.  Only parseMarkdownWithHtml
+and markdownWithHtmlToHtml read raw HTML (HTML blocks and inline HTML after
+CommonMark) and pass it on; then the whole HTML goes through sanitize with
+richPolicy, which removes script, style, iframe, forms, attributes starting
+with on and URLs with javascript:.  A link or an image is made only for a
+URL (Uniform Resource Locator) with https://, http://, mailto:, a single /
+or #, without blanks, control characters, backslash and any of < > " ';
+every other URL stays as text.  Then the HTML goes through sanitize of
+Standard.Html, even though the output is safe already: two layers.
+
+The tree lies in a table of nodes; node 0 is the document.  The relatives of
+a node come from firstChild, nextSibling and parentOf, 0 meaning none.  The
+texts of the nodes lie in the tree and are read as views into it.
+
+Limits: raw HTML only with the functions WithHtml, otherwise it appears as
+text; there the sanitizer is the only layer for the raw HTML, and where it
+reads otherwise than a browser, its reading holds: an open script without an
+end takes the rest of the page, a processing instruction and a CDATA section
+end for it at the first >, <!--> opens a comment up to the next -->, of the
+named entities in attributes it knows six.  An HTML block in a quote or an
+item can take a following line without a marker as a lazy continuation, as a
+paragraph does.  Footnotes, anchors, callouts and [toc] only with
+parseMarkdownWith and extended; no strikethrough with a single ~, no
+autolinks without angle brackets.  A link, an image or a definition with a
+URL outside the rule above (relative without /, empty, with a blank or a
+backslash, another scheme) stays text, also where the CommonMark
+specification makes a link.  Of the named entities the module knows those of
+Latin-1 and 61 more, every other stays text; labels are brought to lower
+case only character by character, for ASCII (American Standard Code for
+Information Interchange), Latin-1, Latin Extended-A, Greek and Cyrillic
+(the capital sharp s does not become SS).  Emphasis tells the Unicode
+character classes apart only approximately.  Quotes and lists are nested at
+most mostMarkdownDepth levels deep, what lies deeper is paragraph text; the
+sanitizer lets at most 100 elements stand inside each other and drops deeper
+tags, keeping their text.
+
+    let tree: Tree := parseMarkdown("# Title\n\n- one\n- two\n");
+    let kind: NodeKind := nodeKind(&tree, firstChild(&tree, 0));
+    let html: String := treeToHtml(&tree);
+    let direct: String := markdownToHtml("*Hello*");
+"""
+import Standard.String (
+    String
+);
+import Standard.Html (
+    Policy
+);
+
+module Wolly.Markdown is
+    """
+    What a node is.  Blocks: DocumentNode, ParagraphNode, HeadingNode,
+    ThematicBreakNode, BlockQuoteNode, BulletListNode, OrderedListNode,
+    ItemNode, CodeBlockNode, TableNode, TableRowNode, TableCellNode,
+    DefinitionNode.  Inline: TextNode, SoftBreakNode, HardBreakNode,
+    CodeSpanNode, EmphasisNode, StrongNode, LinkNode, ImageNode,
+    StrikeNode (strikethrough of GFM).  Only in a tree of
+    parseMarkdownWithHtml: HtmlBlockNode (a block) and HtmlInlineNode (in
+    the text), raw HTML.  Only in a tree of parseMarkdownWith with
+    extended: FootnoteNode (the definition of a footnote, its blocks as
+    children), FootnoteRefNode (the reference [^label] in the text) and
+    TocNode (a paragraph [toc], the table of contents).
+    """
+    union NodeKind: Free is
+        case DocumentNode;
+        case ParagraphNode;
+        case HeadingNode;
+        case ThematicBreakNode;
+        case BlockQuoteNode;
+        case BulletListNode;
+        case OrderedListNode;
+        case ItemNode;
+        case CodeBlockNode;
+        case TableNode;
+        case TableRowNode;
+        case TableCellNode;
+        case DefinitionNode;
+        case TextNode;
+        case SoftBreakNode;
+        case HardBreakNode;
+        case CodeSpanNode;
+        case EmphasisNode;
+        case StrongNode;
+        case LinkNode;
+        case ImageNode;
+        case StrikeNode;
+        case HtmlBlockNode;
+        case HtmlInlineNode;
+        case FootnoteNode;
+        case FootnoteRefNode;
+        case TocNode;
+    end;
+
+    """
+    The tree of a Markdown text.  Linear: destroyTree gives it back.
+    """
+    type Tree: Linear;
+
+    """
+    The most bytes parseMarkdown reads: 1048576.  A longer text is cut
+    there; what is shown is the caller's decision.
+    """
+    function mostMarkdownBytes(): Index
+        ensures result = 1048576;
+
+    """
+    The greatest depth to which quotes and lists are read inside each other:
+    16.  What lies deeper is paragraph text.
+    """
+    function mostMarkdownDepth(): Index
+        ensures result = 16;
+
+    """
+    The most link definitions a tree keeps: 512.  Further ones are read and
+    dropped.
+    """
+    function mostDefinitions(): Index
+        ensures result = 512;
+
+    """
+    The most headings that get an anchor in a tree of parseMarkdownWith with
+    extended: 1024.  Later ones stay without.
+    """
+    function mostAnchors(): Index
+        ensures result = 1024;
+
+    """
+    The tree of text.  The first mostMarkdownBytes bytes are read.  No text
+    is an error: every sequence of bytes gives a tree, at least the
+    document.
+    """
+    generic [T: Region]
+    function parseMarkdown(text: Span[Nat8, T]): Tree
+        ensures nodeCount(&result) >= 1;
+
+    """
+    The tree of text as with parseMarkdown, but with raw HTML: HTML blocks
+    after CommonMark 0.31.2, section 4.6 (all seven kinds), as
+    HtmlBlockNode and inline HTML after section 6.6 (opening and closing
+    tags, comments, processing instructions, declarations, CDATA) as
+    HtmlInlineNode; their nodeText is the source as it stands.  treeToHtml
+    passes it on unchanged and then leads the whole HTML through sanitize
+    with richPolicy.  Only for text whose author may write HTML: the
+    sanitizer stays the only layer for the raw HTML.
+    """
+    generic [T: Region]
+    function parseMarkdownWithHtml(text: Span[Nat8, T]): Tree
+        ensures nodeCount(&result) >= 1;
+
+    """
+    The tree of text, with raw HTML as parseMarkdownWithHtml when html
+    holds, otherwise as parseMarkdown.  With extended in addition, for the
+    editor Canela and for Lucy: every heading gets an anchor as nodeInfo
+    (h- and its text in lower case letters, digits and hyphens, the German
+    umlauts and sharp s as ae oe ue ss, on a clash -2, -3 and on), a link #x
+    points to the anchor h- and the word of x, a definition [^label]: text
+    at the start of a block becomes a FootnoteNode, [^label] in the text a
+    FootnoteRefNode, a paragraph [toc] a TocNode, and a quote whose first
+    line is [!NOTE], [!TIP], [!IMPORTANT], [!WARNING] or [!CAUTION] a
+    callout of that kind (nodeNumber 1 to 5; the line leaves the tree).
+    treeToHtml then gives the headings an id, the callouts a div of the
+    classes callout and callout-note and so on, and appends the footnotes
+    the text refers to as a div of the class footnotes.
+    """
+    generic [T: Region]
+    function parseMarkdownWith(text: Span[Nat8, T], html: Bool, extended: Bool): Tree
+        ensures nodeCount(&result) >= 1;
+
+    """
+    Gives the tree back.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyTree(tree: Tree): Unit;
+
+    """
+    How many nodes the tree has, the document (node 0) counted.
+    """
+    generic [R: Region]
+    function nodeCount(tree: &[Tree, R]): Index
+        ensures result >= 1;
+
+    """
+    The kind of the node n.
+    """
+    generic [R: Region]
+    function nodeKind(tree: &[Tree, R], n: Index): NodeKind
+        requires n < nodeCount(tree);
+
+    """
+    The first child of the node n, 0 when it has none.
+    """
+    generic [R: Region]
+    function firstChild(tree: &[Tree, R], n: Index): Index
+        requires n < nodeCount(tree)
+        ensures result < nodeCount(tree);
+
+    """
+    The last child of the node n, 0 when it has none.
+    """
+    generic [R: Region]
+    function lastChild(tree: &[Tree, R], n: Index): Index
+        requires n < nodeCount(tree)
+        ensures result < nodeCount(tree);
+
+    """
+    The next node under the same parent, 0 when n is the last.
+    """
+    generic [R: Region]
+    function nextSibling(tree: &[Tree, R], n: Index): Index
+        requires n < nodeCount(tree)
+        ensures result < nodeCount(tree);
+
+    """
+    The parent of n; 0 for the document.
+    """
+    generic [R: Region]
+    function parentOf(tree: &[Tree, R], n: Index): Index
+        requires n < nodeCount(tree)
+        ensures result < nodeCount(tree);
+
+    """
+    The text of the node n: the text of a TextNode, the content of a
+    CodeSpanNode and of a CodeBlockNode, the target of a LinkNode and of an
+    ImageNode, the label of a DefinitionNode in the form labels are compared
+    in (white space folded, lower case), the source of an HtmlBlockNode
+    (every line with its line end) and of an HtmlInlineNode.  Empty for
+    every other node, also for paragraph and heading: their text lies in
+    their children.
+    There is no ensures: the length of the view follows the text, no
+    property under O(1) but the type.
+    """
+    generic [R: Region]
+    function nodeText(tree: &[Tree, R], n: Index): Span[Nat8, R]
+        requires n < nodeCount(tree);
+
+    """
+    The second text of the node n: the title of a LinkNode and of an
+    ImageNode, the info string of a CodeBlockNode (such as "rust ignore"),
+    the target of a DefinitionNode (its title is its child, a TextNode),
+    the anchor of a heading in a tree of parseMarkdownWith with extended,
+    the label of a FootnoteNode in the form labels are compared in.  Empty
+    for every other node.
+    There is no ensures: the length of the view follows the text, no
+    property under O(1) but the type.
+    """
+    generic [R: Region]
+    function nodeInfo(tree: &[Tree, R], n: Index): Span[Nat8, R]
+        requires n < nodeCount(tree);
+
+    """
+    A number of the node n: the level of a heading (1 to 6), the start
+    number of an ordered list, the count of columns of a table, the
+    alignment of a cell (0 none, 1 left, 2 centre, 3 right), 1 for the
+    header row of a table, for an ItemNode the task of GFM (0 none, 1 open
+    with [ ], 2 done with [x] or [X]), the number of a footnote for a
+    FootnoteNode (0 when no reference names it) and a FootnoteRefNode, the
+    kind of a callout for a BlockQuoteNode (0 none, 1 note, 2 tip,
+    3 important, 4 warning, 5 caution), the count of footnotes with a
+    reference for the document.  0 for every other node.
+    """
+    generic [R: Region]
+    function nodeNumber(tree: &[Tree, R], n: Index): Index
+        requires n < nodeCount(tree);
+
+    """
+    Whether the list n is tight: no blank line between its items and
+    between the blocks of an item.  False for every other node.
+    """
+    generic [R: Region]
+    function isTightList(tree: &[Tree, R], n: Index): Bool
+        requires n < nodeCount(tree);
+
+    """
+    The rules of the sanitizer for the HTML of this module: the elements
+    a blockquote br code del em h1 to h6 hr img li ol p pre strong table tbody
+    td th thead tr ul and the attributes href title src alt class start.
+    Links get rel="nofollow noopener".
+    No contract: a value of its own type built from constants; no property cheaper than its type holds.
+    """
+    function markdownPolicy(): Policy;
+
+    """
+    The rules of the sanitizer for a tree with raw HTML: the elements of
+    markdownPolicy and in addition abbr del div ins kbd mark s small span
+    sub sup u, the attributes of markdownPolicy and in addition lang dir
+    width height colspan rowspan.  Links get rel="nofollow noopener".  What
+    the sanitizer never lets through stays out: script, style, iframe,
+    forms and input, attributes starting with on, URLs with javascript: and
+    any scheme other than http, https and mailto.
+    No contract: a value of its own type built from constants; no property cheaper than its type holds.
+    """
+    function richPolicy(): Policy;
+
+    """
+    The HTML of the tree, led through the sanitizer of Standard.Html: with
+    richPolicy for a tree of parseMarkdownWithHtml, otherwise with
+    markdownPolicy.
+    No contract: a text whose length follows the tree.
+    """
+    generic [R: Region]
+    function treeToHtml(tree: &[Tree, R]): String;
+
+    """
+    text, Markdown, as HTML: parseMarkdown, treeToHtml and destroyTree in
+    one.  The first mostMarkdownBytes bytes are read.
+    No contract: a text whose length follows the text of the input.
+    """
+    generic [T: Region]
+    function markdownToHtml(text: Span[Nat8, T]): String;
+
+    """
+    text, Markdown with raw HTML, as HTML: parseMarkdownWithHtml,
+    treeToHtml (with richPolicy) and destroyTree in one.  The first
+    mostMarkdownBytes bytes are read.
+    No contract: a text whose length follows the text of the input.
+    """
+    generic [T: Region]
+    function markdownWithHtmlToHtml(text: Span[Nat8, T]): String;
+
+    """
+    text as HTML: parseMarkdownWith with html and extended, treeToHtml and
+    destroyTree in one.  With extended the HTML goes through the sanitizer
+    with the elements of markdownPolicy or richPolicy, in addition div and
+    sup, and the attribute id, which it keeps only as an anchor.
+    No contract: a text whose length follows the text of the input.
+    """
+    generic [T: Region]
+    function markdownToHtmlWith(text: Span[Nat8, T], html: Bool, extended: Bool): String;
+
+    """
+    Whether url may be the target of a link: see the description of the
+    module.
+    No contract: a run over url whose cost grows with its length.
+    """
+    generic [U: Region]
+    function isSafeLink(url: Span[Nat8, U]): Bool;
+end module.

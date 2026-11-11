@@ -1,0 +1,12 @@
+{
+ "title": "Links & <Things>",
+ "kind": "list",
+ "links": [
+  {"name": "a b", "href": "http://example.org/x y?q=1&r=<2>#top"},
+  {"name": "evil", "href": "javascript:alert(1)"},
+  {"name": "O'Neil (x)", "href": "/local/p'q"},
+  {"name": "up", "href": "HTTPS://example.org/"}
+ ],
+ "note": "",
+ "mail": "a@b.example"
+}

@@ -1,0 +1,295 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Widths of code points and clusters first, then the layout: umlauts, also
+-- decomposed, emoji sequences, CJK, tabs, hard and soft breaks.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Wolly.TextLayout (
+    Layout,
+    mostTabSize,
+    mostLineWidth,
+    pointWidth,
+    clusterEndAt,
+    clusterWidth,
+    displayWidth,
+    fittingBytes,
+    wrapText,
+    destroyLayout,
+    lineCount,
+    lineStart,
+    lineEnd,
+    lineWidth,
+    lineSource,
+    endsHard
+);
+
+module body Wolly.TextLayout.Test is
+    -- Whether line i of layout is the bytes start to stop, width columns wide.
+    generic [R: Region]
+    function lineIs(layout: &[Layout, R], i: Index, start: Index, stop: Index, width: Index): Bool is
+        if i >= lineCount(layout) then
+            return false;
+        end if;
+        return ((lineStart(layout, i) = start) and (lineEnd(layout, i) = stop)) and (lineWidth(layout, i) = width);
+    end;
+
+    -- Whether every line of layout ends at or after its start, and starts at
+    -- or after the end of the line before.
+    generic [R: Region]
+    function ordered(layout: &[Layout, R]): Bool is
+        var i: Index := 0;
+        var last: Index := 0;
+        while i < lineCount(layout) do
+            if (lineEnd(layout, i) < lineStart(layout, i)) or (lineStart(layout, i) < last) then
+                return false;
+            end if;
+            last := lineEnd(layout, i);
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function testConstants(): Unit is
+        assertTrue(mostTabSize() = 64, "a tab of 64 at most");
+        assertTrue(mostLineWidth() = 65536, "65536 columns at most");
+        return nil;
+    end;
+
+    function testPointWidth(): Unit is
+        assertTrue(pointWidth('a') = 1, "a letter");
+        assertTrue(pointWidth(0) = 0, "the zero byte");
+        assertTrue(pointWidth(9) = 0, "a tab alone has no width");
+        assertTrue(pointWidth(127) = 0, "delete");
+        assertTrue(pointWidth(#x85) = 0, "a C1 control");
+        assertTrue(pointWidth(#xE9) = 1, "e with acute");
+        assertTrue(pointWidth(#xAD) = 1, "the soft hyphen, as terminals show it");
+        assertTrue(pointWidth(#x301) = 0, "a combining acute");
+        assertTrue(pointWidth(#x20E3) = 0, "the combining keycap");
+        assertTrue(pointWidth(#x200B) = 0, "the zero width space");
+        assertTrue(pointWidth(#x200D) = 0, "the zero width joiner");
+        assertTrue(pointWidth(#xFE0F) = 0, "a variation selector");
+        assertTrue(pointWidth(#x4E2D) = 2, "a CJK ideograph");
+        assertTrue(pointWidth(#x3042) = 2, "hiragana");
+        assertTrue(pointWidth(#xAC00) = 2, "a Hangul syllable");
+        assertTrue(pointWidth(#x1100) = 2, "a Hangul initial");
+        assertTrue(pointWidth(#x1161) = 0, "a Hangul vowel joins the initial");
+        assertTrue(pointWidth(#x3000) = 2, "the ideographic space");
+        assertTrue(pointWidth(#xFF21) = 2, "a fullwidth letter");
+        assertTrue(pointWidth(#xFF71) = 1, "a halfwidth katakana");
+        assertTrue(pointWidth(#x20000) = 2, "CJK extension B");
+        assertTrue(pointWidth(#x1F600) = 2, "an emoji of emoji presentation");
+        assertTrue(pointWidth(#x1F1E9) = 2, "a regional indicator");
+        assertTrue(pointWidth(#x2764) = 1, "a heart of text presentation");
+        assertTrue(pointWidth(#x231A) = 2, "a watch of emoji presentation");
+        assertTrue(pointWidth(#x10FFFF) = 1, "the last code point");
+        return nil;
+    end;
+
+    -- Umlauts, composed and decomposed: the same width, one cluster each.
+    function testUmlauts(): Unit is
+        assertTrue(displayWidth("Gr\u{fc}\u{df}e", 8) = 5, "composed: five columns");
+        assertTrue(displayWidth("Gru\u{308}\u{df}e", 8) = 5, "decomposed: five columns as well");
+        assertTrue(displayWidth("A\u{308}O\u{308}U\u{308}", 8) = 3, "three capitals with diaeresis");
+        assertTrue(clusterEndAt("Gru\u{308}\u{df}e", 2) = 5, "u and the diaeresis are one cluster");
+        assertTrue(clusterWidth("Gru\u{308}\u{df}e", 2) = 1, "of one column");
+        assertTrue(clusterWidth("\u{308}", 0) = 0, "a diaeresis alone has no width");
+        assertTrue(displayWidth("e\u{301}\u{302}\u{303}", 8) = 1, "a letter with three marks");
+        assertTrue(fittingBytes("u\u{308}x", 1, 8) = 3, "the mark goes with its letter");
+        let layout: Layout := wrapText("Gru\u{308}\u{df}e", 3, 8);
+        assertTrue(lineCount(&layout) = 2, "two lines");
+        assertTrue(lineIs(&layout, 0, 0, 5, 3), "the mark stays on the line of its letter");
+        assertTrue(lineIs(&layout, 1, 5, 8, 2), "sharp s and e");
+        destroyLayout(layout);
+        let words: Layout := wrapText("Gr\u{fc}\u{df}e aus Berlin", 10, 8);
+        assertTrue(lineCount(&words) = 2, "two lines of words");
+        assertTrue(lineIs(&words, 0, 0, 11, 9), "the first ends before the blank");
+        assertTrue(lineIs(&words, 1, 12, 18, 6), "the second starts after it");
+        assertFalse(endsHard(&words, 0), "a soft break");
+        assertTrue(lineSource(&words, 1) = 0, "both from the first line of the text");
+        destroyLayout(words);
+        return nil;
+    end;
+
+    -- Emoji sequences: joined by ZWJ, with a skin tone, flags, the two
+    -- variation selectors and a keycap.
+    function testEmoji(): Unit is
+        let family: Span[Nat8, Static] := "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assertTrue(clusterEndAt(family, 0) = 18, "a family joined by ZWJ is one cluster");
+        assertTrue(displayWidth(family, 8) = 2, "of two columns");
+        assertTrue(displayWidth("\u{1f44d}\u{1f3fd}", 8) = 2, "thumbs up with a skin tone: two columns");
+        assertTrue(clusterEndAt("\u{1f44d}\u{1f3fd}", 0) = 8, "one cluster");
+        assertTrue(displayWidth("\u{1f469}\u{1f3fe}\u{200d}\u{1f4bb}", 8) = 2, "a skin tone inside a ZWJ sequence");
+        assertTrue(displayWidth("\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}", 8) = 2, "the rainbow flag");
+        let flags: Span[Nat8, Static] := "\u{1f1e9}\u{1f1ea}\u{1f1eb}\u{1f1f7}";
+        assertTrue(clusterEndAt(flags, 0) = 8, "a flag is two regional indicators");
+        assertTrue(displayWidth(flags, 8) = 4, "two flags, four columns");
+        let layout: Layout := wrapText(flags, 3, 8);
+        assertTrue(lineCount(&layout) = 2, "one flag a line");
+        assertTrue(lineIs(&layout, 0, 0, 8, 2), "a flag is never split");
+        assertTrue(lineIs(&layout, 1, 8, 16, 2), "the second flag");
+        destroyLayout(layout);
+        assertTrue(displayWidth("\u{2764}\u{fe0f}", 8) = 2, "a heart with emoji presentation");
+        assertTrue(displayWidth("\u{2764}", 8) = 1, "without it");
+        assertTrue(displayWidth("\u{231a}\u{fe0e}", 8) = 1, "a watch with text presentation");
+        assertTrue(displayWidth("1\u{fe0f}\u{20e3}", 8) = 2, "a keycap");
+        let joined: Layout := wrapText("ab\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}cd", 3, 8);
+        assertTrue(lineIs(&joined, 0, 0, 2, 2), "the line breaks before the sequence");
+        assertTrue(lineIs(&joined, 1, 2, 20, 2), "the sequence whole");
+        assertTrue(lineIs(&joined, 2, 20, 22, 2), "and after it");
+        destroyLayout(joined);
+        return nil;
+    end;
+
+    -- CJK: two columns a character, a break allowed between any two.
+    function testCjk(): Unit is
+        assertTrue(displayWidth("\u{6771}\u{4eac}\u{90fd}", 8) = 6, "three ideographs, six columns");
+        assertTrue(displayWidth("\u{d55c}\u{ad6d}\u{c5b4}", 8) = 6, "three Hangul syllables");
+        assertTrue(displayWidth("\u{1112}\u{1161}\u{11ab}", 8) = 2, "a Hangul syllable of three parts");
+        assertTrue(clusterEndAt("\u{1112}\u{1161}\u{11ab}", 0) = 9, "is one cluster");
+        assertTrue(displayWidth("\u{30ab}\u{30bf}\u{30ab}\u{30ca}", 8) = 8, "katakana");
+        assertTrue(displayWidth("\u{ff76}\u{ff80}\u{ff76}\u{ff85}", 8) = 4, "halfwidth katakana");
+        assertTrue(fittingBytes("\u{6771}\u{4eac}", 3, 8) = 3, "one ideograph fits in three columns");
+        let city: Layout := wrapText("\u{6771}\u{4eac}\u{90fd}", 4, 8);
+        assertTrue(lineCount(&city) = 2, "two lines");
+        assertTrue(lineIs(&city, 0, 0, 6, 4), "two ideographs");
+        assertTrue(lineIs(&city, 1, 6, 9, 2), "the third");
+        destroyLayout(city);
+        let mixed: Layout := wrapText("ab\u{6771}\u{4eac}", 3, 8);
+        assertTrue(lineCount(&mixed) = 3, "three lines");
+        assertTrue(lineIs(&mixed, 0, 0, 2, 2), "the latin letters");
+        assertTrue(lineIs(&mixed, 1, 2, 5, 2), "a break before the ideograph");
+        assertTrue(lineIs(&mixed, 2, 5, 8, 2), "and between the two");
+        destroyLayout(mixed);
+        let narrow: Layout := wrapText("\u{6771}\u{4eac}", 1, 8);
+        assertTrue(lineCount(&narrow) = 2, "one ideograph a line");
+        assertTrue(lineIs(&narrow, 0, 0, 3, 2), "wider than the line, alone in it");
+        destroyLayout(narrow);
+        return nil;
+    end;
+
+    function testTabs(): Unit is
+        assertTrue(displayWidth("\t", 8) = 8, "a tab to column 8");
+        assertTrue(displayWidth("a\tb", 4) = 5, "a tab after a letter goes to column 4");
+        assertTrue(displayWidth("abcd\t", 4) = 8, "a tab at a stop goes to the next");
+        assertTrue(displayWidth("\u{6771}\t", 4) = 4, "after an ideograph");
+        assertTrue(displayWidth("a\t", 1) = 2, "a tab of one column");
+        assertTrue(fittingBytes("ab\tc", 4, 4) = 3, "the tab fits up to column 4");
+        assertTrue(fittingBytes("ab\tc", 3, 4) = 2, "but not in three");
+        let layout: Layout := wrapText("a\tb", 4, 4);
+        assertTrue(lineCount(&layout) = 2, "a break at the tab");
+        assertTrue(lineIs(&layout, 0, 0, 1, 1), "the tab hangs");
+        assertTrue(lineIs(&layout, 1, 2, 3, 1), "the next line after it");
+        destroyLayout(layout);
+        let fits: Layout := wrapText("a\tb", 8, 4);
+        assertTrue(lineCount(&fits) = 1, "wide enough: one line");
+        assertTrue(lineIs(&fits, 0, 0, 3, 5), "of five columns");
+        destroyLayout(fits);
+        return nil;
+    end;
+
+    function testHardBreaks(): Unit is
+        let empty: Layout := wrapText("", 10, 8);
+        assertTrue(lineCount(&empty) = 1, "the empty text is one line");
+        assertTrue(lineIs(&empty, 0, 0, 0, 0), "an empty one");
+        assertFalse(endsHard(&empty, 0), "without a break");
+        destroyLayout(empty);
+        let two: Layout := wrapText("a\nb", 10, 8);
+        assertTrue(lineCount(&two) = 2, "two lines");
+        assertTrue(endsHard(&two, 0), "the first ends hard");
+        assertFalse(endsHard(&two, 1), "the last without a break");
+        assertTrue(lineSource(&two, 1) = 1, "the second line of the text");
+        destroyLayout(two);
+        let crlf: Layout := wrapText("a\r\nb\rc", 10, 8);
+        assertTrue(lineCount(&crlf) = 3, "CR LF and CR break");
+        assertTrue(lineIs(&crlf, 1, 3, 4, 1), "CR LF is one break");
+        destroyLayout(crlf);
+        let last: Layout := wrapText("a\n", 10, 8);
+        assertTrue(lineCount(&last) = 1, "a break at the end opens no line");
+        assertTrue(endsHard(&last, 0), "but ends the one before");
+        destroyLayout(last);
+        let blank: Layout := wrapText("\n\n", 10, 8);
+        assertTrue(lineCount(&blank) = 2, "two empty lines");
+        destroyLayout(blank);
+        let others: Layout := wrapText("a\u{2028}b\u{2029}c\u{85}d", 10, 8);
+        assertTrue(lineCount(&others) = 4, "the line and paragraph separators and NEL");
+        assertTrue(lineSource(&others, 3) = 3, "four lines of the text");
+        destroyLayout(others);
+        assertTrue(displayWidth("ab\nabcd\nabc", 8) = 4, "the widest line");
+        assertTrue(fittingBytes("a\nbc", 10, 8) = 1, "fittingBytes stops at a break");
+        return nil;
+    end;
+
+    function testSoftBreaks(): Unit is
+        let long: Layout := wrapText("abcdefgh", 3, 8);
+        assertTrue(lineCount(&long) = 3, "a long word is split");
+        assertTrue(lineIs(&long, 0, 0, 3, 3), "abc");
+        assertTrue(lineIs(&long, 2, 6, 8, 2), "gh");
+        destroyLayout(long);
+        let spaces: Layout := wrapText("a   b", 2, 8);
+        assertTrue(lineIs(&spaces, 0, 0, 1, 1), "the blanks hang");
+        assertTrue(lineIs(&spaces, 1, 4, 5, 1), "and are in no line");
+        destroyLayout(spaces);
+        let lead: Layout := wrapText("  ab cd", 5, 8);
+        assertTrue(lineIs(&lead, 0, 0, 4, 4), "blanks at the start of a line stay");
+        assertTrue(lineIs(&lead, 1, 5, 7, 2), "cd");
+        destroyLayout(lead);
+        let zwsp: Layout := wrapText("ab\u{200b}cd", 3, 8);
+        assertTrue(lineIs(&zwsp, 0, 0, 5, 2), "a break after the zero width space");
+        assertTrue(lineIs(&zwsp, 1, 5, 7, 2), "cd");
+        destroyLayout(zwsp);
+        let word: Layout := wrapText("aa bbbbbb", 4, 8);
+        assertTrue(lineIs(&word, 0, 0, 2, 2), "aa");
+        assertTrue(lineIs(&word, 1, 3, 7, 4), "the long word split after the break");
+        assertTrue(lineIs(&word, 2, 7, 9, 2), "its rest");
+        assertTrue(ordered(&word), "in order");
+        destroyLayout(word);
+        let exact: Layout := wrapText("abc def", 7, 8);
+        assertTrue(lineCount(&exact) = 1, "a line of exactly the width");
+        destroyLayout(exact);
+        let wide: Layout := wrapText("x \u{6771}\u{4eac} y", 4, 8);
+        assertTrue(ordered(&wide), "ideographs and blanks in order");
+        assertTrue(lineCount(&wide) = 2, "two lines");
+        assertTrue(lineIs(&wide, 0, 0, 5, 4), "x, the blank and the first ideograph fill four columns");
+        assertTrue(lineIs(&wide, 1, 5, 10, 4), "a break between the ideographs, the blank inside the line");
+        destroyLayout(wide);
+        return nil;
+    end;
+
+    -- A byte that begins no well-formed UTF-8 is a cluster of one column.
+    function testBrokenUtf8(): Unit is
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, "a");
+        writeByte(&!builder, 255);
+        writeByte(&!builder, 195);
+        writeString(&!builder, "b");
+        let text: String := finalize(builder);
+        assertTrue(clusterEndAt(asSpan(&text), 1) = 2, "a stray byte is a cluster");
+        assertTrue(clusterWidth(asSpan(&text), 1) = 1, "of one column");
+        assertTrue(clusterEndAt(asSpan(&text), 2) = 3, "a lead byte without its follower too");
+        assertTrue(displayWidth(asSpan(&text), 8) = 4, "four columns");
+        let layout: Layout := wrapText(asSpan(&text), 2, 8);
+        assertTrue(lineCount(&layout) = 2, "two lines");
+        assertTrue(ordered(&layout), "in order");
+        destroyLayout(layout);
+        destroyString(text);
+        return nil;
+    end;
+end module body.

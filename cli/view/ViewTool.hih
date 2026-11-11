@@ -1,0 +1,29 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The templates of tenants checked and rendered with Wolly.View at
+run time, from the command line.
+
+    view check DIRECTORY [DIRECTORY...]
+    view render DATA LAYOUT PAGE DIRECTORY [DIRECTORY...]
+
+check loads every file of the first directory whose name ends in .html or
+.jinja, searching the directories in their order, as a tenant's engine
+does, and prints ok or the error of each, then how many loaded; it exits 0
+when all did.  render renders PAGE inside LAYOUT (an empty LAYOUT renders
+PAGE alone) with the JSON in the file DATA, and prints what it wrote, or
+the error and exits 1.  The engine of both has the functions of
+Wolly.ViewFunctions, asset without a directory (the path as it is, as
+a template engine without asset directories gives it) and t without a catalog (the key).
+"""
+module Wolly.Example.ViewTool is
+    """
+    The command of the arguments.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

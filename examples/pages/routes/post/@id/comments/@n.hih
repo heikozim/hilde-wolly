@@ -1,0 +1,38 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Tree (
+    Page,
+    isWrapped
+);
+import Wolly.Example.Pages.Site.Post.Id (
+    Param as Post
+);
+
+module Wolly.Example.Pages.Site.Post.Id.Comments.N is
+    """
+    The number of a comment of a post, from 1 to 999.
+    """
+    type Param: Free;
+
+    """
+    The comment whose number text is, one to three decimal digits, or None
+    for anything else and for 0.
+    No contract: an Option, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function parse(text: Span[Nat8, R]): Option[Param];
+
+    """
+    GET /post/:id/comments/:n: the comment n of the post id, the values in
+    the order of the path.
+    """
+    function get(request: Request, post: Post, comment: Param): Page
+        ensures isWrapped(&result);
+end module.

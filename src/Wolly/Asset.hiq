@@ -1,0 +1,121 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex,
+    substring
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile,
+    containsSymlink
+);
+import Standard.Libcrypto (
+    sha256
+);
+
+module body Wolly.Asset is
+    function versionDigits(): Index is
+        return 16;
+    end;
+
+    generic [P: Region]
+    function isAssetPath(path: Span[Nat8, P]): Bool is
+        let size: Index := spanLength(path);
+        if (size < 2) or (size > 1024) then
+            return false;
+        end if;
+        if (path[0] /= '/') or (path[size - 1] = '/') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := path[i];
+            let lower: Bool := (byte >= 'a') and (byte <= 'z');
+            let upper: Bool := (byte >= 'A') and (byte <= 'Z');
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let mark: Bool := (((byte = '.') or (byte = '-')) or (byte = '_')) or (byte = '/');
+            if not (((lower or upper) or digit) or mark) then
+                return false;
+            end if;
+            -- After a slash comes the first byte of a segment: neither
+            -- another slash nor a dot.
+            if (byte = '/') and ((i + 1) < size) then
+                let next: Nat8 := path[i + 1];
+                if (next = '/') or (next = '.') then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The content of the file at path, None when it cannot be read.
+    generic [P: Region]
+    function content(path: Span[Nat8, P]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return read;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, P: Region]
+    function assetVersion(root: Span[Nat8, R], path: Span[Nat8, P]): Option[String] is
+        if (spanLength(root) = 0) or (not isAssetPath(path)) then
+            return None();
+        end if;
+        var whole: StringBuilder := makeStringBuilder();
+        writeString(&!whole, root);
+        writeString(&!whole, path);
+        let full: String := finalize(whole);
+        if containsSymlink(asSpan(&full)) then
+            destroyString(full);
+            return None();
+        else
+            let read: Option[String] := content(asSpan(&full));
+            destroyString(full);
+            case read of
+                when Some(value as bytes: String) do
+                    let digest: Option[String] := sha256(asSpan(&bytes));
+                    destroyString(bytes);
+                    case digest of
+                        when Some(value as hash: String) do
+                            let hex: String := bytesToHex(asSpan(&hash));
+                            destroyString(hash);
+                            var out: StringBuilder := makeStringBuilder();
+                            writeString(&!out, "?v=");
+                            writeString(&!out, substring(asSpan(&hex), 0, versionDigits()));
+                            destroyString(hex);
+                            let version: String := finalize(out);
+                            return Some(value => version);
+                        when None do
+                            return None();
+                    end case;
+                when None do
+                    return None();
+            end case;
+        end if;
+    end;
+end module body.

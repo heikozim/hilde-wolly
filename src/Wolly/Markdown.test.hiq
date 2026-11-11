@@ -1,0 +1,512 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- What must not come out first: a tag, a javascript: link, a way out of
+-- the attribute.  Then that what should come out does.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    contains
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Wolly.Markdown (
+    NodeKind,
+    Tree,
+    mostMarkdownBytes,
+    mostMarkdownDepth,
+    mostDefinitions,
+    parseMarkdown,
+    destroyTree,
+    nodeCount,
+    nodeKind,
+    firstChild,
+    lastChild,
+    nextSibling,
+    parentOf,
+    nodeText,
+    nodeInfo,
+    nodeNumber,
+    isTightList,
+    markdownPolicy,
+    richPolicy,
+    treeToHtml,
+    markdownToHtml,
+    parseMarkdownWithHtml,
+    markdownWithHtmlToHtml,
+    isSafeLink
+);
+import Standard.Html (
+    sanitize
+);
+
+module body Wolly.Markdown.Test is
+    generic [A: Region, B: Region]
+    function sameBytes(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function becomes(text: Span[Nat8, Static], html: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtml(text);
+        assertTrue(sameBytes(asSpan(&made), html), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    function lacks(text: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtml(text);
+        assertFalse(contains(asSpan(&made), part), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    function rich(text: Span[Nat8, Static], html: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownWithHtmlToHtml(text);
+        assertTrue(sameBytes(asSpan(&made), html), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    function richLacks(text: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownWithHtmlToHtml(text);
+        assertFalse(contains(asSpan(&made), part), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    function cleans(html: Span[Nat8, Static], clean: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := sanitize(html, markdownPolicy());
+        assertTrue(sameBytes(asSpan(&made), clean), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    -- A backslash before ASCII punctuation takes its meaning away; before
+    -- anything else it stays.
+    function testEscapes(): Unit is
+        becomes("2 \\* 3 \\* 4", "<p>2 * 3 * 4</p>\n", "escaped stars are no emphasis");
+        becomes("\\# x", "<p># x</p>\n", "an escaped hash is no heading");
+        becomes("1\\. x", "<p>1. x</p>\n", "an escaped dot is no list");
+        becomes("\\- x", "<p>- x</p>\n", "an escaped hyphen is no list");
+        becomes("\\[a\\](/b)", "<p>[a](/b)</p>\n", "escaped brackets are no link");
+        becomes("\\`x\\`", "<p>`x`</p>\n", "escaped backticks are no code");
+        becomes("a\\b", "<p>a\\b</p>\n", "a backslash before a letter stays");
+        becomes("\\\\*x*", "<p>\\<em>x</em></p>\n", "an escaped backslash");
+        becomes("a\\!b\\~c\\{", "<p>a!b~c{</p>\n", "other punctuation, both ends of the range");
+        becomes("x\\", "<p>x\\</p>\n", "a backslash at the end stays");
+        return nil;
+    end;
+
+    function testAttacks(): Unit is
+        becomes("<script>alert(1)</script>", "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n", "a tag is shown, not obeyed");
+        lacks("[x](javascript:alert(1))", "<a", "no link to javascript:");
+        lacks("[x](JavaScript:alert(1))", "<a", "nor in capitals");
+        lacks("[x](//evil.example/)", "<a", "no link that leaves for another host without a scheme");
+        lacks("[x](https://a.example/\"onmouseover=\"alert(1))", "<a", "no link with a quote");
+        lacks("[x](https://a.example/ onmouseover=alert(1))", "<a", "no link with a space");
+        lacks("[x](data:text/html,<script>)", "<a", "no data: link");
+        becomes("**<b>**", "<p><strong>&lt;b&gt;</strong></p>\n", "a tag inside strong is escaped");
+        becomes("`<img src=x onerror=alert(1)>`", "<p><code>&lt;img src=x onerror=alert(1)&gt;</code></p>\n", "a tag inside code is escaped");
+        becomes("[<img>](https://a.example/)", "<p><a href=\"https://a.example/\" rel=\"nofollow noopener\">&lt;img&gt;</a></p>\n", "a tag inside a link text is escaped");
+        becomes("it's \"quoted\" & so", "<p>it&#39;s &quot;quoted&quot; &amp; so</p>\n", "quotes and ampersands become entities");
+        becomes("```\n<script>\n```", "<pre><code>&lt;script&gt;\n</code></pre>\n", "a tag in a code block is escaped");
+        return nil;
+    end;
+
+    function testBlocks(): Unit is
+        becomes("# Title", "<h1>Title</h1>\n", "a heading");
+        becomes("###### Six", "<h6>Six</h6>\n", "the sixth level");
+        becomes("####### Seven", "<p>####### Seven</p>\n", "a seventh is a paragraph");
+        becomes("#Title", "<p>#Title</p>\n", "a hash without a space is text");
+        becomes("one\ntwo\n\nthree", "<p>one\ntwo</p>\n<p>three</p>\n", "a blank line ends a paragraph");
+        becomes("- a\n- b", "<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n", "a list of bullets");
+        becomes("* a", "<ul>\n<li>a</li>\n</ul>\n", "a star as a bullet");
+        becomes("1. a\n2. b", "<ol>\n<li>a</li>\n<li>b</li>\n</ol>\n", "a numbered list");
+        becomes("- a\n1. b", "<ul>\n<li>a</li>\n</ul>\n<ol>\n<li>b</li>\n</ol>\n", "a bullet list then a numbered one");
+        becomes("> said\n> more", "<blockquote>\n<p>said\nmore</p>\n</blockquote>\n", "a quote of two lines");
+        becomes("---", "<hr>\n", "a rule");
+        becomes("text\n```\ncode **not bold**\n```\nafter", "<p>text</p>\n<pre><code>code **not bold**\n</code></pre>\n<p>after</p>\n", "a code block between paragraphs, its marks left alone");
+        becomes("```\nopen", "<pre><code>open\n</code></pre>\n", "a code block that is never closed is closed at the end");
+        becomes("", "", "nothing");
+        assertTrue(mostMarkdownBytes() = 1048576, "a mebibyte at most");
+        return nil;
+    end;
+
+    function testInline(): Unit is
+        becomes("a **b** c", "<p>a <strong>b</strong> c</p>\n", "strong");
+        becomes("a *b* c", "<p>a <em>b</em> c</p>\n", "emphasis");
+        becomes("**a *b* c**", "<p><strong>a <em>b</em> c</strong></p>\n", "emphasis inside strong");
+        becomes("a `*b*` c", "<p>a <code>*b*</code> c</p>\n", "no marks inside code");
+        becomes("a * b", "<p>a * b</p>\n", "a lone star");
+        becomes("****", "<hr>\n", "four stars alone are a rule");
+        becomes("a **** b", "<p>a **** b</p>\n", "an empty strong is no strong");
+        becomes("[home](/)", "<p><a href=\"/\" rel=\"nofollow noopener\">home</a></p>\n", "a link to a path");
+        becomes("[top](#top)", "<p><a href=\"#top\" rel=\"nofollow noopener\">top</a></p>\n", "a link to an anchor");
+        becomes("[mail](mailto:ann@example.com)", "<p><a href=\"mailto:ann@example.com\" rel=\"nofollow noopener\">mail</a></p>\n", "a mail link");
+        becomes("[a **b**](https://example.com/x?y=1&z=2)", "<p><a href=\"https://example.com/x?y=1&amp;z=2\" rel=\"nofollow noopener\">a <strong>b</strong></a></p>\n", "the URL is escaped for the attribute, the text rendered");
+        becomes("[x](ftp://example.com/)", "<p>[x](ftp://example.com/)</p>\n", "another scheme is shown as text");
+        return nil;
+    end;
+
+    -- Strikethrough after GFM: two tildes on each side, flanking as for *;
+    -- one tilde and three are text.
+    function testStrike(): Unit is
+        becomes("~~a~~", "<p><del>a</del></p>\n", "two tildes strike through");
+        becomes("~a~", "<p>~a~</p>\n", "one tilde stays text");
+        becomes("x ~~~a~~~", "<p>x ~~~a~~~</p>\n", "three tildes stay text (at the start of a line they open a code fence)");
+        becomes("~~a~", "<p>~~a~</p>\n", "runs of two and one do not match");
+        becomes("~~ a~~", "<p>~~ a~~</p>\n", "an opener before a blank is none");
+        becomes("~~a ~~", "<p>~~a ~~</p>\n", "a closer after a blank is none");
+        becomes("a~~b~~c", "<p>a<del>b</del>c</p>\n", "inside a word as for *");
+        becomes("**~~a~~**", "<p><strong><del>a</del></strong></p>\n", "inside strong");
+        becomes("~~*a*~~", "<p><del><em>a</em></del></p>\n", "around emphasis");
+        becomes("~~<b>~~", "<p><del>&lt;b&gt;</del></p>\n", "a tag inside is escaped");
+        becomes("\\~~a~~", "<p>~~a~~</p>\n", "an escaped tilde leaves a run of one, which is text");
+        becomes("`~~a~~`", "<p><code>~~a~~</code></p>\n", "no strikethrough in code");
+        let tree: Tree := parseMarkdown("x ~~y~~");
+        let para: Index := firstChild(&tree, 0);
+        let strike: Index := nextSibling(&tree, firstChild(&tree, para));
+        assertTrue(kindAt(&tree, strike) = 21, "a strike node");
+        assertTrue(sameBytes(nodeText(&tree, firstChild(&tree, strike)), "y"), "its text is its child");
+        destroyTree(tree);
+        return nil;
+    end;
+
+    -- Task list items after GFM: the item gets a class, which the sanitizer
+    -- keeps, and its number; the marker leaves the text.
+    function testTasks(): Unit is
+        becomes("- [ ] a\n- [x] b\n- [X] c", "<ul>\n<li class=\"task\">a</li>\n<li class=\"task done\">b</li>\n<li class=\"task done\">c</li>\n</ul>\n", "open and done tasks, the class kept by the sanitizer");
+        becomes("1. [x] done", "<ol>\n<li class=\"task done\">done</li>\n</ol>\n", "a task in a numbered list");
+        becomes("- [ ] a\n\n- [x] b", "<ul>\n<li class=\"task\">\n<p>a</p>\n</li>\n<li class=\"task done\">\n<p>b</p>\n</li>\n</ul>\n", "tasks in a loose list");
+        becomes("- [x] *a*", "<ul>\n<li class=\"task done\"><em>a</em></li>\n</ul>\n", "inlines after the marker");
+        becomes("- [x]\t  a", "<ul>\n<li class=\"task done\">a</li>\n</ul>\n", "a tab after the marker, the blanks after it gone");
+        becomes("- [ ]a", "<ul>\n<li>[ ]a</li>\n</ul>\n", "no blank after the marker, no task");
+        becomes("- [y] a", "<ul>\n<li>[y] a</li>\n</ul>\n", "another letter, no task");
+        becomes("- [ ]", "<ul>\n<li>[ ]</li>\n</ul>\n", "a marker with nothing after it is text");
+        becomes("- a [ ] b", "<ul>\n<li>a [ ] b</li>\n</ul>\n", "a marker not at the start is text");
+        becomes("[ ] a", "<p>[ ] a</p>\n", "outside a list no task");
+        becomes("- > [ ] a", "<ul>\n<li>\n<blockquote>\n<p>[ ] a</p>\n</blockquote>\n</li>\n</ul>\n", "the first block must be the paragraph");
+        lacks("- [ ] a", "<input", "no checkbox element");
+        cleans("<li class=\"task\">a</li><li class=\"task done\">b</li>", "<li class=\"task\">a</li><li class=\"task done\">b</li>", "the sanitizer keeps both classes of a task");
+        cleans("<input type=\"checkbox\" checked>x", "x", "the sanitizer drops an input element, so no checkbox is written");
+        let tree: Tree := parseMarkdown("- [ ] a\n- [x] b\n- c\n");
+        let list: Index := firstChild(&tree, 0);
+        let open: Index := firstChild(&tree, list);
+        let done: Index := nextSibling(&tree, open);
+        let plain: Index := nextSibling(&tree, done);
+        assertTrue(nodeNumber(&tree, open) = 1, "an open task is 1");
+        assertTrue(nodeNumber(&tree, done) = 2, "a done task is 2");
+        assertTrue(nodeNumber(&tree, plain) = 0, "no task is 0");
+        assertTrue(sameBytes(nodeText(&tree, firstChild(&tree, firstChild(&tree, open))), "a"), "the marker is not part of the text");
+        destroyTree(tree);
+        return nil;
+    end;
+
+    -- Raw HTML only through the functions WithHtml: there it passes, then the
+    -- sanitizer with richPolicy takes out what it never lets through.
+    function testRawHtml(): Unit is
+        becomes("<kbd>x</kbd>", "<p>&lt;kbd&gt;x&lt;/kbd&gt;</p>\n", "by default raw HTML stays text");
+        becomes("<div>\n*hi*\n</div>", "<p>&lt;div&gt;\n<em>hi</em>\n&lt;/div&gt;</p>\n", "by default an HTML block is paragraph text");
+        rich("<kbd>Ctrl</kbd> and <mark>m</mark>", "<p><kbd>Ctrl</kbd> and <mark>m</mark></p>\n", "inline HTML passes");
+        rich("<div>\n*hi*\n</div>", "<div>\n*hi*\n</div>\n", "an HTML block up to the blank line, its Markdown left alone");
+        rich("<div>\n\n*hi*\n\n</div>", "<div>\n<p><em>hi</em></p>\n</div>\n", "Markdown between two HTML blocks");
+        rich("a <!-- c --> b", "<p>a  b</p>\n", "a comment is read and dropped by the sanitizer");
+        rich("<b>x</b> <i>y</i>", "<p>x y</p>\n", "an element outside richPolicy loses its tags, its text stays");
+        rich("x <span style=\"color:red\" lang=\"de\" class=\"c\">y</span>", "<p>x <span lang=\"de\" class=\"c\">y</span></p>\n", "an attribute outside richPolicy goes");
+        rich("<table><tr><td colspan=\"2\">x</td></tr></table>", "<table><tr><td colspan=\"2\">x</td></tr></table>\n", "colspan is kept");
+        rich("a ~~b~~ <sub>2</sub>", "<p>a <del>b</del> <sub>2</sub></p>\n", "strikethrough and raw HTML side by side");
+        rich("`<kbd>`", "<p><code>&lt;kbd&gt;</code></p>\n", "no raw HTML inside a code span");
+        rich("    <div>", "<pre><code>&lt;div&gt;\n</code></pre>\n", "no HTML block in indented code");
+        rich("a <script> b\n\nc", "<p>a </p>", "an open script swallows the rest: the sanitizer drops it to the end");
+        rich("> <div>\nfoo", "<blockquote>\n<div>\nfoo\n</div></blockquote>\n", "a limit: an HTML block in a quote takes a lazy line, as a paragraph would");
+        let tree: Tree := parseMarkdownWithHtml("<div>\nx\n</div>\n\na <kbd>c</kbd>\n");
+        let block: Index := firstChild(&tree, 0);
+        assertTrue(kindAt(&tree, block) = 22, "an HTML block node");
+        assertTrue(sameBytes(nodeText(&tree, block), "<div>\nx\n</div>\n"), "its text is the source, each line with its end");
+        let para: Index := nextSibling(&tree, block);
+        let open: Index := nextSibling(&tree, firstChild(&tree, para));
+        assertTrue(kindAt(&tree, open) = 23, "an inline HTML node");
+        assertTrue(sameBytes(nodeText(&tree, open), "<kbd>"), "its text is the tag");
+        let html: String := treeToHtml(&tree);
+        assertTrue(contains(asSpan(&html), "<kbd>c</kbd>"), "a tree of parseMarkdownWithHtml goes through richPolicy");
+        destroyString(html);
+        destroyTree(tree);
+        let plain: Tree := parseMarkdown("a <kbd>c</kbd>\n");
+        let escaped: String := treeToHtml(&plain);
+        assertTrue(sameBytes(asSpan(&escaped), "<p>a &lt;kbd&gt;c&lt;/kbd&gt;</p>\n"), "a tree of parseMarkdown keeps markdownPolicy and shows the tag");
+        destroyString(escaped);
+        destroyTree(plain);
+        let kept: String := sanitize("<kbd>k</kbd><del>d</del>", richPolicy());
+        assertTrue(sameBytes(asSpan(&kept), "<kbd>k</kbd><del>d</del>"), "richPolicy keeps kbd and del");
+        destroyString(kept);
+        return nil;
+    end;
+
+    -- What raw HTML must not bring in: scripts, frames, forms, event
+    -- attributes, javascript: URLs, also hidden behind entities.
+    function testRawHtmlAttacks(): Unit is
+        rich("<script>alert(1)</script>\n\nok", "\n<p>ok</p>\n", "a script block goes whole");
+        rich("a <script>alert(1)</script> b", "<p>a  b</p>\n", "an inline script goes whole");
+        rich("<style>p{color:red}</style>\n\nok", "\n<p>ok</p>\n", "a style block goes whole");
+        rich("<iframe src=\"https://evil.example/\">x</iframe>", "\n", "an iframe goes whole");
+        rich("<form action=\"/x\"><input name=\"a\"><button>go</button></form>", "go\n", "form, input and button go, the text stays");
+        rich("x <input type=\"checkbox\" checked> y", "<p>x  y</p>\n", "no input element inline");
+        rich("x <span onclick=\"alert(1)\" class=\"c\">a</span>", "<p>x <span class=\"c\">a</span></p>\n", "an event attribute goes");
+        rich("<img src=\"/i.png\" onerror=\"alert(1)\">", "<img src=\"/i.png\">\n", "onerror goes from an image");
+        rich("y <a href=\"javascript:alert(1)\">x</a>", "<p>y <a rel=\"nofollow noopener\">x</a></p>\n", "a javascript: URL goes, the link stays without it");
+        rich("z <a href=\"java&#115;cript:x\">y</a>", "<p>z <a rel=\"nofollow noopener\">y</a></p>\n", "also behind a numeric entity");
+        rich("<img src=\"javascript:x\" alt=\"a\">", "<img alt=\"a\">\n", "no javascript: in src");
+        rich("w <a href=\"https://a.example/\" target=\"_blank\">v</a>", "<p>w <a href=\"https://a.example/\" rel=\"nofollow noopener\">v</a></p>\n", "a link of raw HTML gets rel, target goes");
+        rich("<object data=\"x\"><embed src=\"y\"></object>", "<p></p>\n", "no object or embed, nothing out of them");
+        richLacks("<svg><script>alert(1)</script></svg>", "alert", "nothing out of svg");
+        richLacks("<math><mi>x</mi></math>", "x", "nothing out of math");
+        return nil;
+    end;
+
+    -- Openers of raw HTML without a closer do not make the reading
+    -- quadratic: each kind searches the rest of the text once.
+    function testRawHtmlLong(): Unit is
+        var many: StringBuilder := makeStringBuilder();
+        -- A letter first: a line that starts with <!-- is an HTML block.
+        writeString(&!many, "a ");
+        var i: Index := 0;
+        while i < 50000 do
+            writeString(&!many, "<!-- <? <![CDATA[ <!x <a x=\"");
+            i := i + 1;
+        end while;
+        let text: String := finalize(many);
+        let made: String := markdownWithHtmlToHtml(asSpan(&text));
+        assertTrue(contains(asSpan(&made), "&lt;!-- &lt;? &lt;![CDATA[ &lt;!x &lt;a x="), "a mebibyte of open raw HTML stays text");
+        destroyString(made);
+        destroyString(text);
+        return nil;
+    end;
+
+    function testLinks(): Unit is
+        assertTrue(isSafeLink("https://example.com/"), "https");
+        assertTrue(isSafeLink("http://example.com/"), "http");
+        assertTrue(isSafeLink("mailto:a@b.co"), "mailto");
+        assertTrue(isSafeLink("/path"), "a path");
+        assertTrue(isSafeLink("/"), "the root");
+        assertTrue(isSafeLink("#a"), "an anchor");
+        assertFalse(isSafeLink(""), "empty");
+        assertFalse(isSafeLink("//host"), "two slashes");
+        assertFalse(isSafeLink("javascript:x"), "javascript:");
+        assertFalse(isSafeLink("https://a b"), "a space");
+        assertFalse(isSafeLink("https://a\\b"), "a backslash");
+        assertFalse(isSafeLink("https://a<b"), "a <");
+        assertFalse(isSafeLink("https://a'b"), "an apostrophe");
+        assertFalse(isSafeLink("relative/path"), "a relative path");
+        return nil;
+    end;
+    -- The number of a kind, so that a test can compare kinds with =.
+    function kindNumber(kind: NodeKind): Index is
+        case kind of
+            when DocumentNode do return 0;
+            when ParagraphNode do return 1;
+            when HeadingNode do return 2;
+            when ThematicBreakNode do return 3;
+            when BlockQuoteNode do return 4;
+            when BulletListNode do return 5;
+            when OrderedListNode do return 6;
+            when ItemNode do return 7;
+            when CodeBlockNode do return 8;
+            when TableNode do return 9;
+            when TableRowNode do return 10;
+            when TableCellNode do return 11;
+            when DefinitionNode do return 12;
+            when TextNode do return 13;
+            when SoftBreakNode do return 14;
+            when HardBreakNode do return 15;
+            when CodeSpanNode do return 16;
+            when EmphasisNode do return 17;
+            when StrongNode do return 18;
+            when LinkNode do return 19;
+            when ImageNode do return 20;
+            when StrikeNode do return 21;
+            when HtmlBlockNode do return 22;
+            when HtmlInlineNode do return 23;
+            when FootnoteNode do return 24;
+            when FootnoteRefNode do return 25;
+            when TocNode do return 26;
+        end case;
+    end;
+
+    generic [R: Region]
+    function kindAt(tree: &[Tree, R], n: Index): Index is
+        return kindNumber(nodeKind(tree, n));
+    end;
+
+    -- The tree of a document with every kind of block: the kinds, the
+    -- relatives, the texts and the numbers of its nodes.
+    function testTree(): Unit is
+        let tree: Tree := parseMarkdown("# Titel\n\n- eins\n- zwei\n\n3. a\n\n   b\n\n```rust ignore\ncode\n```\n\n| a | b |\n|:-:|--|\n| *c* | d |\n\n> [x](/y \"t\") ![i](/j) `k`  \nl\n\n***\n\n[ Foo  BAR ]: /u \"v\"\n");
+        assertTrue(nodeCount(&tree) = 43, "43 nodes");
+        assertTrue(kindAt(&tree, 0) = 0, "node 0 is the document");
+        assertTrue(parentOf(&tree, 0) = 0, "the document has no parent");
+        let heading: Index := firstChild(&tree, 0);
+        assertTrue(kindAt(&tree, heading) = 2, "a heading first");
+        assertTrue(nodeNumber(&tree, heading) = 1, "of level 1");
+        assertTrue(spanLength(nodeText(&tree, heading)) = 0, "its text lies in its children");
+        let title: Index := firstChild(&tree, heading);
+        assertTrue(kindAt(&tree, title) = 13, "a text in the heading");
+        assertTrue(sameBytes(nodeText(&tree, title), "Titel"), "the text of the heading");
+        assertTrue(parentOf(&tree, title) = heading, "its parent is the heading");
+        let bullets: Index := nextSibling(&tree, heading);
+        assertTrue(kindAt(&tree, bullets) = 5, "then a bullet list");
+        assertTrue(isTightList(&tree, bullets), "a tight one");
+        let first: Index := firstChild(&tree, bullets);
+        let second: Index := nextSibling(&tree, first);
+        assertTrue(kindAt(&tree, first) = 7, "an item");
+        assertTrue(lastChild(&tree, bullets) = second, "two items");
+        assertTrue(nextSibling(&tree, second) = 0, "the second is the last");
+        let para: Index := firstChild(&tree, second);
+        assertTrue(kindAt(&tree, para) = 1, "a tight item keeps its paragraph in the tree");
+        assertTrue(sameBytes(nodeText(&tree, firstChild(&tree, para)), "zwei"), "the text of the second item");
+        let ordered: Index := nextSibling(&tree, bullets);
+        assertTrue(kindAt(&tree, ordered) = 6, "then a numbered list");
+        assertTrue(nodeNumber(&tree, ordered) = 3, "starting at 3");
+        assertFalse(isTightList(&tree, ordered), "loose: a blank line between its blocks");
+        let code: Index := nextSibling(&tree, ordered);
+        assertTrue(kindAt(&tree, code) = 8, "then a code block");
+        assertTrue(sameBytes(nodeText(&tree, code), "code\n"), "its content");
+        assertTrue(sameBytes(nodeInfo(&tree, code), "rust ignore"), "its info line");
+        let table: Index := nextSibling(&tree, code);
+        assertTrue(kindAt(&tree, table) = 9, "then a table");
+        assertTrue(nodeNumber(&tree, table) = 2, "of two columns");
+        let head: Index := firstChild(&tree, table);
+        assertTrue(kindAt(&tree, head) = 10, "a row");
+        assertTrue(nodeNumber(&tree, head) = 1, "the head row");
+        let cell: Index := firstChild(&tree, head);
+        assertTrue(kindAt(&tree, cell) = 11, "a cell");
+        assertTrue(nodeNumber(&tree, cell) = 2, "centred");
+        assertTrue(nodeNumber(&tree, nextSibling(&tree, cell)) = 0, "the second without alignment");
+        let body_row: Index := lastChild(&tree, table);
+        assertTrue(nodeNumber(&tree, body_row) = 0, "a body row");
+        assertTrue(kindAt(&tree, firstChild(&tree, firstChild(&tree, body_row))) = 17, "emphasis in a cell");
+        let quote: Index := nextSibling(&tree, table);
+        assertTrue(kindAt(&tree, quote) = 4, "then a quote");
+        let inline: Index := firstChild(&tree, quote);
+        let link: Index := firstChild(&tree, inline);
+        assertTrue(kindAt(&tree, link) = 19, "a link");
+        assertTrue(sameBytes(nodeText(&tree, link), "/y"), "its target");
+        assertTrue(sameBytes(nodeInfo(&tree, link), "t"), "its title");
+        let image: Index := nextSibling(&tree, nextSibling(&tree, link));
+        assertTrue(kindAt(&tree, image) = 20, "an image");
+        assertTrue(sameBytes(nodeText(&tree, image), "/j"), "its source");
+        assertTrue(spanLength(nodeInfo(&tree, image)) = 0, "no title");
+        let span: Index := nextSibling(&tree, nextSibling(&tree, image));
+        assertTrue(kindAt(&tree, span) = 16, "a code span");
+        assertTrue(sameBytes(nodeText(&tree, span), "k"), "its content");
+        let hard: Index := nextSibling(&tree, span);
+        assertTrue(kindAt(&tree, hard) = 15, "a hard break");
+        assertTrue(lastChild(&tree, inline) = nextSibling(&tree, hard), "the text after it is the last");
+        let rule: Index := nextSibling(&tree, quote);
+        assertTrue(kindAt(&tree, rule) = 3, "then a rule");
+        let definition: Index := nextSibling(&tree, rule);
+        assertTrue(kindAt(&tree, definition) = 12, "then a definition");
+        assertTrue(lastChild(&tree, 0) = definition, "the last block");
+        assertTrue(sameBytes(nodeText(&tree, definition), "foo bar"), "its label as it is compared");
+        assertTrue(sameBytes(nodeInfo(&tree, definition), "/u"), "its target");
+        assertTrue(nodeNumber(&tree, definition) = 0, "no number");
+        assertTrue(sameBytes(nodeText(&tree, firstChild(&tree, definition)), "v"), "its title as its child");
+        let html: String := treeToHtml(&tree);
+        assertTrue(contains(asSpan(&html), "<pre><code class=\"language-rust\">code\n</code></pre>"), "the language as a class");
+        assertTrue(contains(asSpan(&html), "<th class=\"text-center\">a</th>"), "the alignment as a class");
+        assertFalse(contains(asSpan(&html), "\"/u\""), "a definition writes nothing");
+        destroyString(html);
+        destroyTree(tree);
+        return nil;
+    end;
+
+    -- No text is an error: every byte sequence gives a tree.
+    function testAnyText(): Unit is
+        let empty: Tree := parseMarkdown("");
+        assertTrue(nodeCount(&empty) = 1, "the empty text is a document alone");
+        assertTrue(firstChild(&empty, 0) = 0, "without children");
+        destroyTree(empty);
+        let odd: Tree := parseMarkdown("\u{0}\r\n\u{ff}\u{fe}*[`<\\");
+        assertTrue(nodeCount(&odd) >= 1, "a tree for odd bytes");
+        destroyTree(odd);
+        becomes("a\rb\r\nc", "<p>a\nb\nc</p>\n", "a carriage return ends a line");
+        becomes("a\u{0}b", "<p>a\u{fffd}b</p>\n", "a zero byte becomes the replacement character");
+        return nil;
+    end;
+
+    -- The limits of the module head: depth, definitions, bytes.
+    function testLimits(): Unit is
+        assertTrue(mostMarkdownDepth() = 16, "16 levels");
+        assertTrue(mostDefinitions() = 512, "512 definitions");
+        becomes(">>>>>>>>>>>>>>>> x", "<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<blockquote>\n<p>x</p>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n</blockquote>\n", "16 quotes are read");
+        lacks(">>>>>>>>>>>>>>>>> x", "<p>x</p>", "the 17th is paragraph text");
+        var defs: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 513 do
+            writeString(&!defs, "[r]: /u\n");
+            i := i + 1;
+        end while;
+        writeString(&!defs, "[s]: /v\n\n[r] [s]\n");
+        let text: String := finalize(defs);
+        let made: String := markdownToHtml(asSpan(&text));
+        assertTrue(contains(asSpan(&made), "<a href=\"/u\""), "the first definition counts");
+        assertFalse(contains(asSpan(&made), "/v"), "the 514th is dropped");
+        destroyString(made);
+        destroyString(text);
+        var big: StringBuilder := makeStringBuilder();
+        var k: Index := 0;
+        while k < 1048575 do
+            writeString(&!big, "a");
+            k := k + 1;
+        end while;
+        writeString(&!big, "bc");
+        let long: String := finalize(big);
+        let cut: String := markdownToHtml(asSpan(&long));
+        assertTrue(contains(asSpan(&cut), "ab</p>"), "the text is cut after a mebibyte");
+        assertFalse(contains(asSpan(&cut), "c"), "the byte after it is gone");
+        destroyString(cut);
+        destroyString(long);
+        return nil;
+    end;
+
+    -- A URL is judged after its escapes and entities are decoded, in every
+    -- place a URL can stand.
+    function testUrlPlaces(): Unit is
+        lacks("[x](java&#115;cript:alert(1))", "<a", "not through a numeric entity");
+        lacks("[x](&#106;avascript:alert(1))", "<a", "nor at the start");
+        lacks("[x](&#47;&#47;evil.example)", "<a", "no two slashes through entities");
+        lacks("[x]\n\n[x]: javascript:alert(1)", "<a", "not through a definition");
+        lacks("<javascript:alert(1)>", "<a", "not as an autolink");
+        lacks("![x](javascript:alert(1))", "<img", "no image from javascript:");
+        lacks("![x](https://a.example/\"onerror=\"x)", "<img", "no image with a quote");
+        lacks("[x](<https://a.example/\nb>)", "<a", "no line break in a URL");
+        becomes("[x](https://a.example/ \"t\\\" onclick=\\\"y\")", "<p><a href=\"https://a.example/\" title=\"t&quot; onclick=&quot;y\" rel=\"nofollow noopener\">x</a></p>\n", "a quote in a title stays inside it");
+        becomes("``` \"><script>\nx\n```", "<pre><code class=\"language-&quot;&gt;&lt;script&gt;\">x\n</code></pre>\n", "the info line is escaped in its attribute");
+        becomes("![<b>\"](/i)", "<p><img src=\"/i\" alt=\"&lt;b&gt;&quot;\"></p>\n", "the alt text is escaped");
+        becomes("| <b> |\n|---|\n| x |", "<table>\n<thead>\n<tr>\n<th>&lt;b&gt;</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>x</td>\n</tr>\n</tbody>\n</table>\n", "a tag in a cell is escaped");
+        return nil;
+    end;
+end module body.

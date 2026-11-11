@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head><title>{{ title }}</title></head>
+<body>
+{# a comment, and the text around it stays #}
+<h1 class="{{ user }}" data-x='{{ user }}'>Hello, {{ user|upper }}!</h1>
+{% if admin %}<p>admin</p>{% else %}<p>guest</p>{% endif %}
+{% if count > 2 %}many{% elif count == 2 %}two{% else %}few{% endif %}
+{% if count != 3 or not admin %}unexpected{% endif %}
+<ul>
+{%- for item in items %}
+  <li id="i{{ loop.index }}">{{ loop.index0 }}/{{ loop.length }} {{ item.name }}: {{ item.price }}
+  {%- if item.note is not none %} ({{ item.note }}){% endif %}
+  {%- if loop.first %} first{% endif %}{% if loop.last %} last{% endif %}
+  {%- if loop.index >= 2 %} second-or-later{% endif %}</li>
+{%- endfor %}
+</ul>
+{% for item in empty %}{{ item.name }}{% else %}<p>nothing</p>{% endfor %}
+{% if motto is not none %}<em>{{ motto|trim }}</em>{% endif %}
+{% if missing is none %}no missing{% else %}{{ missing }}{% endif %}
+{% if title == "x" %}wrong{% elif user != "x" %}right{% endif %}
+{{ title|length }} {{ items|length }} {{ empty|length }}
+{{ "<b>" }} {{ "<b>"|safe }} {{ 42 }} {{ True }} {{ false }}
+{% raw %}{{ not a tag }} {% if %}{% endraw %}
+{{ user|lower|e }}
+   {{- "|trimmed|" -}}
+   done
+</body>
+</html>

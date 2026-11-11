@@ -1,0 +1,85 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    parseInt
+);
+import Standard.FcgiServer (
+    Request,
+    destroyRequest
+);
+import Wolly.Response (
+    makeResponse,
+    decimalText
+);
+import Wolly.Tree (
+    Page,
+    page
+);
+import Wolly.Example.Pages.Site.Post.Id (
+    Param as Post,
+    number
+);
+
+module body Wolly.Example.Pages.Site.Post.Id.Comments.N is
+    record Param: Free is
+        n: Int64;
+        invariant (n >= 1) and (n <= 999);
+    end;
+
+    generic [R: Region]
+    function parse(text: Span[Nat8, R]): Option[Param] is
+        if (spanLength(text) = 0) or (spanLength(text) > 3) then
+            return None();
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] < '0') or (text[i] > '9') then
+                return None();
+            end if;
+            i := i + 1;
+        end while;
+        case parseInt(text) of
+            when Some(value as n: Int64) do
+                if n < 1 then
+                    return None();
+                end if;
+                return Some(value => Param(n => n));
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [B: Region]
+    function writeNumber(out: &![StringBuilder, B], value: Int64): Unit is
+        let digits: String := decimalText(value);
+        writeString(&~out, asSpan(&digits));
+        destroyString(digits);
+        return nil;
+    end;
+
+    function get(request: Request, post: Post, comment: Param): Page is
+        destroyRequest(request);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<p>Comment ");
+        writeNumber(&!out, comment.n);
+        writeString(&!out, " of post ");
+        writeNumber(&!out, number(post));
+        writeString(&!out, "</p>\n");
+        return page(makeResponse(200, "text/html; charset=utf-8"), finalize(out));
+    end;
+end module body.

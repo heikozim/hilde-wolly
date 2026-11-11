@@ -1,0 +1,2 @@
+{% macro badge(label, kind="plain") %}<span class="{{ kind }}">{{ label }}</span>{% endmacro %}
+{% macro money(amount) %}{{ amount }} EUR{% if amount > 9 %}!{% endif %}{% endmacro %}

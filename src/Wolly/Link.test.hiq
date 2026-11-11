@@ -1,0 +1,474 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.Text (
+    contains,
+    startsWith
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Response (
+    makeResponse,
+    finish,
+    decimalText
+);
+import Wolly.Router (
+    Route,
+    matches,
+    param,
+    dispatch
+);
+import Wolly.Link (
+    Params,
+    NoParams,
+    noParams,
+    Target,
+    Link,
+    target,
+    route,
+    link,
+    path,
+    formAction,
+    withQuery,
+    redirect,
+    linkString,
+    linkLength,
+    destroyLink,
+    encodeSegment,
+    isPattern,
+    paramCount,
+    isStatic,
+    isFormTarget,
+    isQueryName,
+    targetParam
+);
+
+module body Wolly.Link.Test is
+    -- The values of a post: its number.
+    record PostId: Free is
+        id: Int64;
+    end;
+
+    instance Params(PostId) is
+        generic [R: Region]
+        method arity(params: &[PostId, R]): Index is
+            return 1;
+        end;
+
+        generic [R: Region]
+        method segment(params: &[PostId, R], at: Index): String is
+            return decimalText(params->id);
+        end;
+    end;
+
+    -- The values of a user page: a name as the user typed it.
+    record UserName: Linear is
+        name: String;
+    end;
+
+    instance Params(UserName) is
+        generic [R: Region]
+        method arity(params: &[UserName, R]): Index is
+            return 1;
+        end;
+
+        generic [R: Region]
+        method segment(params: &[UserName, R], at: Index): String is
+            return fromSpan(asSpan(&(params->name)));
+        end;
+    end;
+
+    -- The values of a post of a user: two segments.
+    record UserPost: Linear is
+        name: String;
+        id: Int64;
+    end;
+
+    instance Params(UserPost) is
+        generic [R: Region]
+        method arity(params: &[UserPost, R]): Index is
+            return 2;
+        end;
+
+        generic [R: Region]
+        method segment(params: &[UserPost, R], at: Index): String is
+            if at = 0 then
+                return fromSpan(asSpan(&(params->name)));
+            end if;
+            return decimalText(params->id);
+        end;
+    end;
+
+    function answerPost(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(200, "text/plain"), "post");
+    end;
+
+    function answerUser(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(200, "text/plain"), "user");
+    end;
+
+    function showPost(): Target[PostId] is
+        return target("GET", "/post/:id", answerPost);
+    end;
+
+    function showUser(): Target[UserName] is
+        return target("GET", "/user/:name", answerUser);
+    end;
+
+    function showUserPost(): Target[UserPost] is
+        return target("GET", "/user/:name/post/:id", answerPost);
+    end;
+
+    function showFile(): Target[UserName] is
+        return target("GET", "/files/*", answerUser);
+    end;
+
+    function addNote(): Target[NoParams] is
+        return target("POST", "/notes", answerPost);
+    end;
+
+    function home(): Target[NoParams] is
+        return target("GET", "/", answerUser);
+    end;
+
+    generic [A: Region, B: Region]
+    function sameBytes(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function isText(text: String, wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let same: Bool := sameBytes(asSpan(&text), wanted);
+        if not same then
+            printLn(asSpan(&text));
+        end if;
+        destroyString(text);
+        assertTrue(same, message);
+        return nil;
+    end;
+
+    function gives(made: Option[Link], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case made of
+            when Some(value as l: Link) do
+                isText(linkString(l), wanted, message);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function none(made: Option[Link], message: Span[Nat8, Static]): Unit is
+        case made of
+            when Some(value as l: Link) do
+                let text: String := linkString(l);
+                printLn(asSpan(&text));
+                destroyString(text);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function encodes(value: Span[Nat8, Static], wanted: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        isText(encodeSegment(value), wanted, message);
+        return nil;
+    end;
+
+    function testEncodeSegment(): Unit is
+        encodes("AZaz09-._~", "AZaz09-._~", "the unreserved bytes stay");
+        encodes("a b", "a%20b", "a space");
+        encodes("a/b", "a%2Fb", "a slash stays inside its segment");
+        encodes("a?b", "a%3Fb", "a question mark starts no query");
+        encodes("a#b", "a%23b", "a hash starts no fragment");
+        encodes("100%", "100%25", "a percent sign is encoded, never taken as an escape");
+        encodes("%2F", "%252F", "an escape in the value is encoded once more");
+        encodes("!$&'()*+,;=:@", "%21%24%26%27%28%29%2A%2B%2C%3B%3D%3A%40", "the reserved bytes are encoded");
+        encodes("\"<>\\^`{|}", "%22%3C%3E%5C%5E%60%7B%7C%7D", "quotes and brackets are encoded");
+        encodes("Grüße", "Gr%C3%BC%C3%9Fe", "UTF-8 byte by byte with capital hex digits");
+        encodes("日本", "%E6%97%A5%E6%9C%AC", "three bytes a character");
+        encodes("😀", "%F0%9F%98%80", "four bytes a character");
+        encodes("", "", "the empty value");
+        return nil;
+    end;
+
+    function userLink(name: Span[Nat8, Static]): Option[Link] is
+        let user: UserName := UserName(name => fromSpan(name));
+        let made: Option[Link] := link(showUser(), &user);
+        let { name as n: String } := user;
+        destroyString(n);
+        return made;
+    end;
+
+    function fileLink(rest: Span[Nat8, Static]): Option[Link] is
+        let file: UserName := UserName(name => fromSpan(rest));
+        let made: Option[Link] := link(showFile(), &file);
+        let { name as n: String } := file;
+        destroyString(n);
+        return made;
+    end;
+
+    function testLink(): Unit is
+        let post: PostId := PostId(id => 42);
+        gives(link(showPost(), &post), "/post/42", "a number in its segment");
+        gives(userLink("heiko"), "/user/heiko", "a plain name");
+        gives(userLink("a/b?c#d e%f"), "/user/a%2Fb%3Fc%23d%20e%25f", "every special byte stays in the segment");
+        gives(userLink("Jürgen 日本"), "/user/J%C3%BCrgen%20%E6%97%A5%E6%9C%AC", "unicode in a segment");
+        gives(userLink("..."), "/user/...", "three dots are a name");
+        gives(userLink(".a"), "/user/.a", "a leading dot is a name");
+        let both: UserPost := UserPost(name => fromSpan("a b"), id => 7);
+        gives(link(showUserPost(), &both), "/user/a%20b/post/7", "two values, each in its own segment");
+        let { name as n: String, id as i: Int64 } := both;
+        destroyString(n);
+        let nothing: NoParams := noParams();
+        gives(link(home(), &nothing), "/", "the root");
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        none(userLink(""), "an empty value fits no segment");
+        none(userLink("."), "a dot segment a browser would drop");
+        none(userLink(".."), "a dot segment a browser would resolve upwards");
+        let wrong: Target[NoParams] := target("GET", "/user/:name", answerUser);
+        let nothing: NoParams := noParams();
+        none(link(wrong, &nothing), "fewer values than parameter segments");
+        let more: Target[PostId] := target("GET", "/post", answerPost);
+        let post: PostId := PostId(id => 1);
+        none(link(more, &post), "more values than parameter segments");
+        return nil;
+    end;
+
+    function testRest(): Unit is
+        gives(fileLink("x/y z"), "/files/x/y%20z", "the slashes of a rest stay, each part encoded");
+        gives(fileLink(""), "/files/", "the empty rest a last star fits");
+        gives(fileLink("a?b/c#d"), "/files/a%3Fb/c%23d", "query and fragment bytes inside a rest");
+        none(fileLink("a/../b"), "a dot segment inside a rest");
+        none(fileLink("a//b"), "an empty part inside a rest");
+        none(fileLink("/a"), "a rest that begins with a slash");
+        none(fileLink("a/"), "a rest that ends with a slash");
+        return nil;
+    end;
+
+    -- Every link the router gets back fits the pattern of its target, and
+    -- the parameter decodes to the value it was made from.
+    function roundTrip(name: Span[Nat8, Static]): Unit is
+        case userLink(name) of
+            when Some(value as l: Link) do
+                let text: String := linkString(l);
+                assertTrue(matches("/user/:name", asSpan(&text)), "the link fits its own pattern");
+                case param("/user/:name", asSpan(&text), "name") of
+                    when Some(value as back: String) do
+                        let same: Bool := sameBytes(asSpan(&back), name);
+                        destroyString(back);
+                        assertTrue(same, "the router decodes the value it was given");
+                    when None do
+                        assertTrue(false, "the router finds the parameter");
+                end case;
+                destroyString(text);
+            when None do
+                assertTrue(false, "a link for the round trip");
+        end case;
+        return nil;
+    end;
+
+    function testRoundTrip(): Unit is
+        roundTrip("a/b");
+        roundTrip("100% sure?");
+        roundTrip("#top");
+        roundTrip("Grüße aus 日本 😀");
+        roundTrip("%2F%");
+        return nil;
+    end;
+
+    function testPathAndQuery(): Unit is
+        isText(linkString(path(addNote())), "/notes", "a static target is its pattern");
+        isText(formAction(addNote()), "/notes", "the action of a form");
+        let once: Link := withQuery(path(addNote()), "sent", "1");
+        isText(linkString(once), "/notes?sent=1", "the first value of a query");
+        let twice: Link := withQuery(withQuery(path(addNote()), "sent", "1"), "q", "a&b c=d#e");
+        isText(linkString(twice), "/notes?sent=1&q=a%26b%20c%3Dd%23e", "the second value after an and-sign, encoded");
+        let sized: Link := path(home());
+        assertTrue(linkLength(&sized) = 1, "the length of a link");
+        destroyLink(sized);
+        return nil;
+    end;
+
+    function testRedirect(): Unit is
+        let post: PostId := PostId(id => 9);
+        case link(showPost(), &post) of
+            when Some(value as l: Link) do
+                let output: String := finish(redirect(makeResponse(303, "text/plain"), l), "moved");
+                let good: Bool := startsWith(asSpan(&output), "Status: 303 ") and contains(asSpan(&output), "\r\nLocation: /post/9\r\n");
+                if not good then
+                    printLn(asSpan(&output));
+                end if;
+                destroyString(output);
+                assertTrue(good, "the link as the Location of a redirect");
+            when None do
+                assertTrue(false, "a link for the redirect");
+        end case;
+        let user: UserName := UserName(name => fromSpan("a\r\nSet-Cookie: x=1"));
+        case link(showUser(), &user) of
+            when Some(value as l: Link) do
+                let output: String := finish(redirect(makeResponse(303, "text/plain"), l), "moved");
+                let good: Bool := contains(asSpan(&output), "\r\nLocation: /user/a%0D%0ASet-Cookie%3A%20x%3D1\r\n");
+                let split: Bool := contains(asSpan(&output), "\r\nSet-Cookie:");
+                if not good then
+                    printLn(asSpan(&output));
+                end if;
+                destroyString(output);
+                assertTrue(good, "CR and LF of a value are encoded in the Location");
+                assertFalse(split, "a value never adds a header");
+            when None do
+                assertTrue(false, "a link with CR and LF");
+        end case;
+        let { name as n: String } := user;
+        destroyString(n);
+        return nil;
+    end;
+
+    function testChecks(): Unit is
+        assertTrue(isPattern("/x/:id/*"), "a pattern with parameters");
+        assertTrue(isPattern("/"), "the root");
+        assertFalse(isPattern(""), "the empty pattern");
+        assertFalse(isPattern("x"), "a pattern without its slash");
+        assertFalse(isPattern("/a b"), "a space in a pattern");
+        assertFalse(isPattern("/a?b"), "a query in a pattern");
+        assertFalse(isPattern("/a#b"), "a fragment in a pattern");
+        assertFalse(isPattern("/a\"b"), "a quote in a pattern");
+        assertFalse(isPattern("//evil.example/x"), "two slashes, which a browser reads as a host");
+        assertFalse(isPattern("/a\\b"), "a backslash, which a browser reads as a slash");
+        assertTrue(isPattern("/a//b"), "two slashes inside the path");
+        assertTrue(paramCount("/a/:b/*") = 2, "a name and a last star");
+        assertTrue(paramCount("/a/*/c") = 0, "a star that is not last is a literal");
+        assertTrue(paramCount("/:/x") = 0, "a colon alone is a literal");
+        assertTrue(paramCount("/") = 0, "the root has none");
+        let note: Target[NoParams] := addNote();
+        assertTrue(isStatic(&note), "a target without parameters");
+        assertTrue(isFormTarget(&note), "a POST target is an action");
+        destroyLink(path(note));
+        let gone: Target[NoParams] := target("DELETE", "/notes", answerPost);
+        assertFalse(isFormTarget(&gone), "a form sends no DELETE");
+        destroyLink(path(gone));
+        let post: Target[PostId] := showPost();
+        assertFalse(isStatic(&post), "a target with a parameter");
+        let unused: Route := route(post);
+        assertTrue(isQueryName("page_2"), "a query name");
+        assertFalse(isQueryName(""), "the empty query name");
+        assertFalse(isQueryName("a=b"), "an equals sign in a query name");
+        return nil;
+    end;
+
+    generic [R: Region, V: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, V]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    generic [V: Region]
+    function fakeRequest(verb: Span[Nat8, Static], uri: Span[Nat8, V]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", verb);
+        addPair(&!params, "REQUEST_URI", uri);
+        let block: String := finalize(params);
+        var empty: StringBuilder := makeStringBuilder();
+        return makeRequest(block, finalize(empty));
+    end;
+
+    -- The routes made from the targets answer the links made from them.
+    function testRoute(): Unit is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, route(showUserPost()));
+        insertBack(&!routes, route(showUser()));
+        insertBack(&!routes, route(addNote()));
+        case userLink("a/b c") of
+            when Some(value as l: Link) do
+                let text: String := linkString(l);
+                let output: String := dispatch(fakeRequest("GET", asSpan(&text)), &routes);
+                destroyString(text);
+                let good: Bool := startsWith(asSpan(&output), "Status: 200 ") and contains(asSpan(&output), "user");
+                destroyString(output);
+                assertTrue(good, "the link reaches the handler of its target");
+            when None do
+                assertTrue(false, "a link for the router");
+        end case;
+        let action: String := formAction(addNote());
+        let posted: String := dispatch(fakeRequest("POST", asSpan(&action)), &routes);
+        destroyString(action);
+        let good: Bool := startsWith(asSpan(&posted), "Status: 200 ");
+        destroyString(posted);
+        assertTrue(good, "the action of a form reaches its handler");
+        destroyFree(routes);
+        return nil;
+    end;
+
+    -- A handler reads its value through its own target, decoded.
+    function testTargetParam(): Unit is
+        let request: Request := fakeRequest("GET", "/user/a%2Fb%20c?x=1");
+        case targetParam(showUser(), &request, "name") of
+            when Some(value as name: String) do
+                let same: Bool := sameBytes(asSpan(&name), "a/b c");
+                destroyString(name);
+                assertTrue(same, "the value of the segment, decoded");
+            when None do
+                assertTrue(false, "the value of the segment");
+        end case;
+        case targetParam(showPost(), &request, "id") of
+            when Some(value as id: String) do
+                destroyString(id);
+                assertTrue(false, "a path that fits another target");
+            when None do
+                assertTrue(true, "a path that fits another target");
+        end case;
+        destroyRequest(request);
+        return nil;
+    end;
+end module body.

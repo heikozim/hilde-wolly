@@ -1,0 +1,203 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The inline spans of the Markdown text of one block, with their source
+ranges, and the reveal rule of a live editor: a span shows its Markdown
+source while the cursor is in it and is drawn rendered otherwise.
+
+The syntax follows CommonMark 0.31.2, sections 6.1 to 6.7, and GFM (GitHub
+Flavored Markdown) for strikethrough and extended autolinks.  Code spans,
+autolinks (an absolute URI, Uniform Resource Identifier, or an e-mail
+address in angle brackets) and raw HTML (HyperText Markup Language) tags
+bind first, from
+left to right; then links and images; then emphasis, strong emphasis and
+strikethrough by the rules of delimiter runs (left and right flanking, the
+rule of multiples of 3, no intraword emphasis with _).  A span may cross a
+line break: the text may hold LF (line feed) bytes.
+
+The text is UTF-8 (Unicode Transformation Format, 8 bit).  Every offset is
+a byte offset into it; every span starts and stops at an ASCII (American
+Standard Code for Information Interchange) byte or at the end, so no span
+splits a UTF-8 sequence.  A span covers start to stop, stop being the
+byte after it, markers included; its inner part is what a reader sees when
+it is rendered (see innerStart).  Spans come in the order of their start,
+an enclosing span before the spans inside it; spanParent names the
+enclosing one.  Spans nest properly: two spans are disjoint or one holds
+the other.
+
+A reference link counts only when its label is among the labels passed to
+scanSpans: one label per line, normalised the way this module normalises
+the label in the text (ASCII and Latin-1 capitals as small letters, every
+run of white space one blank, none at the ends).
+
+Limits:
+- At most mostSpanBytes bytes are read; the rest of the text has no spans.
+- At most mostSpans spans are kept; later ones are dropped.
+- Entity names are checked for their form (a letter, then 1 to 30 letters
+  and digits), not against the list of HTML entity names.
+- Label folding knows ASCII and Latin-1 capitals only, not the full Unicode
+  case folding.
+- A footnote reference [^id] is a span whatever the labels say; its label
+  holds no blank, no bracket and at most 999 bytes.
+- An emoji :name: is a span for any name of a-z, 0-9, _, + and -; the name
+  is not checked against a list.
+- Bare links (GFM extended autolinks) know the lowercase prefixes www.,
+  http:// and https:// and ASCII domains only, and no bare e-mail address;
+  as in the GFM reference parser, none is found while a [ or ![ is open.
+- Strikethrough takes runs of one or two ~; an opener and its closer have
+  the same length.
+- A URL (Uniform Resource Locator) is not checked for safety here: an
+  unsafe link is still a link span.
+
+    let spans: Spans := scanSpans("a **b** c", "");
+    let first: Index := spanStart(&spans, 0);
+    let shown: Bool := isRevealed(&spans, 0, 4);
+    destroySpans(spans);
+"""
+module Wolly.MarkdownSpans is
+    """
+    The kind of a span.  EmphasisSpan, StrongSpan and StrikeSpan come from
+    delimiter runs; CodeSpan from backticks; LinkSpan and ImageSpan from
+    brackets; AutolinkSpan from an absolute URI or an e-mail address in
+    angle brackets; BareLinkSpan from a www., http:// or https:// link
+    without brackets; HtmlSpan from an inline raw HTML tag, comment,
+    processing instruction, declaration or CDATA (character data) section;
+    EscapeSpan from a backslash before ASCII punctuation; EntitySpan from
+    an entity or a numeric character reference; FootnoteSpan from [^id];
+    EmojiSpan from :name:.
+    """
+    union SpanKind: Free is
+        case EmphasisSpan;
+        case StrongSpan;
+        case StrikeSpan;
+        case CodeSpan;
+        case LinkSpan;
+        case ImageSpan;
+        case AutolinkSpan;
+        case BareLinkSpan;
+        case HtmlSpan;
+        case EscapeSpan;
+        case EntitySpan;
+        case FootnoteSpan;
+        case EmojiSpan;
+    end;
+
+    """
+    The spans of one text, in the order of their start, outer before inner.
+    Linear: destroySpans gives them back.
+    """
+    type Spans: Linear;
+
+    """
+    The most spans scanSpans keeps: 65536.
+    """
+    function mostSpans(): Index
+        ensures result = 65536;
+
+    """
+    The most bytes of the text scanSpans reads: 1048576.
+    """
+    function mostSpanBytes(): Index
+        ensures result = 1048576;
+
+    """
+    The spans of text by the rules of the module head; labels holds the
+    known reference labels, one per line, normalised; the empty span means
+    none.
+    """
+    generic [R: Region, L: Region]
+    function scanSpans(text: Span[Nat8, R], labels: Span[Nat8, L]): Spans
+        ensures spanCount(&result) <= mostSpans();
+
+    """
+    Gives the spans back.
+    No contract: it only frees what it is given.
+    """
+    function destroySpans(spans: Spans): Unit;
+
+    """
+    How many spans there are.
+    """
+    generic [R: Region]
+    function spanCount(spans: &[Spans, R]): Index
+        ensures result <= mostSpans();
+
+    """
+    The kind of span i.
+    """
+    generic [R: Region]
+    function spanKind(spans: &[Spans, R], i: Index): SpanKind
+        requires i < spanCount(spans);
+
+    """
+    The first byte of span i, its opening marker.
+    """
+    generic [R: Region]
+    function spanStart(spans: &[Spans, R], i: Index): Index
+        requires i < spanCount(spans)
+        ensures result < mostSpanBytes();
+
+    """
+    The byte after span i, after its closing marker.  Always greater than
+    spanStart of the span.
+    """
+    generic [R: Region]
+    function spanStop(spans: &[Spans, R], i: Index): Index
+        requires i < spanCount(spans)
+        ensures (result >= 1) and (result <= mostSpanBytes());
+
+    """
+    The first byte of the part of span i shown when it is rendered: for
+    emphasis, strong, strikethrough and a code span the text between the
+    markers (for a code span without the one blank stripped at either end);
+    for a link and an image the text inside the brackets; for an escape the
+    escaped byte; for an entity, an autolink, a bare link, an HTML tag, a
+    footnote and an emoji the whole span.  Never before spanStart.
+    """
+    generic [R: Region]
+    function innerStart(spans: &[Spans, R], i: Index): Index
+        requires i < spanCount(spans)
+        ensures result <= mostSpanBytes();
+
+    """
+    The byte after the part of span i shown when it is rendered.  Never
+    before innerStart and never after spanStop.
+    """
+    generic [R: Region]
+    function innerStop(spans: &[Spans, R], i: Index): Index
+        requires i < spanCount(spans)
+        ensures result <= mostSpanBytes();
+
+    """
+    The index of the span that encloses span i most closely, or spanCount
+    when none does.  An enclosing span comes before the spans inside it.
+    """
+    generic [R: Region]
+    function spanParent(spans: &[Spans, R], i: Index): Index
+        requires i < spanCount(spans)
+        ensures (result < i) or (result = spanCount(spans));
+
+    """
+    Whether span i shows its source for a cursor at the byte offset cursor:
+    when spanStart <= cursor <= spanStop, both ends included, so a cursor
+    right after the closing marker still reveals it.  Every span that
+    encloses a revealed span is revealed too, since it holds the cursor.
+    """
+    generic [R: Region]
+    function isRevealed(spans: &[Spans, R], i: Index, cursor: Index): Bool
+        requires i < spanCount(spans);
+
+    """
+    Whether span i shows its source for the selection from selection_start
+    to selection_stop: when the span, ends included, overlaps the selection
+    or holds one of its ends.  For an empty selection the same as
+    isRevealed.
+    """
+    generic [R: Region]
+    function isRevealedBy(spans: &[Spans, R], i: Index, selection_start: Index, selection_stop: Index): Bool
+        requires (i < spanCount(spans)) and (selection_start <= selection_stop);
+end module.

@@ -1,0 +1,2350 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nth,
+    nthRef,
+    lengthMut,
+    nthMut,
+    storeNth,
+    insertBack,
+    removeFirst,
+    removeLast,
+    wholeSpan,
+    destroyFree,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    length,
+    asSpan,
+    fromSpan,
+    makeEmpty,
+    destroyString,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Html (
+    escapeHtml,
+    sanitize
+);
+import Wolly.TextLayout (
+    clusterEndAt
+);
+import Wolly.Markdown (
+    markdownWithHtmlToHtml,
+    richPolicy
+);
+import Wolly.HtmlToMarkdown (
+    htmlToMarkdown
+);
+
+module body Wolly.Editor is
+    -- The kinds of blocks, as numbers, so that they compare with =.
+    constant kind_paragraph: Index := 1;
+    constant kind_heading: Index := 2;
+    constant kind_quote: Index := 3;
+    constant kind_bullet: Index := 4;
+    constant kind_ordered: Index := 5;
+    constant kind_task: Index := 6;
+    constant kind_fence: Index := 7;
+    constant kind_mermaid: Index := 8;
+    constant kind_rule: Index := 9;
+    constant kind_table: Index := 10;
+    constant kind_html: Index := 11;
+    constant kind_definition: Index := 12;
+    constant kind_toc: Index := 13;
+    constant kind_front: Index := 14;
+    constant kind_empty: Index := 15;
+    -- What a line is when it is not the start of one of the kinds above.
+    constant line_blank: Index := 20;
+    constant line_text: Index := 21;
+
+    -- What the last edit was, for the undo groups.
+    constant typed_none: Index := 0;
+    constant typed_chars: Index := 1;
+    constant typed_back: Index := 2;
+
+    -- One block: its kind, the bytes start to stop of its lines, where the
+    -- content of its first line begins, its level, its number, whether a
+    -- task is done and where its box is, the info string of a fence, the
+    -- byte of its marker (# = - for headings, the bullet, the delimiter of
+    -- an ordered item, the fence byte) and whether a fence is closed.
+    record Block: Free is
+        kind: Index;
+        start: Index;
+        stop: Index;
+        content: Index;
+        level: Index;
+        number: Index;
+        checked: Bool;
+        box: Index;
+        info_start: Index;
+        info_stop: Index;
+        marker: Nat8;
+        closed: Bool;
+    end;
+
+    -- One edit: at the byte at, removed was taken out and inserted put in;
+    -- the selection before and after it, and the group it belongs to.
+    record Step: Linear is
+        at: Index;
+        removed: String;
+        inserted: String;
+        anchor_before: Index;
+        head_before: Index;
+        anchor_after: Index;
+        head_after: Index;
+        group: Index;
+    end;
+
+    record Editor: Linear is
+        source: Buffer[Nat8];
+        blocks: Buffer[Block];
+        anchor: Index;
+        head: Index;
+        undo_steps: Buffer[Step];
+        redo_steps: Buffer[Step];
+        next_group: Index;
+        typed: Index;
+        typed_end: Index;
+        invariant bufferLength(&blocks) >= 1;
+    end;
+
+    function mostEditorBytes(): Index is
+        return 1048576;
+    end;
+
+    function mostUndoSteps(): Index is
+        return 10000;
+    end;
+
+    -- Bytes and lines.
+
+    function isSpaceByte(byte: Nat8): Bool is
+        return (byte = 32) or (byte = 9);
+    end;
+
+    function isDigitByte(byte: Nat8): Bool is
+        return (byte >= 48) and (byte <= 57);
+    end;
+
+    function isLetterByte(byte: Nat8): Bool is
+        return ((byte >= 65) and (byte <= 90)) or ((byte >= 97) and (byte <= 122));
+    end;
+
+    -- The value of byte as an Index.
+    function widen(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function lowerByte(byte: Nat8): Nat8 is
+        if (byte >= 65) and (byte <= 90) then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    -- The end of the line that holds the byte at: the next LF, or the end.
+    generic [R: Region]
+    function lineStopAt(text: Span[Nat8, R], at: Index): Index is
+        var i: Index := at;
+        while i < spanLength(text) do
+            if text[i] = 10 then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    -- The start of the line that holds the byte at.
+    generic [R: Region]
+    function lineStartAt(text: Span[Nat8, R], at: Index): Index is
+        var i: Index := at;
+        if i > spanLength(text) then
+            i := spanLength(text);
+        end if;
+        while i > 0 do
+            if text[i - 1] = 10 then
+                return i;
+            end if;
+            i := i - 1;
+        end while;
+        return 0;
+    end;
+
+    generic [R: Region]
+    function isBlankLine(text: Span[Nat8, R], start: Index, stop: Index): Bool is
+        var i: Index := start;
+        while i < stop do
+            if not (isSpaceByte(text[i])) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The byte after the spaces and tabs at the start of a line.
+    generic [R: Region]
+    function indentEnd(text: Span[Nat8, R], start: Index, stop: Index): Index is
+        var i: Index := start;
+        while (i < stop) and isSpaceByte(text[i]) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- The columns of the spaces and tabs from start to stop, a tab to the
+    -- next multiple of 4.
+    generic [R: Region]
+    function columnsOf(text: Span[Nat8, R], start: Index, stop: Index): Index is
+        var columns: Index := 0;
+        var i: Index := start;
+        while i < stop do
+            if text[i] = 9 then
+                columns := (columns + 4) - (columns - ((columns / 4) * 4));
+            else
+                columns := columns + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return columns;
+    end;
+
+    -- The bytes from start to stop without the spaces and tabs at their ends:
+    -- the first and the byte after the last.
+    generic [R: Region]
+    function trimStart(text: Span[Nat8, R], start: Index, stop: Index): Index is
+        var i: Index := start;
+        while (i < stop) and isSpaceByte(text[i]) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    generic [R: Region]
+    function trimStop(text: Span[Nat8, R], start: Index, stop: Index): Index is
+        var i: Index := stop;
+        while (i > start) and isSpaceByte(text[i - 1]) do
+            i := i - 1;
+        end while;
+        return i;
+    end;
+
+    -- Whether the bytes at at, compared in small letters, begin with word.
+    generic [R: Region, W: Region]
+    function hasWordAt(text: Span[Nat8, R], at: Index, stop: Index, word: Span[Nat8, W]): Bool is
+        if (at + spanLength(word)) > stop then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if lowerByte(text[at + i]) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether the bytes from start to stop hold word, in small letters.
+    generic [R: Region, W: Region]
+    function holdsWord(text: Span[Nat8, R], start: Index, stop: Index, word: Span[Nat8, W]): Bool is
+        var i: Index := start;
+        while (i + spanLength(word)) <= stop do
+            if hasWordAt(text, i, stop, word) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Whether the bytes from start to stop are word, in small letters.
+    generic [R: Region, W: Region]
+    function isWord(text: Span[Nat8, R], start: Index, stop: Index, word: Span[Nat8, W]): Bool is
+        return ((stop - start) = spanLength(word)) and hasWordAt(text, start, stop, word);
+    end;
+
+    -- Lines and what they start.
+
+    -- What one line is: its kind (one of the kinds of blocks, line_blank or
+    -- line_text), where its content begins, its level, number, box and
+    -- whether it is ticked, the byte of its marker, the fence length, the
+    -- info string and the kind of HTML start (1 to 7, 0 for none).
+    record Line: Free is
+        kind: Index;
+        content: Index;
+        level: Index;
+        number: Index;
+        checked: Bool;
+        box: Index;
+        marker: Nat8;
+        info_start: Index;
+        info_stop: Index;
+        html: Index;
+    end;
+
+    function textLine(content: Index, level: Index): Line is
+        return Line(kind => line_text, content => content, level => level, number => 0, checked => false, box => 0, marker => 0, info_start => 0, info_stop => 0, html => 0);
+    end;
+
+    -- The level of an ATX heading starting at at, 0 for none.
+    generic [R: Region]
+    function atxLevel(text: Span[Nat8, R], at: Index, stop: Index): Index is
+        var i: Index := at;
+        while (i < stop) and (text[i] = '#') do
+            i := i + 1;
+        end while;
+        let level: Index := i - at;
+        if (level < 1) or (level > 6) then
+            return 0;
+        end if;
+        if (i < stop) and (not (isSpaceByte(text[i]))) then
+            return 0;
+        end if;
+        return level;
+    end;
+
+    -- Whether the bytes at to stop are a thematic break.
+    generic [R: Region]
+    function isRule(text: Span[Nat8, R], at: Index, stop: Index): Bool is
+        if at >= stop then
+            return false;
+        end if;
+        let first: Nat8 := text[at];
+        if (first /= '*') and ((first /= '-') and (first /= '_')) then
+            return false;
+        end if;
+        var count: Index := 0;
+        var i: Index := at;
+        while i < stop do
+            let byte: Nat8 := text[i];
+            if byte = first then
+                count := count + 1;
+            else if not (isSpaceByte(byte)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return count >= 3;
+    end;
+
+    -- The level of a setext underline at at to stop: 1 for =, 2 for -, 0 none.
+    generic [R: Region]
+    function setextLevel(text: Span[Nat8, R], at: Index, stop: Index): Index is
+        if at >= stop then
+            return 0;
+        end if;
+        let first: Nat8 := text[at];
+        if (first /= '=') and (first /= '-') then
+            return 0;
+        end if;
+        var i: Index := at;
+        while (i < stop) and (text[i] = first) do
+            i := i + 1;
+        end while;
+        if not (isBlankLine(text, i, stop)) then
+            return 0;
+        end if;
+        if first = '=' then
+            return 1;
+        end if;
+        return 2;
+    end;
+
+    -- The length of the run of fence bytes at at, 0 when it is no fence.
+    generic [R: Region]
+    function fenceRun(text: Span[Nat8, R], at: Index, stop: Index): Index is
+        if at >= stop then
+            return 0;
+        end if;
+        let first: Nat8 := text[at];
+        if (first /= '`') and (first /= '~') then
+            return 0;
+        end if;
+        var i: Index := at;
+        while (i < stop) and (text[i] = first) do
+            i := i + 1;
+        end while;
+        if (i - at) < 3 then
+            return 0;
+        end if;
+        if first = '`' then
+            var j: Index := i;
+            while j < stop do
+                if text[j] = '`' then
+                    return 0;
+                end if;
+                j := j + 1;
+            end while;
+        end if;
+        return i - at;
+    end;
+
+    -- Whether the line start to stop closes a fence of marker and run.
+    generic [R: Region]
+    function closesFence(text: Span[Nat8, R], start: Index, stop: Index, marker: Nat8, run: Index): Bool is
+        let at: Index := indentEnd(text, start, stop);
+        if columnsOf(text, start, at) > 3 then
+            return false;
+        end if;
+        var i: Index := at;
+        while (i < stop) and (text[i] = marker) do
+            i := i + 1;
+        end while;
+        return ((i - at) >= run) and isBlankLine(text, i, stop);
+    end;
+
+    -- The block tags of the HTML start condition 6.
+    generic [R: Region]
+    function isBlockTag(text: Span[Nat8, R], start: Index, stop: Index): Bool is
+        return isWord(text, start, stop, "address") or isWord(text, start, stop, "article") or isWord(text, start, stop, "aside") or isWord(text, start, stop, "base") or isWord(text, start, stop, "basefont") or isWord(text, start, stop, "blockquote") or isWord(text, start, stop, "body") or isWord(text, start, stop, "caption") or isWord(text, start, stop, "center") or isWord(text, start, stop, "col") or isWord(text, start, stop, "colgroup") or isWord(text, start, stop, "dd") or isWord(text, start, stop, "details") or isWord(text, start, stop, "dialog") or isWord(text, start, stop, "dir") or isWord(text, start, stop, "div") or isWord(text, start, stop, "dl") or isWord(text, start, stop, "dt") or isWord(text, start, stop, "fieldset") or isWord(text, start, stop, "figcaption") or isWord(text, start, stop, "figure") or isWord(text, start, stop, "footer") or isWord(text, start, stop, "form") or isWord(text, start, stop, "frame") or isWord(text, start, stop, "frameset") or isWord(text, start, stop, "h1") or isWord(text, start, stop, "h2") or isWord(text, start, stop, "h3") or isWord(text, start, stop, "h4") or isWord(text, start, stop, "h5") or isWord(text, start, stop, "h6") or isWord(text, start, stop, "head") or isWord(text, start, stop, "header") or isWord(text, start, stop, "hr") or isWord(text, start, stop, "html") or isWord(text, start, stop, "iframe") or isWord(text, start, stop, "legend") or isWord(text, start, stop, "li") or isWord(text, start, stop, "link") or isWord(text, start, stop, "main") or isWord(text, start, stop, "menu") or isWord(text, start, stop, "menuitem") or isWord(text, start, stop, "nav") or isWord(text, start, stop, "noframes") or isWord(text, start, stop, "ol") or isWord(text, start, stop, "optgroup") or isWord(text, start, stop, "option") or isWord(text, start, stop, "p") or isWord(text, start, stop, "param") or isWord(text, start, stop, "search") or isWord(text, start, stop, "section") or isWord(text, start, stop, "summary") or isWord(text, start, stop, "table") or isWord(text, start, stop, "tbody") or isWord(text, start, stop, "td") or isWord(text, start, stop, "tfoot") or isWord(text, start, stop, "th") or isWord(text, start, stop, "thead") or isWord(text, start, stop, "title") or isWord(text, start, stop, "tr") or isWord(text, start, stop, "track") or isWord(text, start, stop, "ul");
+    end;
+
+    -- The HTML start condition (1 to 7) of a line whose content begins with
+    -- < at at, 0 for none.
+    generic [R: Region]
+    function htmlStart(text: Span[Nat8, R], at: Index, stop: Index): Index is
+        if (at >= stop) or (text[at] /= '<') then
+            return 0;
+        end if;
+        if hasWordAt(text, at, stop, "<script") or hasWordAt(text, at, stop, "<pre") or hasWordAt(text, at, stop, "<style") or hasWordAt(text, at, stop, "<textarea") then
+            var name: Index := at + 1;
+            while (name < stop) and isLetterByte(text[name]) do
+                name := name + 1;
+            end while;
+            if (name = stop) or (isSpaceByte(text[name]) or (text[name] = '>')) then
+                return 1;
+            end if;
+        end if;
+        if hasWordAt(text, at, stop, "<!--") then
+            return 2;
+        end if;
+        if hasWordAt(text, at, stop, "<?") then
+            return 3;
+        end if;
+        if hasWordAt(text, at, stop, "<![cdata[") then
+            return 5;
+        end if;
+        if ((at + 2) < stop) and ((text[at + 1] = '!') and isLetterByte(text[at + 2])) then
+            return 4;
+        end if;
+        var first: Index := at + 1;
+        if (first < stop) and (text[first] = '/') then
+            first := first + 1;
+        end if;
+        if (first >= stop) or (not (isLetterByte(text[first]))) then
+            return 0;
+        end if;
+        var last: Index := first;
+        while (last < stop) and (isLetterByte(text[last]) or isDigitByte(text[last])) do
+            last := last + 1;
+        end while;
+        if isBlockTag(text, first, last) then
+            if (last = stop) or (isSpaceByte(text[last]) or (text[last] = '>')) then
+                return 6;
+            end if;
+            if ((last + 1) < stop) and ((text[last] = '/') and (text[last + 1] = '>')) then
+                return 6;
+            end if;
+        end if;
+        let end_at: Index := trimStop(text, at, stop);
+        if text[end_at - 1] = '>' then
+            return 7;
+        end if;
+        return 0;
+    end;
+
+    -- Whether the line start to stop ends the HTML block of the condition
+    -- html (1 to 5).
+    generic [R: Region]
+    function endsHtml(text: Span[Nat8, R], start: Index, stop: Index, html: Index): Bool is
+        if html = 1 then
+            return holdsWord(text, start, stop, "</script>") or holdsWord(text, start, stop, "</pre>") or holdsWord(text, start, stop, "</style>") or holdsWord(text, start, stop, "</textarea>");
+        end if;
+        if html = 2 then
+            return holdsWord(text, start, stop, "-->");
+        end if;
+        if html = 3 then
+            return holdsWord(text, start, stop, "?>");
+        end if;
+        if html = 4 then
+            return holdsWord(text, start, stop, ">");
+        end if;
+        return holdsWord(text, start, stop, "]]>");
+    end;
+
+    -- The cells of a table row from start to stop: the pipes not escaped,
+    -- without a leading and a trailing one, plus one.  0 without a pipe.
+    generic [R: Region]
+    function rowCells(text: Span[Nat8, R], start: Index, stop: Index): Index is
+        let first: Index := trimStart(text, start, stop);
+        let last: Index := trimStop(text, start, stop);
+        var pipes: Index := 0;
+        var i: Index := first;
+        while i < last do
+            let byte: Nat8 := text[i];
+            if byte = '\\' then
+                i := i + 1;
+            else if byte = '|' then
+                pipes := pipes + 1;
+            end if;
+            i := i + 1;
+        end while;
+        if pipes = 0 then
+            return 0;
+        end if;
+        var cells: Index := pipes + 1;
+        if text[first] = '|' then
+            cells := cells - 1;
+        end if;
+        if (last > (first + 1)) and (text[last - 1] = '|') then
+            cells := cells - 1;
+        end if;
+        return cells;
+    end;
+
+    -- Whether start to stop is the delimiter row of a table: cells of an
+    -- optional colon, dashes and an optional colon, with a pipe.
+    generic [R: Region]
+    function isDelimiterRow(text: Span[Nat8, R], start: Index, stop: Index): Bool is
+        var pipes: Index := 0;
+        var dashes: Index := 0;
+        var i: Index := start;
+        while i < stop do
+            let byte: Nat8 := text[i];
+            if byte = '|' then
+                pipes := pipes + 1;
+            else if byte = '-' then
+                dashes := dashes + 1;
+            else if (byte /= ':') and (not (isSpaceByte(byte))) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return (pipes > 0) and (dashes > 0);
+    end;
+
+    -- Whether start to stop is a link definition: [label]: at the start.
+    generic [R: Region]
+    function isDefinition(text: Span[Nat8, R], at: Index, stop: Index): Bool is
+        if (at >= stop) or (text[at] /= '[') then
+            return false;
+        end if;
+        if ((at + 1) < stop) and (text[at + 1] = '^') then
+            return false;
+        end if;
+        var i: Index := at + 1;
+        while i < stop do
+            let byte: Nat8 := text[i];
+            if byte = '\\' then
+                i := i + 1;
+            else if byte = '[' then
+                return false;
+            else if byte = ']' then
+                return (i > (at + 1)) and (((i + 1) < stop) and (text[i + 1] = ':'));
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The line start to stop, read on its own.
+    generic [R: Region]
+    function classifyLine(text: Span[Nat8, R], start: Index, stop: Index): Line is
+        if isBlankLine(text, start, stop) then
+            return Line(kind => line_blank, content => start, level => 0, number => 0, checked => false, box => 0, marker => 0, info_start => 0, info_stop => 0, html => 0);
+        end if;
+        let at: Index := indentEnd(text, start, stop);
+        let columns: Index := columnsOf(text, start, at);
+        let first: Nat8 := text[at];
+        if columns <= 3 then
+            let level: Index := atxLevel(text, at, stop);
+            if level > 0 then
+                let content: Index := trimStart(text, at + level, stop);
+                return Line(kind => kind_heading, content => content, level => level, number => 0, checked => false, box => 0, marker => '#', info_start => 0, info_stop => 0, html => 0);
+            end if;
+            let run: Index := fenceRun(text, at, stop);
+            if run > 0 then
+                let info_start: Index := trimStart(text, at + run, stop);
+                let info_stop: Index := trimStop(text, info_start, stop);
+                var word: Index := info_start;
+                while (word < info_stop) and (not (isSpaceByte(text[word]))) do
+                    word := word + 1;
+                end while;
+                var kind: Index := kind_fence;
+                if isWord(text, info_start, word, "mermaid") then
+                    kind := kind_mermaid;
+                end if;
+                return Line(kind => kind, content => at, level => run, number => 0, checked => false, box => 0, marker => first, info_start => info_start, info_stop => info_stop, html => 0);
+            end if;
+            if first = '>' then
+                var depth: Index := 0;
+                var i: Index := at;
+                while (i < stop) and (text[i] = '>') do
+                    depth := depth + 1;
+                    i := i + 1;
+                    if (i < stop) and isSpaceByte(text[i]) then
+                        i := i + 1;
+                    end if;
+                    let next: Index := indentEnd(text, i, stop);
+                    if (next < stop) and (text[next] = '>') then
+                        i := next;
+                    end if;
+                end while;
+                return Line(kind => kind_quote, content => i, level => depth, number => 0, checked => false, box => 0, marker => '>', info_start => 0, info_stop => 0, html => 0);
+            end if;
+            if isRule(text, at, stop) then
+                return Line(kind => kind_rule, content => at, level => 0, number => 0, checked => false, box => 0, marker => first, info_start => 0, info_stop => 0, html => 0);
+            end if;
+            let html: Index := htmlStart(text, at, stop);
+            if html > 0 then
+                return Line(kind => kind_html, content => at, level => 0, number => 0, checked => false, box => 0, marker => '<', info_start => 0, info_stop => 0, html => html);
+            end if;
+            let last: Index := trimStop(text, at, stop);
+            if isWord(text, at, last, "[toc]") then
+                return Line(kind => kind_toc, content => at, level => 0, number => 0, checked => false, box => 0, marker => '[', info_start => 0, info_stop => 0, html => 0);
+            end if;
+            if isDefinition(text, at, stop) then
+                return Line(kind => kind_definition, content => at, level => 0, number => 0, checked => false, box => 0, marker => '[', info_start => 0, info_stop => 0, html => 0);
+            end if;
+        end if;
+        return listLine(text, at, stop, columns);
+    end;
+
+    -- The line as a list item when its content at at begins with a marker,
+    -- else as text.
+    generic [R: Region]
+    function listLine(text: Span[Nat8, R], at: Index, stop: Index, columns: Index): Line is
+        let first: Nat8 := text[at];
+        var kind: Index := line_text;
+        var after: Index := at;
+        var number: Index := 0;
+        var marker: Nat8 := 0;
+        if (first = '-') or ((first = '+') or (first = '*')) then
+            kind := kind_bullet;
+            after := at + 1;
+            marker := first;
+        else if isDigitByte(first) then
+            var i: Index := at;
+            while ((i < stop) and isDigitByte(text[i])) and ((i - at) < 9) do
+                number := (number * 10) + widen(text[i] - 48);
+                i := i + 1;
+            end while;
+            if (i < stop) and ((text[i] = '.') or (text[i] = ')')) then
+                kind := kind_ordered;
+                marker := text[i];
+                after := i + 1;
+            end if;
+        end if;
+        if kind = line_text then
+            return textLine(at, columns);
+        end if;
+        if (after < stop) and (not (isSpaceByte(text[after]))) then
+            return textLine(at, columns);
+        end if;
+        var content: Index := after;
+        if after < stop then
+            content := after + 1;
+            var spaces: Index := 1;
+            while ((content < stop) and isSpaceByte(text[content])) and (spaces < 4) do
+                content := content + 1;
+                spaces := spaces + 1;
+            end while;
+        end if;
+        if ((content + 2) < stop) or ((content + 2) = stop) then
+            if (text[content] = '[') and (text[content + 2] = ']') then
+                let mark: Nat8 := text[content + 1];
+                if (mark = ' ') or ((mark = 'x') or (mark = 'X')) then
+                    if ((content + 3) = stop) or isSpaceByte(text[content + 3]) then
+                        let box: Index := content;
+                        var inner: Index := content + 3;
+                        if inner < stop then
+                            inner := inner + 1;
+                        end if;
+                        return Line(kind => kind_task, content => inner, level => columns, number => number, checked => mark /= ' ', box => box, marker => marker, info_start => 0, info_stop => 0, html => 0);
+                    end if;
+                end if;
+            end if;
+        end if;
+        return Line(kind => kind, content => content, level => columns, number => number, checked => false, box => 0, marker => marker, info_start => 0, info_stop => 0, html => 0);
+    end;
+
+    -- Whether a line of this kind ends a paragraph above it.
+    function interruptsParagraph(line: Line, empty_item: Bool): Bool is
+        let kind: Index := line.kind;
+        if (kind = kind_heading) or ((kind = kind_fence) or (kind = kind_mermaid)) then
+            return true;
+        end if;
+        if (kind = kind_quote) or (kind = kind_rule) then
+            return true;
+        end if;
+        if (kind = kind_html) and (line.html < 7) then
+            return true;
+        end if;
+        if (kind = kind_bullet) or (kind = kind_task) then
+            return not empty_item;
+        end if;
+        if kind = kind_ordered then
+            return (line.number = 1) and (not empty_item);
+        end if;
+        return false;
+    end;
+
+    -- Whether a line of this kind starts a block of its own below an item
+    -- or a table row.
+    function startsBlock(line: Line): Bool is
+        let kind: Index := line.kind;
+        return (kind /= line_text) and (kind /= line_blank);
+    end;
+
+    -- Reading the blocks.
+
+    function blockOf(kind: Index, start: Index, stop: Index, line: Line): Block is
+        return Block(kind => kind, start => start, stop => stop, content => line.content, level => line.level, number => line.number, checked => line.checked, box => line.box, info_start => line.info_start, info_stop => line.info_stop, marker => line.marker, closed => false);
+    end;
+
+    function emptyBlock(at: Index): Block is
+        return Block(kind => kind_empty, start => at, stop => at, content => at, level => 0, number => 0, checked => false, box => 0, info_start => 0, info_stop => 0, marker => 0, closed => false);
+    end;
+
+    -- The end of the front matter at the start of text: the end of its
+    -- closing line, or 0 when there is none.
+    generic [R: Region]
+    function frontMatterStop(text: Span[Nat8, R]): Index is
+        let first: Index := lineStopAt(text, 0);
+        if not (isWord(text, 0, trimStop(text, 0, first), "---")) then
+            return 0;
+        end if;
+        var at: Index := first + 1;
+        while at < spanLength(text) do
+            let stop: Index := lineStopAt(text, at);
+            let last: Index := trimStop(text, at, stop);
+            if isWord(text, at, last, "---") or isWord(text, at, last, "...") then
+                return stop;
+            end if;
+            at := stop + 1;
+        end while;
+        return 0;
+    end;
+
+    -- The blocks of text, read line by line; see the module head.
+    generic [R: Region]
+    function scanBlocks(text: Span[Nat8, R]): Buffer[Block] is
+        var blocks: Buffer[Block] := allocateEmpty();
+        let size: Index := spanLength(text);
+        var at: Index := 0;
+        let front: Index := frontMatterStop(text);
+        if front > 0 then
+            let line: Line := textLine(0, 0);
+            insertBack(&!blocks, blockOf(kind_front, 0, front, line));
+            if front = size then
+                return blocks;
+            end if;
+            at := front + 1;
+        end if;
+        while at <= size do
+            let stop: Index := lineStopAt(text, at);
+            let line: Line := classifyLine(text, at, stop);
+            if line.kind = line_blank then
+                at := blankRun(text, &!blocks, at);
+            else
+                at := readBlock(text, &!blocks, at, line);
+            end if;
+        end while;
+        if bufferLength(&blocks) = 0 then
+            insertBack(&!blocks, emptyBlock(0));
+        end if;
+        return blocks;
+    end;
+
+    -- The run of blank lines that begins at at: an empty block for each
+    -- line that does not separate; see the module head.  Gives the start
+    -- of the line after the run, or the size plus one at the end.
+    generic [R: Region, Q: Region]
+    function blankRun(text: Span[Nat8, R], blocks: &![Buffer[Block], Q], at: Index): Index is
+        let size: Index := spanLength(text);
+        let before: Bool := lengthMut(&~blocks) > 0;
+        var count: Index := 0;
+        var line: Index := at;
+        var after: Bool := false;
+        while true do
+            let stop: Index := lineStopAt(text, line);
+            if not (isBlankLine(text, line, stop)) then
+                after := true;
+                skip;
+            end if;
+            if after then
+                skip;
+            else
+                count := count + 1;
+                if stop = size then
+                    line := size + 1;
+                    after := false;
+                end if;
+            end if;
+            if after or (line > size) then
+                return emitBlanks(text, &~blocks, at, count, before, after, line);
+            end if;
+            line := stop + 1;
+        end while;
+    end;
+
+    generic [R: Region, Q: Region]
+    function emitBlanks(text: Span[Nat8, R], blocks: &![Buffer[Block], Q], at: Index, count: Index, before: Bool, after: Bool, next: Index): Index is
+        var j: Index := 0;
+        var line: Index := at;
+        while j < count do
+            let separates: Bool := (before and (j = 0)) or (after and ((j + 1) = count));
+            if not separates then
+                insertBack(&~blocks, emptyBlock(line));
+            end if;
+            line := lineStopAt(text, line) + 1;
+            j := j + 1;
+        end while;
+        return next;
+    end;
+
+    -- One block that begins with the line at at, put into blocks.  Gives the
+    -- start of the line after it, or the size plus one at the end.
+    generic [R: Region, Q: Region]
+    function readBlock(text: Span[Nat8, R], blocks: &![Buffer[Block], Q], at: Index, line: Line): Index is
+        let size: Index := spanLength(text);
+        let stop: Index := lineStopAt(text, at);
+        let kind: Index := line.kind;
+        if (kind = kind_heading) or ((kind = kind_rule) or ((kind = kind_toc) or (kind = kind_definition))) then
+            insertBack(&~blocks, blockOf(kind, at, stop, line));
+            return stop + 1;
+        end if;
+        if (kind = kind_fence) or (kind = kind_mermaid) then
+            return readFence(text, &~blocks, at, line);
+        end if;
+        if kind = kind_html then
+            return readHtml(text, &~blocks, at, line);
+        end if;
+        if (stop < size) and (kind = line_text) then
+            let below: Index := stop + 1;
+            let below_stop: Index := lineStopAt(text, below);
+            let header: Index := rowCells(text, at, stop);
+            if (header > 0) and (isDelimiterRow(text, below, below_stop) and (rowCells(text, below, below_stop) = header)) then
+                return readTable(text, &~blocks, at, below_stop, header, line);
+            end if;
+        end if;
+        return readFlow(text, &~blocks, at, line);
+    end;
+
+    generic [R: Region, Q: Region]
+    function readFence(text: Span[Nat8, R], blocks: &![Buffer[Block], Q], at: Index, line: Line): Index is
+        let size: Index := spanLength(text);
+        var stop: Index := lineStopAt(text, at);
+        var closed: Bool := false;
+        while (stop < size) and (not closed) do
+            let next: Index := stop + 1;
+            let next_stop: Index := lineStopAt(text, next);
+            closed := closesFence(text, next, next_stop, line.marker, line.level);
+            stop := next_stop;
+        end while;
+        let block: Block := blockOf(line.kind, at, stop, line);
+        insertBack(&~blocks, Block(kind => block.kind, start => block.start, stop => block.stop, content => block.content, level => block.level, number => block.number, checked => block.checked, box => block.box, info_start => block.info_start, info_stop => block.info_stop, marker => block.marker, closed => closed));
+        return stop + 1;
+    end;
+
+    generic [R: Region, Q: Region]
+    function readHtml(text: Span[Nat8, R], blocks: &![Buffer[Block], Q], at: Index, line: Line): Index is
+        let size: Index := spanLength(text);
+        var stop: Index := lineStopAt(text, at);
+        if line.html <= 5 then
+            var done: Bool := endsHtml(text, at, stop, line.html);
+            while (stop < size) and (not done) do
+                let next: Index := stop + 1;
+                let next_stop: Index := lineStopAt(text, next);
+                done := endsHtml(text, next, next_stop, line.html);
+                stop := next_stop;
+            end while;
+        else
+            var more: Bool := stop < size;
+            while more do
+                let next: Index := stop + 1;
+                let next_stop: Index := lineStopAt(text, next);
+                if isBlankLine(text, next, next_stop) then
+                    more := false;
+                else
+                    stop := next_stop;
+                    more := stop < size;
+                end if;
+            end while;
+        end if;
+        insertBack(&~blocks, blockOf(kind_html, at, stop, line));
+        return stop + 1;
+    end;
+
+    generic [R: Region, Q: Region]
+    function readTable(text: Span[Nat8, R], blocks: &![Buffer[Block], Q], at: Index, delimiter_stop: Index, columns: Index, line: Line): Index is
+        let size: Index := spanLength(text);
+        var stop: Index := delimiter_stop;
+        var more: Bool := stop < size;
+        while more do
+            let next: Index := stop + 1;
+            let next_stop: Index := lineStopAt(text, next);
+            let below: Line := classifyLine(text, next, next_stop);
+            if startsBlock(below) or (below.kind = line_blank) then
+                more := false;
+            else
+                stop := next_stop;
+                more := stop < size;
+            end if;
+        end while;
+        let block: Block := blockOf(kind_table, at, stop, line);
+        insertBack(&~blocks, Block(kind => kind_table, start => at, stop => stop, content => block.content, level => columns, number => 0, checked => false, box => 0, info_start => 0, info_stop => 0, marker => '|', closed => false));
+        return stop + 1;
+    end;
+
+    -- A paragraph, a quote or a list item with the lines that continue it.
+    generic [R: Region, Q: Region]
+    function readFlow(text: Span[Nat8, R], blocks: &![Buffer[Block], Q], at: Index, line: Line): Index is
+        let size: Index := spanLength(text);
+        var stop: Index := lineStopAt(text, at);
+        var kind: Index := line.kind;
+        if kind = line_text then
+            kind := kind_paragraph;
+        end if;
+        var level: Index := line.level;
+        var marker: Nat8 := line.marker;
+        var more: Bool := stop < size;
+        while more do
+            let next: Index := stop + 1;
+            let next_stop: Index := lineStopAt(text, next);
+            let below: Line := classifyLine(text, next, next_stop);
+            if below.kind = line_blank then
+                more := false;
+            else if kind = kind_paragraph then
+                let under: Index := setextLevel(text, indentEnd(text, next, next_stop), next_stop);
+                if (under > 0) and (columnsOf(text, next, indentEnd(text, next, next_stop)) <= 3) then
+                    kind := kind_heading;
+                    level := under;
+                    marker := '=';
+                    if under = 2 then
+                        marker := '-';
+                    end if;
+                    stop := next_stop;
+                    more := false;
+                else if interruptsParagraph(below, below.content = next_stop) then
+                    more := false;
+                else
+                    stop := next_stop;
+                    more := stop < size;
+                end if;
+            else if kind = kind_quote then
+                if (below.kind = kind_quote) or (below.kind = line_text) then
+                    stop := next_stop;
+                    more := stop < size;
+                else
+                    more := false;
+                end if;
+            else if startsBlock(below) then
+                more := false;
+            else
+                stop := next_stop;
+                more := stop < size;
+            end if;
+        end while;
+        insertBack(&~blocks, Block(kind => kind, start => at, stop => stop, content => line.content, level => level, number => line.number, checked => line.checked, box => line.box, info_start => 0, info_stop => 0, marker => marker, closed => false));
+        return stop + 1;
+    end;
+
+    -- The editor and its parts.
+
+    generic [R: Region]
+    function blockRecord(editor: &[Editor, R], i: Index): Block is
+        let blocks: &[Buffer[Block], R] := &(editor->blocks);
+        if i < bufferLength(blocks) then
+            return nth(blocks, i);
+        end if;
+        return nth(blocks, bufferLength(blocks) - 1);
+    end;
+
+    generic [R: Region]
+    function textOf(editor: &[Editor, R]): Span[Nat8, R] is
+        return wholeSpan(&(editor->source));
+    end;
+
+    -- The text with CR LF and CR as LF.
+    generic [R: Region]
+    function normalized(text: Span[Nat8, R]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if byte = 13 then
+                writeByte(&!builder, 10);
+                if ((i + 1) < spanLength(text)) and (text[i + 1] = 10) then
+                    i := i + 1;
+                end if;
+            else
+                writeByte(&!builder, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    -- The longest start of text, ending at a cluster end, of at most most bytes.
+    generic [R: Region]
+    function fittingStart(text: Span[Nat8, R], most: Index): Index is
+        if spanLength(text) <= most then
+            return spanLength(text);
+        end if;
+        var at: Index := 0;
+        while at < spanLength(text) do
+            let next: Index := clusterEndAt(text, at);
+            if next > most then
+                return at;
+            end if;
+            at := next;
+        end while;
+        return at;
+    end;
+
+    -- An editor over bytes, the cursor at the start.
+    function makeEditor(bytes: Buffer[Nat8]): Editor is
+        let blocks: Buffer[Block] := scanBlocks(wholeSpan(&bytes));
+        let undo_steps: Buffer[Step] := allocateEmpty();
+        let redo_steps: Buffer[Step] := allocateEmpty();
+        return Editor(source => bytes, blocks => blocks, anchor => 0, head => 0, undo_steps => undo_steps, redo_steps => redo_steps, next_group => 1, typed => typed_none, typed_end => 0);
+    end;
+
+    generic [R: Region]
+    function openEditor(text: Span[Nat8, R]): Editor is
+        let plain: String := normalized(text);
+        let cut: Index := fittingStart(asSpan(&plain), mostEditorBytes());
+        var bytes: Buffer[Nat8] := allocateEmpty();
+        appendBytes(&!bytes, substring(asSpan(&plain), 0, cut));
+        destroyString(plain);
+        return makeEditor(bytes);
+    end;
+
+    generic [R: Region, S: Region]
+    function appendBytes(bytes: &![Buffer[Nat8], R], text: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            insertBack(&~bytes, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function destroyStep(step: Step): Unit is
+        let { at: Index, removed: String, inserted: String, anchor_before: Index, head_before: Index, anchor_after: Index, head_after: Index, group: Index } := step;
+        destroyString(removed);
+        destroyString(inserted);
+        return nil;
+    end;
+
+    function destroySteps(steps: Buffer[Step]): Unit is
+        var rest: Buffer[Step] := steps;
+        while bufferLength(&rest) > 0 do
+            destroyStep(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyEditor(editor: Editor): Unit is
+        let { source: Buffer[Nat8], blocks: Buffer[Block], anchor: Index, head: Index, undo_steps: Buffer[Step], redo_steps: Buffer[Step], next_group: Index, typed: Index, typed_end: Index } := editor;
+        destroyFree(source);
+        destroyFree(blocks);
+        destroySteps(undo_steps);
+        destroySteps(redo_steps);
+        return nil;
+    end;
+
+    -- Reading.
+
+    generic [R: Region]
+    function sourceLength(editor: &[Editor, R]): Index is
+        let size: Index := bufferLength(&(editor->source));
+        if size > mostEditorBytes() then
+            return mostEditorBytes();
+        end if;
+        return size;
+    end;
+
+    generic [R: Region]
+    function sourceText(editor: &[Editor, R]): Span[Nat8, R] is
+        return textOf(editor);
+    end;
+
+    generic [R: Region]
+    function toMarkdown(editor: &[Editor, R]): String is
+        return fromSpan(substring(textOf(editor), 0, sourceLength(editor)));
+    end;
+
+    generic [R: Region]
+    function blockCount(editor: &[Editor, R]): Index is
+        let count: Index := bufferLength(&(editor->blocks));
+        if count = 0 then
+            return 1;
+        end if;
+        return count;
+    end;
+
+    function kindOf(code: Index): BlockKind is
+        if code = kind_heading then
+            return HeadingBlock();
+        else if code = kind_quote then
+            return QuoteBlock();
+        else if code = kind_bullet then
+            return BulletBlock();
+        else if code = kind_ordered then
+            return OrderedBlock();
+        else if code = kind_task then
+            return TaskBlock();
+        else if code = kind_fence then
+            return FenceBlock();
+        else if code = kind_mermaid then
+            return MermaidBlock();
+        else if code = kind_rule then
+            return RuleBlock();
+        else if code = kind_table then
+            return TableBlock();
+        else if code = kind_html then
+            return HtmlBlock();
+        else if code = kind_definition then
+            return DefinitionBlock();
+        else if code = kind_toc then
+            return TocBlock();
+        else if code = kind_front then
+            return FrontMatterBlock();
+        else if code = kind_empty then
+            return EmptyBlock();
+        end if;
+        return ParagraphBlock();
+    end;
+
+    generic [R: Region]
+    function blockKind(editor: &[Editor, R], i: Index): BlockKind is
+        let block: Block := blockRecord(editor, i);
+        return kindOf(block.kind);
+    end;
+
+    -- An offset no greater than the source length.
+    generic [R: Region]
+    function clamped(editor: &[Editor, R], at: Index): Index is
+        if at > sourceLength(editor) then
+            return sourceLength(editor);
+        end if;
+        return at;
+    end;
+
+    generic [R: Region]
+    function blockStart(editor: &[Editor, R], i: Index): Index is
+        let block: Block := blockRecord(editor, i);
+        return clamped(editor, block.start);
+    end;
+
+    generic [R: Region]
+    function blockStop(editor: &[Editor, R], i: Index): Index is
+        let block: Block := blockRecord(editor, i);
+        return clamped(editor, block.stop);
+    end;
+
+    generic [R: Region]
+    function blockContent(editor: &[Editor, R], i: Index): Index is
+        let block: Block := blockRecord(editor, i);
+        return clamped(editor, block.content);
+    end;
+
+    generic [R: Region]
+    function blockLevel(editor: &[Editor, R], i: Index): Index is
+        let block: Block := blockRecord(editor, i);
+        return block.level;
+    end;
+
+    generic [R: Region]
+    function blockNumber(editor: &[Editor, R], i: Index): Index is
+        let block: Block := blockRecord(editor, i);
+        return block.number;
+    end;
+
+    generic [R: Region]
+    function blockChecked(editor: &[Editor, R], i: Index): Bool is
+        let block: Block := blockRecord(editor, i);
+        return block.checked;
+    end;
+
+    generic [R: Region]
+    function blockText(editor: &[Editor, R], i: Index): Span[Nat8, R] is
+        let block: Block := blockRecord(editor, i);
+        return substring(textOf(editor), block.start, block.stop);
+    end;
+
+    generic [R: Region]
+    function blockInfo(editor: &[Editor, R], i: Index): Span[Nat8, R] is
+        let block: Block := blockRecord(editor, i);
+        return substring(textOf(editor), block.info_start, block.info_stop);
+    end;
+
+    generic [R: Region]
+    function blockAt(editor: &[Editor, R], at: Index): Index is
+        let blocks: &[Buffer[Block], R] := &(editor->blocks);
+        let count: Index := bufferLength(blocks);
+        var found: Index := 0;
+        var i: Index := 0;
+        while i < count do
+            let block: Block := nth(blocks, i);
+            if block.start > at then
+                return found;
+            end if;
+            found := i;
+            if at <= block.stop then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        if found >= blockCount(editor) then
+            return 0;
+        end if;
+        return found;
+    end;
+
+    generic [R: Region]
+    function cursorOffset(editor: &[Editor, R]): Index is
+        return clamped(editor, editor->head);
+    end;
+
+    generic [R: Region]
+    function anchorOffset(editor: &[Editor, R]): Index is
+        return clamped(editor, editor->anchor);
+    end;
+
+    generic [R: Region]
+    function selectionStart(editor: &[Editor, R]): Index is
+        let anchor: Index := anchorOffset(editor);
+        let head: Index := cursorOffset(editor);
+        if anchor < head then
+            return anchor;
+        end if;
+        return head;
+    end;
+
+    generic [R: Region]
+    function selectionStop(editor: &[Editor, R]): Index is
+        let anchor: Index := anchorOffset(editor);
+        let head: Index := cursorOffset(editor);
+        if anchor > head then
+            return anchor;
+        end if;
+        return head;
+    end;
+
+    generic [R: Region]
+    function cursorBlock(editor: &[Editor, R]): Index is
+        return blockAt(editor, cursorOffset(editor));
+    end;
+
+    generic [R: Region]
+    function canUndo(editor: &[Editor, R]): Bool is
+        return bufferLength(&(editor->undo_steps)) > 0;
+    end;
+
+    generic [R: Region]
+    function canRedo(editor: &[Editor, R]): Bool is
+        return bufferLength(&(editor->redo_steps)) > 0;
+    end;
+
+    -- Clusters.
+
+    -- The start of the cluster that holds the byte at, or at itself when a
+    -- cluster ends there.
+    generic [R: Region]
+    function snapped(text: Span[Nat8, R], at: Index): Index is
+        if at >= spanLength(text) then
+            return spanLength(text);
+        end if;
+        var start: Index := lineStartAt(text, at);
+        while start < at do
+            let next: Index := clusterEndAt(text, start);
+            if next > at then
+                return start;
+            end if;
+            start := next;
+        end while;
+        return at;
+    end;
+
+    -- The start of the cluster before the byte at.
+    generic [R: Region]
+    function clusterBefore(text: Span[Nat8, R], at: Index): Index is
+        if at = 0 then
+            return 0;
+        end if;
+        if text[at - 1] = 10 then
+            return at - 1;
+        end if;
+        var start: Index := lineStartAt(text, at - 1);
+        while start < at do
+            let next: Index := clusterEndAt(text, start);
+            if next >= at then
+                return start;
+            end if;
+            start := next;
+        end while;
+        return at - 1;
+    end;
+
+    -- The end of the cluster at the byte at.
+    generic [R: Region]
+    function clusterAfter(text: Span[Nat8, R], at: Index): Index is
+        if at >= spanLength(text) then
+            return spanLength(text);
+        end if;
+        return clusterEndAt(text, at);
+    end;
+
+    -- Changing the source.
+
+    -- Puts text in place of the bytes start to stop of bytes, in time linear
+    -- in the length of bytes and text.
+    generic [R: Region, S: Region]
+    function splice(bytes: &![Buffer[Nat8], R], start: Index, stop: Index, text: Span[Nat8, S]): Unit is
+        let size: Index := lengthMut(&~bytes);
+        let gone: Index := stop - start;
+        let count: Index := spanLength(text);
+        if count >= gone then
+            let grow: Index := count - gone;
+            var g: Index := 0;
+            while g < grow do
+                let zero: Nat8 := 0;
+                insertBack(&~bytes, zero);
+                g := g + 1;
+            end while;
+            var i: Index := size;
+            while i > stop do
+                i := i - 1;
+                let byte: Nat8 := nthMut(&~bytes, i);
+                storeNth(&~bytes, i + grow, byte);
+            end while;
+        else
+            let shrink: Index := gone - count;
+            var i: Index := stop;
+            while i < size do
+                let byte: Nat8 := nthMut(&~bytes, i);
+                storeNth(&~bytes, i - shrink, byte);
+                i := i + 1;
+            end while;
+            var s: Index := 0;
+            while s < shrink do
+                let last: Nat8 := removeLast(&~bytes);
+                s := s + 1;
+            end while;
+        end if;
+        var k: Index := 0;
+        while k < count do
+            storeNth(&~bytes, start + k, text[k]);
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The group of the last step of steps.
+    generic [R: Region]
+    function lastGroup(steps: &[Buffer[Step], R]): Index is
+        if bufferLength(steps) = 0 then
+            return 0;
+        end if;
+        let step: &[Step, R] := nthRef(steps, bufferLength(steps) - 1);
+        return step->group;
+    end;
+
+    -- The group of the first step of steps.
+    generic [R: Region]
+    function firstGroup(steps: &[Buffer[Step], R]): Index is
+        if bufferLength(steps) = 0 then
+            return 0;
+        end if;
+        let step: &[Step, R] := nthRef(steps, 0);
+        return step->group;
+    end;
+
+    -- Puts text in place of the bytes start to stop, as one undo step, the
+    -- cursor then at head and nothing selected.  The step joins the last
+    -- group when join holds; typed and typed_end say what was done, for the
+    -- next one.
+    generic [S: Region]
+    function replaceRange(editor: Editor, start: Index, stop: Index, text: Span[Nat8, S], head: Index, join: Bool, typed: Index, typed_end: Index): Editor is
+        let { source: Buffer[Nat8], blocks: Buffer[Block], anchor as anchor_before: Index, head as head_before: Index, undo_steps: Buffer[Step], redo_steps: Buffer[Step], next_group: Index, typed as typed_before: Index, typed_end as typed_end_before: Index } := editor;
+        var bytes: Buffer[Nat8] := source;
+        var undo_list: Buffer[Step] := undo_steps;
+        let removed: String := fromSpan(substring(wholeSpan(&bytes), start, stop));
+        let inserted: String := fromSpan(text);
+        splice(&!bytes, start, stop, text);
+        var group: Index := next_group;
+        var after_group: Index := next_group + 1;
+        if join and (bufferLength(&undo_list) > 0) then
+            group := lastGroup(&undo_list);
+            after_group := next_group;
+        end if;
+        let at_head: Index := snapped(wholeSpan(&bytes), head);
+        insertBack(&!undo_list, Step(at => start, removed => removed, inserted => inserted, anchor_before => anchor_before, head_before => head_before, anchor_after => at_head, head_after => at_head, group => group));
+        while bufferLength(&undo_list) > mostUndoSteps() do
+            let oldest: Index := firstGroup(&undo_list);
+            while (bufferLength(&undo_list) > 1) and (firstGroup(&undo_list) = oldest) do
+                destroyStep(removeFirst(&!undo_list));
+            end while;
+        end while;
+        destroySteps(redo_steps);
+        let no_redo: Buffer[Step] := allocateEmpty();
+        destroyFree(blocks);
+        let new_blocks: Buffer[Block] := scanBlocks(wholeSpan(&bytes));
+        return Editor(source => bytes, blocks => new_blocks, anchor => at_head, head => at_head, undo_steps => undo_list, redo_steps => no_redo, next_group => after_group, typed => typed, typed_end => typed_end);
+    end;
+
+    -- The editor with the selection anchor to head, the undo group closed.
+    function withSelection(editor: Editor, anchor: Index, head: Index): Editor is
+        let { source: Buffer[Nat8], blocks: Buffer[Block], anchor as old_anchor: Index, head as old_head: Index, undo_steps: Buffer[Step], redo_steps: Buffer[Step], next_group: Index, typed: Index, typed_end: Index } := editor;
+        let at_anchor: Index := snapped(wholeSpan(&source), anchor);
+        let at_head: Index := snapped(wholeSpan(&source), head);
+        return Editor(source => source, blocks => blocks, anchor => at_anchor, head => at_head, undo_steps => undo_steps, redo_steps => redo_steps, next_group => next_group, typed => typed_none, typed_end => 0);
+    end;
+
+    function setCursor(editor: Editor, at: Index): Editor is
+        return withSelection(editor, at, at);
+    end;
+
+    function setSelection(editor: Editor, anchor: Index, head: Index): Editor is
+        return withSelection(editor, anchor, head);
+    end;
+
+    function selectAll(editor: Editor): Editor is
+        let size: Index := sourceLength(&editor);
+        return withSelection(editor, 0, size);
+    end;
+
+    function closeUndoGroup(editor: Editor): Editor is
+        let anchor: Index := anchorOffset(&editor);
+        let head: Index := cursorOffset(&editor);
+        return withSelection(editor, anchor, head);
+    end;
+
+    -- Moving.
+
+    -- Where the cursor goes one cluster back from at.
+    generic [R: Region]
+    function leftOf(editor: &[Editor, R], at: Index): Index is
+        let text: Span[Nat8, R] := textOf(editor);
+        let i: Index := blockAt(editor, at);
+        let block: Block := blockRecord(editor, i);
+        if at > block.stop then
+            return block.stop;
+        end if;
+        if (i > 0) and ((at <= block.content) and (at <= lineStopAt(text, block.start))) then
+            let before: Block := blockRecord(editor, i - 1);
+            return before.stop;
+        end if;
+        return clusterBefore(text, at);
+    end;
+
+    -- Where the cursor goes one cluster on from at.
+    generic [R: Region]
+    function rightOf(editor: &[Editor, R], at: Index): Index is
+        let text: Span[Nat8, R] := textOf(editor);
+        let i: Index := blockAt(editor, at);
+        let block: Block := blockRecord(editor, i);
+        if at >= block.stop then
+            if (i + 1) < blockCount(editor) then
+                let after: Block := blockRecord(editor, i + 1);
+                return after.content;
+            end if;
+            return at;
+        end if;
+        if at < block.start then
+            return block.content;
+        end if;
+        return clusterAfter(text, at);
+    end;
+
+    function moveLeft(editor: Editor, extend: Bool): Editor is
+        let anchor: Index := anchorOffset(&editor);
+        let head: Index := cursorOffset(&editor);
+        if (not extend) and (anchor /= head) then
+            let first: Index := selectionStart(&editor);
+            return withSelection(editor, first, first);
+        end if;
+        let target: Index := leftOf(&editor, head);
+        if extend then
+            return withSelection(editor, anchor, target);
+        end if;
+        return withSelection(editor, target, target);
+    end;
+
+    function moveRight(editor: Editor, extend: Bool): Editor is
+        let anchor: Index := anchorOffset(&editor);
+        let head: Index := cursorOffset(&editor);
+        if (not extend) and (anchor /= head) then
+            let last: Index := selectionStop(&editor);
+            return withSelection(editor, last, last);
+        end if;
+        let target: Index := rightOf(&editor, head);
+        if extend then
+            return withSelection(editor, anchor, target);
+        end if;
+        return withSelection(editor, target, target);
+    end;
+
+    -- Where the content of the line of at begins: the content of its block
+    -- on the first line, else the start of the line.
+    generic [R: Region]
+    function lineContentOf(editor: &[Editor, R], at: Index): Index is
+        let text: Span[Nat8, R] := textOf(editor);
+        let start: Index := lineStartAt(text, at);
+        let block: Block := blockRecord(editor, blockAt(editor, at));
+        if (block.start = start) and (block.content <= lineStopAt(text, start)) then
+            return block.content;
+        end if;
+        return start;
+    end;
+
+    function moveLineStart(editor: Editor, extend: Bool): Editor is
+        let anchor: Index := anchorOffset(&editor);
+        let head: Index := cursorOffset(&editor);
+        let content: Index := lineContentOf(&editor, head);
+        var target: Index := content;
+        if head = content then
+            target := lineStartAt(textOf(&editor), head);
+        end if;
+        if extend then
+            return withSelection(editor, anchor, target);
+        end if;
+        return withSelection(editor, target, target);
+    end;
+
+    function moveLineEnd(editor: Editor, extend: Bool): Editor is
+        let anchor: Index := anchorOffset(&editor);
+        let head: Index := cursorOffset(&editor);
+        let target: Index := lineStopAt(textOf(&editor), head);
+        if extend then
+            return withSelection(editor, anchor, target);
+        end if;
+        return withSelection(editor, target, target);
+    end;
+
+    -- Typing.
+
+    generic [R: Region]
+    function typedOf(editor: &[Editor, R]): Index is
+        return editor->typed;
+    end;
+
+    generic [R: Region]
+    function typedEndOf(editor: &[Editor, R]): Index is
+        return editor->typed_end;
+    end;
+
+    -- Whether text is one cluster that is not a line break.
+    generic [R: Region]
+    function isOneCluster(text: Span[Nat8, R]): Bool is
+        if spanLength(text) = 0 then
+            return false;
+        end if;
+        if text[0] = 10 then
+            return false;
+        end if;
+        return clusterEndAt(text, 0) = spanLength(text);
+    end;
+
+    generic [R: Region]
+    function insertText(editor: Editor, text: Span[Nat8, R]): Editor is
+        let plain: String := normalized(text);
+        let start: Index := selectionStart(&editor);
+        let stop: Index := selectionStop(&editor);
+        let size: Index := sourceLength(&editor);
+        let room: Index := mostEditorBytes() - (size - (stop - start));
+        let cut: Index := fittingStart(asSpan(&plain), room);
+        let one: Bool := isOneCluster(substring(asSpan(&plain), 0, cut));
+        let join: Bool := (one and (start = stop)) and ((typedOf(&editor) = typed_chars) and (typedEndOf(&editor) = start));
+        var typed: Index := typed_none;
+        if one then
+            if not (isSpaceByte(nthByte(&plain, 0))) then
+                typed := typed_chars;
+            end if;
+        end if;
+        let edited: Editor := replaceRange(editor, start, stop, substring(asSpan(&plain), 0, cut), start + cut, join, typed, start + cut);
+        destroyString(plain);
+        return edited;
+    end;
+
+    -- Edits planned on the editor and then made: the bytes start to stop
+    -- become text, the cursor goes to head.
+    record Change: Linear is
+        start: Index;
+        stop: Index;
+        head: Index;
+        text: String;
+    end;
+
+    function noChange(head: Index): Change is
+        return Change(start => head, stop => head, head => head, text => makeEmpty());
+    end;
+
+    generic [R: Region]
+    function changeOf(start: Index, stop: Index, head: Index, text: Span[Nat8, R]): Change is
+        return Change(start => start, stop => stop, head => head, text => fromSpan(text));
+    end;
+
+    -- Makes change as one undo group; a change of nothing only moves the cursor.
+    function applyChange(editor: Editor, change: Change): Editor is
+        let { start: Index, stop: Index, head: Index, text: String } := change;
+        if (start = stop) and (length(&text) = 0) then
+            destroyString(text);
+            return withSelection(editor, head, head);
+        end if;
+        let edited: Editor := replaceRange(editor, start, stop, asSpan(&text), head, false, typed_none, 0);
+        destroyString(text);
+        return edited;
+    end;
+
+    generic [R: Region]
+    function writeTimes(builder: &![StringBuilder, R], byte: Nat8, count: Index): Unit is
+        var i: Index := 0;
+        while i < count do
+            writeByte(&~builder, byte);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function newlines(count: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        writeTimes(&!builder, 10, count);
+        return finalize(builder);
+    end;
+
+    -- The LFs from start to stop.
+    generic [R: Region]
+    function countNewlines(text: Span[Nat8, R], start: Index, stop: Index): Index is
+        var count: Index := 0;
+        var i: Index := start;
+        while i < stop do
+            if text[i] = 10 then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    function isTextual(kind: Index): Bool is
+        return (kind = kind_paragraph) or ((kind = kind_heading) or ((kind = kind_quote) or ((kind = kind_bullet) or ((kind = kind_ordered) or ((kind = kind_task) or (kind = kind_empty))))));
+    end;
+
+    function isItem(kind: Index): Bool is
+        return (kind = kind_bullet) or ((kind = kind_ordered) or (kind = kind_task));
+    end;
+
+    -- The decimal digits of value.
+    generic [R: Region]
+    function writeNumber(builder: &![StringBuilder, R], value: Index): Unit is
+        if value >= 10 then
+            writeNumber(&~builder, value / 10);
+        end if;
+        let digit: Index := value - ((value / 10) * 10);
+        let byte: Nat8 := 48;
+        writeByte(&~builder, byte + digitByte(digit));
+        return nil;
+    end;
+
+    function digitByte(digit: Index): Nat8 is
+        if digit = 1 then
+            return 1;
+        else if digit = 2 then
+            return 2;
+        else if digit = 3 then
+            return 3;
+        else if digit = 4 then
+            return 4;
+        else if digit = 5 then
+            return 5;
+        else if digit = 6 then
+            return 6;
+        else if digit = 7 then
+            return 7;
+        else if digit = 8 then
+            return 8;
+        else if digit = 9 then
+            return 9;
+        end if;
+        return 0;
+    end;
+
+    -- Return at the end of block i: an empty paragraph after it, the
+    -- cursor in it.
+    generic [R: Region]
+    function returnAtEnd(editor: &[Editor, R], i: Index): Change is
+        let text: Span[Nat8, R] := textOf(editor);
+        let block: Block := blockRecord(editor, i);
+        var next: Index := i + 1;
+        while next < blockCount(editor) do
+            let after: Block := blockRecord(editor, next);
+            if after.kind /= kind_empty then
+                let blank: Index := countNewlines(text, block.stop, after.start) - 1;
+                return gapChange(block.stop, blank, 3, block.stop + 2, false);
+            end if;
+            next := next + 1;
+        end while;
+        let blank: Index := countNewlines(text, block.stop, spanLength(text));
+        return gapChange(block.stop, blank, 2, block.stop + 2, false);
+    end;
+
+    -- Return at the start of block i: an empty paragraph before it, the
+    -- cursor staying where it is.
+    generic [R: Region]
+    function returnAtStart(editor: &[Editor, R], i: Index, head: Index): Change is
+        let text: Span[Nat8, R] := textOf(editor);
+        let block: Block := blockRecord(editor, i);
+        var before: Index := i;
+        while before > 0 do
+            before := before - 1;
+            let prior: Block := blockRecord(editor, before);
+            if prior.kind /= kind_empty then
+                let blank: Index := countNewlines(text, prior.stop, block.start) - 1;
+                return gapChange(block.start, blank, 3, head, true);
+            end if;
+        end while;
+        let blank: Index := countNewlines(text, 0, block.start);
+        return gapChange(block.start, blank, 2, head, true);
+    end;
+
+    -- LFs put in at at, so that a run of blank lines that has blank of them
+    -- has at least need, and at least one more; the cursor at head, moved on
+    -- by the LFs when shifted holds.
+    function gapChange(at: Index, blank: Index, need: Index, head: Index, shifted: Bool): Change is
+        var count: Index := 1;
+        if need > blank then
+            count := need - blank;
+        end if;
+        var cursor: Index := head;
+        if shifted then
+            cursor := head + count;
+        end if;
+        return Change(start => at, stop => at, head => cursor, text => newlines(count));
+    end;
+
+    -- The line start to stop as an empty paragraph: blank, with an LF more
+    -- before it when the line above is not blank and after it when the line
+    -- below is not.
+    generic [R: Region]
+    function emptyLineChange(text: Span[Nat8, R], start: Index, stop: Index): Change is
+        var above: Bool := false;
+        if start > 0 then
+            let up: Index := lineStartAt(text, start - 1);
+            above := not (isBlankLine(text, up, start - 1));
+        end if;
+        var below: Bool := false;
+        if stop < spanLength(text) then
+            below := not (isBlankLine(text, stop + 1, lineStopAt(text, stop + 1)));
+        end if;
+        var count: Index := 0;
+        var head: Index := start;
+        if above then
+            count := count + 1;
+            head := start + 1;
+        end if;
+        if below then
+            count := count + 1;
+        end if;
+        return Change(start => start, stop => stop, head => head, text => newlines(count));
+    end;
+
+    -- Return in list item i at head.
+    generic [R: Region]
+    function returnInItem(editor: &[Editor, R], i: Index, head: Index): Change is
+        let text: Span[Nat8, R] := textOf(editor);
+        let block: Block := blockRecord(editor, i);
+        let first_stop: Index := lineStopAt(text, block.start);
+        let indent: Index := indentEnd(text, block.start, first_stop);
+        if (block.stop = first_stop) and isBlankLine(text, block.content, block.stop) then
+            if block.level > 0 then
+                var parent: Index := 0;
+                var j: Index := i;
+                var found: Bool := false;
+                while (j > 0) and (not found) do
+                    j := j - 1;
+                    let prior: Block := blockRecord(editor, j);
+                    if isItem(prior.kind) and (prior.level < block.level) then
+                        parent := prior.level;
+                        found := true;
+                    end if;
+                end while;
+                var builder: StringBuilder := makeStringBuilder();
+                writeTimes(&!builder, 32, parent);
+                let spaces: String := finalize(builder);
+                let moved: Index := (block.content - indent) + parent;
+                let change: Change := changeOf(block.start, indent, block.start + moved, asSpan(&spaces));
+                destroyString(spaces);
+                return change;
+            end if;
+            return emptyLineChange(text, block.start, block.stop);
+        end if;
+        var at: Index := head;
+        if (at < block.content) and (at <= first_stop) then
+            at := block.content;
+        end if;
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, 10);
+        writeString(&!builder, substring(text, block.start, indent));
+        if block.kind = kind_bullet then
+            writeByte(&!builder, block.marker);
+        else if (block.kind = kind_task) and (block.number = 0) then
+            writeByte(&!builder, block.marker);
+        else
+            writeNumber(&!builder, block.number + 1);
+            writeByte(&!builder, block.marker);
+        end if;
+        writeByte(&!builder, 32);
+        if block.kind = kind_task then
+            writeString(&!builder, "[ ] ");
+        end if;
+        let inserted: String := finalize(builder);
+        let size: Index := length(&inserted);
+        let change: Change := changeOf(at, at, at + size, asSpan(&inserted));
+        destroyString(inserted);
+        return change;
+    end;
+
+    -- Return in quote i at head.
+    generic [R: Region]
+    function returnInQuote(editor: &[Editor, R], i: Index, head: Index): Change is
+        let text: Span[Nat8, R] := textOf(editor);
+        let block: Block := blockRecord(editor, i);
+        let start: Index := lineStartAt(text, head);
+        let stop: Index := lineStopAt(text, head);
+        var content: Index := start;
+        let line: Line := classifyLine(text, start, stop);
+        if line.kind = kind_quote then
+            content := line.content;
+        end if;
+        if (content > start) and isBlankLine(text, content, stop) then
+            return emptyLineChange(text, start, stop);
+        end if;
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, 10);
+        writeString(&!builder, substring(text, block.start, block.content));
+        let inserted: String := finalize(builder);
+        let size: Index := length(&inserted);
+        let change: Change := changeOf(head, head, head + size, asSpan(&inserted));
+        destroyString(inserted);
+        return change;
+    end;
+
+    -- Whether the paragraph i is one line that is a table header row.
+    generic [R: Region]
+    function isHeaderRow(editor: &[Editor, R], i: Index): Bool is
+        let text: Span[Nat8, R] := textOf(editor);
+        let block: Block := blockRecord(editor, i);
+        if lineStopAt(text, block.start) /= block.stop then
+            return false;
+        end if;
+        let first: Index := trimStart(text, block.start, block.stop);
+        let last: Index := trimStop(text, block.start, block.stop);
+        if (last - first) < 3 then
+            return false;
+        end if;
+        return ((text[first] = '|') and (text[last - 1] = '|')) and (rowCells(text, block.start, block.stop) > 0);
+    end;
+
+    -- A row of columns empty cells, after an LF.
+    generic [R: Region]
+    function emptyRow(builder: &![StringBuilder, R], columns: Index): Unit is
+        writeByte(&~builder, 10);
+        writeByte(&~builder, '|');
+        var c: Index := 0;
+        while c < columns do
+            writeString(&~builder, "  |");
+            c := c + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Return after a table header row: the delimiter row and a first row,
+    -- the cursor in its first cell.
+    generic [R: Region]
+    function tableChange(editor: &[Editor, R], i: Index): Change is
+        let text: Span[Nat8, R] := textOf(editor);
+        let block: Block := blockRecord(editor, i);
+        let columns: Index := rowCells(text, block.start, block.stop);
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, 10);
+        writeByte(&!builder, '|');
+        var c: Index := 0;
+        while c < columns do
+            writeString(&!builder, " --- |");
+            c := c + 1;
+        end while;
+        let delimiter: Index := 2 + (columns * 6);
+        emptyRow(&!builder, columns);
+        let inserted: String := finalize(builder);
+        let change: Change := changeOf(block.stop, block.stop, (block.stop + delimiter) + 3, asSpan(&inserted));
+        destroyString(inserted);
+        return change;
+    end;
+
+    -- What Return does at the cursor, nothing selected.
+    generic [R: Region]
+    function returnChange(editor: &[Editor, R]): Change is
+        let text: Span[Nat8, R] := textOf(editor);
+        let head: Index := cursorOffset(editor);
+        let i: Index := blockAt(editor, head);
+        let block: Block := blockRecord(editor, i);
+        let kind: Index := block.kind;
+        if (kind = kind_fence) or (kind = kind_mermaid) then
+            if (not block.closed) and (head = lineStopAt(text, block.start)) then
+                var builder: StringBuilder := makeStringBuilder();
+                writeString(&!builder, "\n\n");
+                writeTimes(&!builder, block.marker, block.level);
+                let inserted: String := finalize(builder);
+                let change: Change := changeOf(head, head, head + 1, asSpan(&inserted));
+                destroyString(inserted);
+                return change;
+            end if;
+            return changeOf(head, head, head + 1, "\n");
+        end if;
+        if (kind = kind_html) or (kind = kind_front) then
+            return changeOf(head, head, head + 1, "\n");
+        end if;
+        if kind = kind_table then
+            let stop: Index := lineStopAt(text, head);
+            var builder: StringBuilder := makeStringBuilder();
+            emptyRow(&!builder, block.level);
+            let inserted: String := finalize(builder);
+            let change: Change := changeOf(stop, stop, stop + 3, asSpan(&inserted));
+            destroyString(inserted);
+            return change;
+        end if;
+        if kind = kind_empty then
+            return changeOf(block.start, block.start, block.start + 1, "\n");
+        end if;
+        if isItem(kind) then
+            return returnInItem(editor, i, head);
+        end if;
+        if kind = kind_quote then
+            return returnInQuote(editor, i, head);
+        end if;
+        if head > block.stop then
+            return returnAtEnd(editor, i);
+        end if;
+        if (kind = kind_paragraph) and ((head = block.stop) and isHeaderRow(editor, i)) then
+            return tableChange(editor, i);
+        end if;
+        if head = block.stop then
+            return returnAtEnd(editor, i);
+        end if;
+        if (head <= block.start) or ((kind = kind_heading) and (head <= block.content)) then
+            return returnAtStart(editor, i, head);
+        end if;
+        if (kind = kind_paragraph) or (kind = kind_heading) then
+            return changeOf(head, head, head + 2, "\n\n");
+        end if;
+        return returnAtEnd(editor, i);
+    end;
+
+    -- Deletes the selection as one group.
+    function deleteSelection(editor: Editor): Editor is
+        let start: Index := selectionStart(&editor);
+        let stop: Index := selectionStop(&editor);
+        return replaceRange(editor, start, stop, "", start, false, typed_none, 0);
+    end;
+
+    function pressReturn(editor: Editor): Editor is
+        if selectionStart(&editor) /= selectionStop(&editor) then
+            let cleared: Editor := deleteSelection(editor);
+            let change: Change := returnChange(&cleared);
+            return applyChange(cleared, change);
+        end if;
+        let change: Change := returnChange(&editor);
+        return applyChange(editor, change);
+    end;
+
+    generic [R: Region]
+    function shiftReturnChange(editor: &[Editor, R]): Change is
+        let head: Index := cursorOffset(editor);
+        let block: Block := blockRecord(editor, blockAt(editor, head));
+        let kind: Index := block.kind;
+        if (head < block.start) or (head > block.stop) then
+            return noChange(head);
+        end if;
+        if (kind = kind_paragraph) or ((kind = kind_quote) or isItem(kind)) then
+            return changeOf(head, head, head + 2, "\\\n");
+        end if;
+        if (kind = kind_fence) or ((kind = kind_mermaid) or ((kind = kind_html) or (kind = kind_front))) then
+            return changeOf(head, head, head + 1, "\n");
+        end if;
+        return noChange(head);
+    end;
+
+    function pressShiftReturn(editor: Editor): Editor is
+        if selectionStart(&editor) /= selectionStop(&editor) then
+            let cleared: Editor := deleteSelection(editor);
+            let change: Change := shiftReturnChange(&cleared);
+            return applyChange(cleared, change);
+        end if;
+        let change: Change := shiftReturnChange(&editor);
+        return applyChange(editor, change);
+    end;
+
+    -- Backspace at the cursor, nothing selected, when it is not a plain
+    -- cluster: the change, or none with its start past its stop.
+    generic [R: Region]
+    function backChange(editor: &[Editor, R]): Change is
+        let text: Span[Nat8, R] := textOf(editor);
+        let head: Index := cursorOffset(editor);
+        let i: Index := blockAt(editor, head);
+        let block: Block := blockRecord(editor, i);
+        let kind: Index := block.kind;
+        let first_stop: Index := lineStopAt(text, block.start);
+        if head > block.stop then
+            return noChange(block.stop);
+        end if;
+        if ((head = block.content) and (block.content > block.start)) and (head <= first_stop) then
+            if kind = kind_heading then
+                if block.marker = '#' then
+                    return changeOf(block.start, block.content, block.start, "");
+                end if;
+                let under: Index := lineStartAt(text, block.stop);
+                return changeOf(under - 1, block.stop, head, "");
+            end if;
+            if (kind = kind_quote) or isItem(kind) then
+                return changeOf(block.start, block.content, block.start, "");
+            end if;
+        end if;
+        if ((head = block.start) and (head = block.content)) and (i > 0) then
+            let prior: Block := blockRecord(editor, i - 1);
+            if isTextual(prior.kind) or (kind = kind_empty) then
+                return changeOf(prior.stop, head, prior.stop, "");
+            end if;
+            return noChange(prior.stop);
+        end if;
+        if kind = kind_quote then
+            let start: Index := lineStartAt(text, head);
+            if start > block.start then
+                let line: Line := classifyLine(text, start, lineStopAt(text, start));
+                if (line.kind = kind_quote) and (line.content = head) then
+                    return changeOf(start - 1, head, start - 1, "");
+                end if;
+            end if;
+        end if;
+        return Change(start => 1, stop => 0, head => head, text => makeEmpty());
+    end;
+
+    function deleteBackward(editor: Editor): Editor is
+        if selectionStart(&editor) /= selectionStop(&editor) then
+            return deleteSelection(editor);
+        end if;
+        let head: Index := cursorOffset(&editor);
+        if head = 0 then
+            return withSelection(editor, 0, 0);
+        end if;
+        let change: Change := backChange(&editor);
+        let { start: Index, stop: Index, head as target: Index, text: String } := change;
+        if start <= stop then
+            return applyChange(editor, Change(start => start, stop => stop, head => target, text => text));
+        end if;
+        destroyString(text);
+        let before: Index := clusterBefore(textOf(&editor), head);
+        let join: Bool := (typedOf(&editor) = typed_back) and (typedEndOf(&editor) = head);
+        return replaceRange(editor, before, head, "", before, join, typed_back, before);
+    end;
+
+    function deleteForward(editor: Editor): Editor is
+        if selectionStart(&editor) /= selectionStop(&editor) then
+            return deleteSelection(editor);
+        end if;
+        let head: Index := cursorOffset(&editor);
+        let size: Index := sourceLength(&editor);
+        if head >= size then
+            return withSelection(editor, head, head);
+        end if;
+        let i: Index := blockAt(&editor, head);
+        let block: Block := blockRecord(&editor, i);
+        if head >= block.stop then
+            if (i + 1) < blockCount(&editor) then
+                let after: Block := blockRecord(&editor, i + 1);
+                if isTextual(after.kind) and isTextual(block.kind) then
+                    return replaceRange(editor, head, after.content, "", head, false, typed_none, 0);
+                end if;
+            end if;
+            return withSelection(editor, head, head);
+        end if;
+        let after: Index := clusterAfter(textOf(&editor), head);
+        return replaceRange(editor, head, after, "", head, false, typed_none, 0);
+    end;
+
+    -- Headings and tasks.
+
+    generic [R: Region]
+    function headingChange(editor: &[Editor, R], level: Index): Change is
+        let text: Span[Nat8, R] := textOf(editor);
+        let head: Index := cursorOffset(editor);
+        let block: Block := blockRecord(editor, blockAt(editor, head));
+        var builder: StringBuilder := makeStringBuilder();
+        writeTimes(&!builder, '#', level);
+        if level > 0 then
+            writeByte(&!builder, 32);
+        end if;
+        let prefix: String := finalize(builder);
+        let size: Index := length(&prefix);
+        if (block.kind = kind_paragraph) and (level > 0) then
+            var at: Index := head + size;
+            if head < block.content then
+                at := block.content + size;
+            end if;
+            let change: Change := changeOf(block.content, block.content, at, asSpan(&prefix));
+            destroyString(prefix);
+            return change;
+        end if;
+        if (block.kind = kind_heading) and (block.marker = '#') then
+            var at: Index := block.start + size;
+            if head > block.content then
+                at := (head - (block.content - block.start)) + size;
+            end if;
+            let change: Change := changeOf(block.start, block.content, at, asSpan(&prefix));
+            destroyString(prefix);
+            return change;
+        end if;
+        if block.kind = kind_heading then
+            let first_stop: Index := lineStopAt(text, block.start);
+            let last: Index := trimStop(text, block.content, first_stop);
+            var at: Index := block.start + size;
+            if (head > block.content) and (head <= last) then
+                at := (block.start + size) + (head - block.content);
+            end if;
+            var whole: StringBuilder := makeStringBuilder();
+            writeString(&!whole, asSpan(&prefix));
+            writeString(&!whole, substring(text, block.content, last));
+            let inserted: String := finalize(whole);
+            let change: Change := changeOf(block.start, block.stop, at, asSpan(&inserted));
+            destroyString(inserted);
+            destroyString(prefix);
+            return change;
+        end if;
+        destroyString(prefix);
+        return noChange(head);
+    end;
+
+    function setHeading(editor: Editor, level: Index): Editor is
+        let change: Change := headingChange(&editor, level);
+        return applyChange(editor, change);
+    end;
+
+    function toggleTask(editor: Editor, i: Index): Editor is
+        let block: Block := blockRecord(&editor, i);
+        let head: Index := cursorOffset(&editor);
+        if block.kind /= kind_task then
+            return editor;
+        end if;
+        if block.checked then
+            return replaceRange(editor, block.box + 1, block.box + 2, " ", head, false, typed_none, 0);
+        end if;
+        return replaceRange(editor, block.box + 1, block.box + 2, "x", head, false, typed_none, 0);
+    end;
+
+    -- Undo and redo.
+
+    function undo(editor: Editor): Editor is
+        if not (canUndo(&editor)) then
+            return editor;
+        end if;
+        let { source: Buffer[Nat8], blocks: Buffer[Block], anchor: Index, head: Index, undo_steps: Buffer[Step], redo_steps: Buffer[Step], next_group: Index, typed: Index, typed_end: Index } := editor;
+        var bytes: Buffer[Nat8] := source;
+        var undo_list: Buffer[Step] := undo_steps;
+        var redo_list: Buffer[Step] := redo_steps;
+        let group: Index := lastGroup(&undo_list);
+        var anchor_to: Index := anchor;
+        var head_to: Index := head;
+        while (bufferLength(&undo_list) > 0) and (lastGroup(&undo_list) = group) do
+            let step: Step := removeLast(&!undo_list);
+            let { at: Index, removed: String, inserted: String, anchor_before: Index, head_before: Index, anchor_after: Index, head_after: Index, group as step_group: Index } := step;
+            let size: Index := length(&inserted);
+            splice(&!bytes, at, at + size, asSpan(&removed));
+            anchor_to := anchor_before;
+            head_to := head_before;
+            insertBack(&!redo_list, Step(at => at, removed => removed, inserted => inserted, anchor_before => anchor_before, head_before => head_before, anchor_after => anchor_after, head_after => head_after, group => step_group));
+        end while;
+        destroyFree(blocks);
+        let new_blocks: Buffer[Block] := scanBlocks(wholeSpan(&bytes));
+        return Editor(source => bytes, blocks => new_blocks, anchor => anchor_to, head => head_to, undo_steps => undo_list, redo_steps => redo_list, next_group => next_group, typed => typed_none, typed_end => 0);
+    end;
+
+    function redo(editor: Editor): Editor is
+        if not (canRedo(&editor)) then
+            return editor;
+        end if;
+        let { source: Buffer[Nat8], blocks: Buffer[Block], anchor: Index, head: Index, undo_steps: Buffer[Step], redo_steps: Buffer[Step], next_group: Index, typed: Index, typed_end: Index } := editor;
+        var bytes: Buffer[Nat8] := source;
+        var undo_list: Buffer[Step] := undo_steps;
+        var redo_list: Buffer[Step] := redo_steps;
+        let group: Index := lastGroup(&redo_list);
+        var anchor_to: Index := anchor;
+        var head_to: Index := head;
+        while (bufferLength(&redo_list) > 0) and (lastGroup(&redo_list) = group) do
+            let step: Step := removeLast(&!redo_list);
+            let { at: Index, removed: String, inserted: String, anchor_before: Index, head_before: Index, anchor_after: Index, head_after: Index, group as step_group: Index } := step;
+            let size: Index := length(&removed);
+            splice(&!bytes, at, at + size, asSpan(&inserted));
+            anchor_to := anchor_after;
+            head_to := head_after;
+            insertBack(&!undo_list, Step(at => at, removed => removed, inserted => inserted, anchor_before => anchor_before, head_before => head_before, anchor_after => anchor_after, head_after => head_after, group => step_group));
+        end while;
+        destroyFree(blocks);
+        let new_blocks: Buffer[Block] := scanBlocks(wholeSpan(&bytes));
+        return Editor(source => bytes, blocks => new_blocks, anchor => anchor_to, head => head_to, undo_steps => undo_list, redo_steps => redo_list, next_group => next_group, typed => typed_none, typed_end => 0);
+    end;
+
+    -- HTML in and out.
+
+    generic [R: Region]
+    function openEditorFromHtml(html: Span[Nat8, R]): Editor is
+        let markdown: String := htmlToMarkdown(html);
+        let editor: Editor := openEditor(asSpan(&markdown));
+        destroyString(markdown);
+        return editor;
+    end;
+
+    -- The HTML of the source from start to stop, after the definitions.
+    generic [R: Region, D: Region, Q: Region]
+    function writeRun(builder: &![StringBuilder, Q], text: Span[Nat8, R], start: Index, stop: Index, definitions: Span[Nat8, D]): Unit is
+        if start >= stop then
+            return nil;
+        end if;
+        var whole: StringBuilder := makeStringBuilder();
+        writeString(&!whole, definitions);
+        writeByte(&!whole, 10);
+        writeString(&!whole, substring(text, start, stop));
+        let markdown: String := finalize(whole);
+        let html: String := renderMarkdown(asSpan(&markdown));
+        writeString(&~builder, asSpan(&html));
+        destroyString(html);
+        destroyString(markdown);
+        return nil;
+    end;
+
+    -- The text of a heading block without its marker and closing hashes.
+    generic [R: Region]
+    function headingTextOf(text: Span[Nat8, R], block: Block): Span[Nat8, R] is
+        let first_stop: Index := lineStopAt(text, block.start);
+        var last: Index := trimStop(text, block.content, first_stop);
+        if block.marker = '#' then
+            var hashes: Index := last;
+            while (hashes > block.content) and (text[hashes - 1] = '#') do
+                hashes := hashes - 1;
+            end while;
+            if (hashes = block.content) or isSpaceByte(text[hashes - 1]) then
+                last := trimStop(text, block.content, hashes);
+            end if;
+        end if;
+        return substring(text, block.content, last);
+    end;
+
+    -- The list of the headings for a line [toc], nothing without headings.
+    generic [R: Region, Q: Region]
+    function writeToc(builder: &![StringBuilder, Q], editor: &[Editor, R]): Unit is
+        let text: Span[Nat8, R] := textOf(editor);
+        var headings: Index := 0;
+        var k: Index := 0;
+        while k < blockCount(editor) do
+            let found: Block := blockRecord(editor, k);
+            if found.kind = kind_heading then
+                headings := headings + 1;
+            end if;
+            k := k + 1;
+        end while;
+        if headings = 0 then
+            return nil;
+        end if;
+        var list: StringBuilder := makeStringBuilder();
+        writeString(&!list, "<ul class=\"toc\">");
+        var i: Index := 0;
+        while i < blockCount(editor) do
+            let block: Block := blockRecord(editor, i);
+            if block.kind = kind_heading then
+                writeString(&!list, "<li class=\"toc-");
+                writeNumber(&!list, block.level);
+                writeString(&!list, "\">");
+                let escaped: String := escapeHtml(headingTextOf(text, block));
+                writeString(&!list, asSpan(&escaped));
+                destroyString(escaped);
+                writeString(&!list, "</li>");
+            end if;
+            i := i + 1;
+        end while;
+        writeString(&!list, "</ul>\n");
+        let raw: String := finalize(list);
+        let clean: String := sanitize(asSpan(&raw), richPolicy());
+        writeString(&~builder, asSpan(&clean));
+        destroyString(clean);
+        destroyString(raw);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function editorToHtml(editor: &[Editor, R]): String is
+        let text: Span[Nat8, R] := textOf(editor);
+        var found: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < blockCount(editor) do
+            let block: Block := blockRecord(editor, i);
+            if block.kind = kind_definition then
+                writeString(&!found, substring(text, block.start, block.stop));
+                writeByte(&!found, 10);
+            end if;
+            i := i + 1;
+        end while;
+        let definitions: String := finalize(found);
+        var builder: StringBuilder := makeStringBuilder();
+        var start: Index := 0;
+        var j: Index := 0;
+        while j < blockCount(editor) do
+            let block: Block := blockRecord(editor, j);
+            if (block.kind = kind_toc) or (block.kind = kind_front) then
+                writeRun(&!builder, text, start, block.start, asSpan(&definitions));
+                if block.kind = kind_toc then
+                    writeToc(&!builder, editor);
+                end if;
+                start := block.stop;
+            end if;
+            j := j + 1;
+        end while;
+        writeRun(&!builder, text, start, spanLength(text), asSpan(&definitions));
+        destroyString(definitions);
+        return finalize(builder);
+    end;
+
+    -- Markdown as HTML, the way the editor shows it: raw HTML in it kept, as
+    -- far as the rich policy of the sanitizer allows.
+    generic [R: Region]
+    function renderMarkdown(markdown: Span[Nat8, R]): String is
+        return markdownWithHtmlToHtml(markdown);
+    end;
+end module body.

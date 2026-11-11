@@ -1,0 +1,94 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Routes derived from the tree of route modules: the answer of a page, the
+layouts around it and the refusal of a parameter that does not parse.
+
+scripts/route-tree.py reads the tree when the programme is built and
+writes a module with the routes for Wolly.Router; nothing is scanned when
+the programme runs.  In the tree, below its root:
+
+- a file name is a segment of the path: about.hih gives /about, a
+  directory blog/ holds the modules below /blog, index.hih stands for the
+  path of its directory;
+- a name with a leading underscore adds a layout and no segment:
+  _admin.hih exports layout, and every page in _admin/ is wrapped in it;
+- a name with a leading at-sign is a typed parameter: @id.hih exports a
+  type Param and parse, and every page from @id.hih down gets a Param;
+- a page exports get, post, put, patch or delete, each taking the request
+  and the values of the parameters above it, in their order, and giving a
+  Page;
+- two routes of one method and one path, parameter names aside, do not
+  compile.
+
+    function get(request: Request, id: Param): Page is
+        destroyRequest(request);
+        return page(makeResponse(200, "text/html; charset=utf-8"), postBody(id));
+    end;
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Response (
+    Response
+);
+
+module Wolly.Tree is
+    """
+    The answer of a page: a response with a body the layouts above it
+    still wrap, or a finished answer such as a redirect that they leave as
+    it is.  Linear: finishPage gives the CGI output.
+    """
+    type Page: Linear;
+
+    """
+    A page whose content the layouts wrap before response is finished with
+    it.
+    """
+    function page(response: Response, content: String): Page
+        ensures isWrapped(&result);
+
+    """
+    A finished CGI answer, a redirect or an error, which no layout
+    touches.
+    """
+    function answer(output: String): Page
+        requires length(&output) > 0
+        ensures not isWrapped(&result);
+
+    """
+    Whether the layouts wrap the body of made.
+    No contract: it reads the case of made and has nothing to promise
+    beyond it.
+    """
+    generic [R: Region]
+    function isWrapped(made: &[Page, R]): Bool;
+
+    """
+    made with its body put through layout, or made as it is when it is a
+    finished answer.
+    """
+    function wrapPage(made: Page, layout: Fn[String, String]): Page
+        ensures isWrapped(&result) = old(isWrapped(&made));
+
+    """
+    The CGI output of made: the response finished with the body.
+    """
+    function finishPage(made: Page): String
+        ensures length(&result) > 0;
+
+    """
+    The answer 404 to request, whose path fits a route but a parameter of
+    it does not parse as its type: such a path names nothing.
+    """
+    function paramNotFound(request: Request): String
+        ensures length(&result) > 0;
+end module.

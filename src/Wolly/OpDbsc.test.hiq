@@ -1,0 +1,747 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The binding of a provider session to a device key, end to end without a
+-- network: a session of Wolly.OpStore, the requests a browser would post
+-- as FastCGI requests, the proofs signed by hand with a key of P-256.
+-- Every refusal has its control.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    contains,
+    indexOf,
+    startsWith,
+    substring
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Log (
+    Log,
+    logToNothing,
+    closeLog
+);
+import Standard.X509 (
+    PrivateKey,
+    EcP256,
+    generateKey,
+    publicKeyDer,
+    signMessage,
+    destroyPrivateKey
+);
+import Standard.Jws (
+    base64UrlEncode,
+    jwkOfPublicKey
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.Account (
+    Account,
+    AccountProblem,
+    prepareAccounts,
+    createAccount,
+    destroyAccount,
+    setLocked
+);
+import Wolly.OpClient (
+    prepareClients
+);
+import Wolly.OpStore (
+    OpSession,
+    Started,
+    prepareStore,
+    startSession,
+    revokeSubject,
+    destroySession
+);
+import Wolly.OpBase (
+    OpSettings,
+    makeSettings,
+    destroySettings,
+    cookieSession,
+    cookieHeader,
+    bindingOwner
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack
+);
+import Wolly.Op (
+    Handover,
+    destroyHandover
+);
+import Wolly.Dbsc (
+    dropBinding
+);
+import Wolly.OpDbsc (
+    offerAfter,
+    offer,
+    register,
+    refresh
+);
+
+module body Wolly.OpDbsc.Test is
+    constant issuer: Span[Nat8, Static] := "https://auth.example.com";
+    constant start_at: Int64 := 100000;
+    constant register_path: Span[Nat8, Static] := "/dbsc/register";
+    constant refresh_path: Span[Nat8, Static] := "/dbsc/refresh";
+    constant ip: Span[Nat8, Static] := "192.0.2.7";
+
+    function nothing(): String is
+        var empty: StringBuilder := makeStringBuilder();
+        return finalize(empty);
+    end;
+
+    generic [A: Region, B: Region]
+    function sameText(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        return contains(a, b) and (spanLength(a) = spanLength(b));
+    end;
+
+    generic [R: Region, N: Region, C: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, N], content: Span[Nat8, C]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    generic [T: Region]
+    function quoted(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "\"");
+        writeString(&!out, text);
+        writeString(&!out, "\"");
+        return finalize(out);
+    end;
+
+    -- A POST as Hiawatha passes it on: the session cookie of the provider,
+    -- the proof and the binding id, each only when it is not empty.
+    generic [T: Region, P: Region, I: Region]
+    function postOf(token: Span[Nat8, T], proof: Span[Nat8, P], id: Span[Nat8, I]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        addPair(&!params, "REQUEST_METHOD", "POST");
+        addPair(&!params, "REQUEST_URI", "/dbsc");
+        if spanLength(token) > 0 then
+            var cookie: StringBuilder := makeStringBuilder();
+            writeString(&!cookie, "__Host-rambo=");
+            writeString(&!cookie, token);
+            let header: String := finalize(cookie);
+            addPair(&!params, "HTTP_COOKIE", asSpan(&header));
+            destroyString(header);
+        end if;
+        if spanLength(proof) > 0 then
+            let header: String := quoted(proof);
+            addPair(&!params, "HTTP_SECURE_SESSION_RESPONSE", asSpan(&header));
+            destroyString(header);
+        end if;
+        if spanLength(id) > 0 then
+            let header: String := quoted(id);
+            addPair(&!params, "HTTP_SEC_SECURE_SESSION_ID", asSpan(&header));
+            destroyString(header);
+        end if;
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(""));
+    end;
+
+    generic [T: Region]
+    function after(text: Span[Nat8, T], marker: Span[Nat8, Static], stop: Nat8): String is
+        case indexOf(text, marker) of
+            when Some(value as at: Index) do
+                let first: Index := at + spanLength(marker);
+                var i: Index := first;
+                while (i < spanLength(text)) and (text[i] /= stop) do
+                    i := i + 1;
+                end while;
+                return fromSpan(substring(text, first, i));
+            when None do
+                return nothing();
+        end case;
+    end;
+
+    generic [K: Region]
+    function jwkOf(key: &[PrivateKey, K]): String is
+        case publicKeyDer(key) of
+            when Some(value as der: String) do
+                case jwkOfPublicKey(asSpan(&der)) of
+                    when Some(value as jwk: String) do
+                        destroyString(der);
+                        return jwk;
+                    when None do
+                        destroyString(der);
+                        assertTrue(false, "the JWK of the key");
+                        return nothing();
+                end case;
+            when None do
+                assertTrue(false, "the DER of the key");
+                return nothing();
+        end case;
+    end;
+
+    function widen(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region, D: Region]
+    function writeNumber32(out: &![StringBuilder, R], der: Span[Nat8, D], first: Index, n: Index): Unit is
+        var at: Index := first;
+        var left: Index := n;
+        while (left > 32) and (der[at] = 0) do
+            at := at + 1;
+            left := left - 1;
+        end while;
+        var pad: Index := 0;
+        if left < 32 then
+            pad := 32 - left;
+        end if;
+        while pad > 0 do
+            writeByte(&~out, 0);
+            pad := pad - 1;
+        end while;
+        var i: Index := at;
+        while i < (at + left) do
+            writeByte(&~out, der[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- An ECDSA signature of P-256 in DER (30 L 02 lr r 02 ls s) as the 64
+    -- bytes of RFC 7518.
+    generic [D: Region]
+    function rawOfDer(der: Span[Nat8, D]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let r_length: Index := widen(der[3]);
+        writeNumber32(&!out, der, 4, r_length);
+        let s_at: Index := 4 + r_length;
+        writeNumber32(&!out, der, s_at + 2, widen(der[s_at + 1]));
+        return finalize(out);
+    end;
+
+    -- A proof of ES256: header with typ dbsc+jwt and, when jwk is not
+    -- empty, jwk; payload with jti; the signature as the 64 bytes of RFC 7518.
+    generic [K: Region, J: Region, T: Region]
+    function makeProof(key: &[PrivateKey, K], jwk: Span[Nat8, J], jti: Span[Nat8, T]): String is
+        var header: StringBuilder := makeStringBuilder();
+        writeString(&!header, "{\"alg\":\"ES256\",\"typ\":\"dbsc+jwt\"");
+        if spanLength(jwk) > 0 then
+            writeString(&!header, ",\"jwk\":");
+            writeString(&!header, jwk);
+        end if;
+        writeString(&!header, "}");
+        let header_text: String := finalize(header);
+        var payload: StringBuilder := makeStringBuilder();
+        writeString(&!payload, "{\"jti\":\"");
+        writeString(&!payload, jti);
+        writeString(&!payload, "\"}");
+        let payload_text: String := finalize(payload);
+        let header_part: String := base64UrlEncode(asSpan(&header_text));
+        let payload_part: String := base64UrlEncode(asSpan(&payload_text));
+        destroyString(header_text);
+        destroyString(payload_text);
+        var signed: StringBuilder := makeStringBuilder();
+        writeString(&!signed, asSpan(&header_part));
+        writeString(&!signed, ".");
+        writeString(&!signed, asSpan(&payload_part));
+        destroyString(header_part);
+        destroyString(payload_part);
+        let message: String := finalize(signed);
+        var token: StringBuilder := makeStringBuilder();
+        writeString(&!token, asSpan(&message));
+        writeString(&!token, ".");
+        case signMessage(key, asSpan(&message)) of
+            when Some(value as der: String) do
+                let raw_text: String := rawOfDer(asSpan(&der));
+                destroyString(der);
+                let signature: String := base64UrlEncode(asSpan(&raw_text));
+                destroyString(raw_text);
+                writeString(&!token, asSpan(&signature));
+                destroyString(signature);
+            when None do
+                assertTrue(false, "the key signs");
+        end case;
+        destroyString(message);
+        return finalize(token);
+    end;
+
+    generic [O: Region]
+    function statusIs(output: Span[Nat8, O], status: Span[Nat8, Static]): Bool is
+        return startsWith(output, status);
+    end;
+
+    -- The cookie value the Set-Cookie of output gives.
+    generic [O: Region]
+    function cookieOf(output: Span[Nat8, O]): String is
+        return after(output, "Set-Cookie: __Host-rambo=", ';');
+    end;
+
+    -- Whether the cookie token opens a live session of the provider at now.
+    generic [R: Region, S: Region, T: Region]
+    function opens(db: &![Database[Writing], R], settings: &[OpSettings, S], token: Span[Nat8, T], now: Int64): Bool is
+        let request: Request := postOf(token, "", "");
+        let found: Either[DbError, Option[OpSession]] := cookieSession(&request, &~db, settings, now);
+        destroyRequest(request);
+        case found of
+            when Right(right as maybe: Option[OpSession]) do
+                case maybe of
+                    when Some(value as session: OpSession) do
+                        destroySession(session);
+                        return true;
+                    when None do
+                        return false;
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "the session is read");
+                return false;
+        end case;
+    end;
+
+    -- The challenge of the offer for the session of token, or empty.
+    generic [R: Region, S: Region, T: Region]
+    function offered(db: &![Database[Writing], R], settings: &[OpSettings, S], token: Span[Nat8, T], now: Int64): String is
+        let request: Request := postOf(token, "", "");
+        let made: Either[DbError, Option[String]] := offer(&request, &~db, settings, register_path, now);
+        destroyRequest(request);
+        case made of
+            when Right(right as maybe: Option[String]) do
+                case maybe of
+                    when Some(value as header: String) do
+                        let challenge: String := after(asSpan(&header), "challenge=\"", '"');
+                        destroyString(header);
+                        return challenge;
+                    when None do
+                        return nothing();
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "an offer is made");
+                return nothing();
+        end case;
+    end;
+
+    -- The challenge of the offer after a login whose answer sets the
+    -- cookie of name to token, or empty.
+    generic [R: Region, S: Region, T: Region]
+    function offeredAfter(db: &![Database[Writing], R], settings: &[OpSettings, S], name: Span[Nat8, Static], token: Span[Nat8, T],
+        now: Int64): String is
+        var cookies: Buffer[String] := allocateEmpty();
+        insertBack(&!cookies, cookieHeader("__Host-rambo-flow", "", -1));
+        insertBack(&!cookies, cookieHeader(name, token, 0));
+        let handover: Handover := Handover(status => 303, location => fromSpan("/"), cookies => cookies);
+        let made: Either[DbError, Option[String]] := offerAfter(&~db, settings, &handover, register_path, now);
+        destroyHandover(handover);
+        case made of
+            when Right(right as maybe: Option[String]) do
+                case maybe of
+                    when Some(value as header: String) do
+                        let challenge: String := after(asSpan(&header), "challenge=\"", '"');
+                        destroyString(header);
+                        return challenge;
+                    when None do
+                        return nothing();
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "an offer after the login is made");
+                return nothing();
+        end case;
+    end;
+
+    generic [R: Region, S: Region, L: Region, T: Region, P: Region]
+    function registered(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], token: Span[Nat8, T],
+        proof: Span[Nat8, P], now: Int64): String is
+        let request: Request := postOf(token, proof, "");
+        let output: String := register(&request, &~db, settings, &~log, refresh_path, ip, now);
+        destroyRequest(request);
+        return output;
+    end;
+
+    generic [R: Region, S: Region, L: Region, I: Region, P: Region]
+    function refreshed(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], id: Span[Nat8, I],
+        proof: Span[Nat8, P], now: Int64): String is
+        let request: Request := postOf("", proof, id);
+        let output: String := refresh(&request, &~db, settings, &~log, refresh_path, ip, now);
+        destroyRequest(request);
+        return output;
+    end;
+
+    -- A refresh of id with a proof by key over a new challenge, at later.
+    generic [R: Region, S: Region, L: Region, I: Region, K: Region]
+    function refreshWith(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], id: Span[Nat8, I],
+        key: &[PrivateKey, K], now: Int64, later: Int64): String is
+        let asked: String := refreshed(&~db, settings, &~log, id, "", now);
+        assertTrue(statusIs(asSpan(&asked), "Status: 403"), "a refresh without a proof is a 403");
+        let challenge: String := after(asSpan(&asked), "Secure-Session-Challenge: \"", '"');
+        destroyString(asked);
+        let proof: String := makeProof(key, "", asSpan(&challenge));
+        destroyString(challenge);
+        let output: String := refreshed(&~db, settings, &~log, id, asSpan(&proof), later);
+        destroyString(proof);
+        return output;
+    end;
+
+    generic [R: Region]
+    function subjectMade(db: &![Database[Writing], R]): String is
+        assertTrue(isNone(prepareAccounts(&~db)), "the accounts");
+        assertTrue(isNone(prepareClients(&~db)), "the clients, which op_roles names");
+        assertTrue(isNone(prepareStore(&~db)), "the store and the bindings");
+        case createAccount(&~db, "alice@example.com", "Alice", start_at) of
+            when Right(right as made: Either[AccountProblem, Account]) do
+                case made of
+                    when Right(right as account: Account) do
+                        let id: String := idOfAccount(&account);
+                        destroyAccount(account);
+                        return id;
+                    when Left(left as problem: AccountProblem) do
+                        assertTrue(false, "an account is made");
+                        return nothing();
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "an account is stored");
+                return nothing();
+        end case;
+    end;
+
+    generic [A: Region]
+    function idOfAccount(account: &[Account, A]): String is
+        return fromSpan(asSpan(&(account->id)));
+    end;
+
+    function isNone(error: Option[DbError]): Bool is
+        case error of
+            when Some(value as e: DbError) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- A session of subject at now and its cookie value.
+    generic [R: Region, U: Region]
+    function sessionOf(db: &![Database[Writing], R], subject: Span[Nat8, U], now: Int64): String is
+        let no_cookie: Option[String] := None();
+        case startSession(&~db, no_cookie, subject, "pwd", ip, "test", now, 7200, 43200) of
+            when Right(right as made: Option[Started]) do
+                case made of
+                    when Some(value as started: Started) do
+                        let { session: OpSession, token: String } := started;
+                        destroySession(session);
+                        return token;
+                    when None do
+                        assertTrue(false, "a session starts");
+                        return nothing();
+                end case;
+            when Left(left as error: DbError) do
+                assertTrue(false, "a session is stored");
+                return nothing();
+        end case;
+    end;
+
+    function testBindingOwner(): Unit is
+        let owner: String := bindingOwner("abc");
+        assertTrue(sameText(asSpan(&owner), "op:abc"), "op: and the id");
+        destroyString(owner);
+        return nil;
+    end;
+
+    function testBoundSession(): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                case openTestDatabase() of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let subject: String := subjectMade(&!db);
+                        case makeSettings(issuer, "RAMBO", "__Host-rambo", false, 7200, 43200) of
+                            when Some(value as settings: OpSettings) do
+                                var log: Log := logToNothing();
+                                roundTrip(&!db, &settings, &!log, &key, asSpan(&subject));
+                                let closed: Bool := closeLog(log);
+                                destroySettings(settings);
+                            when None do
+                                assertTrue(false, "the settings hold");
+                        end case;
+                        destroyString(subject);
+                        closeDatabase(db);
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "a database opens");
+                end case;
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key of P-256");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, L: Region, K: Region, U: Region]
+    function roundTrip(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], key: &[PrivateKey, K],
+        subject: Span[Nat8, U]): Unit is
+        let jwk: String := jwkOf(key);
+        let token: String := sessionOf(&~db, subject, start_at);
+        assertTrue(opens(&~db, settings, asSpan(&token), start_at + 1), "control: the cookie of the login opens the session");
+        let none: String := offered(&~db, settings, "no session at all here, not one at all", start_at + 1);
+        assertTrue(spanLength(asSpan(&none)) = 0, "no offer without a session");
+        destroyString(none);
+        let at_login: String := offeredAfter(&~db, settings, "__Host-rambo", asSpan(&token), start_at + 1);
+        assertTrue(spanLength(asSpan(&at_login)) = 43, "an offer with the cookie the login sets");
+        destroyString(at_login);
+        let other_cookie: String := offeredAfter(&~db, settings, "__Host-other", asSpan(&token), start_at + 1);
+        assertTrue(spanLength(asSpan(&other_cookie)) = 0, "control: no offer without the session cookie among them");
+        destroyString(other_cookie);
+        -- A proof without a session cookie, and one of another key's jwk.
+        let challenge: String := offered(&~db, settings, asSpan(&token), start_at + 1);
+        assertTrue(spanLength(asSpan(&challenge)) = 43, "an offer to the session");
+        let proof: String := makeProof(key, asSpan(&jwk), asSpan(&challenge));
+        let anonymous: String := registered(&~db, settings, &~log, "", asSpan(&proof), start_at + 2);
+        assertTrue(statusIs(asSpan(&anonymous), "Status: 401"), "no cookie, no binding");
+        destroyString(anonymous);
+        let bare: String := registered(&~db, settings, &~log, asSpan(&token), "", start_at + 2);
+        assertTrue(statusIs(asSpan(&bare), "Status: 400"), "no proof, no binding");
+        destroyString(bare);
+        let output: String := registered(&~db, settings, &~log, asSpan(&token), asSpan(&proof), start_at + 2);
+        assertTrue(statusIs(asSpan(&output), "Status: 200"), "the registration is taken");
+        assertTrue(contains(asSpan(&output), "Max-Age=600"), "the cookie lives boundSeconds");
+        assertTrue(contains(asSpan(&output), "\"name\":\"__Host-rambo\""), "the instructions name the cookie of the provider");
+        let id: String := after(asSpan(&output), "\"session_identifier\":\"", '"');
+        let bound: String := cookieOf(asSpan(&output));
+        destroyString(output);
+        destroyString(proof);
+        destroyString(challenge);
+        assertTrue(spanLength(asSpan(&id)) = 43, "a binding id");
+        assertTrue(opens(&~db, settings, asSpan(&bound), start_at + 3), "the bound cookie opens the session");
+        assertFalse(opens(&~db, settings, asSpan(&token), start_at + 3), "the cookie before the binding opens nothing");
+        assertTrue(opens(&~db, settings, asSpan(&bound), start_at + 602), "alive up to boundSeconds after the registration");
+        assertFalse(opens(&~db, settings, asSpan(&bound), start_at + 603), "dead after boundSeconds");
+        let again: String := offered(&~db, settings, asSpan(&bound), start_at + 4);
+        assertTrue(spanLength(asSpan(&again)) = 0, "a bound session gets no offer");
+        destroyString(again);
+        let second_proof: String := makeProof(key, asSpan(&jwk), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let second: String := registered(&~db, settings, &~log, asSpan(&bound), asSpan(&second_proof), start_at + 4);
+        assertTrue(statusIs(asSpan(&second), "Status: 401"), "a bound session registers no second key");
+        destroyString(second);
+        destroyString(second_proof);
+        -- A refresh with the key of the binding.
+        let renewed: String := refreshWith(&~db, settings, &~log, asSpan(&id), key, start_at + 100, start_at + 101);
+        assertTrue(statusIs(asSpan(&renewed), "Status: 200"), "the refresh is taken");
+        let next: String := cookieOf(asSpan(&renewed));
+        destroyString(renewed);
+        assertTrue(opens(&~db, settings, asSpan(&next), start_at + 102), "the new cookie opens the session");
+        assertFalse(opens(&~db, settings, asSpan(&bound), start_at + 102), "the cookie before the refresh opens nothing");
+        assertTrue(opens(&~db, settings, asSpan(&next), start_at + 701), "the new cookie lives boundSeconds from the refresh");
+        -- A refresh with a jwk is refused.
+        let with_jwk: String := refreshed(&~db, settings, &~log, asSpan(&id), "", start_at + 110);
+        let refresh_challenge: String := after(asSpan(&with_jwk), "Secure-Session-Challenge: \"", '"');
+        destroyString(with_jwk);
+        let jwk_proof: String := makeProof(key, asSpan(&jwk), asSpan(&refresh_challenge));
+        let refused: String := refreshed(&~db, settings, &~log, asSpan(&id), asSpan(&jwk_proof), start_at + 111);
+        assertTrue(statusIs(asSpan(&refused), "Status: 401"), "a jwk at a refresh");
+        destroyString(refused);
+        destroyString(jwk_proof);
+        destroyString(refresh_challenge);
+        -- A locked account ends the binding at the next refresh.
+        case setLocked(&~db, subject, true, start_at + 120) of
+            when Right(right as changed: Bool) do
+                assertTrue(changed, "the account is locked");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the account is locked");
+        end case;
+        let locked: String := refreshWith(&~db, settings, &~log, asSpan(&id), key, start_at + 121, start_at + 122);
+        assertTrue(statusIs(asSpan(&locked), "Status: 401"), "the binding of a locked account");
+        destroyString(locked);
+        let gone: String := refreshed(&~db, settings, &~log, asSpan(&id), "", start_at + 123);
+        assertTrue(statusIs(asSpan(&gone), "Status: 401"), "the binding is dropped with it");
+        destroyString(gone);
+        destroyString(next);
+        destroyString(bound);
+        destroyString(id);
+        destroyString(token);
+        destroyString(jwk);
+        return nil;
+    end;
+
+    function testDroppedBinding(): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                case generateKey(EcP256()) of
+                    when Some(value as other: PrivateKey) do
+                        case openTestDatabase() of
+                            when Right(right as opened: Database[Writing]) do
+                                var db: Database[Writing] := opened;
+                                let subject: String := subjectMade(&!db);
+                                case makeSettings(issuer, "RAMBO", "__Host-rambo", false, 7200, 43200) of
+                                    when Some(value as settings: OpSettings) do
+                                        var log: Log := logToNothing();
+                                        droppedRun(&!db, &settings, &!log, &key, &other, asSpan(&subject));
+                                        let closed: Bool := closeLog(log);
+                                        destroySettings(settings);
+                                    when None do
+                                        assertTrue(false, "the settings hold");
+                                end case;
+                                destroyString(subject);
+                                closeDatabase(db);
+                            when Left(left as error: DbError) do
+                                assertTrue(false, "a database opens");
+                        end case;
+                        destroyPrivateKey(other);
+                    when None do
+                        assertTrue(false, "a second key of P-256");
+                end case;
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key of P-256");
+        end case;
+        return nil;
+    end;
+
+    -- A session whose binding is gone, dropped or past its life, does not count as unbound again:
+    -- its last cookie opens nothing, and no other key can be bound to it.
+    generic [R: Region, S: Region, L: Region, K: Region, O: Region, U: Region]
+    function droppedRun(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], key: &[PrivateKey, K],
+        other: &[PrivateKey, O], subject: Span[Nat8, U]): Unit is
+        let jwk: String := jwkOf(key);
+        let token: String := sessionOf(&~db, subject, start_at);
+        let challenge: String := offered(&~db, settings, asSpan(&token), start_at + 1);
+        let proof: String := makeProof(key, asSpan(&jwk), asSpan(&challenge));
+        let output: String := registered(&~db, settings, &~log, asSpan(&token), asSpan(&proof), start_at + 2);
+        assertTrue(statusIs(asSpan(&output), "Status: 200"), "the registration is taken");
+        let id: String := after(asSpan(&output), "\"session_identifier\":\"", '"');
+        let bound: String := cookieOf(asSpan(&output));
+        destroyString(output);
+        assertTrue(opens(&~db, settings, asSpan(&bound), start_at + 3), "control: the bound cookie opens the session");
+        assertTrue(isNone(dropBinding(&~db, asSpan(&id))), "the binding is dropped");
+        assertFalse(opens(&~db, settings, asSpan(&bound), start_at + 4), "the last cookie of a session bound once opens nothing");
+        let other_jwk: String := jwkOf(other);
+        let foreign_challenge: String := offered(&~db, settings, asSpan(&bound), start_at + 5);
+        let foreign_proof: String := makeProof(other, asSpan(&other_jwk), asSpan(&foreign_challenge));
+        let foreign: String := registered(&~db, settings, &~log, asSpan(&bound), asSpan(&foreign_proof), start_at + 5);
+        assertFalse(statusIs(asSpan(&foreign), "Status: 200"), "no other key is bound to it");
+        destroyString(foreign);
+        destroyString(foreign_proof);
+        destroyString(foreign_challenge);
+        destroyString(other_jwk);
+        -- A session never bound still opens with its cookie.
+        let plain: String := sessionOf(&~db, subject, start_at + 10);
+        assertTrue(opens(&~db, settings, asSpan(&plain), start_at + 11), "control: a session never bound opens");
+        destroyString(plain);
+        destroyString(bound);
+        destroyString(id);
+        destroyString(proof);
+        destroyString(challenge);
+        destroyString(token);
+        destroyString(jwk);
+        return nil;
+    end;
+
+    function testEndedSession(): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                case openTestDatabase() of
+                    when Right(right as opened: Database[Writing]) do
+                        var db: Database[Writing] := opened;
+                        let subject: String := subjectMade(&!db);
+                        case makeSettings(issuer, "RAMBO", "__Host-rambo", false, 7200, 43200) of
+                            when Some(value as settings: OpSettings) do
+                                var log: Log := logToNothing();
+                                endedRun(&!db, &settings, &!log, &key, asSpan(&subject));
+                                let closed: Bool := closeLog(log);
+                                destroySettings(settings);
+                            when None do
+                                assertTrue(false, "the settings hold");
+                        end case;
+                        destroyString(subject);
+                        closeDatabase(db);
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "a database opens");
+                end case;
+                destroyPrivateKey(key);
+            when None do
+                assertTrue(false, "a key of P-256");
+        end case;
+        return nil;
+    end;
+
+    -- A binding whose session ended: the refresh is refused.
+    generic [R: Region, S: Region, L: Region, K: Region, U: Region]
+    function endedRun(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], key: &[PrivateKey, K],
+        subject: Span[Nat8, U]): Unit is
+        let jwk: String := jwkOf(key);
+        let token: String := sessionOf(&~db, subject, start_at);
+        let challenge: String := offered(&~db, settings, asSpan(&token), start_at + 1);
+        let proof: String := makeProof(key, asSpan(&jwk), asSpan(&challenge));
+        let output: String := registered(&~db, settings, &~log, asSpan(&token), asSpan(&proof), start_at + 2);
+        assertTrue(statusIs(asSpan(&output), "Status: 200"), "the registration is taken");
+        let id: String := after(asSpan(&output), "\"session_identifier\":\"", '"');
+        destroyString(output);
+        let control: String := refreshWith(&~db, settings, &~log, asSpan(&id), key, start_at + 10, start_at + 11);
+        assertTrue(statusIs(asSpan(&control), "Status: 200"), "control: a refresh while the session lives");
+        destroyString(control);
+        -- Every session of the subject ends, as a logout everywhere does.
+        case revokeSubject(&~db, subject, "logout", start_at + 20) of
+            when Right(right as changed: Int64) do
+                assertTrue(changed > 0, "the session ends");
+            when Left(left as error: DbError) do
+                assertTrue(false, "the session ends");
+        end case;
+        let after_end: String := refreshWith(&~db, settings, &~log, asSpan(&id), key, start_at + 21, start_at + 22);
+        assertTrue(statusIs(asSpan(&after_end), "Status: 401"), "the binding of an ended session");
+        destroyString(after_end);
+        -- A new session, unused longer than the idle limit of 7200 seconds:
+        -- it lives no more, though nothing ended it.
+        let later_token: String := sessionOf(&~db, subject, start_at + 30);
+        let later_challenge: String := offered(&~db, settings, asSpan(&later_token), start_at + 31);
+        let later_proof: String := makeProof(key, asSpan(&jwk), asSpan(&later_challenge));
+        let later: String := registered(&~db, settings, &~log, asSpan(&later_token), asSpan(&later_proof), start_at + 32);
+        assertTrue(statusIs(asSpan(&later), "Status: 200"), "control: the second session is bound");
+        let later_id: String := after(asSpan(&later), "\"session_identifier\":\"", '"');
+        destroyString(later);
+        let idle: String := refreshWith(&~db, settings, &~log, asSpan(&later_id), key, start_at + 7300, start_at + 7301);
+        assertTrue(statusIs(asSpan(&idle), "Status: 401"), "the binding of a session past its idle limit");
+        destroyString(idle);
+        destroyString(later_id);
+        destroyString(later_proof);
+        destroyString(later_challenge);
+        destroyString(later_token);
+        destroyString(id);
+        destroyString(proof);
+        destroyString(challenge);
+        destroyString(token);
+        destroyString(jwk);
+        return nil;
+    end;
+end module body.

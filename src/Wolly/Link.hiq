@@ -1,0 +1,392 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    asSpan,
+    destroyString,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Router (
+    Route,
+    routeParam
+);
+import Wolly.Response (
+    Response,
+    addHeader
+);
+
+module body Wolly.Link is
+    instance Params(NoParams) is
+        generic [R: Region]
+        method arity(params: &[NoParams, R]): Index is
+            return 0;
+        end;
+
+        generic [R: Region]
+        method segment(params: &[NoParams, R], at: Index): String is
+            return fromSpan("");
+        end;
+    end;
+
+    function noParams(): NoParams is
+        return NoParams();
+    end;
+
+    record Target[P: Type]: Linear is
+        verb: Span[Nat8, Static];
+        pattern: Span[Nat8, Static];
+        handler: Fn[Request, String];
+    end;
+
+    -- query tells whether text has a ? already, so that the next value of
+    -- withQuery goes after an and-sign.
+    record Link: Linear is
+        text: String;
+        query: Bool;
+        invariant length(&text) > 0;
+    end;
+
+    generic [A: Region, B: Region]
+    function sameBytes(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Letters, digits and - . _ ~, the bytes RFC 3986 calls unreserved: the
+    -- only ones a segment carries as they stand.
+    function isUnreserved(byte: Nat8): Bool is
+        if ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z')) then
+            return true;
+        end if;
+        if (byte >= '0') and (byte <= '9') then
+            return true;
+        end if;
+        return (((byte = '-') or (byte = '.')) or (byte = '_')) or (byte = '~');
+    end;
+
+    -- A byte of a pattern: printable ASCII but space, the quote, ?, #, the
+    -- angle brackets and the bytes RFC 3986 does not allow in a path.
+    function isPatternByte(byte: Nat8): Bool is
+        if (byte <= ' ') or (byte >= 127) then
+            return false;
+        end if;
+        if (((byte = '"') or (byte = '?')) or (byte = '#')) or ((byte = '<') or (byte = '>')) then
+            return false;
+        end if;
+        return not ((((byte = '\\') or (byte = '^')) or (byte = '`')) or (((byte = '{') or (byte = '|')) or (byte = '}')));
+    end;
+
+    generic [P: Region]
+    function isPattern(pattern: Span[Nat8, P]): Bool is
+        if spanLength(pattern) = 0 then
+            return false;
+        end if;
+        if pattern[0] /= '/' then
+            return false;
+        end if;
+        -- Two slashes at the start make a browser read the rest as a host.
+        if (spanLength(pattern) > 1) and (pattern[1] = '/') then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < spanLength(pattern) do
+            if not isPatternByte(pattern[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [N: Region]
+    function isQueryName(name: Span[Nat8, N]): Bool is
+        if spanLength(name) = 0 then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if not isUnreserved(name[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Where the segment that begins at first ends: at the next slash or at
+    -- the end, as Wolly.Router reads a pattern.
+    generic [P: Region]
+    function segmentEnd(pattern: Span[Nat8, P], first: Index): Index is
+        var i: Index := first;
+        while i < spanLength(pattern) do
+            if pattern[i] = '/' then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(pattern);
+    end;
+
+    -- Whether the segment first up to stop is a last *.
+    generic [P: Region]
+    function isRest(pattern: Span[Nat8, P], first: Index, stop: Index): Bool is
+        return ((stop = (first + 1)) and (stop = spanLength(pattern))) and (pattern[first] = '*');
+    end;
+
+    -- Whether the segment first up to stop takes a value: :name or a last *.
+    generic [P: Region]
+    function isParam(pattern: Span[Nat8, P], first: Index, stop: Index): Bool is
+        if (stop > (first + 1)) and (pattern[first] = ':') then
+            return true;
+        end if;
+        return isRest(pattern, first, stop);
+    end;
+
+    generic [P: Region]
+    function paramCount(pattern: Span[Nat8, P]): Index is
+        var count: Index := 0;
+        var first: Index := 1;
+        while first < spanLength(pattern) do
+            let stop: Index := segmentEnd(pattern, first);
+            if isParam(pattern, first, stop) then
+                count := count + 1;
+            end if;
+            first := stop + 1;
+        end while;
+        return count;
+    end;
+
+    function hexDigit(n: Nat8): Nat8 is
+        if n < 10 then
+            return '0' + n;
+        end if;
+        return 'A' + (n - 10);
+    end;
+
+    generic [B: Region, V: Region]
+    function writeEncoded(out: &![StringBuilder, B], value: Span[Nat8, V]): Unit is
+        var i: Index := 0;
+        while i < spanLength(value) do
+            let byte: Nat8 := value[i];
+            if isUnreserved(byte) then
+                writeByte(&~out, byte);
+            else
+                writeByte(&~out, '%');
+                writeByte(&~out, hexDigit(byte / 16));
+                writeByte(&~out, hexDigit(byte - ((byte / 16) * 16)));
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [V: Region]
+    function encodeSegment(value: Span[Nat8, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeEncoded(&!out, value);
+        return finalize(out);
+    end;
+
+    -- Whether value can stand as a segment: not empty, and neither . nor
+    -- .. which a browser resolves before it sends the path, encoded or not.
+    generic [V: Region]
+    function isSegmentValue(value: Span[Nat8, V]): Bool is
+        if spanLength(value) = 0 then
+            return false;
+        end if;
+        return not (sameBytes(value, ".") or sameBytes(value, ".."));
+    end;
+
+    -- Writes value as the rest a last * fits: each part between slashes
+    -- encoded, the slashes kept.  False when a part cannot be a segment;
+    -- the empty rest is allowed, as the router lets * fit it.
+    generic [B: Region, V: Region]
+    function writeRest(out: &![StringBuilder, B], value: Span[Nat8, V]): Bool is
+        if spanLength(value) = 0 then
+            return true;
+        end if;
+        var first: Index := 0;
+        while first <= spanLength(value) do
+            let stop: Index := segmentEnd(value, first);
+            let part: Span[Nat8, V] := substring(value, first, stop);
+            if not isSegmentValue(part) then
+                return false;
+            end if;
+            if first > 0 then
+                writeByte(&~out, '/');
+            end if;
+            writeEncoded(&~out, part);
+            first := stop + 1;
+        end while;
+        return true;
+    end;
+
+    generic [P: Type]
+    function target(verb: Span[Nat8, Static], pattern: Span[Nat8, Static], handler: Fn[Request, String]): Target[P] is
+        return Target(verb => verb, pattern => pattern, handler => handler);
+    end;
+
+    generic [P: Type, R: Region]
+    function targetPattern(goal: &[Target[P], R]): Span[Nat8, Static] is
+        return goal->pattern;
+    end;
+
+    generic [P: Type, R: Region]
+    function targetVerb(goal: &[Target[P], R]): Span[Nat8, Static] is
+        return goal->verb;
+    end;
+
+    generic [P: Type, R: Region]
+    function isStatic(goal: &[Target[P], R]): Bool is
+        return paramCount(goal->pattern) = 0;
+    end;
+
+    generic [P: Type, R: Region]
+    function isFormTarget(goal: &[Target[P], R]): Bool is
+        let verb: Span[Nat8, Static] := goal->verb;
+        if not (sameBytes(verb, "GET") or sameBytes(verb, "POST")) then
+            return false;
+        end if;
+        return paramCount(goal->pattern) = 0;
+    end;
+
+    generic [P: Type]
+    function route(goal: Target[P]): Route is
+        let { verb as v: Span[Nat8, Static], pattern as p: Span[Nat8, Static], handler as h: Fn[Request, String] } := goal;
+        return Route(verb => v, pattern => p, handler => h);
+    end;
+
+    generic [P: Type, R: Region, N: Region]
+    function targetParam(goal: Target[P], request: &[Request, R], name: Span[Nat8, N]): Option[String] is
+        let { verb as v: Span[Nat8, Static], pattern as p: Span[Nat8, Static], handler as h: Fn[Request, String] } := goal;
+        return routeParam(request, p, name);
+    end;
+
+    function noLink(): Option[Link] is
+        let none: Option[Link] := None();
+        return none;
+    end;
+
+    generic [P: Type(Params), R: Region]
+    function link(goal: Target[P], params: &[P, R]): Option[Link] is
+        let { verb as v: Span[Nat8, Static], pattern as p: Span[Nat8, Static], handler as h: Fn[Request, String] } := goal;
+        if paramCount(p) /= arity(params) then
+            return noLink();
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, '/');
+        var fits: Bool := true;
+        var next: Index := 0;
+        var first: Index := 1;
+        while (first < spanLength(p)) and fits do
+            let stop: Index := segmentEnd(p, first);
+            if first > 1 then
+                writeByte(&!out, '/');
+            end if;
+            if isParam(p, first, stop) then
+                let value: String := segment(params, next);
+                next := next + 1;
+                if isRest(p, first, stop) then
+                    fits := writeRest(&!out, asSpan(&value));
+                else
+                    if isSegmentValue(asSpan(&value)) then
+                        writeEncoded(&!out, asSpan(&value));
+                    else
+                        fits := false;
+                    end if;
+                end if;
+                destroyString(value);
+            else
+                writeString(&!out, substring(p, first, stop));
+            end if;
+            first := stop + 1;
+        end while;
+        -- A pattern that ends in a slash has an empty last segment, which
+        -- the loop above does not reach.
+        if (spanLength(p) > 1) and (p[spanLength(p) - 1] = '/') then
+            writeByte(&!out, '/');
+        end if;
+        let text: String := finalize(out);
+        if not fits then
+            destroyString(text);
+            return noLink();
+        end if;
+        return Some(value => Link(text => text, query => false));
+    end;
+
+    function path(goal: Target[NoParams]): Link is
+        let { verb as v: Span[Nat8, Static], pattern as p: Span[Nat8, Static], handler as h: Fn[Request, String] } := goal;
+        return Link(text => fromSpan(p), query => false);
+    end;
+
+    function formAction(goal: Target[NoParams]): String is
+        return linkString(path(goal));
+    end;
+
+    generic [V: Region]
+    function withQuery(made: Link, name: Span[Nat8, Static], value: Span[Nat8, V]): Link is
+        let { text as t: String, query as q: Bool } := made;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&t));
+        destroyString(t);
+        if q then
+            writeByte(&!out, '&');
+        else
+            writeByte(&!out, '?');
+        end if;
+        writeString(&!out, name);
+        writeByte(&!out, '=');
+        writeEncoded(&!out, value);
+        return Link(text => finalize(out), query => true);
+    end;
+
+    function redirect(response: Response, made: Link): Response is
+        let text: String := linkString(made);
+        let located: Response := addHeader(response, "Location", asSpan(&text));
+        destroyString(text);
+        return located;
+    end;
+
+    function linkString(made: Link): String is
+        let { text as t: String, query as q: Bool } := made;
+        return t;
+    end;
+
+    generic [R: Region]
+    function linkLength(made: &[Link, R]): Index is
+        return length(&(made->text));
+    end;
+
+    function destroyLink(made: Link): Unit is
+        let { text as t: String, query as q: Bool } := made;
+        destroyString(t);
+        return nil;
+    end;
+end module body.

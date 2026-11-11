@@ -1,0 +1,21 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Tree (
+    Page,
+    isWrapped
+);
+
+module Wolly.Example.Pages.Site.Docs.Intro is
+    """
+    GET /docs/intro: a page two segments deep.
+    """
+    function get(request: Request): Page
+        ensures isWrapped(&result);
+end module.

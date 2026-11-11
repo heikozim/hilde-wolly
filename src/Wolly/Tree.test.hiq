@@ -1,0 +1,108 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    contains,
+    startsWith
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest
+);
+import Wolly.Response (
+    makeResponse,
+    finish
+);
+import Wolly.Tree (
+    Page,
+    page,
+    answer,
+    isWrapped,
+    wrapPage,
+    finishPage,
+    paramNotFound
+);
+
+module body Wolly.Tree.Test is
+    function bracket(content: String): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "[");
+        writeString(&!out, asSpan(&content));
+        writeString(&!out, "]");
+        destroyString(content);
+        return finalize(out);
+    end;
+
+    function brace(content: String): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{");
+        writeString(&!out, asSpan(&content));
+        writeString(&!out, "}");
+        destroyString(content);
+        return finalize(out);
+    end;
+
+    function answers(output: String, status: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let good: Bool := startsWith(asSpan(&output), status) and contains(asSpan(&output), part);
+        if not good then
+            printLn(asSpan(&output));
+        end if;
+        destroyString(output);
+        assertTrue(good, message);
+        return nil;
+    end;
+
+    function testPageIsWrapped(): Unit is
+        let made: Page := page(makeResponse(200, "text/html"), fromSpan("x"));
+        assertTrue(isWrapped(&made), "a page is wrapped");
+        answers(finishPage(made), "Status: 200 ", "\r\n\r\nx", "a page without a layout is its content");
+        return nil;
+    end;
+
+    function testLayoutsFromTheInnermostOut(): Unit is
+        let made: Page := page(makeResponse(200, "text/html"), fromSpan("x"));
+        let inner: Page := wrapPage(made, bracket);
+        let outer: Page := wrapPage(inner, brace);
+        assertTrue(isWrapped(&outer), "a wrapped page stays a page");
+        answers(finishPage(outer), "Status: 200 ", "\r\n\r\n{[x]}", "the inner layout first, the outer around it");
+        return nil;
+    end;
+
+    function testAnswerIsLeftAlone(): Unit is
+        let done: Page := answer(finish(makeResponse(303, "text/plain"), "moved"));
+        assertFalse(isWrapped(&done), "a finished answer is not wrapped");
+        let still: Page := wrapPage(wrapPage(done, bracket), brace);
+        assertFalse(isWrapped(&still), "and stays so through layouts");
+        let output: String := finishPage(still);
+        assertFalse(contains(asSpan(&output), "[") or contains(asSpan(&output), "{"), "no layout touched it");
+        answers(output, "Status: 303 ", "\r\n\r\nmoved", "the answer as it was made");
+        return nil;
+    end;
+
+    function testParamNotFound(): Unit is
+        var empty: StringBuilder := makeStringBuilder();
+        var none: StringBuilder := makeStringBuilder();
+        let request: Request := makeRequest(finalize(empty), finalize(none));
+        answers(paramNotFound(request), "Status: 404 ", "not found", "a parameter that does not parse names nothing");
+        return nil;
+    end;
+end module body.

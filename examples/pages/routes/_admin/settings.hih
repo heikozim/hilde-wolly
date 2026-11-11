@@ -1,0 +1,28 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Tree (
+    Page,
+    isWrapped
+);
+
+module Wolly.Example.Pages.Site.Admin.Settings is
+    """
+    GET /settings: the settings, inside the layout of the admin pages.
+    """
+    function get(request: Request): Page
+        ensures isWrapped(&result);
+
+    """
+    POST /settings: a redirect to GET /settings, finished, so that no
+    layout wraps it.
+    """
+    function post(request: Request): Page
+        ensures not isWrapped(&result);
+end module.

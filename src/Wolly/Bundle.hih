@@ -1,0 +1,150 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Static assets compiled into the programme, named by the hash of their
+content: app.css becomes app.<16 hex digits of its SHA-256>.css under
+/assets/, so a browser may keep it for a year and fetches a new name when
+the content changes.
+
+The check at compile time is Hilde's @bytes: the application names each
+asset by a function of its own that gives asset a name and the bytes of
+@bytes("static/app.css").  A file that is not there stops the compiler, a
+page links the asset through that function, and a misspelt function does
+not compile either.  The path of @bytes stays inside the directory of the
+module, so no asset can come from elsewhere.
+
+    function appCss(): Asset is
+        return asset("app.css", @bytes("static/app.css"));
+    end;
+    ...
+    case assetUrl(appCss()) of
+        when Some(value as url: String) do
+
+exportAssets writes the assets of the application under their hashed
+names into one directory, for Hiawatha to serve below /assets/;
+serveAsset gives the same bytes as an answer with the header
+Cache-Control: public, max-age=31536000, immutable.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Wolly.Bundle is
+    """
+    One asset: its name without the hash and its bytes, both fixed when
+    the programme is compiled.
+    """
+    type Asset: Free;
+
+    """
+    The hex digits of the hash in a hashed name: 16, the first 64 bits of
+    the SHA-256.
+    """
+    function hashDigits(): Index
+        ensures result = 16;
+
+    """
+    The path below which the hashed assets stand, /assets/.
+    """
+    function assetPrefix(): Span[Nat8, Static]
+        ensures spanLength(result) = 8;
+
+    """
+    The value of Cache-Control for a hashed asset: public, max-age of a
+    year in seconds, immutable.
+    """
+    function immutableCache(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    Whether name can be the name of an asset: 1 to 200 bytes of a to z,
+    A to Z, 0 to 9, dot, hyphen and underscore, no dot first and no dot
+    last, so one segment of a path and never a hidden file, . or ..
+    No contract: a Bool of a walk over name.
+    """
+    generic [N: Region]
+    function isAssetName(name: Span[Nat8, N]): Bool;
+
+    """
+    The asset name with content, which is meant to come from @bytes.
+    """
+    function asset(name: Span[Nat8, Static], content: Span[Nat8, Static]): Asset
+        requires isAssetName(name)
+        ensures assetSize(result) = spanLength(content);
+
+    """
+    The name of item without the hash.
+    """
+    function assetName(item: Asset): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The bytes of item, any bytes, the empty file too.
+    """
+    function assetContent(item: Asset): Span[Nat8, Static]
+        ensures spanLength(result) = assetSize(item);
+
+    """
+    How many bytes item has.
+    No contract: it is the measure the ensures of asset and assetContent
+    name, one length read.
+    """
+    function assetSize(item: Asset): Index;
+
+    """
+    The name of item with the hash: before its last dot the first
+    hashDigits hex digits of the SHA-256 of its content and a dot, or
+    after it with a dot for a name without one.  None when the hash cannot
+    be made.
+    No contract: an Option, which an ensures cannot look into.
+    """
+    function hashedName(item: Asset): Option[String];
+
+    """
+    The path of item for a page: assetPrefix and its hashed name.  None
+    as hashedName.
+    No contract: an Option, which an ensures cannot look into.
+    """
+    function assetUrl(item: Asset): Option[String];
+
+    """
+    The content type of an asset by the extension of name, in lower case:
+    css, js, mjs, json, svg, png, jpg, jpeg, gif, webp, ico, woff, woff2
+    and txt; application/octet-stream for every other name.
+    """
+    generic [N: Region]
+    function contentTypeOf(name: Span[Nat8, N]): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The answer for path when it is assetPrefix and the hashed name of one
+    of assets: 200, its content type, Cache-Control immutableCache,
+    X-Content-Type-Options nosniff and its bytes.  None for any other
+    path, an unhashed name and an old hash included, and when a hash
+    cannot be made.
+    No contract: an Option, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function serveAsset(assets: &[Buffer[Asset], R], path: Span[Nat8, P]): Option[String];
+
+    """
+    Writes each of assets into directory under its hashed name with mode
+    0644, through a new file renamed into place, so a reader finds the
+    old file or the whole new one.  Files of older hashes stay for pages
+    that still name them.  False, with what was written before left in
+    place, when directory is empty, no directory, holds a symbolic link,
+    two assets share a name, a hash cannot be made, something other than
+    an ordinary file is at a name, or a write fails.
+    No contract: the answer is a Bool of the file system.
+    """
+    generic [D: Region, R: Region]
+    function exportAssets(directory: Span[Nat8, D], assets: &[Buffer[Asset], R]): Bool;
+end module.

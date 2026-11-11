@@ -1,0 +1,76 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Mode 2 of Wolly.Bunti, the bases a DNA synthesiser can write
+(docs/bunti-format.md): never more than three equal bases in a row, and
+between 45 and 55 percent G and C in each segment.
+
+The codewords are cut into segments of 32 bytes, the last one shorter.
+A segment is its bytes, each XOR a byte of a sequence of its seed, as
+bases, with the seed as four bases written three times: before the
+bytes, after the first half of them and after the last.  The encoder
+takes the first seed from 0 to 255 whose segment keeps both rules, a run
+of equal bases counted on from the segment before.  The decoder takes
+each base of the seed by the vote of its three copies, so a wrong base
+of a copy costs nothing, and a wrong base of the bytes costs one byte,
+as in mode 1.
+
+A base is a Nat8 from 0 to 3: A, C, G, T.
+"""
+import Standard.Buffer (
+    Buffer,
+    length
+);
+
+module Wolly.BuntiDna is
+    """
+    The bytes of a segment: 32.
+    """
+    function segmentBytes(): Index
+        ensures result = 32;
+
+    """
+    The bases of mode 2 for count codewords, at most 2^24 (far above the
+    codewords of a code of version 60).
+    """
+    function dnaBaseCount(count: Index): Index
+        requires count <= 16777216
+        ensures result >= (count * 4);
+
+    """
+    The bases of mode 2 for the codewords; None when a segment finds no
+    seed that keeps both rules.
+    No contract: an Option over the search for seeds; None is its answer
+    when a segment finds none.
+    """
+    generic [C: Region]
+    function dnaEncode(codewords: &[Buffer[Nat8], C]): Option[Buffer[Nat8]];
+
+    """
+    The count codewords of the bases of mode 2 from first on, the bases
+    as they were read: a wrong base gives a wrong byte, never a shorter
+    result.  first + dnaBaseCount(count) is at most the length of bases.
+    """
+    generic [B: Region]
+    function dnaDecode(bases: &[Buffer[Nat8], B], first: Index, count: Index): Buffer[Nat8]
+        ensures length(&result) = count;
+
+    """
+    The longest run of equal bases in bases.
+    """
+    generic [B: Region]
+    function longestRun(bases: &[Buffer[Nat8], B]): Index
+        ensures result <= length(bases);
+
+    """
+    Whether the bases from first to before stop hold between 45 and 55
+    percent G and C.
+    """
+    generic [B: Region]
+    function gcInRange(bases: &[Buffer[Nat8], B], first: Index, stop: Index): Bool
+        requires stop > first;
+end module.

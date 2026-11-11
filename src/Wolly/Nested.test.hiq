@@ -1,0 +1,83 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A transaction inside a transaction of the caller is refused on both backends (Wolly.TestDb): a module that begins
+-- its own, keepLine of Wolly.LogStore for one, must fail inside the caller's, or its commit would end the caller's
+-- transaction early.  The property is one of Standard.Database's begin, so it has a test file of its own beside the
+-- tests of the modules that rely on it.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Buffer (
+    Buffer,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction,
+    begin,
+    rollback,
+    closeDatabase
+);
+import Standard.Search (
+    SearchError,
+    SearchHit,
+    destroyHits
+);
+import Wolly.TestDb (
+    openTestDatabase
+);
+import Wolly.LogStore (
+    prepareLogStore,
+    keepLine,
+    findLines
+);
+
+module body Wolly.Nested.Test is
+    generic [R: Region]
+    function exerciseNested(db: &![Database[Writing], R]): Unit is
+        case prepareLogStore(&~db) of
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the tables");
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        case begin(&~db) of
+            when Right(right as open: Transaction) do
+                case keepLine(&~db, "web1.example.org", "/a", 35, "info", "nested line") of
+                    when Right(right as kept: Option[Int64]) do
+                        assertTrue(false, "keepLine inside the caller's transaction is refused");
+                    when Left(left as failure: SearchError) do
+                        assertTrue(true, "keepLine inside the caller's transaction is refused");
+                end case;
+                rollback(&~db, open);
+            when Left(left as error: DbError) do
+                assertTrue(false, "a transaction of the caller");
+        end case;
+        case findLines(&~db, "nested", 10, 0) of
+            when Right(right as hits: Buffer[SearchHit]) do
+                assertTrue(length(&hits) = 0, "the refused line is nowhere");
+                destroyHits(hits);
+            when Left(left as failure: SearchError) do
+                assertTrue(false, "the refused line is nowhere");
+        end case;
+        return nil;
+    end;
+
+    function testNested(): Unit is
+        case openTestDatabase() of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                exerciseNested(&!db);
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "the test database");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,16 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Wolly.Bundle (
+    Asset,
+    asset
+);
+
+module body Wolly.BundleProbe is
+    function appCss(): Asset is
+        return asset("app.css", @bytes("../../present/Wolly/static/app.css"));
+    end;
+end module body.

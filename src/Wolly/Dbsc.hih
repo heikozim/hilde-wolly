@@ -1,0 +1,235 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Device Bound Session Credentials after the W3C draft: a key per session on the device, a short cookie renewed by its signature.
+
+The server offers a binding with the header Secure-Session-Registration,
+which names the algorithms ES256 and RS256, the path of the registration
+and a challenge.  The browser makes a key pair, signs a token whose header
+has typ dbsc+jwt, the algorithm and the public key as jwk, and whose jti
+is the challenge, and posts it in Secure-Session-Response.  registerKey
+checks it with Standard.Jws and keeps the public key under a new id.
+
+At a refresh the browser posts Sec-Secure-Session-Id; without a proof it
+gets a 403 with Secure-Session-Challenge, then signs that challenge with
+the same key, now without jwk.  refreshKey checks it against the key in
+the table and moves the generation of the binding on; Wolly.Auth gives
+out a new cookie of the generation, which lives boundSeconds.
+
+A challenge is used once and lives challengeSeconds.  A binding lives
+boundLifeSeconds from its registration.  The algorithm none is never
+taken.  Every statement is a constant and every value bound.
+"""
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Response (
+    Response
+);
+
+module Wolly.Dbsc is
+    """
+    What a refresh with a proof came to.
+    """
+    union RefreshOutcome: Free is
+        """
+        The proof holds: the binding is at generation, fresh for
+        boundSeconds.
+        """
+        case Refreshed is
+            generation: Int64;
+        """
+        The proof signs no challenge that is open: answer 403 with a new
+        one.
+        """
+        case ChallengeStale;
+        """
+        No such binding, one past its life, or a signature that does not
+        hold: answer 401, which ends the session in the browser.
+        """
+        case RefreshRefused;
+    end;
+
+    """
+    How long the cookie of a bound session lives, and the server counts
+    it: 600 seconds.
+    """
+    function boundSeconds(): Int64
+        ensures result = 600;
+
+    """
+    How long a challenge is taken: 300 seconds.
+    """
+    function challengeSeconds(): Int64
+        ensures result = 300;
+
+    """
+    How long a binding lives from its registration: 43200 seconds, the
+    absolute limit of Standard.Session.
+    """
+    function boundLifeSeconds(): Int64
+        ensures result = 43200;
+
+    """
+    The attributes of the bound cookie, as the session instructions name
+    them and Wolly.Auth sets them: Secure, HttpOnly, SameSite=Strict, Path=/.
+    """
+    function cookieAttributes(): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    Makes the tables of offers and of bindings when the database has none.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareDbsc(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    Whether path may stand in a header as the path of an endpoint: a slash
+    first, then 1 to 200 bytes of letters, digits, slash, dot, hyphen and
+    underscore.
+    No contract: a walk over path.
+    """
+    generic [P: Region]
+    function isEndpointPath(path: Span[Nat8, P]): Bool;
+
+    """
+    A new challenge for name, who has just logged in, and the value of
+    Secure-Session-Registration with it and path.  An earlier offer to name
+    goes.  Right None when path is no endpoint path or the random source
+    failed.
+    No contract on the result: it is the work of the database.
+    """
+    generic [R: Region, N: Region, P: Region]
+    function offerRegistration(db: &![Database[Writing], R], name: Span[Nat8, N], path: Span[Nat8, P], now: Int64): Either[DbError, Option[String]]
+        requires (now > 0) and (spanLength(name) > 0);
+
+    """
+    response with the header Secure-Session-Registration of
+    offerRegistration added; response as it was when no offer could be
+    made.
+    No contract: what the opaque response holds is not stated in O(1).
+    """
+    generic [R: Region, N: Region, P: Region]
+    function withOffer(db: &![Database[Writing], R], response: Response, name: Span[Nat8, N], path: Span[Nat8, P], now: Int64): Response
+        requires (now > 0) and (spanLength(name) > 0);
+
+    """
+    The registration of the proof of name at now: the proof is checked, its
+    jti must be a challenge offered to name and still open, which is then
+    used up, and the public key of its jwk is kept under a new id at
+    generation 1.  Right Some the id; Right None when anything does not hold.
+    No contract on the result: it is the work of the database.
+    """
+    generic [R: Region, N: Region, P: Region]
+    function registerKey(db: &![Database[Writing], R], name: Span[Nat8, N], proof: Span[Nat8, P], now: Int64): Either[DbError, Option[String]]
+        requires (now > 0) and (spanLength(name) > 0);
+
+    """
+    The open challenge of the binding id, a new one only when none is open
+    (none was given, it was used or it ran out), and the value of
+    Secure-Session-Challenge with it; asking again does not replace a
+    challenge the browser may be signing.  Right None when there is
+    no such binding, it is past its life, or the random source failed.
+    No contract on the result: it is the work of the database.
+    """
+    generic [R: Region, I: Region]
+    function newChallenge(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): Either[DbError, Option[String]]
+        requires now > 0;
+
+    """
+    The refresh of the binding id with proof at now.  Refreshed moves the
+    generation on by one, sets fresh_until to now and boundSeconds and
+    uses the challenge up.
+    No contract on the result: it is the work of the database.
+    """
+    generic [R: Region, I: Region, P: Region]
+    function refreshKey(db: &![Database[Writing], R], id: Span[Nat8, I], proof: Span[Nat8, P], now: Int64): Either[DbError, RefreshOutcome]
+        requires now > 0;
+
+    """
+    The user of the binding id at generation: Right None when there is no
+    such binding, the generation is an earlier one, or now is after its
+    fresh_until.
+    No contract on the result: it is the work of the database.
+    """
+    generic [R: Region, I: Region]
+    function boundName(db: &![Database[Writing], R], id: Span[Nat8, I], generation: Int64, now: Int64): Either[DbError, Option[String]]
+        requires now >= 0;
+
+    """
+    Whether owner, the name an offer was made to, holds a binding: Right
+    None when it never held one, Right Some true while its newest refresh
+    is no older than boundSeconds at now, Right Some false after that and
+    once its binding is gone, dropped or past its life (a name that held a
+    binding is remembered 400 days), so that a session bound once never
+    counts as unbound again.  For
+    an owner whose cookie value changes at each refresh (Wolly.OpDbsc),
+    where no generation is kept in the session.
+    No contract on the result: it is the work of the database.
+    """
+    generic [R: Region, O: Region]
+    function bindingFresh(db: &![Database[Writing], R], owner: Span[Nat8, O], now: Int64): Either[DbError, Option[Bool]]
+        requires now >= 0;
+
+    """
+    Removes the binding id; an id that is none is no failure.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, I: Region]
+    function dropBinding(db: &![Database[Writing], R], id: Span[Nat8, I]): Option[DbError];
+
+    """
+    Removes every binding and offer of name.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function dropBindingsOf(db: &![Database[Writing], R], name: Span[Nat8, N]): Option[DbError];
+
+    """
+    The session instructions of the binding id as JSON: its id, the
+    refresh path, the scope of the origin without the site, and the cookie
+    named cookie_name with cookieAttributes.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [I: Region, P: Region, C: Region]
+    function instructions(id: Span[Nat8, I], refresh_path: Span[Nat8, P], cookie_name: Span[Nat8, C]): Option[String];
+
+    """
+    The content of a header written as an sf-string, its quotes taken off,
+    or as a bare token: 1 to 8192 bytes of letters, digits, dot, hyphen and
+    underscore.  None for anything else, a backslash or inner quote among
+    them.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [V: Region]
+    function headerString(value: Span[Nat8, V]): Option[String];
+
+    """
+    The binding id of Sec-Secure-Session-Id in request, as headerString
+    reads it.
+    No contract: an Option read from the request.
+    """
+    generic [R: Region]
+    function sessionIdOf(request: &[Request, R]): Option[String];
+
+    """
+    The proof of Secure-Session-Response in request, as headerString reads
+    it.
+    No contract: an Option read from the request.
+    """
+    generic [R: Region]
+    function proofOf(request: &[Request, R]): Option[String];
+end module.

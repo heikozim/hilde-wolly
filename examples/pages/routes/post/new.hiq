@@ -1,0 +1,27 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    fromSpan
+);
+import Standard.FcgiServer (
+    Request,
+    destroyRequest
+);
+import Wolly.Response (
+    makeResponse
+);
+import Wolly.Tree (
+    Page,
+    page
+);
+
+module body Wolly.Example.Pages.Site.Post.New is
+    function get(request: Request): Page is
+        destroyRequest(request);
+        return page(makeResponse(200, "text/html; charset=utf-8"), fromSpan("<h1>New post</h1>\n"));
+    end;
+end module body.

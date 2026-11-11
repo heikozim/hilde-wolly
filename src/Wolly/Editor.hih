@@ -1,0 +1,430 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The document of a live Markdown editor, without any user interface: the
+Markdown source, its blocks, a cursor with a selection, the edits a user
+makes and undo and redo.  The file is the source itself, so saving gives
+back exactly what was opened and edited.
+
+The source is UTF-8 (Unicode Transformation Format, 8 bit) with LF line
+ends: openEditor and insertText turn CR LF and a lone CR into LF.  The
+cursor and both ends of the selection are byte offsets that always stand
+at the end of a grapheme cluster after UAX 29 (Unicode Standard Annex 29),
+so a cursor never splits an e with its accent, an emoji sequence or a flag.
+
+The blocks are read from the source after every edit, line by line, after
+CommonMark and GFM (GitHub Flavored Markdown): paragraphs, ATX and setext
+headings, quotes, bullet, ordered and task list items (one block for each
+item), fenced code (Mermaid when its info string is mermaid), thematic
+breaks, tables, HTML (HyperText Markup Language) blocks, link definitions,
+a table of contents line [toc] and YAML (YAML Ain't Markup Language) front
+matter.  Indented code does not exist here: an indented line is text.  An
+empty paragraph is an EmptyBlock: in a run of blank lines the first line
+after a block and the last line before a block separate, every other blank
+line is an empty paragraph.
+
+Edits follow the editing model of Canela: Return splits a block or starts a
+new item, quote line or empty paragraph; Return on an empty item or quote
+line ends the list or quote; Return after a fence line with no closing
+fence closes it; Return after a table header row adds the delimiter row
+and a first row.  Shift+Return is a hard line break.  Backspace at the
+start of a block takes off its prefix or joins it with the block before.
+Typing a marker (# , > , - , 1. , - [ ] ) turns the line into its block by
+itself, since the blocks are read from the source.
+
+Undo and redo work in groups: the characters typed one after another up to
+and including a space, the backspaces one after another, and each other
+edit are a group each.  A cursor move closes the group.
+
+Limits: at most mostEditorBytes bytes of source, longer input and pastes
+are cut at a cluster end; at most mostUndoSteps steps are kept, the oldest
+groups go first.  The blocks are read again in full after each edit, so an
+edit costs time linear in the source.  An HTML block is read by the start
+and end conditions of CommonMark, but a tag of an unknown name alone on a
+line starts one only after a blank line.
+
+    var editor: Editor := openEditor("# Title\n\nSome *text*\n");
+    editor := setCursor(editor, 21);
+    editor := insertText(editor, " more");
+    editor := pressReturn(editor);
+    let markdown: String := toMarkdown(&editor);
+    destroyEditor(editor);
+"""
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.Editor is
+    """
+    What a block is.  ParagraphBlock, HeadingBlock (ATX or setext),
+    QuoteBlock, BulletBlock, OrderedBlock and TaskBlock (one list item
+    each), FenceBlock and MermaidBlock (fenced code), RuleBlock (a thematic
+    break), TableBlock, HtmlBlock, DefinitionBlock (a link definition),
+    TocBlock (a line [toc]), FrontMatterBlock and EmptyBlock (an empty
+    paragraph).
+    """
+    union BlockKind: Free is
+        case ParagraphBlock;
+        case HeadingBlock;
+        case QuoteBlock;
+        case BulletBlock;
+        case OrderedBlock;
+        case TaskBlock;
+        case FenceBlock;
+        case MermaidBlock;
+        case RuleBlock;
+        case TableBlock;
+        case HtmlBlock;
+        case DefinitionBlock;
+        case TocBlock;
+        case FrontMatterBlock;
+        case EmptyBlock;
+    end;
+
+    """
+    A document being edited.  Linear: destroyEditor gives it back.
+    """
+    type Editor: Linear;
+
+    """
+    The most bytes of source an editor holds: 1048576, as many as
+    Wolly.Markdown reads.
+    """
+    function mostEditorBytes(): Index
+        ensures result = 1048576;
+
+    """
+    The most undo steps an editor keeps: 10000.  The oldest groups go first.
+    """
+    function mostUndoSteps(): Index
+        ensures result = 10000;
+
+    """
+    An editor over text, Markdown, with the cursor at the start.  CR LF and
+    CR become LF, and the text is cut at mostEditorBytes bytes.  Any bytes
+    give an editor with at least one block.
+    """
+    generic [R: Region]
+    function openEditor(text: Span[Nat8, R]): Editor
+        ensures (blockCount(&result) >= 1) and (cursorOffset(&result) = 0);
+
+    """
+    Gives the editor back.
+    No contract: it only frees what it is given.
+    """
+    function destroyEditor(editor: Editor): Unit;
+
+    """
+    How many bytes the source has.
+    """
+    generic [R: Region]
+    function sourceLength(editor: &[Editor, R]): Index
+        ensures result <= mostEditorBytes();
+
+    """
+    The Markdown source as a view, all of it.
+    No contract: a view whose length is sourceLength, which a contract over a view cannot state without reaching C.
+    """
+    generic [R: Region]
+    function sourceText(editor: &[Editor, R]): Span[Nat8, R];
+
+    """
+    The Markdown of the document, a copy of its source: what a file holds.
+    """
+    generic [R: Region]
+    function toMarkdown(editor: &[Editor, R]): String
+        ensures length(&result) = sourceLength(editor);
+
+    """
+    How many blocks the document has, at least one.
+    """
+    generic [R: Region]
+    function blockCount(editor: &[Editor, R]): Index
+        ensures result >= 1;
+
+    """
+    The kind of block i.
+    """
+    generic [R: Region]
+    function blockKind(editor: &[Editor, R], i: Index): BlockKind
+        requires i < blockCount(editor);
+
+    """
+    The first byte of block i: the start of its first line.
+    """
+    generic [R: Region]
+    function blockStart(editor: &[Editor, R], i: Index): Index
+        requires i < blockCount(editor)
+        ensures result <= sourceLength(editor);
+
+    """
+    The byte after block i: the end of its last line, before its LF.
+    """
+    generic [R: Region]
+    function blockStop(editor: &[Editor, R], i: Index): Index
+        requires i < blockCount(editor)
+        ensures result <= sourceLength(editor);
+
+    """
+    Where the content of block i begins on its first line: after the # and
+    the space of a heading, the > of a quote, the marker of an item and the
+    box of a task.  For a fence its first line, the fence itself.
+    """
+    generic [R: Region]
+    function blockContent(editor: &[Editor, R], i: Index): Index
+        requires i < blockCount(editor)
+        ensures result <= sourceLength(editor);
+
+    """
+    A number of block i: the level of a heading (1 to 6), the depth of a
+    quote, the indent in columns of a list item and a paragraph, the length
+    of the fence of a code block, the columns of a table.  0 otherwise.
+    """
+    generic [R: Region]
+    function blockLevel(editor: &[Editor, R], i: Index): Index
+        requires i < blockCount(editor);
+
+    """
+    The number of an ordered item (also of an ordered task), 0 otherwise.
+    """
+    generic [R: Region]
+    function blockNumber(editor: &[Editor, R], i: Index): Index
+        requires i < blockCount(editor);
+
+    """
+    Whether block i is a task that is done.
+    """
+    generic [R: Region]
+    function blockChecked(editor: &[Editor, R], i: Index): Bool
+        requires i < blockCount(editor);
+
+    """
+    The source of block i, from blockStart to blockStop.
+    No contract: a view whose length follows the block, read through the source buffer, which reaches C.
+    """
+    generic [R: Region]
+    function blockText(editor: &[Editor, R], i: Index): Span[Nat8, R]
+        requires i < blockCount(editor);
+
+    """
+    The info string of the fence of block i (rust in ```rust), empty for
+    any other block.
+    No contract: a view whose length follows the block, read through the source buffer, which reaches C.
+    """
+    generic [R: Region]
+    function blockInfo(editor: &[Editor, R], i: Index): Span[Nat8, R]
+        requires i < blockCount(editor);
+
+    """
+    The block that holds the byte offset at: the one with blockStart <= at
+    <= blockStop, else the last one that starts before at.
+    """
+    generic [R: Region]
+    function blockAt(editor: &[Editor, R], at: Index): Index
+        ensures result < blockCount(editor);
+
+    """
+    The cursor: the end of the selection that moves.
+    """
+    generic [R: Region]
+    function cursorOffset(editor: &[Editor, R]): Index
+        ensures result <= sourceLength(editor);
+
+    """
+    The anchor: the end of the selection that stays.  Equal to the cursor
+    when nothing is selected.
+    """
+    generic [R: Region]
+    function anchorOffset(editor: &[Editor, R]): Index
+        ensures result <= sourceLength(editor);
+
+    """
+    The first byte of the selection, the smaller of anchor and cursor.
+    """
+    generic [R: Region]
+    function selectionStart(editor: &[Editor, R]): Index
+        ensures result <= sourceLength(editor);
+
+    """
+    The byte after the selection, the larger of anchor and cursor.
+    """
+    generic [R: Region]
+    function selectionStop(editor: &[Editor, R]): Index
+        ensures result <= sourceLength(editor);
+
+    """
+    The block of the cursor.
+    """
+    generic [R: Region]
+    function cursorBlock(editor: &[Editor, R]): Index
+        ensures result < blockCount(editor);
+
+    """
+    Puts the cursor at the byte offset at, with nothing selected; an offset
+    inside a grapheme cluster goes back to its start.  Closes the undo
+    group.
+    """
+    function setCursor(editor: Editor, at: Index): Editor
+        requires at <= sourceLength(&editor)
+        ensures (cursorOffset(&result) <= at) and (cursorOffset(&result) = anchorOffset(&result));
+
+    """
+    Selects from anchor to head, the cursor at head; each goes back to the
+    start of its cluster.  Closes the undo group.
+    """
+    function setSelection(editor: Editor, anchor: Index, head: Index): Editor
+        requires (anchor <= sourceLength(&editor)) and (head <= sourceLength(&editor))
+        ensures cursorOffset(&result) <= head;
+
+    """
+    Selects the whole source.
+    """
+    function selectAll(editor: Editor): Editor
+        ensures (anchorOffset(&result) = 0) and (cursorOffset(&result) = sourceLength(&result));
+
+    """
+    Moves the cursor one grapheme cluster back; from the start of a block
+    to the end of the block before.  With extend the anchor stays, else a
+    selection collapses to its start.  Closes the undo group.
+    """
+    function moveLeft(editor: Editor, extend: Bool): Editor
+        ensures cursorOffset(&result) <= sourceLength(&result);
+
+    """
+    Moves the cursor one grapheme cluster on; from the end of a block to the
+    content of the block after.  With extend the anchor stays, else a
+    selection collapses to its end.  Closes the undo group.
+    """
+    function moveRight(editor: Editor, extend: Bool): Editor
+        ensures cursorOffset(&result) <= sourceLength(&result);
+
+    """
+    Moves the cursor to the start of the content of its line, or to the
+    start of the line when it is there already.
+    """
+    function moveLineStart(editor: Editor, extend: Bool): Editor
+        ensures cursorOffset(&result) <= sourceLength(&result);
+
+    """
+    Moves the cursor to the end of its line.
+    """
+    function moveLineEnd(editor: Editor, extend: Bool): Editor
+        ensures cursorOffset(&result) <= sourceLength(&result);
+
+    """
+    Types text at the cursor in place of the selection.  CR LF and CR become
+    LF; what would go past mostEditorBytes is cut at a cluster end.  Single
+    characters typed one after another join one undo group, up to and
+    including a space; a text of more than one cluster is a group of its
+    own.
+    """
+    generic [R: Region]
+    function insertText(editor: Editor, text: Span[Nat8, R]): Editor
+        ensures sourceLength(&result) <= mostEditorBytes();
+
+    """
+    Return: see the module head.  Deletes the selection first.
+    """
+    function pressReturn(editor: Editor): Editor
+        ensures sourceLength(&result) <= mostEditorBytes();
+
+    """
+    Shift+Return: a hard line break (a backslash before the LF) in a
+    paragraph, quote or item, a plain LF in code; nothing in a heading or a
+    one-line block.
+    """
+    function pressShiftReturn(editor: Editor): Editor
+        ensures sourceLength(&result) <= mostEditorBytes();
+
+    """
+    Backspace: deletes the selection, or the cluster before the cursor; at
+    the start of the content of a block takes off its prefix (heading to
+    paragraph, item and quote line to text), at the start of a paragraph
+    joins it with the block before.
+    """
+    function deleteBackward(editor: Editor): Editor
+        ensures sourceLength(&result) <= old(sourceLength(&editor));
+
+    """
+    Delete: deletes the selection, or the cluster after the cursor; at the
+    end of a block joins the next block to it.
+    """
+    function deleteForward(editor: Editor): Editor
+        ensures sourceLength(&result) <= old(sourceLength(&editor));
+
+    """
+    Makes the block of the cursor a heading of level (1 to 6), or a
+    paragraph for 0, as Cmd+1 to Cmd+6 and Cmd+0 do; a setext heading
+    becomes an ATX one.  Only paragraphs and headings change.
+    """
+    function setHeading(editor: Editor, level: Index): Editor
+        requires level <= 6
+        ensures sourceLength(&result) <= mostEditorBytes();
+
+    """
+    Ticks or unticks the task of block i in the source, [ ] to [x] and back.
+    Nothing for a block that is no task.
+    """
+    function toggleTask(editor: Editor, i: Index): Editor
+        requires i < blockCount(&editor)
+        ensures sourceLength(&result) = old(sourceLength(&editor));
+
+    """
+    Ends the undo group: the next edit starts a new one.  A frontend calls
+    it after a pause in typing.
+    """
+    function closeUndoGroup(editor: Editor): Editor
+        ensures sourceLength(&result) = old(sourceLength(&editor));
+
+    """
+    An editor over html, the content Lucy stores: htmlToMarkdown of
+    Wolly.HtmlToMarkdown, then openEditor.
+    """
+    generic [R: Region]
+    function openEditorFromHtml(html: Span[Nat8, R]): Editor
+        ensures (blockCount(&result) >= 1) and (cursorOffset(&result) = 0);
+
+    """
+    The HTML of the document, through the sanitizer of Standard.Html: the
+    source as markdownWithHtmlToHtml of Wolly.Markdown renders it, raw HTML
+    kept as far as richPolicy allows (B4), without the front matter, each
+    [toc] line as a list of the headings (nothing when there is none) (a ul of class toc, an li of class
+    toc-1 to toc-6 for each, its text the source of the heading, escaped).
+    No contract: a text whose length follows the source.
+    """
+    generic [R: Region]
+    function editorToHtml(editor: &[Editor, R]): String;
+
+    """
+    Whether there is a group to undo.
+    No contract: a Bool read from the undo list, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function canUndo(editor: &[Editor, R]): Bool;
+
+    """
+    Whether there is a group to redo.
+    No contract: a Bool read from the redo list, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function canRedo(editor: &[Editor, R]): Bool;
+
+    """
+    Undoes the last group; the cursor and the selection go back to where
+    they were before it.  Nothing when there is none.
+    """
+    function undo(editor: Editor): Editor
+        ensures canRedo(&result) or (not old(canUndo(&editor)));
+
+    """
+    Redoes the group undone last; the cursor goes to where it was after it.
+    Nothing when there is none.  Any other edit drops what could be redone.
+    """
+    function redo(editor: Editor): Editor
+        ensures canUndo(&result) or (not old(canRedo(&editor)));
+end module.

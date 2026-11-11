@@ -1,0 +1,344 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The data a template of Wolly.View renders, a value without a fixed record
+type: text, a whole number, a truth value, a list, a map whose keys keep
+the order they were put in, a missing value, and HTML that was checked.
+
+A ViewData is one document of nodes, numbered from 0, the root; a list or
+a map holds the nodes put into it, in order.  Building it is a call per
+value: put into a map under a key, add to the end of a list.  A key a map
+holds already keeps its first value, and the call gives that node back.
+
+A put into a node that is no map, an add to one that is no list, and a
+read of what a node does not hold (the text of a list, the key of an
+element) stop the programme: they are the caller's mistake, and isMap,
+isList, isTextual and the others tell before the call.  The contracts say
+only that the node is there, since a contract cannot read a node.
+
+HTML that is written as it is comes in only two ways: putSanitizedHtml
+and addSanitizedHtml clean it with Standard.Html.sanitize under a policy,
+and putMarkdown and addMarkdown render Markdown with Wolly.Markdown, which
+escapes everything it does not build itself.  No function makes such a
+value from text as it stands.
+
+    var page: ViewData := makeMapData();
+    let title: Index := putText(&!page, rootNode(), "title", "Hello");
+    let items: Index := putList(&!page, rootNode(), "items");
+    let first: Index := addText(&!page, items, "one");
+    destroyViewData(page);
+"""
+import Standard.String (
+    String
+);
+import Standard.Html (
+    Policy
+);
+
+module Wolly.ViewData is
+    """
+    What a node holds.
+    """
+    union ViewKind: Free is
+        case ViewText;
+        case ViewInteger;
+        case ViewBool;
+        case ViewList;
+        case ViewMap;
+        case ViewMissing;
+        case ViewHtml;
+    end;
+
+    """
+    A document of values.  Linear: destroyViewData gives it back.
+    """
+    type ViewData: Linear;
+
+    """
+    The number of the root node: 0.
+    """
+    function rootNode(): Index
+        ensures result = 0;
+
+    """
+    A document whose root is an empty map, an empty list, a text, a whole
+    number, a truth value or the missing value.
+    """
+    function makeMapData(): ViewData
+        ensures nodeCount(&result) = 1;
+    function makeListData(): ViewData
+        ensures nodeCount(&result) = 1;
+    generic [T: Region]
+    function makeTextData(text: Span[Nat8, T]): ViewData
+        ensures nodeCount(&result) = 1;
+    function makeIntegerData(value: Int64): ViewData
+        ensures nodeCount(&result) = 1;
+    function makeBoolData(value: Bool): ViewData
+        ensures nodeCount(&result) = 1;
+    function makeMissingData(): ViewData
+        ensures nodeCount(&result) = 1;
+
+    """
+    A document whose root is HTML: html cleaned by Standard.Html.sanitize
+    under policy, or the HTML Wolly.Markdown makes of markdown.  The only
+    ways, with putSanitizedHtml and putMarkdown, that HTML enters a document.
+    """
+    generic [T: Region]
+    function makeSanitizedHtmlData(html: Span[Nat8, T], policy: Policy): ViewData
+        ensures nodeCount(&result) = 1;
+    generic [T: Region]
+    function makeMarkdownData(markdown: Span[Nat8, T]): ViewData
+        ensures nodeCount(&result) = 1;
+
+    """
+    Gives the document and all its text back.
+    No contract: nothing is left to ask.
+    """
+    function destroyViewData(data: ViewData): Unit;
+
+    """
+    How many nodes the document holds, the root included.
+    """
+    generic [R: Region]
+    function nodeCount(data: &[ViewData, R]): Index
+        ensures result >= 1;
+
+    """
+    Whether node is a node of the document.
+    """
+    generic [R: Region]
+    function isNode(data: &[ViewData, R], node: Index): Bool
+        ensures result = (node < nodeCount(data));
+
+    """
+    What the node holds.  No ensures: a union has no equality to state it
+    with.
+    """
+    generic [R: Region]
+    function kindOf(data: &[ViewData, R], node: Index): ViewKind
+        requires isNode(data, node);
+
+    """
+    Whether node is a node of the document of that kind.  Text and HTML
+    are both textual: they have a text.
+    """
+    generic [R: Region]
+    function isMap(data: &[ViewData, R], node: Index): Bool
+        ensures (not result) or isNode(data, node);
+    generic [R: Region]
+    function isList(data: &[ViewData, R], node: Index): Bool
+        ensures (not result) or isNode(data, node);
+    generic [R: Region]
+    function isTextual(data: &[ViewData, R], node: Index): Bool
+        ensures (not result) or isNode(data, node);
+    generic [R: Region]
+    function isInteger(data: &[ViewData, R], node: Index): Bool
+        ensures (not result) or isNode(data, node);
+    generic [R: Region]
+    function isBool(data: &[ViewData, R], node: Index): Bool
+        ensures (not result) or isNode(data, node);
+    generic [R: Region]
+    function isMissing(data: &[ViewData, R], node: Index): Bool
+        ensures (not result) or isNode(data, node);
+    generic [R: Region]
+    function isHtml(data: &[ViewData, R], node: Index): Bool
+        ensures (not result) or isNode(data, node);
+
+    """
+    Whether node is a member of a map, which has a key.
+    """
+    generic [R: Region]
+    function isMember(data: &[ViewData, R], node: Index): Bool
+        ensures (not result) or isNode(data, node);
+
+    """
+    A value put into the map under key.  The number of the node; when the
+    map holds key already, nothing is added and the number of the node it
+    holds there comes back.  A list or a map put is empty, to be filled.
+    """
+    generic [R: Region, K: Region, T: Region]
+    function putText(data: &![ViewData, R], map: Index, key: Span[Nat8, K], text: Span[Nat8, T]): Index
+        requires isNode(&data, map)
+        ensures result < nodeCount(&data);
+    generic [R: Region, K: Region]
+    function putInteger(data: &![ViewData, R], map: Index, key: Span[Nat8, K], value: Int64): Index
+        requires isNode(&data, map)
+        ensures result < nodeCount(&data);
+    generic [R: Region, K: Region]
+    function putBool(data: &![ViewData, R], map: Index, key: Span[Nat8, K], value: Bool): Index
+        requires isNode(&data, map)
+        ensures result < nodeCount(&data);
+    generic [R: Region, K: Region]
+    function putMissing(data: &![ViewData, R], map: Index, key: Span[Nat8, K]): Index
+        requires isNode(&data, map)
+        ensures result < nodeCount(&data);
+    generic [R: Region, K: Region]
+    function putList(data: &![ViewData, R], map: Index, key: Span[Nat8, K]): Index
+        requires isNode(&data, map)
+        ensures result < nodeCount(&data);
+    generic [R: Region, K: Region]
+    function putMap(data: &![ViewData, R], map: Index, key: Span[Nat8, K]): Index
+        requires isNode(&data, map)
+        ensures result < nodeCount(&data);
+
+    """
+    HTML put into the map under key after Standard.Html.sanitize cleaned
+    it under policy: what comes out is well formed and escaped, whatever
+    went in.
+    """
+    generic [R: Region, K: Region, T: Region]
+    function putSanitizedHtml(data: &![ViewData, R], map: Index, key: Span[Nat8, K], html: Span[Nat8, T],
+        policy: Policy): Index
+        requires isNode(&data, map)
+        ensures result < nodeCount(&data);
+
+    """
+    Markdown put into the map under key as the HTML Wolly.Markdown makes
+    of it.
+    """
+    generic [R: Region, K: Region, T: Region]
+    function putMarkdown(data: &![ViewData, R], map: Index, key: Span[Nat8, K], markdown: Span[Nat8, T]): Index
+        requires isNode(&data, map)
+        ensures result < nodeCount(&data);
+
+    """
+    A value added to the end of the list.  The number of the new node,
+    the last of the document.
+    """
+    generic [R: Region, T: Region]
+    function addText(data: &![ViewData, R], list: Index, text: Span[Nat8, T]): Index
+        requires isNode(&data, list)
+        ensures (result + 1) = nodeCount(&data);
+    generic [R: Region]
+    function addInteger(data: &![ViewData, R], list: Index, value: Int64): Index
+        requires isNode(&data, list)
+        ensures (result + 1) = nodeCount(&data);
+    generic [R: Region]
+    function addBool(data: &![ViewData, R], list: Index, value: Bool): Index
+        requires isNode(&data, list)
+        ensures (result + 1) = nodeCount(&data);
+    generic [R: Region]
+    function addMissing(data: &![ViewData, R], list: Index): Index
+        requires isNode(&data, list)
+        ensures (result + 1) = nodeCount(&data);
+    generic [R: Region]
+    function addList(data: &![ViewData, R], list: Index): Index
+        requires isNode(&data, list)
+        ensures (result + 1) = nodeCount(&data);
+    generic [R: Region]
+    function addMap(data: &![ViewData, R], list: Index): Index
+        requires isNode(&data, list)
+        ensures (result + 1) = nodeCount(&data);
+    generic [R: Region, T: Region]
+    function addSanitizedHtml(data: &![ViewData, R], list: Index, html: Span[Nat8, T], policy: Policy): Index
+        requires isNode(&data, list)
+        ensures (result + 1) = nodeCount(&data);
+    generic [R: Region, T: Region]
+    function addMarkdown(data: &![ViewData, R], list: Index, markdown: Span[Nat8, T]): Index
+        requires isNode(&data, list)
+        ensures (result + 1) = nodeCount(&data);
+
+    """
+    The text of a text or an HTML node.
+    """
+    generic [R: Region]
+    function textOf(data: &[ViewData, R], node: Index): Span[Nat8, R]
+        requires isNode(data, node);
+
+    """
+    The number of a whole number, and the value of a truth value.
+    """
+    generic [R: Region]
+    function integerOf(data: &[ViewData, R], node: Index): Int64
+        requires isNode(data, node);
+    generic [R: Region]
+    function boolOf(data: &[ViewData, R], node: Index): Bool
+        requires isNode(data, node);
+
+    """
+    How many nodes a list or a map holds; 0 for every other node.
+    """
+    generic [R: Region]
+    function childCount(data: &[ViewData, R], node: Index): Index
+        requires isNode(data, node);
+
+    """
+    The first node a list or a map holds, and the node after a node in its
+    list or map; None at the end.  No ensures: an Option has no order to
+    state the number with.
+    """
+    generic [R: Region]
+    function firstChild(data: &[ViewData, R], node: Index): Option[Index]
+        requires isNode(data, node);
+    generic [R: Region]
+    function nextSibling(data: &[ViewData, R], node: Index): Option[Index]
+        requires isNode(data, node);
+
+    """
+    The key of a member of a map.
+    """
+    generic [R: Region]
+    function keyOf(data: &[ViewData, R], node: Index): Span[Nat8, R]
+        requires isNode(data, node);
+
+    """
+    The member of the map with key, None when it holds none or node is no
+    map.
+    No contract: a walk over the members, more than O(1) to state.
+    """
+    generic [R: Region, K: Region]
+    function memberNamed(data: &[ViewData, R], map: Index, key: Span[Nat8, K]): Option[Index];
+
+    """
+    The element of the list at position, counted from 0; None past the end
+    or when node is no list.
+    No contract: a walk over the elements, more than O(1) to state.
+    """
+    generic [R: Region]
+    function elementAt(data: &[ViewData, R], list: Index, position: Index): Option[Index];
+
+    """
+    A copy of the node of source and everything it holds, put into the map
+    of data under key, or added to the end of the list of data.  The number
+    of the copy, as putText and addText give it.
+    """
+    generic [R: Region, K: Region, S: Region]
+    function putCopy(data: &![ViewData, R], map: Index, key: Span[Nat8, K], source: &[ViewData, S], node: Index): Index
+        requires isNode(&data, map) and isNode(source, node)
+        ensures result < nodeCount(&data);
+    generic [R: Region, S: Region]
+    function addCopy(data: &![ViewData, R], list: Index, source: &[ViewData, S], node: Index): Index
+        requires isNode(&data, list) and isNode(source, node)
+        ensures result < nodeCount(&data);
+
+    """
+    A document whose root is a copy of the node of source and of all it
+    holds.  HTML stays HTML: it was checked when it entered source.
+    """
+    generic [S: Region]
+    function copyData(source: &[ViewData, S], node: Index): ViewData
+        requires isNode(source, node)
+        ensures nodeCount(&result) >= 1;
+
+    """
+    A document made from the JSON in text: an object is a map with its
+    names in their order, an array a list, null the missing value, a
+    number a whole number within Int64.  Left with what was wrong: the text
+    is no JSON (Standard.Json refuses it), or holds a number with a fraction
+    or an exponent, or one outside Int64.
+    No contract: a parser over outside input; Left is its answer for a bad
+    one.
+
+    Its time grows with the square of the length of a list or a map:
+    Standard.Json finds each element by reading the container from its
+    start (measured: 10000 elements in 11 s, 40000 in 182 s).  It is for
+    data of tests and tools; an application builds its data with the
+    functions above, each in constant time.
+    """
+    generic [T: Region]
+    function readViewJson(text: Span[Nat8, T]): Either[String, ViewData];
+end module.

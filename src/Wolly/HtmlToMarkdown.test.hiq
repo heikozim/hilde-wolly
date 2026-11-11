@@ -1,0 +1,380 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Every mapping with the exact Markdown it gives, the HTML of CKEditor 5,
+-- escapes and white space, hostile and broken input, the limits, and the
+-- round trip through Wolly.Markdown.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal
+);
+import Wolly.Markdown (
+    markdownToHtml
+);
+import Wolly.HtmlToMarkdown (
+    mostHtmlBytes,
+    mostHtmlDepth,
+    htmlToMarkdown
+);
+
+module body Wolly.HtmlToMarkdown.Test is
+    -- Whether html gives exactly want; prints what it gave when not.
+    function gives(html: Span[Nat8, Static], want: Span[Nat8, Static]): Bool is
+        let got: String := htmlToMarkdown(html);
+        let same: Bool := equal(asSpan(&got), want);
+        if not same then
+            print("htmlToMarkdown gave [");
+            print(asSpan(&got));
+            print("]\n");
+        end if;
+        destroyString(got);
+        return same;
+    end;
+
+    -- Whether the HTML that Wolly.Markdown writes of md gives md again.
+    function roundTrips(md: Span[Nat8, Static]): Bool is
+        let html: String := markdownToHtml(md);
+        let back: String := htmlToMarkdown(asSpan(&html));
+        let same: Bool := equal(asSpan(&back), md);
+        if not same then
+            print("round trip of [");
+            print(md);
+            print("] through [");
+            print(asSpan(&html));
+            print("] gave [");
+            print(asSpan(&back));
+            print("]\n");
+        end if;
+        destroyString(back);
+        destroyString(html);
+        return same;
+    end;
+
+    -- piece written count times.
+    function repeated(piece: Span[Nat8, Static], count: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeString(&!builder, piece);
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    -- The facts of the lines of text: how many there are, the most spaces
+    -- one starts with, how many start with spaces and a bullet.
+    record Shape: Free is
+        lines: Index;
+        indent: Index;
+        bullets: Index;
+    end;
+
+    generic [S: Region]
+    function shapeOf(text: Span[Nat8, S]): Shape is
+        var lines: Index := 0;
+        var indent: Index := 0;
+        var bullets: Index := 0;
+        var i: Index := 0;
+        let size: Index := spanLength(text);
+        while i < size do
+            var spaces: Index := 0;
+            while (i < size) and (text[i] = ' ') do
+                spaces := spaces + 1;
+                i := i + 1;
+            end while;
+            if spaces > indent then
+                indent := spaces;
+            end if;
+            if ((i + 1) < size) and ((text[i] = '-') and (text[i + 1] = ' ')) then
+                bullets := bullets + 1;
+            end if;
+            while (i < size) and (text[i] /= 10) do
+                i := i + 1;
+            end while;
+            if i < size then
+                lines := lines + 1;
+                i := i + 1;
+            end if;
+        end while;
+        return Shape(lines => lines, indent => indent, bullets => bullets);
+    end;
+
+    function testConstants(): Unit is
+        assertTrue(mostHtmlBytes() = 1048576, "one mebibyte of HTML at most");
+        assertTrue(mostHtmlDepth() = 16, "sixteen levels of lists and quotes");
+        return nil;
+    end;
+
+    function testEmpty(): Unit is
+        assertTrue(gives("", ""), "empty input gives the empty text");
+        assertTrue(gives("  \n\t ", ""), "white space alone gives nothing");
+        assertTrue(gives("<p></p><div> </div>", ""), "empty blocks give nothing");
+        assertTrue(gives("<!-- note --><!doctype html>", ""), "a comment and a doctype are dropped");
+        return nil;
+    end;
+
+    function testParagraphs(): Unit is
+        assertTrue(gives("<p>a</p><p>b</p>", "a\n\nb\n"), "two paragraphs, one blank line between");
+        assertTrue(gives("<p>  one\n  two  </p>", "one two\n"), "white space collapsed and trimmed");
+        assertTrue(gives("<div>a<p>b</p>c</div>", "a\n\nb\n\nc\n"), "a div is a block boundary");
+        assertTrue(gives("<p>a<p>b", "a\n\nb\n"), "a new p closes the open one");
+        return nil;
+    end;
+
+    function testHeadings(): Unit is
+        assertTrue(gives("<h1>T</h1><h2>U</h2><h6>V</h6>", "# T\n\n## U\n\n###### V\n"), "headings one, two and six");
+        assertTrue(gives("<h3> a <em>b</em> </h3>", "### a *b*\n"), "inline marks in a heading");
+        assertTrue(gives("<h2>a<br>b</h2>", "## a b\n"), "a break in a heading is a space");
+        return nil;
+    end;
+
+    function testEmphasis(): Unit is
+        assertTrue(gives("<p><strong>s</strong> <b>b</b> <em>e</em> <i>i</i></p>", "**s** **b** *e* *i*\n"), "strong, b, em and i");
+        assertTrue(gives("<p>a<strong> b </strong>c</p>", "a **b** c\n"), "spaces move out of the marks");
+        assertTrue(gives("<p><strong></strong>x</p>", "x\n"), "an empty mark is dropped");
+        assertTrue(gives("<p><em><strong>x</strong></em></p>", "***x***\n"), "strong in emphasis");
+        assertTrue(gives("<p><del>a</del> <s>b</s> <strike>c</strike></p>", "~~a~~ ~~b~~ ~~c~~\n"), "del, s and strike are strikethrough");
+        return nil;
+    end;
+
+    function testRawInline(): Unit is
+        assertTrue(gives("<p><u>u</u> <sub>2</sub> <sup>3</sup> <mark>m</mark> <kbd>k</kbd> <span>s</span></p>", "<u>u</u> <sub>2</sub> <sup>3</sup> <mark>m</mark> <kbd>k</kbd> <span>s</span>\n"), "raw inline elements stay as HTML");
+        assertTrue(gives("<p><span class=\"x\">t</span></p>", "t\n"), "a span with attributes is transparent");
+        assertTrue(gives("<p>a<label>b</label><foo>c</foo></p>", "abc\n"), "label and unknown elements are transparent");
+        assertTrue(gives("<div><section><article>x</article></section></div>", "x\n"), "nested block boundaries");
+        return nil;
+    end;
+
+    function testCodeSpans(): Unit is
+        assertTrue(gives("<p><code>a*b</code></p>", "`a*b`\n"), "a code span is not escaped");
+        assertTrue(gives("<p><code>a`b</code></p>", "``a`b``\n"), "a longer run than inside");
+        assertTrue(gives("<p><code>`x</code></p>", "`` `x ``\n"), "padded when it starts with a backtick");
+        assertTrue(gives("<p><code><b>x</b> &lt;y&gt;</code></p>", "`x <y>`\n"), "the text of the code element");
+        assertTrue(gives("<p>a <code></code> b</p>", "a b\n"), "an empty code element gives nothing");
+        return nil;
+    end;
+
+    function testCodeBlocks(): Unit is
+        assertTrue(gives("<pre><code class=\"language-go\">x := 1\ny\n</code></pre>", "```go\nx := 1\ny\n```\n"), "the language of the code element");
+        assertTrue(gives("<pre class=\"language-sh\">\nls</pre>", "```sh\nls\n```\n"), "the language of pre, its first line feed dropped");
+        assertTrue(gives("<pre>a\n```\nb</pre>", "````\na\n```\nb\n````\n"), "a fence longer than any run inside");
+        assertTrue(gives("<pre><code>  keep *this*  \n</code></pre>", "```\n  keep *this*  \n```\n"), "content verbatim");
+        assertTrue(gives("<p>t</p><pre><code>c\n</code></pre><p>u</p>", "t\n\n```\nc\n```\n\nu\n"), "a code block between paragraphs");
+        return nil;
+    end;
+
+    function testLinks(): Unit is
+        assertTrue(gives("<p><a href=\"https://example.com\" title=\"T\">x</a></p>", "[x](https://example.com \"T\")\n"), "a link with a title");
+        assertTrue(gives("<p><a href=\"/a(b)\">p</a></p>", "[p](</a(b)>)\n"), "a parenthesis puts the URL in angle brackets");
+        assertTrue(gives("<p><a>plain</a></p>", "plain\n"), "an a without href is its text");
+        assertTrue(gives("<p><a href=\"https://e.com/\" title=\"say &quot;hi&quot;\">q</a></p>", "[q](https://e.com/ \"say \\\"hi\\\"\")\n"), "quotes in a title escaped");
+        assertTrue(gives("<p><a href=\"#top\"><strong>up</strong></a></p>", "[**up**](#top)\n"), "marks in a link");
+        assertTrue(gives("<p><a href=\"/a\">x<a href=\"/b\">y</a></a></p>", "[x](/a)[y](/b)\n"), "a link in a link closes the first");
+        return nil;
+    end;
+
+    function testImages(): Unit is
+        assertTrue(gives("<p><img src=\"/i.png\" alt=\"A b\" title=\"T\"></p>", "![A b](/i.png \"T\")\n"), "an image with alt and title");
+        assertTrue(gives("<img src=\"https://x.org/y.png\">", "![](https://x.org/y.png)\n"), "an image without alt");
+        assertTrue(gives("<p><img src=\"/s.png\" alt=\"a*b\"/></p>", "![a\\*b](/s.png)\n"), "the alt text escaped");
+        return nil;
+    end;
+
+    function testLists(): Unit is
+        assertTrue(gives("<ul><li>a</li><li>b</li></ul>", "- a\n- b\n"), "a bullet list");
+        assertTrue(gives("<ol><li>x</li><li>y</li></ol>", "1. x\n2. y\n"), "an ordered list counts from 1");
+        assertTrue(gives("<ol start=\"3\"><li>x</li><li>y</li></ol>", "3. x\n4. y\n"), "the start attribute");
+        assertTrue(gives("<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>", "- a\n  - b\n- c\n"), "a nested list under the content of its item");
+        assertTrue(gives("<ol><li>a<ul><li>b</li></ul></li></ol>", "1. a\n   - b\n"), "indented by the width of the number");
+        assertTrue(gives("<ul><li><p>a</p></li><li><p>b</p></li></ul>", "- a\n\n- b\n"), "a loose list");
+        assertTrue(gives("<ul><li><p>a</p><p>b</p></li></ul>", "- a\n\n  b\n"), "two paragraphs in an item");
+        assertTrue(gives("<ul><li></li></ul>", "-\n"), "an empty item");
+        assertTrue(gives("<ul><li>a</li></ul><ul><li>b</li></ul>", "- a\n\n* b\n"), "two lists in a row get two bullets");
+        assertTrue(gives("<p>t</p><ul><li>a</li></ul><p>u</p>", "t\n\n- a\n\nu\n"), "a list between paragraphs");
+        assertTrue(gives("<ul><li>a<li>b</ul>", "- a\n- b\n"), "an item closes the open one");
+        return nil;
+    end;
+
+    function testTasks(): Unit is
+        let ckeditor: Span[Nat8, Static] := "<ul class=\"todo-list\"><li><label class=\"todo-list__label\"><input type=\"checkbox\" disabled=\"disabled\" checked=\"checked\"><span class=\"todo-list__label__description\">done</span></label></li><li><label class=\"todo-list__label\"><input type=\"checkbox\" disabled=\"disabled\"><span class=\"todo-list__label__description\">open</span></label></li></ul>";
+        assertTrue(gives(ckeditor, "- [x] done\n- [ ] open\n"), "the todo list of CKEditor 5");
+        assertTrue(gives("<ul><li class=\"task\">a</li><li class=\"task done\">b</li></ul>", "- [ ] a\n- [x] b\n"), "items of the class task");
+        assertTrue(gives("<ul><li><input type=\"checkbox\"> t</li></ul>", "- [ ] t\n"), "a bare checkbox");
+        assertTrue(gives("<ul><li><input type=\"text\">t</li></ul>", "- t\n"), "another input is no task");
+        return nil;
+    end;
+
+    function testQuotes(): Unit is
+        assertTrue(gives("<blockquote><p>a</p><p>b</p></blockquote>", "> a\n>\n> b\n"), "a quote of two paragraphs");
+        assertTrue(gives("<blockquote><p>a</p><blockquote><p>b</p></blockquote></blockquote>", "> a\n>\n> > b\n"), "a nested quote");
+        assertTrue(gives("<blockquote><ul><li>a</li><li>b</li></ul></blockquote>", "> - a\n> - b\n"), "a list in a quote");
+        assertTrue(gives("<p>x</p><blockquote>q</blockquote>", "x\n\n> q\n"), "text directly in a quote");
+        assertTrue(gives("<ul><li><blockquote><p>a</p><p>b</p></blockquote></li></ul>", "- > a\n  >\n  > b\n"), "a quote in an item");
+        return nil;
+    end;
+
+    function testRulesAndBreaks(): Unit is
+        assertTrue(gives("<p>a</p><hr><p>b</p>", "a\n\n---\n\nb\n"), "a thematic break");
+        assertTrue(gives("<p>a<br>b</p>", "a\\\nb\n"), "a hard break");
+        assertTrue(gives("<p>a<br/>\n  b</p>", "a\\\nb\n"), "white space after a break dropped");
+        assertTrue(gives("<p>a<br></p>", "a\n"), "a break at the end dropped");
+        assertTrue(gives("<p><br>x</p>", "x\n"), "a break at the start dropped");
+        assertTrue(gives("<p><b>a<br></b>c</p>", "**a**\\\nc\n"), "a break after a mark");
+        return nil;
+    end;
+
+    function testTables(): Unit is
+        let ckeditor: Span[Nat8, Static] := "<figure class=\"table\"><table><thead><tr><th>a</th><th class=\"text-center\">b</th><th style=\"text-align:right;\">c</th></tr></thead><tbody><tr><td>1 | 2</td><td>x<br>y</td><td></td></tr></tbody></table></figure>";
+        assertTrue(gives(ckeditor, "| a | b | c |\n| --- | :---: | ---: |\n| 1 \\| 2 | x y | |\n"), "the figure table of CKEditor 5");
+        assertTrue(gives("<table><tr><th>a</th><th>b</th></tr><tr><td>1</td></tr></table>", "| a | b |\n| --- | --- |\n| 1 | |\n"), "a short row padded");
+        assertTrue(gives("<table><tr><td class=\"text-left\">l</td><td style=\"text-align: center\">m</td></tr></table>", "| l | m |\n| :--- | :---: |\n"), "a header row only");
+        assertTrue(gives("<table><tr><td><b>x</b> <code>a|b</code></td></tr></table>", "| **x** `a\\|b` |\n| --- |\n"), "marks and code in a cell");
+        assertTrue(gives("<p>t</p><table><tr><td>a<td>b</table><p>u</p>", "t\n\n| a | b |\n| --- | --- |\n\nu\n"), "cells close each other");
+        assertTrue(gives("<table></table>", ""), "an empty table gives nothing");
+        return nil;
+    end;
+
+    function testFigures(): Unit is
+        assertTrue(gives("<figure class=\"image\"><img src=\"/pic.jpg\" alt=\"Pic\"><figcaption>Caption</figcaption></figure>", "![Pic](/pic.jpg)\n\nCaption\n"), "the figure image of CKEditor 5");
+        assertTrue(gives("<figure><img src=\"javascript:x\" alt=\"cat\"></figure>", "cat\n"), "an image of an unsafe source is its alt text");
+        return nil;
+    end;
+
+    function testEscapes(): Unit is
+        assertTrue(gives("<p>a*b_c`d[e]f&lt;g&gt;h~i|j&amp;k\\l</p>", "a\\*b\\_c\\`d\\[e\\]f\\<g\\>h\\~i\\|j\\&k\\\\l\n"), "the marks escaped everywhere");
+        assertTrue(gives("<p># x</p>", "\\# x\n"), "a number sign at the start");
+        assertTrue(gives("<p>- x</p><p>+ y</p><p>= z</p>", "\\- x\n\n\\+ y\n\n\\= z\n"), "minus, plus and equals at the start");
+        assertTrue(gives("<p>1. x</p><p>12) y</p>", "1\\. x\n\n12\\) y\n"), "a number at the start");
+        assertTrue(gives("<p>a - b # c 1. d</p>", "a - b # c 1. d\n"), "not escaped inside a line");
+        assertTrue(gives("<p>a<br>- b</p>", "a\\\n\\- b\n"), "the start of a line after a break");
+        assertTrue(gives("<ul><li>- x</li></ul>", "- \\- x\n"), "the start of an item");
+        return nil;
+    end;
+
+    function testWhitespace(): Unit is
+        assertTrue(gives("<p>\n  a \t b\n</p>\n\n<p> c </p>", "a b\n\nc\n"), "runs of white space are one space");
+        assertTrue(gives("<p>a&nbsp;b</p>", "a\u{a0}b\n"), "a no-break space is kept");
+        assertTrue(gives("<p>a<em> </em>b</p>", "a b\n"), "a mark of white space is a space");
+        assertTrue(gives("\n<ul>\n <li> a </li>\n <li>b\n</li>\n</ul>\n", "- a\n- b\n"), "white space between items");
+        return nil;
+    end;
+
+    function testDropped(): Unit is
+        assertTrue(gives("<p>a<script>alert('<p>x</p>')</script>b</p>", "ab\n"), "a script goes with its content");
+        assertTrue(gives("<style>p { color: red }</style><template><p>t</p></template><p>k</p>", "k\n"), "style and template go");
+        assertTrue(gives("<iframe src=\"/x\">i</iframe><object>o</object><svg><text>s</text></svg><p>k</p>", "k\n"), "iframe, object and svg go");
+        assertTrue(gives("<form><input value=\"v\"><button>b</button>f</form><select><option>o</option></select><p>k</p>", "k\n"), "forms and their controls go");
+        assertTrue(gives("<textarea><b>t</b></textarea><p>k</p>", "k\n"), "a text area goes");
+        return nil;
+    end;
+
+    function testHostile(): Unit is
+        assertTrue(gives("<p><a href=\"javascript:alert(1)\">click</a></p>", "click\n"), "a javascript link is its text");
+        assertTrue(gives("<p><a href=\"JavaScript:x\">k</a> <a href=\"data:text/html,x\">d</a></p>", "k d\n"), "other schemes are text");
+        assertTrue(gives("<p><a href=\"//evil.example/\">e</a></p>", "e\n"), "a link without scheme to another host is text");
+        assertTrue(gives("<p onclick=\"x()\">a<img src=\"/i.png\" onerror=\"x()\" alt=\"i\"></p>", "a![i](/i.png)\n"), "handlers are not carried");
+        assertTrue(gives("<p><b>bold<i>it", "**bold*it***\n"), "unclosed tags are closed at the end");
+        assertTrue(gives("</p></div>x</b></table>", "x\n"), "stray end tags are dropped");
+        assertTrue(gives("<p>a<script>never closed", "a\n"), "an unclosed script takes the rest");
+        assertTrue(gives("<<p>>&lt;b&gt;", "\\<\n\n\\>\\<b\\>\n"), "angle brackets in text");
+        return nil;
+    end;
+
+    function testDeepDivs(): Unit is
+        let open: String := repeated("<div>", 10000);
+        let shut: String := repeated("</div>", 10000);
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, asSpan(&open));
+        writeString(&!builder, "x");
+        writeString(&!builder, asSpan(&shut));
+        writeString(&!builder, "<p>after</p>");
+        let html: String := finalize(builder);
+        let got: String := htmlToMarkdown(asSpan(&html));
+        assertTrue(equal(asSpan(&got), "x\n\nafter\n"), "10000 nested divs give their text");
+        destroyString(got);
+        destroyString(html);
+        destroyString(shut);
+        destroyString(open);
+        return nil;
+    end;
+
+    function testDeepLists(): Unit is
+        let html: String := repeated("<ul><li>x", 10000);
+        let got: String := htmlToMarkdown(asSpan(&html));
+        let shape: Shape := shapeOf(asSpan(&got));
+        assertTrue(shape.lines = 10000, "one line for every x");
+        assertTrue(shape.bullets = 16, "sixteen levels of lists");
+        assertTrue(shape.indent = 32, "the deeper items written into the deepest level");
+        destroyString(got);
+        destroyString(html);
+        return nil;
+    end;
+
+    function testDeepQuotes(): Unit is
+        let open: String := repeated("<blockquote>", 20);
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, asSpan(&open));
+        writeString(&!builder, "q");
+        let html: String := finalize(builder);
+        let marks: String := repeated("> ", 16);
+        var want: StringBuilder := makeStringBuilder();
+        writeString(&!want, asSpan(&marks));
+        writeString(&!want, "q\n");
+        let expected: String := finalize(want);
+        let got: String := htmlToMarkdown(asSpan(&html));
+        assertTrue(equal(asSpan(&got), asSpan(&expected)), "twenty quotes are sixteen");
+        destroyString(got);
+        destroyString(expected);
+        destroyString(marks);
+        destroyString(html);
+        destroyString(open);
+        return nil;
+    end;
+
+    function testInputLimit(): Unit is
+        let html: String := repeated("a", mostHtmlBytes() + 10);
+        let got: String := htmlToMarkdown(asSpan(&html));
+        assertTrue(length(&got) = (mostHtmlBytes() + 1), "the input is cut at mostHtmlBytes");
+        destroyString(got);
+        destroyString(html);
+        return nil;
+    end;
+
+    function testRoundTrip(): Unit is
+        assertTrue(roundTrips("# Title\n\nA paragraph with *emphasis* and **strong** text.\n"), "heading, emphasis, strong");
+        assertTrue(roundTrips("## Second\n\nOne line\\\nand a hard break.\n"), "a hard break");
+        assertTrue(roundTrips("- one\n- two\n- three\n"), "a bullet list");
+        assertTrue(roundTrips("3. three\n4. four\n"), "an ordered list from 3");
+        assertTrue(roundTrips("- a\n  - b\n  - c\n- d\n"), "a nested list");
+        assertTrue(roundTrips("1. a\n   - b\n2. c\n"), "a bullet list in an ordered one");
+        assertTrue(roundTrips("- a\n\n- b\n"), "a loose list");
+        assertTrue(roundTrips("> quoted\n>\n> > nested\n"), "nested quotes");
+        assertTrue(roundTrips("> - x\n> - y\n"), "a list in a quote");
+        assertTrue(roundTrips("```go\nfunc main() {}\n```\n"), "a fenced code block");
+        assertTrue(roundTrips("Text with `code` and ``a`b`` spans.\n"), "code spans");
+        assertTrue(roundTrips("[link](https://example.com \"Title\") and ![img](/a.png \"T\")\n"), "a link and an image");
+        assertTrue(roundTrips("| a | b |\n| :--- | ---: |\n| 1 | 2 |\n"), "a table");
+        assertTrue(roundTrips("Escapes: \\* \\_ \\` \\[ \\] \\< \\> \\& \\~ \\| \\\\\n"), "escapes");
+        assertTrue(roundTrips("\\# not a heading\n\n\\- not a list\n\n1\\. not a list\n"), "escapes at the start of a line");
+        assertTrue(roundTrips("---\n\nafter the rule\n"), "a thematic break");
+        return nil;
+    end;
+end module body.

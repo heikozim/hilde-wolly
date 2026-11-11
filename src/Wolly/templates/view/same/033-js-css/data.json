@@ -1,0 +1,9 @@
+{
+ "s": "a\"b'c<d>&e/f\\g",
+ "n": 42,
+ "neg": -7,
+ "flag": true,
+ "color": "#fff",
+ "bad": "red;x",
+ "font": "Open Sans"
+}

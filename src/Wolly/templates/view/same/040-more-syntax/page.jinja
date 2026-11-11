@@ -1,0 +1,17 @@
+{% import "templates/view/same/040-more-syntax/macros.jinja" as lib %}
+{% macro box(t) %}<div>{{ t }}:{{ caller() }}</div>{% endmacro %}
+<h1>{{ title|title }}</h1>
+{% set who = name %}{% set greeting = "Hi " ~ who %}{% set next = n + 1 %}
+<p>{{ greeting }}|{{ who|capitalize }}|{{ word|replace("o", "0") }}|{{ word|replace("l", "L", 2) }}|{{ next * 2 }}</p>
+<p>{{ sentence|truncate(20) }}|{{ sentence|truncate(20, true) }}|{{ sentence|truncate(20, false, "..") }}|{{ sentence|truncate(43) }}|[{{ word|center(15) }}]</p>
+<p>{{ items|join(", ") }}|{{ items|join }}|{{ n + 1 }}|{{ n - 10 }}|{{ n * 3 }}|{{ n // 2 }}|{{ m // 2 }}|{{ n % 3 }}|{{ m % 3 }}|{{ m // -2 }}|{{ m % -3 }}|{{ -1 }}|{{ 2 + 3 * 4 }}</p>
+<p>{{ "ll" in word }}|{{ "zz" in word }}|{{ "b<" in items }}|{{ "ll" not in word }}|{{ "yes" if n > 3 else "no" }}|[{{ name if n < 3 }}]|{{ n + 1 > 7 }}</p>
+{% set cell %}<b>{{ name }}</b>{% endset %}<p>{{ cell }}{{ cell }}</p>
+{% with a = name, b = "q" %}<p>{{ a }}{{ b }}</p>{% endwith %}
+{% filter upper %}<i>{{ name }}</i>{% endfilter %}
+{% call box("T") %}in {{ name }}{% endcall %}
+<ul>{% for i in items %}<li class="{{ loop.cycle("odd", "even") }}">{{ loop.first }}{{ loop.last }}{{ i }}</li>{% endfor %}</ul>
+<ul>{% for k, v in pairs %}<li>{{ k }}={{ v }}</li>{% endfor %}</ul>
+<ul>{% for u in users if u.active %}<li>{{ loop.index }}/{{ loop.length }} {{ u.name }} {{ loop.last }}</li>{% else %}<li>none</li>{% endfor %}</ul>
+<ul>{% for u in users if u.name == "Zed" %}<li>{{ u.name }}</li>{% else %}<li>none</li>{% endfor %}</ul>
+<p>{{ lib.hello(name) }}|{{ author["name"] }}</p>

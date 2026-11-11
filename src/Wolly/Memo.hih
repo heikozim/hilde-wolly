@@ -1,0 +1,126 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Functions memoized for one request: a function marked with memoized keeps
+its result under its argument while the request is answered, so a page
+that asks for the same thing in several places makes it once.
+
+A handler opens a Memo of each memoized function it uses when the request
+comes in and closes it before it answers.  The Memo is linear and lives in
+the handler, not in the process: Hilde has no global state and a handler
+is a function of its request, so nothing a Memo holds reaches another
+request.  memoCall gives the result held for an argument, or runs the
+function, keeps its result and gives it.
+
+Tasks of a lending scope may call one Memo at the same time.  The first
+call of an argument runs the function; a call of the same argument while
+it runs waits for that result and does not run the function again.  Other
+arguments run meanwhile.  A function that calls its own Memo with the
+argument it is running for waits for itself, and does not end.
+
+The argument and the result must be Free: a linear value, such as a
+connection, a string or a file, owned by one holder and used up once,
+cannot be handed out twice, so memoized refuses it when the programme is
+compiled.  More arguments go into one Free record with an order.  A Memo
+keeps at most the entries it was opened with; a call of a new argument
+once it is full runs the function and keeps nothing, so a request cannot
+make the Memo grow without bound.
+
+    function price(): Memoized[Nat64, Nat64] is
+        return memoized(lookUpPrice);
+    end;
+
+    case openMemo(price(), defaultMemoEntries()) of
+        when Some(value as memo: Memo[Nat64, Nat64]) do
+            let first: Nat64 := memoCall(&memo, 7);
+            let again: Nat64 := memoCall(&memo, 7);
+            closeMemo(memo);
+        when None do
+            skip;
+    end case;
+"""
+import Standard.Order (
+    TotalOrder
+);
+
+module Wolly.Memo is
+    """
+    A function marked as memoized.  Its argument and result are Free.
+    """
+    type Memoized[A: Free, T: Free]: Free;
+
+    """
+    The results of one memoized function for one request.  Linear:
+    closeMemo ends it with the request.
+    """
+    type Memo[A: Free, T: Free]: Linear;
+
+    """
+    The most entries a Memo may be opened with: 65536.
+    """
+    function mostMemoEntries(): Index
+        ensures result = 65536;
+
+    """
+    The entries a handler opens a Memo with when it knows no better: 1024.
+    """
+    function defaultMemoEntries(): Index
+        ensures (result > 0) and (result <= mostMemoEntries());
+
+    """
+    Marks work as memoized.  A linear argument or result does not compile.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [A: Free(TotalOrder), T: Free]
+    function memoized(work: Fn[A, T]): Memoized[A, T];
+
+    """
+    An empty Memo of the function marked for one request, keeping at most
+    entries results.  None when there is no memory for its mutex.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [A: Free(TotalOrder), T: Free]
+    function openMemo(marked: Memoized[A, T], entries: Index): Option[Memo[A, T]]
+        requires (entries > 0) and (entries <= mostMemoEntries());
+
+    """
+    The result of the function of memo for argument: the one kept, the one
+    of a call of argument that is still running, which it waits for, or a
+    new one, which it keeps while memo has room.
+    No contract: a value of the type of the function, which has no property cheaper than its type.
+    """
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function memoCall(memo: &[Memo[A, T], R], argument: A): T;
+
+    """
+    How often memoCall has run the function of memo.
+    No contract: a number read under the mutex of memo, a call of a binding.
+    """
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function memoRuns(memo: &[Memo[A, T], R]): Nat64;
+
+    """
+    How many arguments memo holds a result for, or a running call of.
+    No contract: a number read under the mutex of memo, a call of a binding.
+    """
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function memoSize(memo: &[Memo[A, T], R]): Index;
+
+    """
+    The most entries memo keeps, as it was opened.
+    """
+    generic [A: Free, T: Free, R: Region]
+    function memoLimit(memo: &[Memo[A, T], R]): Index
+        ensures (result > 0) and (result <= mostMemoEntries());
+
+    """
+    Ends memo and everything it holds.  No task may be calling it.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [A: Free(TotalOrder), T: Free]
+    function closeMemo(memo: Memo[A, T]): Unit;
+end module.

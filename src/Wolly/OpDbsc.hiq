@@ -1,0 +1,499 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    nthRef,
+    length as bufferLength
+);
+import Standard.Text (
+    substring,
+    startsWith
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+import Standard.Log (
+    Log
+);
+import Wolly.Response (
+    withHeader
+);
+import Wolly.OpClient (
+    Limits
+);
+import Wolly.OpStore (
+    OpSession,
+    destroySession,
+    isAlive,
+    sessionById,
+    sessionByToken,
+    newToken
+);
+import Wolly.Op (
+    Handover
+);
+import Wolly.OpBase (
+    OpSettings,
+    Subject,
+    destroySubject,
+    activeSubject,
+    cookieSession,
+    cookieHeader,
+    jsonOutput,
+    bindingOwner,
+    audit
+);
+import Wolly.Dbsc (
+    RefreshOutcome,
+    Refreshed,
+    ChallengeStale,
+    RefreshRefused,
+    boundSeconds,
+    offerRegistration,
+    registerKey,
+    newChallenge,
+    refreshKey,
+    boundName,
+    bindingFresh,
+    dropBinding,
+    instructions,
+    sessionIdOf,
+    proofOf
+);
+
+module body Wolly.OpDbsc is
+    constant owner_prefix_length: Index := 3;
+
+    -- A short text answer of status, not to be kept by a cache.
+    function shortAnswer(status: Nat16, text: Span[Nat8, Static]): String is
+        return jsonOutput(status, "text/plain; charset=utf-8", text, "no-store");
+    end;
+
+    generic [S: Region]
+    function idOf(session: &[OpSession, S]): String is
+        return fromSpan(asSpan(&(session->id)));
+    end;
+
+    generic [S: Region]
+    function subjectOf(session: &[OpSession, S]): String is
+        return fromSpan(asSpan(&(session->subject)));
+    end;
+
+    generic [S: Region]
+    function cookieNameOf(settings: &[OpSettings, S]): String is
+        return fromSpan(asSpan(&(settings->cookieName)));
+    end;
+
+    -- Whether owner holds a binding: Right true when it does, fresh or not.
+    generic [R: Region, O: Region]
+    function isBound(db: &![Database[Writing], R], owner: Span[Nat8, O], now: Int64): Either[DbError, Bool] is
+        case bindingFresh(&~db, owner, now) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as bound: Option[Bool]) do
+                case bound of
+                    when Some(value as fresh: Bool) do
+                        return Right(right => true);
+                    when None do
+                        return Right(right => false);
+                end case;
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, P: Region]
+    function offer(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], path: Span[Nat8, P],
+        now: Int64): Either[DbError, Option[String]] is
+        case cookieSession(request, &~db, settings, now) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as session: OpSession) do
+                        let id: String := idOf(&session);
+                        destroySession(session);
+                        let owner: String := bindingOwner(asSpan(&id));
+                        destroyString(id);
+                        let made: Either[DbError, Option[String]] := offerFor(&~db, asSpan(&owner), path, now);
+                        destroyString(owner);
+                        return made;
+                    when None do
+                        let none: Option[String] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, S: Region, H: Region, P: Region]
+    function offerAfter(db: &![Database[Writing], R], settings: &[OpSettings, S], step: &[Handover, H], path: Span[Nat8, P],
+        now: Int64): Either[DbError, Option[String]] is
+        let token: String := sessionCookieIn(settings, step);
+        if length(&token) = 0 then
+            destroyString(token);
+            let none: Option[String] := None();
+            return Right(right => none);
+        end if;
+        let found: Either[DbError, Option[OpSession]] := sessionByToken(&~db, asSpan(&token));
+        destroyString(token);
+        case found of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as maybe: Option[OpSession]) do
+                case maybe of
+                    when Some(value as session: OpSession) do
+                        let limits: Limits := settings->session;
+                        let alive: Bool := isAlive(&session, now, limits.idle, limits.max);
+                        let id: String := idOf(&session);
+                        destroySession(session);
+                        if not alive then
+                            destroyString(id);
+                            let none: Option[String] := None();
+                            return Right(right => none);
+                        end if;
+                        let owner: String := bindingOwner(asSpan(&id));
+                        destroyString(id);
+                        let made: Either[DbError, Option[String]] := offerFor(&~db, asSpan(&owner), path, now);
+                        destroyString(owner);
+                        return made;
+                    when None do
+                        let none: Option[String] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+
+    -- The value of the session cookie of settings that a cookie of
+    -- step sets; empty when none does.
+    generic [S: Region, H: Region]
+    function sessionCookieIn(settings: &[OpSettings, S], step: &[Handover, H]): String is
+        var prefix: StringBuilder := makeStringBuilder();
+        writeString(&!prefix, asSpan(&(settings->cookieName)));
+        writeString(&!prefix, "=");
+        let wanted: String := finalize(prefix);
+        let cookies: &[Buffer[String], H] := &(step->cookies);
+        var i: Index := 0;
+        while i < bufferLength(cookies) do
+            let text: Span[Nat8, H] := asSpan(nthRef(cookies, i));
+            if startsWith(text, asSpan(&wanted)) then
+                let first: Index := spanLength(asSpan(&wanted));
+                var stop: Index := first;
+                while (stop < spanLength(text)) and (text[stop] /= ';') do
+                    stop := stop + 1;
+                end while;
+                if stop > first then
+                    destroyString(wanted);
+                    return fromSpan(substring(text, first, stop));
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(wanted);
+        return fromSpan("");
+    end;
+
+    -- The offer to owner, when owner holds no binding yet.
+    generic [R: Region, O: Region, P: Region]
+    function offerFor(db: &![Database[Writing], R], owner: Span[Nat8, O], path: Span[Nat8, P], now: Int64): Either[DbError, Option[String]] is
+        case isBound(&~db, owner, now) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as bound: Bool) do
+                if bound then
+                    let none: Option[String] := None();
+                    return Right(right => none);
+                end if;
+                return offerRegistration(&~db, owner, path, now);
+        end case;
+    end;
+
+    -- The answer 200 with the instructions of the binding id and the session
+    -- cookie of settings set to token for boundSeconds.
+    generic [S: Region, I: Region, P: Region, T: Region]
+    function boundAnswer(settings: &[OpSettings, S], id: Span[Nat8, I], refresh_path: Span[Nat8, P], token: Span[Nat8, T]): String is
+        let cookie_name: String := cookieNameOf(settings);
+        case instructions(id, refresh_path, asSpan(&cookie_name)) of
+            when Some(value as json: String) do
+                let plain: String := jsonOutput(200, "application/json", asSpan(&json), "no-store");
+                destroyString(json);
+                let set: String := cookieHeader(asSpan(&cookie_name), token, boundSeconds());
+                destroyString(cookie_name);
+                let output: String := withHeader(plain, "Set-Cookie", asSpan(&set));
+                destroyString(set);
+                return output;
+            when None do
+                destroyString(cookie_name);
+                return shortAnswer(500, "internal server error\n");
+        end case;
+    end;
+
+    -- The answer 403 with a new challenge for the binding id, or 401 when id
+    -- has no binding that lives.
+    generic [R: Region, I: Region]
+    function challengeAnswer(db: &![Database[Writing], R], id: Span[Nat8, I], now: Int64): String is
+        case newChallenge(&~db, id, now) of
+            when Right(right as made: Option[String]) do
+                case made of
+                    when Some(value as header: String) do
+                        let plain: String := shortAnswer(403, "challenge\n");
+                        let output: String := withHeader(plain, "Secure-Session-Challenge", asSpan(&header));
+                        destroyString(header);
+                        return output;
+                    when None do
+                        return shortAnswer(401, "no such session\n");
+                end case;
+            when Left(left as error: DbError) do
+                return shortAnswer(500, "internal server error\n");
+        end case;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, P: Region, A: Region]
+    function register(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64): String is
+        case cookieSession(request, &~db, settings, now) of
+            when Left(left as error: DbError) do
+                return shortAnswer(500, "internal server error\n");
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as session: OpSession) do
+                        let id: String := idOf(&session);
+                        let subject: String := subjectOf(&session);
+                        destroySession(session);
+                        let output: String := registerFor(request, &~db, settings, &~log, asSpan(&id), asSpan(&subject), refresh_path,
+                            ip, now);
+                        destroyString(id);
+                        destroyString(subject);
+                        return output;
+                    when None do
+                        return shortAnswer(401, "no session\n");
+                end case;
+        end case;
+    end;
+
+    -- The registration for the live session id of subject.
+    generic [Q: Region, R: Region, S: Region, L: Region, I: Region, U: Region, P: Region, A: Region]
+    function registerFor(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        id: Span[Nat8, I], subject: Span[Nat8, U], refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64): String is
+        let owner: String := bindingOwner(id);
+        let bound: Either[DbError, Bool] := isBound(&~db, asSpan(&owner), now);
+        case bound of
+            when Left(left as error: DbError) do
+                destroyString(owner);
+                return shortAnswer(500, "internal server error\n");
+            when Right(right as already: Bool) do
+                if already then
+                    destroyString(owner);
+                    return shortAnswer(401, "bound already\n");
+                end if;
+        end case;
+        case proofOf(request) of
+            when Some(value as proof: String) do
+                let registered: Either[DbError, Option[String]] := registerKey(&~db, asSpan(&owner), asSpan(&proof), now);
+                destroyString(proof);
+                destroyString(owner);
+                case registered of
+                    when Right(right as made: Option[String]) do
+                        case made of
+                            when Some(value as binding: String) do
+                                let output: String := renewed(&~db, settings, &~log, asSpan(&binding), id, subject, refresh_path, ip, now,
+                                    "dbsc-register");
+                                destroyString(binding);
+                                return output;
+                            when None do
+                                audit(&~log, "dbsc-register", "", subject, id, "proof refused", "denied", ip);
+                                return shortAnswer(400, "proof refused\n");
+                        end case;
+                    when Left(left as error: DbError) do
+                        return shortAnswer(500, "internal server error\n");
+                end case;
+            when None do
+                destroyString(owner);
+                audit(&~log, "dbsc-register", "", subject, id, "no proof", "denied", ip);
+                return shortAnswer(400, "no proof\n");
+        end case;
+    end;
+
+    -- The session id under a new cookie value, handed out with the
+    -- instructions of binding; 401 when the session ended meanwhile.
+    generic [R: Region, S: Region, L: Region, B: Region, I: Region, U: Region, P: Region, A: Region]
+    function renewed(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], binding: Span[Nat8, B],
+        id: Span[Nat8, I], subject: Span[Nat8, U], refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64,
+        event: Span[Nat8, Static]): String is
+        case newToken(&~db, id, now) of
+            when Right(right as made: Option[String]) do
+                case made of
+                    when Some(value as token: String) do
+                        audit(&~log, event, "", subject, id, "", "ok", ip);
+                        let output: String := boundAnswer(settings, binding, refresh_path, asSpan(&token));
+                        destroyString(token);
+                        return output;
+                    when None do
+                        let dropped: Option[DbError] := dropBinding(&~db, binding);
+                        dropError(dropped);
+                        audit(&~log, event, "", subject, id, "session ended", "denied", ip);
+                        return shortAnswer(401, "refused\n");
+                end case;
+            when Left(left as error: DbError) do
+                return shortAnswer(500, "internal server error\n");
+        end case;
+    end;
+
+    function dropError(error: Option[DbError]): Unit is
+        case error of
+            when Some(value as failure: DbError) do
+                skip;
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [Q: Region, R: Region, S: Region, L: Region, P: Region, A: Region]
+    function refresh(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64): String is
+        case sessionIdOf(request) of
+            when Some(value as binding: String) do
+                let output: String := refreshOf(request, &~db, settings, &~log, asSpan(&binding), refresh_path, ip, now);
+                destroyString(binding);
+                return output;
+            when None do
+                return shortAnswer(400, "no session id\n");
+        end case;
+    end;
+
+    -- The refresh of the binding.
+    generic [Q: Region, R: Region, S: Region, L: Region, B: Region, P: Region, A: Region]
+    function refreshOf(request: &[Request, Q], db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L],
+        binding: Span[Nat8, B], refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64): String is
+        case proofOf(request) of
+            when Some(value as proof: String) do
+                let outcome: Either[DbError, RefreshOutcome] := refreshKey(&~db, binding, asSpan(&proof), now);
+                destroyString(proof);
+                case outcome of
+                    when Right(right as reached: RefreshOutcome) do
+                        case reached of
+                            when Refreshed(generation as next: Int64) do
+                                return refreshedAs(&~db, settings, &~log, binding, next, refresh_path, ip, now);
+                            when ChallengeStale do
+                                return challengeAnswer(&~db, binding, now);
+                            when RefreshRefused do
+                                audit(&~log, "dbsc-refresh", "", "", "", "proof refused", "denied", ip);
+                                return shortAnswer(401, "refused\n");
+                        end case;
+                    when Left(left as error: DbError) do
+                        return shortAnswer(500, "internal server error\n");
+                end case;
+            when None do
+                return challengeAnswer(&~db, binding, now);
+        end case;
+    end;
+
+    -- After a proof that held: the session the binding belongs to, when it
+    -- lives and its account is active, under a new cookie value.
+    generic [R: Region, S: Region, L: Region, B: Region, P: Region, A: Region]
+    function refreshedAs(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], binding: Span[Nat8, B],
+        generation: Int64, refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64): String is
+        case boundName(&~db, binding, generation, now) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as owner: String) do
+                        let output: String := refreshOwner(&~db, settings, &~log, binding, asSpan(&owner), refresh_path, ip, now);
+                        destroyString(owner);
+                        return output;
+                    when None do
+                        return shortAnswer(401, "refused\n");
+                end case;
+            when Left(left as error: DbError) do
+                return shortAnswer(500, "internal server error\n");
+        end case;
+    end;
+
+    -- The refresh for owner, op: and a session id.
+    generic [R: Region, S: Region, L: Region, B: Region, O: Region, P: Region, A: Region]
+    function refreshOwner(db: &![Database[Writing], R], settings: &[OpSettings, S], log: &![Log, L], binding: Span[Nat8, B],
+        owner: Span[Nat8, O], refresh_path: Span[Nat8, P], ip: Span[Nat8, A], now: Int64): String is
+        if (spanLength(owner) <= owner_prefix_length) or (not startsWith(owner, "op:")) then
+            return shortAnswer(401, "refused\n");
+        end if;
+        let id: Span[Nat8, O] := substring(owner, owner_prefix_length, spanLength(owner));
+        case liveSubject(&~db, settings, id, now) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as subject: String) do
+                        let output: String := renewed(&~db, settings, &~log, binding, id, asSpan(&subject), refresh_path, ip, now,
+                            "dbsc-refresh");
+                        destroyString(subject);
+                        return output;
+                    when None do
+                        let dropped: Option[DbError] := dropBinding(&~db, binding);
+                        dropError(dropped);
+                        audit(&~log, "dbsc-refresh", "", "", id, "session gone", "denied", ip);
+                        return shortAnswer(401, "refused\n");
+                end case;
+            when Left(left as error: DbError) do
+                return shortAnswer(500, "internal server error\n");
+        end case;
+    end;
+
+    -- The subject of the session id while it lives within the limits of
+    -- settings and its account is active.
+    generic [R: Region, S: Region, I: Region]
+    function liveSubject(db: &![Database[Writing], R], settings: &[OpSettings, S], id: Span[Nat8, I], now: Int64): Either[DbError, Option[String]] is
+        case sessionById(&~db, id) of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as found: Option[OpSession]) do
+                case found of
+                    when Some(value as session: OpSession) do
+                        let limits: Limits := settings->session;
+                        let lives: Bool := isAlive(&session, now, limits.idle, limits.max);
+                        let subject: String := subjectOf(&session);
+                        destroySession(session);
+                        if not lives then
+                            destroyString(subject);
+                            let none: Option[String] := None();
+                            return Right(right => none);
+                        end if;
+                        case activeSubject(&~db, asSpan(&subject)) of
+                            when Left(left as error: DbError) do
+                                destroyString(subject);
+                                return Left(left => error);
+                            when Right(right as who: Option[Subject]) do
+                                case who of
+                                    when Some(value as s: Subject) do
+                                        destroySubject(s);
+                                        let some: Option[String] := Some(value => subject);
+                                        return Right(right => some);
+                                    when None do
+                                        destroyString(subject);
+                                        let none: Option[String] := None();
+                                        return Right(right => none);
+                                end case;
+                        end case;
+                    when None do
+                        let none: Option[String] := None();
+                        return Right(right => none);
+                end case;
+        end case;
+    end;
+end module body.

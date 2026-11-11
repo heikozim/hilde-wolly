@@ -1,0 +1,189 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Text layout for a display in fixed columns (a terminal, a text view): the
+display width and the line wrapping of UTF-8 text (Unicode Transformation
+Format, 8 bit).
+
+The unit is the grapheme cluster, the character a reader sees, after UAX 29
+(Unicode Standard Annex #29, Text Segmentation) from Standard.Grapheme: an e
+with a combining accent, a Hangul syllable block of parts, an emoji sequence
+with ZWJ (Zero Width Joiner, U+200D) or a skin tone and a flag of two
+regional indicators are one cluster each.  A cluster is never split.
+
+Widths after East-Asian-Width (UAX 11, Unicode Standard Annex #11): a
+cluster is as wide as its first code point that has a width (0 for a cluster
+without one), 2 columns for the classes W (wide) and F (fullwidth), that is
+CJK characters (Chinese, Japanese, Korean), Hangul, fullwidth forms and
+emoji with Emoji_Presentation, 1 column for all others.  Control
+characters, combining marks (Mn, Me), format characters (Cf, such as U+200B
+and the ZWJ) and the vowels and finals of Hangul (U+1160 to U+11FF, U+D7B0
+to U+D7FF) have 0 columns.  A cluster with the variation selector 16
+(U+FE0F, emoji presentation) is 2 columns wide, one with the variation
+selector 15 (U+FE0E, text presentation) 1.  A byte with which no valid UTF-8
+begins is a cluster of width 1, shown as U+FFFD.
+
+A tab advances to the next column that is a multiple of tab_size, counted
+from the start of the shown line.  Hard breaks are LF, CR, CR LF, U+0085
+(NEL, Next Line), U+2028 and U+2029; a break at the end of the text starts
+no new line.  Soft breaks fall after blanks and tabs, at U+200B and before
+and after a cluster of width 2, so that CJK text can break between all
+characters.  White space at a soft break hangs over: it belongs to no line,
+the next one starts after it.  A word that does not fit into a line is
+split between clusters; every line holds at least one cluster.
+
+Limits: characters of the class A (ambiguous) count narrow; the table of
+wide characters is put together from the CJK, Kana and Tangut blocks of the
+planes 1 to 3 and Emoji_Presentation of Unicode 17.0.0, not generated from
+EastAsianWidth.txt.  The break points approximate UAX 14 (Unicode Standard
+Annex #14, Line Breaking): no rules for punctuation (such as no ban on a
+break before an ideographic full stop or a closing parenthesis), no break
+at hyphens, no hyphenation, no bidirectional text.  A cluster wider than
+the line stands alone in a line, which is then wider.  White space before a
+hard break or the end counts to the line and can go beyond the width.
+
+    let layout: Layout := wrapText("Greetings from 東京", 8, 4);
+    let lines: Index := lineCount(&layout);
+    let first: Index := lineEnd(&layout, 0);
+    destroyLayout(layout);
+    let columns: Index := displayWidth("e\u{301}\u{1f1e9}\u{1f1ea}", 8);
+"""
+module Wolly.TextLayout is
+    """
+    The lines of a wrapped text: for each the bytes it shows, its width and
+    the line of the text it comes from.  Linear: destroyLayout gives them
+    back.
+    """
+    type Layout: Linear;
+
+    """
+    The greatest tab_size the functions take: 64.
+    """
+    function mostTabSize(): Index
+        ensures result = 64;
+
+    """
+    The greatest width wrapText wraps to: 65536 columns.
+    """
+    function mostLineWidth(): Index
+        ensures result = 65536;
+
+    """
+    The width of the code point point in columns, 0, 1 or 2, after the rules
+    of the head of the module; a tab and a break are 0 here, their width
+    depends on the column.
+    """
+    function pointWidth(point: Index): Index
+        requires point <= 1114111
+        ensures result <= 2;
+
+    """
+    The end of the grapheme cluster that begins at the byte start of text:
+    the index of the byte after it.  A byte with which no valid UTF-8
+    begins is a cluster of its own.
+    """
+    generic [R: Region]
+    function clusterEndAt(text: Span[Nat8, R], start: Index): Index
+        requires start < spanLength(text)
+        ensures (result > start) and (result <= spanLength(text));
+
+    """
+    The width of the grapheme cluster that begins at the byte start of
+    text, in columns; a tab and a break are 0 here.
+    """
+    generic [R: Region]
+    function clusterWidth(text: Span[Nat8, R], start: Index): Index
+        requires start < spanLength(text)
+        ensures result <= 2;
+
+    """
+    The width of text in columns: that of the widest line when text holds
+    hard breaks; tabs advance to a multiple of tab_size.  0 for the empty
+    text.
+    There is no ensures: the width follows the text, a bound costs a run
+    over it.
+    """
+    generic [R: Region]
+    function displayWidth(text: Span[Nat8, R], tab_size: Index): Index
+        requires (tab_size >= 1) and (tab_size <= mostTabSize());
+
+    """
+    How many bytes from the start of text fit into width columns: the
+    longest run of whole clusters of the first line that is not wider than
+    width, to shorten a line.  The hard break that ends the first line does
+    not count.
+    """
+    generic [R: Region]
+    function fittingBytes(text: Span[Nat8, R], width: Index, tab_size: Index): Index
+        requires (tab_size >= 1) and (tab_size <= mostTabSize())
+        ensures result <= spanLength(text);
+
+    """
+    text, wrapped to width columns after the rules of the head of the
+    module.  Every text gives at least one line, the empty one too.
+    """
+    generic [R: Region]
+    function wrapText(text: Span[Nat8, R], width: Index, tab_size: Index): Layout
+        requires ((width >= 1) and (width <= mostLineWidth())) and ((tab_size >= 1) and (tab_size <= mostTabSize()))
+        ensures lineCount(&result) >= 1;
+
+    """
+    Gives the lines back.
+    No contract: it only frees what it is given.
+    """
+    function destroyLayout(layout: Layout): Unit;
+
+    """
+    How many lines the layout has.
+    """
+    generic [R: Region]
+    function lineCount(layout: &[Layout, R]): Index
+        ensures result >= 1;
+
+    """
+    The first byte of the line i in the wrapped text.
+    """
+    generic [R: Region]
+    function lineStart(layout: &[Layout, R], i: Index): Index
+        requires i < lineCount(layout);
+
+    """
+    The byte after the last one of the line i: without the hard break that
+    ends it and without the white space at a soft break.  Never less than
+    lineStart of the line.
+    There is no ensures: lineStart reads the buffer of the lines, which
+    reaches C and stands in no condition (H3098); the test holds the
+    relation.
+    """
+    generic [R: Region]
+    function lineEnd(layout: &[Layout, R], i: Index): Index
+        requires i < lineCount(layout);
+
+    """
+    The width of the line i in columns.
+    """
+    generic [R: Region]
+    function lineWidth(layout: &[Layout, R], i: Index): Index
+        requires i < lineCount(layout);
+
+    """
+    The line of the text the line i comes from, counted from 0 after the
+    hard breaks.
+    """
+    generic [R: Region]
+    function lineSource(layout: &[Layout, R], i: Index): Index
+        requires i < lineCount(layout)
+        ensures result <= i;
+
+    """
+    Whether the line i ends with a hard break; false for a line broken soft
+    and for the last one when the text ends without a break.
+    """
+    generic [R: Region]
+    function endsHard(layout: &[Layout, R], i: Index): Bool
+        requires i < lineCount(layout);
+end module.

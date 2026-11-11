@@ -1,0 +1,81 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Routing: a request goes to the first route whose method and pattern fit
+its method and path.
+
+A pattern is a path of segments.  A segment is compared byte for byte,
+except a segment :name, which fits any one segment that is not empty, and
+a last segment *, which fits the rest of the path, empty included.  The
+path is compared as the client sent it, percent-encoded; a parameter is
+decoded when it is read, so %2F inside a segment never becomes a separator.
+
+A route with method GET also answers a request for the headers alone; the
+web server drops the body.
+A path no pattern fits gets 404; a path that fits a pattern of another
+method only gets 405 with an Allow header.  A request without a method or
+a path that does not begin with a slash gets 400.
+
+The table is a Buffer the application builds; nothing is global, because
+a handler of Standard.FcgiServer is a plain function and the table is built
+inside it.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Router is
+    """
+    One route: a method such as GET, a pattern and the handler that
+    answers it.
+    """
+    record Route: Free is
+        verb: Span[Nat8, Static];
+        pattern: Span[Nat8, Static];
+        handler: Fn[Request, String];
+    end;
+
+    """
+    Whether pattern fits path.
+    No contract: the answer is a walk over both.
+    """
+    generic [P: Region, A: Region]
+    function matches(pattern: Span[Nat8, P], path: Span[Nat8, A]): Bool;
+
+    """
+    The decoded segment of path that the segment :name of pattern fits,
+    or for name * the rest of the path that a last * fits.  None when
+    pattern does not fit path or has no such segment.
+    No contract: an Option over outside input; None is its answer for a
+    bad one.
+    """
+    generic [P: Region, A: Region, N: Region]
+    function param(pattern: Span[Nat8, P], path: Span[Nat8, A], name: Span[Nat8, N]): Option[String];
+
+    """
+    param for the path of request: what a handler asks with its own
+    pattern.
+    No contract: an Option over outside input, as param.
+    """
+    generic [R: Region, P: Region, N: Region]
+    function routeParam(request: &[Request, R], pattern: Span[Nat8, P], name: Span[Nat8, N]): Option[String];
+
+    """
+    The answer of the handler of the first route that fits request, or
+    400, 404 or 405.
+    """
+    generic [R: Region]
+    function dispatch(request: Request, routes: &[Buffer[Route], R]): String
+        ensures length(&result) > 0;
+end module.

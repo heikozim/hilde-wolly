@@ -1,0 +1,76 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.FcgiServer (
+    Request,
+    destroyRequest
+);
+import Wolly.Response (
+    Response,
+    makeResponse,
+    finish
+);
+
+module body Wolly.Tree is
+    -- A union, so no invariant: a finished answer is not empty by the
+    -- requires of answer, a body may be.
+    union Page: Linear is
+        case Wrapped is
+            response: Response;
+            content: String;
+        case Finished is
+            output: String;
+    end;
+
+    function page(response: Response, content: String): Page is
+        return Wrapped(response => response, content => content);
+    end;
+
+    function answer(output: String): Page is
+        return Finished(output => output);
+    end;
+
+    generic [R: Region]
+    function isWrapped(made: &[Page, R]): Bool is
+        case made of
+            when Wrapped(response: &[Response, R], content: &[String, R]) do
+                return true;
+            when Finished(output: &[String, R]) do
+                return false;
+        end case;
+    end;
+
+    function wrapPage(made: Page, layout: Fn[String, String]): Page is
+        case made of
+            when Wrapped(response: Response, content: String) do
+                return Wrapped(response => response, content => layout(content));
+            when Finished(output: String) do
+                return Finished(output => output);
+        end case;
+    end;
+
+    function finishPage(made: Page): String is
+        case made of
+            when Wrapped(response: Response, content: String) do
+                let output: String := finish(response, asSpan(&content));
+                destroyString(content);
+                return output;
+            when Finished(output: String) do
+                return output;
+        end case;
+    end;
+
+    function paramNotFound(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(404, "text/plain; charset=utf-8"), "not found\n");
+    end;
+end module body.

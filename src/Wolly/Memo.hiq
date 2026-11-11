@@ -1,0 +1,199 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Map (
+    Map,
+    makeMap,
+    destroyFree,
+    size,
+    getMut,
+    put,
+    replaceValue
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Shared (
+    Mutex,
+    Key,
+    makeMutex,
+    acquire,
+    release,
+    destroyMutex
+);
+import Standard.Task (
+    yieldNow
+);
+
+module body Wolly.Memo is
+    record Memoized[A: Free, T: Free]: Free is
+        work: Fn[A, T];
+    end;
+
+    -- What a Memo keeps under an argument: Running while the first call
+    -- of it has not returned, then its result.
+    union Slot[T: Free]: Free is
+        case Running;
+        case Made is
+            result: T;
+    end;
+
+    -- What the mutex guards: the slots and how often the work ran.
+    record State[A: Free, T: Free]: Linear is
+        slots: Map[A, Slot[T]];
+        runs: Nat64;
+    end;
+
+    record Memo[A: Free, T: Free]: Linear is
+        work: Fn[A, T];
+        limit: Index;
+        state: Mutex[State[A, T]];
+        invariant (limit > 0) and (limit <= 65536);
+    end;
+
+    function mostMemoEntries(): Index is
+        return 65536;
+    end;
+
+    function defaultMemoEntries(): Index is
+        return 1024;
+    end;
+
+    generic [A: Free(TotalOrder), T: Free]
+    function memoized(work: Fn[A, T]): Memoized[A, T] is
+        return Memoized(work => work);
+    end;
+
+    generic [A: Free(TotalOrder), T: Free]
+    function openMemo(marked: Memoized[A, T], entries: Index): Option[Memo[A, T]] is
+        let none: Nat64 := 0;
+        let slots: Map[A, Slot[T]] := makeMap();
+        case makeMutex(State(slots => slots, runs => none)) of
+            when Right(right as mutex: Mutex[State[A, T]]) do
+                return Some(value => Memo(work => marked.work, limit => entries, state => mutex));
+            when Left(left as back: State[A, T]) do
+                let { slots as empty: Map[A, Slot[T]], runs: Nat64 } := back;
+                destroyFree(empty);
+                return None();
+        end case;
+    end;
+
+    ---
+    --- The state, one use of a field each
+    ---
+
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function slotOf(state: &![State[A, T], R], argument: A): Option[Slot[T]] is
+        return getMut(&!(state->slots), &argument);
+    end;
+
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function slotCount(state: &![State[A, T], R]): Index is
+        return size(&(state->slots));
+    end;
+
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function markRunning(state: &![State[A, T], R], argument: A): Unit is
+        let running: Slot[T] := Running();
+        case put(&!(state->slots), argument, running) of
+            when Some(value as old: Pair[A, Slot[T]]) do
+                skip;
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function keep(state: &![State[A, T], R], argument: A, result: T): Unit is
+        let made: Slot[T] := Made(result => result);
+        case replaceValue(&!(state->slots), &argument, made) of
+            when Right(right as old: Slot[T]) do
+                skip;
+            when Left(left as back: Slot[T]) do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- The functions of the module
+    ---
+
+    -- The slots sit behind a mutex.  The work runs outside it, so that
+    -- other arguments and other Memos stay usable meanwhile; a call that
+    -- finds its argument Running lets the mutex go, yields and looks
+    -- again.  A full Memo runs the work without a slot, so no call waits
+    -- for a slot that is never made.
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function memoCall(memo: &[Memo[A, T], R], argument: A): T is
+        let work: Fn[A, T] := memo->work;
+        let limit: Index := memo->limit;
+        while true do
+            let { value as state: State[A, T], key as lock: Key } := acquire(&(memo->state));
+            var held: State[A, T] := state;
+            case slotOf(&!held, argument) of
+                when Some(value as slot: Slot[T]) do
+                    case slot of
+                        when Made(result as kept: T) do
+                            release(&(memo->state), held, lock);
+                            return kept;
+                        when Running do
+                            release(&(memo->state), held, lock);
+                            yieldNow();
+                    end case;
+                when None do
+                    held.runs := held.runs + 1;
+                    if slotCount(&!held) >= limit then
+                        release(&(memo->state), held, lock);
+                        return work(argument);
+                    end if;
+                    markRunning(&!held, argument);
+                    release(&(memo->state), held, lock);
+                    let made: T := work(argument);
+                    let { value as again: State[A, T], key as relock: Key } := acquire(&(memo->state));
+                    var after: State[A, T] := again;
+                    keep(&!after, argument, made);
+                    release(&(memo->state), after, relock);
+                    return made;
+            end case;
+        end while;
+        abort("memoCall: left its loop");
+    end;
+
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function memoRuns(memo: &[Memo[A, T], R]): Nat64 is
+        let { value as state: State[A, T], key as lock: Key } := acquire(&(memo->state));
+        let runs: Nat64 := state.runs;
+        release(&(memo->state), state, lock);
+        return runs;
+    end;
+
+    generic [A: Free(TotalOrder), T: Free, R: Region]
+    function memoSize(memo: &[Memo[A, T], R]): Index is
+        let { value as state: State[A, T], key as lock: Key } := acquire(&(memo->state));
+        var held: State[A, T] := state;
+        let entries: Index := slotCount(&!held);
+        release(&(memo->state), held, lock);
+        return entries;
+    end;
+
+    generic [A: Free, T: Free, R: Region]
+    function memoLimit(memo: &[Memo[A, T], R]): Index is
+        return memo->limit;
+    end;
+
+    generic [A: Free(TotalOrder), T: Free]
+    function closeMemo(memo: Memo[A, T]): Unit is
+        let { work: Fn[A, T], limit: Index, state: Mutex[State[A, T]] } := memo;
+        let { slots: Map[A, Slot[T]], runs: Nat64 } := destroyMutex(state);
+        destroyFree(slots);
+        return nil;
+    end;
+end module body.

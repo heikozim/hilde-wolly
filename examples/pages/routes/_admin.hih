@@ -1,0 +1,19 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    length
+);
+
+module Wolly.Example.Pages.Site.Admin is
+    """
+    The content of a page below _admin inside the main element of the
+    admin pages.
+    """
+    function layout(content: String): String
+        ensures length(&result) > 0;
+end module.

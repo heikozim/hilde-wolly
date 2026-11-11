@@ -1,0 +1,728 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The blocks of a document of every kind first, then the round trip, the
+-- cursor over clusters, typing, Return, Shift+Return, Backspace and Delete,
+-- headings and tasks, undo and redo, and the limit of the source.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Wolly.Editor (
+    BlockKind,
+    ParagraphBlock,
+    HeadingBlock,
+    QuoteBlock,
+    BulletBlock,
+    OrderedBlock,
+    TaskBlock,
+    FenceBlock,
+    MermaidBlock,
+    RuleBlock,
+    TableBlock,
+    HtmlBlock,
+    DefinitionBlock,
+    TocBlock,
+    FrontMatterBlock,
+    EmptyBlock,
+    Editor,
+    mostEditorBytes,
+    mostUndoSteps,
+    openEditor,
+    destroyEditor,
+    sourceLength,
+    sourceText,
+    toMarkdown,
+    blockCount,
+    blockKind,
+    blockStart,
+    blockStop,
+    blockContent,
+    blockLevel,
+    blockNumber,
+    blockChecked,
+    blockText,
+    blockInfo,
+    blockAt,
+    cursorOffset,
+    anchorOffset,
+    selectionStart,
+    selectionStop,
+    cursorBlock,
+    setCursor,
+    setSelection,
+    selectAll,
+    moveLeft,
+    moveRight,
+    moveLineStart,
+    moveLineEnd,
+    insertText,
+    pressReturn,
+    pressShiftReturn,
+    deleteBackward,
+    deleteForward,
+    setHeading,
+    toggleTask,
+    closeUndoGroup,
+    canUndo,
+    canRedo,
+    undo,
+    redo,
+    openEditorFromHtml,
+    editorToHtml
+);
+import Wolly.Markdown (
+    markdownWithHtmlToHtml as markdownToHtml
+);
+
+module body Wolly.Editor.Test is
+    function kindCode(kind: BlockKind): Index is
+        case kind of
+            when ParagraphBlock do
+                return 1;
+            when HeadingBlock do
+                return 2;
+            when QuoteBlock do
+                return 3;
+            when BulletBlock do
+                return 4;
+            when OrderedBlock do
+                return 5;
+            when TaskBlock do
+                return 6;
+            when FenceBlock do
+                return 7;
+            when MermaidBlock do
+                return 8;
+            when RuleBlock do
+                return 9;
+            when TableBlock do
+                return 10;
+            when HtmlBlock do
+                return 11;
+            when DefinitionBlock do
+                return 12;
+            when TocBlock do
+                return 13;
+            when FrontMatterBlock do
+                return 14;
+            when EmptyBlock do
+                return 15;
+        end case;
+    end;
+
+    -- The kind of block i as its number above, 0 past the last block.
+    generic [R: Region]
+    function kindAt(editor: &[Editor, R], i: Index): Index is
+        if i >= blockCount(editor) then
+            return 0;
+        end if;
+        return kindCode(blockKind(editor, i));
+    end;
+
+    -- Whether the source is expected and the cursor at cursor, nothing selected.
+    generic [R: Region, S: Region]
+    function stateIs(editor: &[Editor, R], expected: Span[Nat8, S], cursor: Index): Bool is
+        return (equal(sourceText(editor), expected) and (cursorOffset(editor) = cursor)) and (anchorOffset(editor) = cursor);
+    end;
+
+    -- An editor over text with the cursor at cursor.
+    generic [R: Region]
+    function editorAt(text: Span[Nat8, R], cursor: Index): Editor is
+        let editor: Editor := openEditor(text);
+        return setCursor(editor, cursor);
+    end;
+
+    function corpus(): Span[Nat8, Static] is
+        return "---\ntitle: x\n---\n# Title\n\nPara *em* text\nsecond line\n\n> quote\n> more\n\n- one\n- two\n  - nested\n1. first\n2) second\n- [ ] open\n- [x] done\n\n```rust\nfn main() {}\n```\n\n```mermaid\ngraph TD\n```\n\n***\n\n| a | b |\n| --- | :-: |\n| 1 | 2 |\n\n<div>\nhtml\n</div>\n\n[ref]: https://example.com\n\n[toc]\n\nSetext\n===\n";
+    end;
+
+    function testBlocksOfEveryKind(): Unit is
+        let editor: Editor := openEditor(corpus());
+        assertTrue(blockCount(&editor) = 19, "19 blocks in the corpus");
+        assertTrue(kindAt(&editor, 0) = 14, "front matter");
+        assertTrue(kindAt(&editor, 1) = 2, "an ATX heading");
+        assertTrue(blockLevel(&editor, 1) = 1, "of level 1");
+        assertTrue(equal(blockText(&editor, 1), "# Title"), "the heading line");
+        assertTrue(blockContent(&editor, 1) = (blockStart(&editor, 1) + 2), "its content after # and the space");
+        assertTrue(kindAt(&editor, 2) = 1, "a paragraph of two lines");
+        assertTrue(equal(blockText(&editor, 2), "Para *em* text\nsecond line"), "both lines in it");
+        assertTrue(kindAt(&editor, 3) = 3, "a quote of two lines");
+        assertTrue(blockLevel(&editor, 3) = 1, "of depth 1");
+        assertTrue(kindAt(&editor, 4) = 4, "a bullet item");
+        assertTrue(kindAt(&editor, 5) = 4, "a second bullet item");
+        assertTrue(kindAt(&editor, 6) = 4, "a nested bullet item");
+        assertTrue(blockLevel(&editor, 6) = 2, "indented by 2");
+        assertTrue(kindAt(&editor, 7) = 5, "an ordered item");
+        assertTrue(blockNumber(&editor, 7) = 1, "number 1");
+        assertTrue(kindAt(&editor, 8) = 5, "an ordered item with )");
+        assertTrue(blockNumber(&editor, 8) = 2, "number 2");
+        assertTrue(kindAt(&editor, 9) = 6, "an open task");
+        assertFalse(blockChecked(&editor, 9), "not done");
+        assertTrue(kindAt(&editor, 10) = 6, "a done task");
+        assertTrue(blockChecked(&editor, 10), "done");
+        assertTrue(kindAt(&editor, 11) = 7, "a fence");
+        assertTrue(equal(blockInfo(&editor, 11), "rust"), "its info string");
+        assertTrue(blockLevel(&editor, 11) = 3, "a fence of 3");
+        assertTrue(equal(blockText(&editor, 11), "```rust\nfn main() {}\n```"), "the fence with its closing line");
+        assertTrue(kindAt(&editor, 12) = 8, "a Mermaid fence");
+        assertTrue(kindAt(&editor, 13) = 9, "a thematic break");
+        assertTrue(kindAt(&editor, 14) = 10, "a table");
+        assertTrue(blockLevel(&editor, 14) = 2, "of 2 columns");
+        assertTrue(equal(blockText(&editor, 14), "| a | b |\n| --- | :-: |\n| 1 | 2 |"), "all rows in it");
+        assertTrue(kindAt(&editor, 15) = 11, "an HTML block");
+        assertTrue(equal(blockText(&editor, 15), "<div>\nhtml\n</div>"), "up to the blank line");
+        assertTrue(kindAt(&editor, 16) = 12, "a link definition");
+        assertTrue(kindAt(&editor, 17) = 13, "a table of contents");
+        assertTrue(kindAt(&editor, 18) = 2, "a setext heading");
+        assertTrue(blockLevel(&editor, 18) = 1, "of level 1");
+        assertTrue(equal(blockInfo(&editor, 2), ""), "no info string for a paragraph");
+        destroyEditor(editor);
+        return nil;
+    end;
+
+    function testEmptyParagraphs(): Unit is
+        let empty: Editor := openEditor("");
+        assertTrue(blockCount(&empty) = 1, "the empty text is one block");
+        assertTrue(kindAt(&empty, 0) = 15, "an empty paragraph");
+        destroyEditor(empty);
+        let one: Editor := openEditor("a\n\n\n\nb");
+        assertTrue(blockCount(&one) = 3, "a, an empty paragraph, b");
+        assertTrue(kindAt(&one, 1) = 15, "the middle line of three blank ones");
+        assertTrue(blockStart(&one, 1) = 3, "on the second blank line");
+        destroyEditor(one);
+        let two: Editor := openEditor("a\n\nb");
+        assertTrue(blockCount(&two) = 2, "one blank line only separates");
+        destroyEditor(two);
+        let tail: Editor := openEditor("a\n\n");
+        assertTrue(blockCount(&tail) = 2, "a blank line at the end after the separator");
+        assertTrue(kindAt(&tail, 1) = 15, "is an empty paragraph");
+        destroyEditor(tail);
+        let line: Editor := openEditor("a\n");
+        assertTrue(blockCount(&line) = 1, "a closing LF is no paragraph");
+        destroyEditor(line);
+        return nil;
+    end;
+
+    function testBlockRules(): Unit is
+        let setext: Editor := openEditor("a\n---\n");
+        assertTrue((kindAt(&setext, 0) = 2) and (blockLevel(&setext, 0) = 2), "--- under text is a heading of level 2");
+        destroyEditor(setext);
+        let rule: Editor := openEditor("a\n\n- - -\n");
+        assertTrue(kindAt(&rule, 1) = 9, "- - - is a break, not an item");
+        destroyEditor(rule);
+        let lazy: Editor := openEditor("> a\nb\n");
+        assertTrue((blockCount(&lazy) = 1) and (kindAt(&lazy, 0) = 3), "a lazy line continues a quote");
+        destroyEditor(lazy);
+        let item: Editor := openEditor("- a\nb\n- c\n");
+        assertTrue(blockCount(&item) = 2, "a line of text continues an item");
+        destroyEditor(item);
+        let unclosed: Editor := openEditor("```\ncode\n\nmore");
+        assertTrue((blockCount(&unclosed) = 1) and (kindAt(&unclosed, 0) = 7), "an open fence runs to the end");
+        destroyEditor(unclosed);
+        let empty_item: Editor := openEditor("a\n*\n");
+        assertTrue((blockCount(&empty_item) = 1) and (kindAt(&empty_item, 0) = 1), "an empty item does not end a paragraph");
+        destroyEditor(empty_item);
+        let ordered: Editor := openEditor("a\n2. b\n");
+        assertTrue(blockCount(&ordered) = 1, "an item numbered 2 does not end a paragraph");
+        destroyEditor(ordered);
+        let comment: Editor := openEditor("<!-- a\n\nb -->\nc\n");
+        assertTrue((kindAt(&comment, 0) = 11) and (blockStop(&comment, 0) = 13), "a comment runs to its end, over a blank line");
+        destroyEditor(comment);
+        let tag: Editor := openEditor("a\n<span>\n");
+        assertTrue(blockCount(&tag) = 1, "an inline tag does not end a paragraph");
+        destroyEditor(tag);
+        let crlf: Editor := openEditor("a\r\nb\rc");
+        assertTrue(equal(sourceText(&crlf), "a\nb\nc"), "CR LF and CR become LF");
+        destroyEditor(crlf);
+        let quote: Editor := openEditor("> > deep\n");
+        assertTrue(blockLevel(&quote, 0) = 2, "a quote of depth 2");
+        assertTrue(blockContent(&quote, 0) = 4, "its content after both markers");
+        destroyEditor(quote);
+        return nil;
+    end;
+
+    function testRoundTrip(): Unit is
+        let editor: Editor := openEditor(corpus());
+        let markdown: String := toMarkdown(&editor);
+        assertTrue(equal(asSpan(&markdown), corpus()), "the Markdown out is the Markdown in");
+        destroyString(markdown);
+        destroyEditor(editor);
+        var edited: Editor := editorAt("# Title\n", 7);
+        edited := insertText(edited, "!");
+        edited := undo(edited);
+        let back: String := toMarkdown(&edited);
+        assertTrue(equal(asSpan(&back), "# Title\n"), "an edit undone gives the same bytes back");
+        destroyString(back);
+        destroyEditor(edited);
+        return nil;
+    end;
+
+    function testCursorOverClusters(): Unit is
+        var editor: Editor := openEditor("e\u{301}x\u{1f1e9}\u{1f1ea}");
+        editor := moveRight(editor, false);
+        assertTrue(cursorOffset(&editor) = 3, "past e with its accent");
+        editor := moveRight(editor, false);
+        assertTrue(cursorOffset(&editor) = 4, "past x");
+        editor := moveRight(editor, false);
+        assertTrue(cursorOffset(&editor) = 12, "past the flag of two code points");
+        editor := moveRight(editor, false);
+        assertTrue(cursorOffset(&editor) = 12, "at the end it stays");
+        editor := moveLeft(editor, false);
+        assertTrue(cursorOffset(&editor) = 4, "back before the flag");
+        editor := setCursor(editor, 2);
+        assertTrue(cursorOffset(&editor) = 0, "inside a cluster the cursor goes to its start");
+        editor := moveRight(editor, true);
+        editor := moveRight(editor, true);
+        assertTrue((selectionStart(&editor) = 0) and (selectionStop(&editor) = 4), "a selection of two clusters");
+        editor := moveLeft(editor, false);
+        assertTrue((cursorOffset(&editor) = 0) and (anchorOffset(&editor) = 0), "left collapses to the start");
+        destroyEditor(editor);
+        var blocks: Editor := editorAt("a\n\nb", 1);
+        blocks := moveRight(blocks, false);
+        assertTrue(cursorOffset(&blocks) = 3, "right from the end of a block to the next one");
+        blocks := moveLeft(blocks, false);
+        assertTrue(cursorOffset(&blocks) = 1, "left from the start of a block to the end of the one before");
+        destroyEditor(blocks);
+        var heading: Editor := editorAt("x\n\n# Title", 1);
+        heading := moveRight(heading, false);
+        assertTrue(cursorOffset(&heading) = 5, "into the content of a heading, past its marker");
+        heading := moveLineStart(heading, false);
+        assertTrue(cursorOffset(&heading) = 3, "from the content to the start of the line");
+        heading := moveLineStart(heading, false);
+        assertTrue(cursorOffset(&heading) = 5, "and back to the content");
+        heading := moveLineEnd(heading, false);
+        assertTrue(cursorOffset(&heading) = 10, "to the end of the line");
+        heading := selectAll(heading);
+        assertTrue((selectionStart(&heading) = 0) and (selectionStop(&heading) = 10), "all of it selected");
+        destroyEditor(heading);
+        return nil;
+    end;
+
+    function testTypingMakesBlocks(): Unit is
+        var editor: Editor := openEditor("");
+        editor := insertText(editor, "#");
+        assertTrue(kindAt(&editor, 0) = 2, "a # alone is an empty heading");
+        editor := insertText(editor, "a");
+        assertTrue(kindAt(&editor, 0) = 1, "#a is text");
+        editor := setCursor(editor, 1);
+        editor := insertText(editor, " ");
+        assertTrue(stateIs(&editor, "# a", 2) and (kindAt(&editor, 0) = 2), "with the space it is a heading");
+        destroyEditor(editor);
+        var task: Editor := openEditor("");
+        task := insertText(task, "- [ ] ");
+        assertTrue(kindAt(&task, 0) = 6, "a task");
+        destroyEditor(task);
+        var quote: Editor := openEditor("");
+        quote := insertText(quote, "> a");
+        assertTrue(stateIs(&quote, "> a", 3) and (kindAt(&quote, 0) = 3), "a quote, the cursor after the text");
+        destroyEditor(quote);
+        var replaced: Editor := openEditor("abcd");
+        replaced := setSelection(replaced, 1, 3);
+        replaced := insertText(replaced, "X");
+        assertTrue(stateIs(&replaced, "aXd", 2), "typing replaces the selection");
+        destroyEditor(replaced);
+        var pasted: Editor := openEditor("");
+        pasted := insertText(pasted, "a\r\nb");
+        assertTrue(stateIs(&pasted, "a\nb", 3), "a paste with CR LF");
+        destroyEditor(pasted);
+        return nil;
+    end;
+
+    function testReturnInText(): Unit is
+        var editor: Editor := editorAt("abc", 3);
+        editor := pressReturn(editor);
+        assertTrue(stateIs(&editor, "abc\n\n", 5), "Return at the end gives an empty paragraph");
+        assertTrue(kindAt(&editor, cursorBlock(&editor)) = 15, "the cursor in it");
+        editor := insertText(editor, "d");
+        assertTrue(stateIs(&editor, "abc\n\nd", 6) and (blockCount(&editor) = 2), "typing fills it");
+        destroyEditor(editor);
+        var split: Editor := editorAt("abcd", 2);
+        split := pressReturn(split);
+        assertTrue(stateIs(&split, "ab\n\ncd", 4) and (blockCount(&split) = 2), "Return in the middle splits");
+        destroyEditor(split);
+        var start: Editor := editorAt("abc", 0);
+        start := pressReturn(start);
+        assertTrue(stateIs(&start, "\n\nabc", 2) and (kindAt(&start, 0) = 15), "Return at the start puts an empty paragraph before");
+        destroyEditor(start);
+        var middle: Editor := editorAt("a\n\nb", 1);
+        middle := pressReturn(middle);
+        assertTrue(stateIs(&middle, "a\n\n\n\nb", 3) and (kindAt(&middle, 1) = 15), "an empty paragraph between two blocks");
+        middle := pressReturn(middle);
+        assertTrue(stateIs(&middle, "a\n\n\n\n\nb", 4) and (blockCount(&middle) = 4), "Return in an empty paragraph adds one");
+        destroyEditor(middle);
+        var trailing: Editor := editorAt("abc\n", 3);
+        trailing := pressReturn(trailing);
+        assertTrue(stateIs(&trailing, "abc\n\n", 5) and (blockCount(&trailing) = 2), "one empty paragraph also before a closing LF");
+        destroyEditor(trailing);
+        var heading: Editor := editorAt("# Title", 7);
+        heading := pressReturn(heading);
+        assertTrue(stateIs(&heading, "# Title\n\n", 9) and (kindAt(&heading, 1) = 15), "after a heading a paragraph");
+        destroyEditor(heading);
+        var before: Editor := editorAt("# Title", 2);
+        before := pressReturn(before);
+        assertTrue(stateIs(&before, "\n\n# Title", 4), "at the start of the heading text an empty paragraph before it");
+        destroyEditor(before);
+        var cut: Editor := editorAt("# Title", 4);
+        cut := pressReturn(cut);
+        assertTrue(stateIs(&cut, "# Ti\n\ntle", 6) and (kindAt(&cut, 1) = 1), "a heading split, the rest a paragraph");
+        destroyEditor(cut);
+        var rule: Editor := editorAt("---", 3);
+        rule := pressReturn(rule);
+        assertTrue(stateIs(&rule, "---\n\n", 5) and (kindAt(&rule, 0) = 9), "--- and Return is a break and a paragraph");
+        destroyEditor(rule);
+        return nil;
+    end;
+
+    function testReturnInLists(): Unit is
+        var bullet: Editor := editorAt("- a", 3);
+        bullet := pressReturn(bullet);
+        assertTrue(stateIs(&bullet, "- a\n- ", 6) and (kindAt(&bullet, 1) = 4), "a new item");
+        bullet := pressReturn(bullet);
+        assertTrue(stateIs(&bullet, "- a\n\n", 5) and (kindAt(&bullet, 1) = 15), "Return on an empty item ends the list");
+        destroyEditor(bullet);
+        var ordered: Editor := editorAt("1. a", 4);
+        ordered := pressReturn(ordered);
+        assertTrue(stateIs(&ordered, "1. a\n2. ", 8) and (blockNumber(&ordered, 1) = 2), "the next number");
+        destroyEditor(ordered);
+        var paren: Editor := editorAt("9) a", 4);
+        paren := pressReturn(paren);
+        assertTrue(stateIs(&paren, "9) a\n10) ", 9), "the delimiter kept, 10 after 9");
+        destroyEditor(paren);
+        var task: Editor := editorAt("- [x] a", 7);
+        task := pressReturn(task);
+        assertTrue(stateIs(&task, "- [x] a\n- [ ] ", 14) and (kindAt(&task, 1) = 6), "an open task after a done one");
+        destroyEditor(task);
+        var nested: Editor := editorAt("- a\n  - ", 8);
+        nested := pressReturn(nested);
+        assertTrue(stateIs(&nested, "- a\n- ", 6), "an empty nested item moves out one level");
+        destroyEditor(nested);
+        var inside: Editor := editorAt("- ab", 3);
+        inside := pressReturn(inside);
+        assertTrue(stateIs(&inside, "- a\n- b", 6), "the rest goes into the new item");
+        destroyEditor(inside);
+        var quote: Editor := editorAt("> a", 3);
+        quote := pressReturn(quote);
+        assertTrue(stateIs(&quote, "> a\n> ", 6), "the quote continues");
+        quote := pressReturn(quote);
+        assertTrue(stateIs(&quote, "> a\n\n", 5), "an empty quote line ends it");
+        destroyEditor(quote);
+        return nil;
+    end;
+
+    function testReturnInCodeAndTables(): Unit is
+        var fence: Editor := editorAt("```js", 5);
+        fence := pressReturn(fence);
+        assertTrue(stateIs(&fence, "```js\n\n```", 6), "``` and Return opens a closed block");
+        fence := insertText(fence, "x");
+        fence := pressReturn(fence);
+        assertTrue(stateIs(&fence, "```js\nx\n\n```", 8) and (blockCount(&fence) = 1), "Return in code is a line");
+        destroyEditor(fence);
+        var table: Editor := editorAt("| a | b |", 9);
+        table := pressReturn(table);
+        assertTrue(stateIs(&table, "| a | b |\n| --- | --- |\n|  |  |", 26), "a header row and Return make a table");
+        assertTrue((kindAt(&table, 0) = 10) and (blockLevel(&table, 0) = 2), "a table of two columns");
+        table := insertText(table, "1");
+        assertTrue(equal(sourceText(&table), "| a | b |\n| --- | --- |\n| 1 |  |"), "typing into the first cell");
+        table := pressReturn(table);
+        assertTrue(stateIs(&table, "| a | b |\n| --- | --- |\n| 1 |  |\n|  |  |", 35), "Return in a row adds a row");
+        destroyEditor(table);
+        var shift: Editor := editorAt("ab", 1);
+        shift := pressShiftReturn(shift);
+        assertTrue(stateIs(&shift, "a\\\nb", 3) and (blockCount(&shift) = 1), "Shift+Return is a hard break");
+        destroyEditor(shift);
+        var code: Editor := editorAt("```\nab\n```", 5);
+        code := pressShiftReturn(code);
+        assertTrue(stateIs(&code, "```\na\nb\n```", 6), "Shift+Return in code is a line");
+        destroyEditor(code);
+        var title: Editor := editorAt("# ab", 3);
+        title := pressShiftReturn(title);
+        assertTrue(stateIs(&title, "# ab", 3), "Shift+Return in a heading does nothing");
+        destroyEditor(title);
+        return nil;
+    end;
+
+    function testBackspace(): Unit is
+        var heading: Editor := editorAt("# abc", 2);
+        heading := deleteBackward(heading);
+        assertTrue(stateIs(&heading, "abc", 0) and (kindAt(&heading, 0) = 1), "at the start of a heading it becomes a paragraph");
+        destroyEditor(heading);
+        var item: Editor := editorAt("- abc", 2);
+        item := deleteBackward(item);
+        assertTrue(stateIs(&item, "abc", 0), "an item becomes text");
+        destroyEditor(item);
+        var task: Editor := editorAt("- [ ] abc", 6);
+        task := deleteBackward(task);
+        assertTrue(stateIs(&task, "abc", 0), "a task loses marker and box");
+        destroyEditor(task);
+        var join: Editor := editorAt("a\n\nb", 3);
+        join := deleteBackward(join);
+        assertTrue(stateIs(&join, "ab", 1), "two paragraphs join");
+        destroyEditor(join);
+        var empty: Editor := editorAt("a\n\n\n\nb", 3);
+        empty := deleteBackward(empty);
+        assertTrue(stateIs(&empty, "a\n\nb", 1), "an empty paragraph goes");
+        destroyEditor(empty);
+        var accent: Editor := editorAt("ae\u{301}", 4);
+        accent := deleteBackward(accent);
+        assertTrue(stateIs(&accent, "a", 1), "e with its accent goes as one");
+        destroyEditor(accent);
+        var flag: Editor := editorAt("\u{1f1e9}\u{1f1ea}", 8);
+        flag := deleteBackward(flag);
+        assertTrue(stateIs(&flag, "", 0), "a flag goes as one");
+        destroyEditor(flag);
+        var setext: Editor := editorAt("x\n\nT\n===", 3);
+        setext := deleteBackward(setext);
+        assertTrue(stateIs(&setext, "xT\n===", 1), "a setext heading joins the paragraph before");
+        destroyEditor(setext);
+        var quoted: Editor := editorAt("> a\n> b", 6);
+        quoted := deleteBackward(quoted);
+        assertTrue(stateIs(&quoted, "> ab", 3), "a quote line joins the one above");
+        destroyEditor(quoted);
+        var code: Editor := editorAt("```\nx\n```\n\nb", 11);
+        code := deleteBackward(code);
+        assertTrue(stateIs(&code, "```\nx\n```\n\nb", 9), "after code the cursor goes into it, nothing deleted");
+        destroyEditor(code);
+        var first: Editor := editorAt("ab", 0);
+        first := deleteBackward(first);
+        assertTrue(stateIs(&first, "ab", 0), "at the start nothing");
+        destroyEditor(first);
+        return nil;
+    end;
+
+    function testDeleteForward(): Unit is
+        var join: Editor := editorAt("a\n\nb", 1);
+        join := deleteForward(join);
+        assertTrue(stateIs(&join, "ab", 1), "Delete at the end joins the next block");
+        destroyEditor(join);
+        var cluster: Editor := editorAt("e\u{301}x", 0);
+        cluster := deleteForward(cluster);
+        assertTrue(stateIs(&cluster, "x", 0), "one cluster forward");
+        destroyEditor(cluster);
+        var last: Editor := editorAt("ab", 2);
+        last := deleteForward(last);
+        assertTrue(stateIs(&last, "ab", 2), "at the end nothing");
+        destroyEditor(last);
+        var selected: Editor := openEditor("abcdef");
+        selected := setSelection(selected, 4, 1);
+        selected := deleteForward(selected);
+        assertTrue(stateIs(&selected, "aef", 1), "a selection backwards is deleted too");
+        destroyEditor(selected);
+        return nil;
+    end;
+
+    function testHeadingsAndTasks(): Unit is
+        var editor: Editor := editorAt("abc", 1);
+        editor := setHeading(editor, 2);
+        assertTrue(stateIs(&editor, "## abc", 4) and (kindAt(&editor, 0) = 2), "a paragraph becomes a heading of level 2");
+        editor := setHeading(editor, 4);
+        assertTrue(stateIs(&editor, "#### abc", 6) and (blockLevel(&editor, 0) = 4), "level 4");
+        editor := setHeading(editor, 0);
+        assertTrue(stateIs(&editor, "abc", 1) and (kindAt(&editor, 0) = 1), "level 0 is a paragraph again");
+        destroyEditor(editor);
+        var setext: Editor := editorAt("T\n===", 1);
+        setext := setHeading(setext, 3);
+        assertTrue(stateIs(&setext, "### T", 5), "a setext heading becomes ATX");
+        destroyEditor(setext);
+        var quote: Editor := editorAt("> a", 3);
+        quote := setHeading(quote, 1);
+        assertTrue(stateIs(&quote, "> a", 3), "a quote does not change");
+        destroyEditor(quote);
+        var task: Editor := openEditor("- [ ] a\n- [x] b");
+        task := toggleTask(task, 0);
+        assertTrue(equal(sourceText(&task), "- [x] a\n- [x] b") and blockChecked(&task, 0), "ticked");
+        task := toggleTask(task, 1);
+        assertTrue(equal(sourceText(&task), "- [x] a\n- [ ] b") and (not (blockChecked(&task, 1))), "unticked");
+        destroyEditor(task);
+        var plain: Editor := openEditor("a");
+        plain := toggleTask(plain, 0);
+        assertTrue(equal(sourceText(&plain), "a") and (not (canUndo(&plain))), "no task, no edit");
+        destroyEditor(plain);
+        return nil;
+    end;
+
+    function testUndoGroups(): Unit is
+        var editor: Editor := openEditor("");
+        assertFalse(canUndo(&editor), "nothing to undo at first");
+        editor := insertText(editor, "a");
+        editor := insertText(editor, "b");
+        editor := insertText(editor, "c");
+        editor := insertText(editor, " ");
+        editor := insertText(editor, "d");
+        assertTrue(stateIs(&editor, "abc d", 5), "typed");
+        editor := undo(editor);
+        assertTrue(stateIs(&editor, "abc ", 4), "the word after the space is one group");
+        editor := undo(editor);
+        assertTrue(stateIs(&editor, "", 0), "the word with its space is one group");
+        assertFalse(canUndo(&editor), "nothing more");
+        assertTrue(canRedo(&editor), "but to redo");
+        editor := redo(editor);
+        assertTrue(stateIs(&editor, "abc ", 4), "redone");
+        editor := redo(editor);
+        assertTrue(stateIs(&editor, "abc d", 5), "redone again");
+        assertFalse(canRedo(&editor), "nothing more to redo");
+        editor := undo(editor);
+        editor := insertText(editor, "x");
+        assertFalse(canRedo(&editor), "a new edit drops the redo");
+        destroyEditor(editor);
+        var back: Editor := editorAt("abc", 3);
+        back := deleteBackward(back);
+        back := deleteBackward(back);
+        back := deleteBackward(back);
+        assertTrue(stateIs(&back, "", 0), "three backspaces");
+        back := undo(back);
+        assertTrue(stateIs(&back, "abc", 3), "undone as one group");
+        destroyEditor(back);
+        var moved: Editor := openEditor("");
+        moved := insertText(moved, "a");
+        moved := moveLeft(moved, false);
+        moved := moveRight(moved, false);
+        moved := insertText(moved, "b");
+        moved := undo(moved);
+        assertTrue(stateIs(&moved, "a", 1), "a cursor move ends the group");
+        destroyEditor(moved);
+        var paused: Editor := openEditor("");
+        paused := insertText(paused, "a");
+        paused := closeUndoGroup(paused);
+        paused := insertText(paused, "b");
+        paused := undo(paused);
+        assertTrue(stateIs(&paused, "a", 1), "closeUndoGroup ends it too");
+        destroyEditor(paused);
+        var compound: Editor := editorAt("- a", 3);
+        compound := pressReturn(compound);
+        compound := pressReturn(compound);
+        compound := undo(compound);
+        assertTrue(stateIs(&compound, "- a\n- ", 6), "each Return is a group");
+        destroyEditor(compound);
+        return nil;
+    end;
+
+    function testLimits(): Unit is
+        assertTrue(mostEditorBytes() = 1048576, "1 MiB of source");
+        assertTrue(mostUndoSteps() = 10000, "10000 undo steps");
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 1048580 do
+            writeByte(&!builder, 'a');
+            i := i + 1;
+        end while;
+        let big: String := finalize(builder);
+        var editor: Editor := openEditor(asSpan(&big));
+        assertTrue(sourceLength(&editor) = 1048576, "cut at the limit");
+        editor := setCursor(editor, 10);
+        editor := insertText(editor, "b");
+        assertTrue(sourceLength(&editor) = 1048576, "nothing more goes in");
+        destroyEditor(editor);
+        destroyString(big);
+        var steps: Editor := openEditor("");
+        var n: Index := 0;
+        while n < 10050 do
+            steps := insertText(steps, "a");
+            steps := closeUndoGroup(steps);
+            n := n + 1;
+        end while;
+        var undone: Index := 0;
+        while canUndo(&steps) do
+            steps := undo(steps);
+            undone := undone + 1;
+        end while;
+        assertTrue(undone = 10000, "only the last 10000 groups are kept");
+        assertTrue(sourceLength(&steps) = 50, "the 50 oldest stay");
+        destroyEditor(steps);
+        return nil;
+    end;
+
+    -- Whether the HTML of the editor over markdown is the HTML of plain.
+    generic [R: Region, P: Region]
+    function htmlLike(markdown: Span[Nat8, R], plain: Span[Nat8, P]): Bool is
+        let editor: Editor := openEditor(markdown);
+        let html: String := editorToHtml(&editor);
+        let expected: String := markdownToHtml(plain);
+        let same: Bool := equal(asSpan(&html), asSpan(&expected));
+        destroyString(expected);
+        destroyString(html);
+        destroyEditor(editor);
+        return same;
+    end;
+
+    function testHtmlOut(): Unit is
+        assertTrue(htmlLike("# T\n\n*a* [b](https://x.example)\n", "# T\n\n*a* [b](https://x.example)\n"), "the HTML of Wolly.Markdown");
+        assertTrue(htmlLike("---\ntitle: x\n---\n# T\n", "# T\n"), "without the front matter");
+        assertTrue(htmlLike("[a][r]\n\n[toc]\n\n[b][r]\n\n[r]: https://r.example\n", "[a][r]\n\n[b][r]\n\n[r]: https://r.example\n"), "a definition holds on both sides of a [toc]");
+        let editor: Editor := openEditor("[toc]\n\n# A *x* ##\n\n## B & C\n");
+        let html: String := editorToHtml(&editor);
+        assertTrue(contains(asSpan(&html), "<ul class=\"toc\"><li class=\"toc-1\">A *x*</li><li class=\"toc-2\">B &amp; C</li></ul>"), "a [toc] lists the headings");
+        assertTrue(contains(asSpan(&html), "<h2>B &amp; C</h2>"), "and the headings follow");
+        destroyString(html);
+        destroyEditor(editor);
+        let script: Editor := openEditor("<script>alert(1)</script>\n");
+        let safe: String := editorToHtml(&script);
+        assertFalse(contains(asSpan(&safe), "<script"), "no script comes out");
+        destroyString(safe);
+        destroyEditor(script);
+        return nil;
+    end;
+
+    function testHtmlIn(): Unit is
+        let editor: Editor := openEditorFromHtml("<h1>T</h1><p>a <strong>b</strong></p><ul><li>c</li></ul>");
+        assertTrue(equal(sourceText(&editor), "# T\n\na **b**\n\n- c\n"), "Lucy HTML as Markdown");
+        assertTrue((kindAt(&editor, 0) = 2) and (kindAt(&editor, 2) = 4), "a heading and an item");
+        let html: String := editorToHtml(&editor);
+        assertTrue(equal(asSpan(&html), "<h1>T</h1>\n<p>a <strong>b</strong></p>\n<ul>\n<li>c</li>\n</ul>\n"), "and back to HTML");
+        destroyString(html);
+        destroyEditor(editor);
+        let empty: Editor := openEditorFromHtml("");
+        assertTrue((blockCount(&empty) = 1) and (sourceLength(&empty) = 0), "no HTML, an empty document");
+        destroyEditor(empty);
+        return nil;
+    end;
+
+    -- Whether the HTML of the editor over markdown holds part.
+    generic [R: Region, P: Region]
+    function htmlHolds(markdown: Span[Nat8, R], part: Span[Nat8, P]): Bool is
+        let editor: Editor := openEditor(markdown);
+        let html: String := editorToHtml(&editor);
+        let holds: Bool := contains(asSpan(&html), part);
+        destroyString(html);
+        destroyEditor(editor);
+        return holds;
+    end;
+
+    function testRawHtmlAndGfm(): Unit is
+        assertTrue(htmlHolds("a <u>b</u> <sub>2</sub>\n", "<p>a <u>b</u> <sub>2</sub></p>"), "inline raw HTML is kept");
+        assertTrue(htmlHolds("<div>\nx\n</div>\n", "<div>\nx\n</div>"), "an HTML block is kept");
+        assertFalse(htmlHolds("<div onclick=\"f()\">x</div>\n", "onclick"), "an event attribute goes");
+        assertFalse(htmlHolds("<iframe src=\"https://x.example\"></iframe>\n", "iframe"), "a frame goes");
+        assertFalse(htmlHolds("<a href=\"javascript:f()\">x</a>\n", "javascript"), "a script URL goes");
+        assertTrue(htmlHolds("~~gone~~\n", "<p><del>gone</del></p>"), "strikethrough");
+        assertTrue(htmlHolds("- [ ] a\n- [x] b\n", "<li class=\"task\">a</li>\n<li class=\"task done\">b</li>"), "task items");
+        let editor: Editor := openEditorFromHtml("<p><del>a</del> <u>u</u></p><ul class=\"todo-list\"><li><label class=\"todo-list__label\"><input type=\"checkbox\" disabled=\"disabled\" checked=\"checked\"><span class=\"todo-list__label__description\">b</span></label></li></ul>");
+        assertTrue(equal(sourceText(&editor), "~~a~~ <u>u</u>\n\n- [x] b\n"), "CKEditor HTML with a done task as Markdown");
+        assertTrue(kindAt(&editor, 1) = 6, "a task block");
+        let html: String := editorToHtml(&editor);
+        assertTrue(equal(asSpan(&html), "<p><del>a</del> <u>u</u></p>\n<ul>\n<li class=\"task done\">b</li>\n</ul>\n"), "and back as HTML");
+        destroyString(html);
+        destroyEditor(editor);
+        return nil;
+    end;
+end module body.

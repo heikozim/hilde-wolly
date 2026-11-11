@@ -1,0 +1,174 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The settings are read as Hilde's own test support does it (DbTest of the tests of
+-- Standard.Database).
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    asSpan,
+    length,
+    nthByte
+);
+import Standard.Text (
+    startsWith
+);
+import Standard.File (
+    environmentValue
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase,
+    noValues,
+    execute,
+    Cursor,
+    start,
+    advance,
+    columnInt64,
+    finish
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Database.Postgres (
+    openPostgres
+);
+
+module body Wolly.TestDb is
+    function setting(name: Span[Nat8, Static]): String is
+        case environmentValue(name) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                print(name);
+                printLn(" is not set: a test on PostgreSQL needs the server of scripts/db/server.sh");
+                abort("TestDb: no server");
+                return fromLiteral("");
+        end case;
+    end;
+
+    function port(name: Span[Nat8, Static]): Nat16 is
+        let text: String := setting(name);
+        var total: Nat64 := 0;
+        var good: Bool := (length(&text) > 0) and (length(&text) <= 5);
+        var i: Index := 0;
+        while good and (i < length(&text)) do
+            let b: Nat8 := nthByte(&text, i);
+            if (b < '0') or (b > '9') then
+                good := false;
+            else
+                case toNat64(b - '0') of
+                    when Some(value as d: Nat64) do
+                        total := (total * 10) + d;
+                    when None do
+                        good := false;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(text);
+        if not good then
+            abort("TestDb: the port is not a number");
+        end if;
+        case toNat16(total) of
+            when Some(value as number: Nat16) do
+                if number = 0 then
+                    abort("TestDb: the port is 0");
+                end if;
+                return number;
+            when None do
+                abort("TestDb: the port is past 65535");
+                return 1;
+        end case;
+    end;
+
+    function releaseAll(a: String, b: String, c: String, d: String, e: String): Unit is
+        destroyString(a);
+        destroyString(b);
+        destroyString(c);
+        destroyString(d);
+        destroyString(e);
+        return nil;
+    end;
+
+    -- Whether WOLLY_DB says postgres.
+    function wantsPostgres(): Bool is
+        case environmentValue("WOLLY_DB") of
+            when Some(value as text: String) do
+                let yes: Bool := (length(&text) = 8) and startsWith(asSpan(&text), "postgres");
+                destroyString(text);
+                return yes;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- opened with the schema public dropped and made again.
+    function cleaned(opened: Database[Writing]): Either[DbError, Database[Writing]] is
+        var db: Database[Writing] := opened;
+        case execute(&!db, "DROP SCHEMA public CASCADE", noValues()) of
+            when Left(left as error: DbError) do
+                closeDatabase(db);
+                return Left(left => error);
+            when Right(right as dropped: Nat64) do
+                case execute(&!db, "CREATE SCHEMA public", noValues()) of
+                    when Left(left as error: DbError) do
+                        closeDatabase(db);
+                        return Left(left => error);
+                    when Right(right as made: Nat64) do
+                        if not unicode(&!db) then
+                            abort("TestDb: the test database is not UTF8; start the server with LC_ALL=C.UTF-8");
+                        end if;
+                        return Right(right => db);
+                end case;
+        end case;
+    end;
+
+    -- Whether the database of db keeps its text as UTF8: in SQL_ASCII, which initdb makes in the C locale, the text
+    -- search of PostgreSQL takes no letter beyond ASCII for one, and a test of it would prove nothing.
+    generic [R: Region]
+    function unicode(db: &![Database[Writing], R]): Bool is
+        var cursor: Cursor := start(&~db, "SELECT count(*) FROM pg_database WHERE datname = current_database() AND encoding = pg_char_to_encoding('UTF8')", noValues());
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return false;
+            when None do
+                return count = 1;
+        end case;
+    end;
+
+    function openPostgresClean(): Either[DbError, Database[Writing]] is
+        let host: String := setting("HILDE_PG_HOST");
+        let database: String := setting("HILDE_PG_DATABASE");
+        let user: String := setting("HILDE_PG_USER");
+        let secret: String := setting("HILDE_PG_PASSWORD");
+        let ca: String := setting("HILDE_PG_CA");
+        let number: Nat16 := port("HILDE_PG_PORT");
+        let result: Either[DbError, Database[Writing]] := openPostgres(asSpan(&host), number, asSpan(&database), asSpan(&user), asSpan(&secret), asSpan(&ca));
+        releaseAll(host, database, user, secret, ca);
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as opened: Database[Writing]) do
+                return cleaned(opened);
+        end case;
+    end;
+
+    function openTestDatabase(): Either[DbError, Database[Writing]] is
+        if wantsPostgres() then
+            return openPostgresClean();
+        else
+            return openSqlite(":memory:");
+        end if;
+    end;
+end module body.

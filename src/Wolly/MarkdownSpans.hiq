@@ -1,0 +1,1845 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    storeNth,
+    insertBack,
+    removeLast,
+    destroyFree
+);
+import Standard.String (
+    String,
+    asSpan,
+    fromByteBuffer,
+    destroyString
+);
+import Standard.Text (
+    substring,
+    equal
+);
+import Standard.Utf8 (
+    Decoded,
+    decodeAt,
+    decodedPoint,
+    decodedWidth,
+    codePointValue
+);
+import Standard.UnicodeProperties (
+    generalCategory
+);
+
+module body Wolly.MarkdownSpans is
+    -- The kinds of a span, as numbers; kindOf turns them into SpanKind.
+    constant k_emphasis: Index := 0;
+    constant k_strong: Index := 1;
+    constant k_strike: Index := 2;
+    constant k_code: Index := 3;
+    constant k_link: Index := 4;
+    constant k_image: Index := 5;
+    constant k_autolink: Index := 6;
+    constant k_bare: Index := 7;
+    constant k_html: Index := 8;
+    constant k_escape: Index := 9;
+    constant k_entity: Index := 10;
+    constant k_footnote: Index := 11;
+    constant k_emoji: Index := 12;
+
+    -- No index: no span, no run, no parent.
+    constant no_index: Index := 4294967295;
+    -- No code point: what pointAt gives where no well-formed UTF-8 begins.
+    constant no_point: Index := 1114112;
+    -- No run of delimiters: the end of their list.
+    constant no_delim: Index := 0;
+
+    -- The places in the memo of htmlEnd: from which place on no closer of
+    -- a comment, a processing instruction, a CDATA section, a declaration,
+    -- a double or a single quote exists.
+    constant m_comment: Index := 0;
+    constant m_instruction: Index := 1;
+    constant m_cdata: Index := 2;
+    constant m_declaration: Index := 3;
+    constant m_double: Index := 4;
+    constant m_single: Index := 5;
+
+    -- One span: its kind, its source start to stop, the part shown when it
+    -- is rendered, and the index of its parent (no_index for none).
+    record Item: Free is
+        kind: Index;
+        start: Index;
+        stop: Index;
+        innerStart: Index;
+        innerStop: Index;
+        parent: Index;
+    end;
+
+    record Spans: Linear is
+        items: Buffer[Item];
+        invariant length(&items) <= 65536;
+    end;
+
+    function mostSpans(): Index is
+        return 65536;
+    end;
+
+    function mostSpanBytes(): Index is
+        return 1048576;
+    end;
+
+    ---
+    --- Bytes and code points
+    ---
+
+    function isAsciiLetter(byte: Nat8): Bool is
+        return ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+    end;
+
+    function isAsciiDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    function isAlnum(byte: Nat8): Bool is
+        return isAsciiLetter(byte) or isAsciiDigit(byte);
+    end;
+
+    function isHexByte(byte: Nat8): Bool is
+        return (isAsciiDigit(byte) or ((byte >= 'a') and (byte <= 'f'))) or ((byte >= 'A') and (byte <= 'F'));
+    end;
+
+    -- Whether byte is ASCII punctuation, which a backslash escapes.
+    function isPunctByte(byte: Nat8): Bool is
+        let low: Bool := (byte >= 33) and (byte <= 47);
+        let middle: Bool := (byte >= 58) and (byte <= 64);
+        let high: Bool := ((byte >= 91) and (byte <= 96)) or ((byte >= 123) and (byte <= 126));
+        return (low or middle) or high;
+    end;
+
+    -- Whether byte is a blank, a tab or a line end.
+    function isBlankByte(byte: Nat8): Bool is
+        return ((byte = ' ') or (byte = 9)) or ((byte = 10) or (byte = 13));
+    end;
+
+    -- The value of byte as an Index.
+    function valueOf(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The byte with the value n, for n below 256.
+    function byteFor(n: Index): Nat8 is
+        case toNat8(n) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Whether the bytes of seq stand at at of raw.
+    generic [S: Region]
+    function startsAt(raw: Span[Nat8, S], at: Index, seq: Span[Nat8, Static]): Bool is
+        let n: Index := spanLength(seq);
+        if (at + n) > spanLength(raw) then
+            return false;
+        end if;
+        var k: Index := 0;
+        while k < n do
+            if raw[at + k] /= seq[k] then
+                return false;
+            end if;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+
+    -- A code point and the bytes it takes.
+    record Point: Free is
+        value: Index;
+        size: Index;
+    end;
+
+    -- The code point that starts at i of raw; no_point, one byte long,
+    -- where no well-formed UTF-8 begins.
+    generic [S: Region]
+    function pointAt(raw: Span[Nat8, S], i: Index): Point is
+        case decodeAt(raw, i) of
+            when Some(value as decoded: Decoded) do
+                case toIndex(codePointValue(decodedPoint(decoded))) of
+                    when Some(value as point: Index) do
+                        return Point(value => point, size => decodedWidth(decoded));
+                    when None do
+                        return Point(value => no_point, size => 1);
+                end case;
+            when None do
+                return Point(value => no_point, size => 1);
+        end case;
+    end;
+
+    -- The code point that ends right before i of raw; a line feed at the
+    -- start, no_point after bytes that are no well-formed UTF-8.
+    generic [S: Region]
+    function pointBefore(raw: Span[Nat8, S], i: Index): Index is
+        if i = 0 then
+            return 10;
+        end if;
+        var start: Index := i - 1;
+        var steps: Index := 0;
+        while (start > 0) and (steps < 3) and ((raw[start] >= 128) and (raw[start] <= 191)) do
+            start := start - 1;
+            steps := steps + 1;
+        end while;
+        let p: Point := pointAt(raw, start);
+        if (p.value /= no_point) and ((start + p.size) = i) then
+            return p.value;
+        end if;
+        return no_point;
+    end;
+
+    -- Whether code point c is white space for the rules of emphasis: a
+    -- blank, a tab, a line end, a form feed or of the class Zs.
+    function isSpacePoint(c: Index): Bool is
+        if c = no_point then
+            return false;
+        end if;
+        if (((c = 9) or (c = 10)) or ((c = 12) or (c = 13))) or (c = 32) then
+            return true;
+        end if;
+        if c < 128 then
+            return false;
+        end if;
+        let category: Span[Nat8, Static] := generalCategory(c);
+        return (category[0] = 'Z') and (category[1] = 's');
+    end;
+
+    -- Whether code point c is punctuation for the rules of emphasis: of a
+    -- class P or S.
+    function isPunctPoint(c: Index): Bool is
+        if c = no_point then
+            return false;
+        end if;
+        if c < 128 then
+            return isPunctByte(byteFor(c));
+        end if;
+        let category: Span[Nat8, Static] := generalCategory(c);
+        return (category[0] = 'P') or (category[0] = 'S');
+    end;
+
+    ---
+    --- Spans
+    ---
+
+    -- Appends a span; its index, or no_index when mostSpans are there.
+    generic [I: Region]
+    function addItem(items: &![Buffer[Item], I], kind: Index, start: Index, stop: Index, inner_start: Index, inner_stop: Index): Index is
+        let count: Index := lengthMut(&~items);
+        if count >= mostSpans() then
+            return no_index;
+        end if;
+        insertBack(&~items, Item(kind => kind, start => start, stop => stop, innerStart => inner_start, innerStop => inner_stop, parent => no_index));
+        return count;
+    end;
+
+    ---
+    --- Delimiter runs
+    ---
+
+    -- A run of * _ or ~ that may open or close.  pos is where the run
+    -- starts, orig its length, count what is left of it (taken from the
+    -- right of an opener, from the left of a closer); prev and next link
+    -- the runs in the order of the text, 0 for none, entry 0 being the head
+    -- whose prev is the last.
+    record Delim: Free is
+        pos: Index;
+        mark: Nat8;
+        count: Index;
+        orig: Index;
+        canOpen: Bool;
+        canClose: Bool;
+        prev: Index;
+        next: Index;
+    end;
+
+    function emptyDelim(): Delim is
+        return Delim(pos => 0, mark => 0, count => 0, orig => 0, canOpen => false, canClose => false, prev => 0, next => 0);
+    end;
+
+    generic [D: Region]
+    function delimAt(delims: &![Buffer[Delim], D], id: Index): Delim is
+        return nthMut(&~delims, id);
+    end;
+
+    generic [D: Region]
+    function putDelim(delims: &![Buffer[Delim], D], id: Index, delim: Delim): Unit is
+        storeNth(&~delims, id, delim);
+        return nil;
+    end;
+
+    -- The last run of the list, 0 when it is empty.
+    generic [D: Region]
+    function delimTail(delims: &![Buffer[Delim], D]): Index is
+        let sentinel: Delim := delimAt(&~delims, 0);
+        return sentinel.prev;
+    end;
+
+    -- Takes run id out of the list of runs.
+    generic [D: Region]
+    function removeDelim(delims: &![Buffer[Delim], D], id: Index): Unit is
+        let delim: Delim := delimAt(&~delims, id);
+        var before: Delim := delimAt(&~delims, delim.prev);
+        before.next := delim.next;
+        putDelim(&~delims, delim.prev, before);
+        if delim.next /= 0 then
+            var after: Delim := delimAt(&~delims, delim.next);
+            after.prev := delim.prev;
+            putDelim(&~delims, delim.next, after);
+        else
+            var head: Delim := delimAt(&~delims, 0);
+            head.prev := delim.prev;
+            putDelim(&~delims, 0, head);
+        end if;
+        return nil;
+    end;
+
+    -- Which of the sixteen limits a closer looks back to: by mark, by the
+    -- length of the run (modulo 3 for * and _), by whether it may open.
+    function limitKey(mark: Nat8, orig: Index, can_open: Bool): Index is
+        var key: Index := 0;
+        if mark = '~' then
+            key := 12 + ((orig - 1) * 2);
+        else
+            key := (orig - ((orig / 3) * 3)) * 2;
+            if mark = '_' then
+                key := key + 6;
+            end if;
+        end if;
+        if can_open then
+            key := key + 1;
+        end if;
+        return key;
+    end;
+
+    -- Whether the opener o matches the closer c: the same mark; for ~ the
+    -- same length; for * and _ the rule of multiples of 3.
+    function matches(o: Delim, c: Delim): Bool is
+        if (o.mark /= c.mark) or (not o.canOpen) then
+            return false;
+        end if;
+        if c.mark = '~' then
+            return o.orig = c.orig;
+        end if;
+        let both: Bool := c.canOpen or o.canClose;
+        let sum: Index := o.orig + c.orig;
+        let rule: Bool := (sum - ((sum / 3) * 3)) = 0;
+        let each: Bool := ((o.orig - ((o.orig / 3) * 3)) = 0) and ((c.orig - ((c.orig / 3) * 3)) = 0);
+        return not ((both and rule) and (not each));
+    end;
+
+    -- Turns the runs above bottom into emphasis, strong and strikethrough
+    -- spans, as far as they match, and takes them all off the list.
+    generic [I: Region, D: Region]
+    function processEmphasis(items: &![Buffer[Item], I], delims: &![Buffer[Delim], D], bottom: Index): Unit is
+        var limits: Buffer[Index] := initialize(16, bottom);
+        let head: Delim := delimAt(&~delims, bottom);
+        var closer: Index := head.next;
+        while closer /= 0 do
+            let c: Delim := delimAt(&~delims, closer);
+            if c.canClose then
+                let key: Index := limitKey(c.mark, c.orig, c.canOpen);
+                let floor: Index := nth(&limits, key);
+                var opener: Index := c.prev;
+                var found: Bool := false;
+                while (opener > floor) and (not found) do
+                    let o: Delim := delimAt(&~delims, opener);
+                    if matches(o, c) then
+                        found := true;
+                    else
+                        opener := o.prev;
+                    end if;
+                end while;
+                if found then
+                    let o: Delim := delimAt(&~delims, opener);
+                    var use: Index := 1;
+                    var kind: Index := k_emphasis;
+                    if c.mark = '~' then
+                        use := c.count;
+                        kind := k_strike;
+                    else
+                        if (c.count >= 2) and (o.count >= 2) then
+                            use := 2;
+                            kind := k_strong;
+                        end if;
+                    end if;
+                    let open_end: Index := o.pos + o.count;
+                    let close_left: Index := c.pos + (c.orig - c.count);
+                    ignore(addItem(&~items, kind, open_end - use, close_left + use, open_end, close_left));
+                    var od: Delim := o;
+                    od.count := o.count - use;
+                    od.next := closer;
+                    putDelim(&~delims, opener, od);
+                    var cd: Delim := c;
+                    cd.count := c.count - use;
+                    cd.prev := opener;
+                    putDelim(&~delims, closer, cd);
+                    if od.count = 0 then
+                        removeDelim(&~delims, opener);
+                    end if;
+                    if cd.count = 0 then
+                        let after: Index := cd.next;
+                        removeDelim(&~delims, closer);
+                        closer := after;
+                    end if;
+                else
+                    storeNth(&!limits, key, c.prev);
+                    let after: Index := c.next;
+                    if not c.canOpen then
+                        removeDelim(&~delims, closer);
+                    end if;
+                    closer := after;
+                end if;
+            else
+                closer := c.next;
+            end if;
+        end while;
+        var top: Delim := delimAt(&~delims, bottom);
+        top.next := no_delim;
+        putDelim(&~delims, bottom, top);
+        var sentinel: Delim := delimAt(&~delims, 0);
+        sentinel.prev := bottom;
+        putDelim(&~delims, 0, sentinel);
+        destroyFree(limits);
+        return nil;
+    end;
+
+    -- A run of * _ or ~ at pos: an entry of the list of runs when it may
+    -- open or close (a run of ~ only when one or two long).  The index
+    -- after the run.
+    generic [D: Region, S: Region]
+    function runDelim(delims: &![Buffer[Delim], D], raw: Span[Nat8, S], pos: Index): Index is
+        let size: Index := spanLength(raw);
+        let mark: Nat8 := raw[pos];
+        var e: Index := pos;
+        while (e < size) and (raw[e] = mark) do
+            e := e + 1;
+        end while;
+        if (mark = '~') and ((e - pos) > 2) then
+            return e;
+        end if;
+        let before: Index := pointBefore(raw, pos);
+        var after: Index := 10;
+        if e < size then
+            let p: Point := pointAt(raw, e);
+            after := p.value;
+        end if;
+        let before_space: Bool := isSpacePoint(before);
+        let after_space: Bool := isSpacePoint(after);
+        let before_punct: Bool := isPunctPoint(before);
+        let after_punct: Bool := isPunctPoint(after);
+        let left: Bool := (not after_space) and ((not after_punct) or (before_space or before_punct));
+        let right: Bool := (not before_space) and ((not before_punct) or (after_space or after_punct));
+        var can_open: Bool := left;
+        var can_close: Bool := right;
+        if mark = '_' then
+            can_open := left and ((not right) or before_punct);
+            can_close := right and ((not left) or after_punct);
+        end if;
+        if can_open or can_close then
+            let tail_id: Index := delimTail(&~delims);
+            let entry: Index := lengthMut(&~delims);
+            insertBack(&~delims, Delim(pos => pos, mark => mark, count => e - pos, orig => e - pos, canOpen => can_open, canClose => can_close, prev => tail_id, next => 0));
+            var tail: Delim := delimAt(&~delims, tail_id);
+            tail.next := entry;
+            putDelim(&~delims, tail_id, tail);
+            var sentinel: Delim := delimAt(&~delims, 0);
+            sentinel.prev := entry;
+            putDelim(&~delims, 0, sentinel);
+        end if;
+        return e;
+    end;
+
+    ---
+    --- Code spans
+    ---
+
+    -- A maximal run of backticks: where it starts, how long it is, and the
+    -- next run of the same length (no_index for none).
+    record Run: Free is
+        start: Index;
+        size: Index;
+        next: Index;
+    end;
+
+    -- Collects the runs of backticks of raw; the length of the longest.
+    generic [S: Region, U: Region]
+    function collectRuns(raw: Span[Nat8, S], runs: &![Buffer[Run], U]): Index is
+        let size: Index := spanLength(raw);
+        var longest: Index := 0;
+        var i: Index := 0;
+        while i < size do
+            if raw[i] = '`' then
+                var j: Index := i;
+                while (j < size) and (raw[j] = '`') do
+                    j := j + 1;
+                end while;
+                insertBack(&~runs, Run(start => i, size => j - i, next => no_index));
+                if (j - i) > longest then
+                    longest := j - i;
+                end if;
+                i := j;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        return longest;
+    end;
+
+    -- Links every run to the next of its length; for every length the
+    -- first run of it, the cursor codeAt moves forward.
+    generic [U: Region]
+    function linkRuns(runs: &![Buffer[Run], U], longest: Index): Buffer[Index] is
+        var heads: Buffer[Index] := initialize(longest + 1, no_index);
+        var r: Index := lengthMut(&~runs);
+        while r > 0 do
+            r := r - 1;
+            var run: Run := nthMut(&~runs, r);
+            run.next := nth(&heads, run.size);
+            storeNth(&~runs, r, run);
+            storeNth(&!heads, run.size, r);
+        end while;
+        return heads;
+    end;
+
+    -- The index of the run that holds pos, looking from run since on.
+    generic [U: Region]
+    function runAt(runs: &![Buffer[Run], U], since: Index, pos: Index): Index is
+        var rc: Index := since;
+        while rc < lengthMut(&~runs) do
+            let run: Run := nthMut(&~runs, rc);
+            if (run.start + run.size) > pos then
+                return rc;
+            end if;
+            rc := rc + 1;
+        end while;
+        return rc;
+    end;
+
+    -- The backticks at pos, in run rc: a code span when a later run of the
+    -- same length closes it.  The index after the span, or after the
+    -- backticks when none closes.
+    generic [I: Region, U: Region, H: Region, S: Region]
+    function codeAt(items: &![Buffer[Item], I], runs: &![Buffer[Run], U], heads: &![Buffer[Index], H], rc: Index, raw: Span[Nat8, S], pos: Index): Index is
+        let run: Run := nthMut(&~runs, rc);
+        let e: Index := run.start + run.size;
+        let k: Index := e - pos;
+        var c: Index := no_index;
+        if k < lengthMut(&~heads) then
+            c := nthMut(&~heads, k);
+            while (c /= no_index) and (c <= rc) do
+                let later: Run := nthMut(&~runs, c);
+                c := later.next;
+            end while;
+            storeNth(&~heads, k, c);
+        end if;
+        if c = no_index then
+            return e;
+        end if;
+        let closer: Run := nthMut(&~runs, c);
+        var lo: Index := e;
+        var hi: Index := closer.start;
+        if (hi - lo) >= 2 then
+            let first: Nat8 := raw[lo];
+            let last: Nat8 := raw[hi - 1];
+            if ((first = ' ') or (first = 10)) and ((last = ' ') or (last = 10)) then
+                var filled: Bool := false;
+                var i: Index := lo;
+                while i < hi do
+                    if (raw[i] /= ' ') and (raw[i] /= 10) then
+                        filled := true;
+                    end if;
+                    i := i + 1;
+                end while;
+                if filled then
+                    lo := lo + 1;
+                    hi := hi - 1;
+                end if;
+            end if;
+        end if;
+        ignore(addItem(&~items, k_code, pos, closer.start + k, lo, hi));
+        return closer.start + k;
+    end;
+
+    ---
+    --- Escapes, entities, emoji
+    ---
+
+    -- A backslash at pos: an escape span before ASCII punctuation.  The
+    -- index after what was read.
+    generic [I: Region, S: Region]
+    function escapeAt(items: &![Buffer[Item], I], raw: Span[Nat8, S], pos: Index): Index is
+        if (pos + 1) < spanLength(raw) then
+            if isPunctByte(raw[pos + 1]) then
+                ignore(addItem(&~items, k_escape, pos, pos + 2, pos + 1, pos + 2));
+                return pos + 2;
+            end if;
+        end if;
+        return pos + 1;
+    end;
+
+    -- The index after the ; of the character reference that starts at i of
+    -- raw: & with a letter and 1 to 30 letters and digits, &# with 1 to 7
+    -- digits, &#x with 1 to 6 hexadecimal digits, then ;.  0 when none
+    -- starts there.
+    generic [S: Region]
+    function entityEnd(raw: Span[Nat8, S], i: Index): Index is
+        let size: Index := spanLength(raw);
+        if (i + 2) >= size then
+            return 0;
+        end if;
+        var j: Index := i + 1;
+        var count: Index := 0;
+        if raw[j] = '#' then
+            j := j + 1;
+            if (raw[j] = 'x') or (raw[j] = 'X') then
+                j := j + 1;
+                while ((j < size) and (count < 7)) and isHexByte(raw[j]) do
+                    count := count + 1;
+                    j := j + 1;
+                end while;
+                if (count < 1) or (count > 6) then
+                    return 0;
+                end if;
+            else
+                while ((j < size) and (count < 8)) and isAsciiDigit(raw[j]) do
+                    count := count + 1;
+                    j := j + 1;
+                end while;
+                if (count < 1) or (count > 7) then
+                    return 0;
+                end if;
+            end if;
+        else
+            if not isAsciiLetter(raw[j]) then
+                return 0;
+            end if;
+            while ((j < size) and (count < 32)) and isAlnum(raw[j]) do
+                count := count + 1;
+                j := j + 1;
+            end while;
+            if (count < 2) or (count > 31) then
+                return 0;
+            end if;
+        end if;
+        if (j < size) and (raw[j] = ';') then
+            return j + 1;
+        end if;
+        return 0;
+    end;
+
+    -- An & at pos: an entity span when a character reference starts there.
+    generic [I: Region, S: Region]
+    function entityAt(items: &![Buffer[Item], I], raw: Span[Nat8, S], pos: Index): Index is
+        let stop: Index := entityEnd(raw, pos);
+        if stop = 0 then
+            return pos + 1;
+        end if;
+        ignore(addItem(&~items, k_entity, pos, stop, pos, stop));
+        return stop;
+    end;
+
+    -- Whether byte may stand in the name of an emoji.
+    function isEmojiByte(byte: Nat8): Bool is
+        let small: Bool := (byte >= 'a') and (byte <= 'z');
+        return (small or isAsciiDigit(byte)) or (((byte = '_') or (byte = '+')) or (byte = '-'));
+    end;
+
+    -- A colon at pos: an emoji span :name: when a name and a colon follow.
+    generic [I: Region, S: Region]
+    function emojiAt(items: &![Buffer[Item], I], raw: Span[Nat8, S], pos: Index): Index is
+        let size: Index := spanLength(raw);
+        var j: Index := pos + 1;
+        while (j < size) and isEmojiByte(raw[j]) do
+            j := j + 1;
+        end while;
+        if (j > (pos + 1)) and (j < size) then
+            if raw[j] = ':' then
+                ignore(addItem(&~items, k_emoji, pos, j + 1, pos, j + 1));
+                return j + 1;
+            end if;
+        end if;
+        return pos + 1;
+    end;
+
+    ---
+    --- Autolinks and raw HTML
+    ---
+
+    -- Whether text is an absolute URI of an autolink: a scheme of 2 to 32
+    -- letters, digits, + . -, starting with a letter, and a colon.
+    generic [S: Region]
+    function isUriText(text: Span[Nat8, S]): Bool is
+        if (spanLength(text) < 3) or (not isAsciiLetter(text[0])) then
+            return false;
+        end if;
+        var i: Index := 1;
+        while ((i < spanLength(text)) and (i < 33)) and ((isAlnum(text[i]) or (text[i] = '+')) or ((text[i] = '.') or (text[i] = '-'))) do
+            i := i + 1;
+        end while;
+        return ((i >= 2) and (i < spanLength(text))) and (text[i] = ':');
+    end;
+
+    -- Whether text is a host name: labels of letters, digits and hyphens, none
+    -- empty or longer than 63 bytes or starting or ending with a hyphen, with
+    -- dots between.
+    generic [S: Region]
+    function isDomainText(text: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(text);
+        if size = 0 then
+            return false;
+        end if;
+        var label_size: Index := 0;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if byte = '.' then
+                if (label_size = 0) or (text[i - 1] = '-') then
+                    return false;
+                end if;
+                label_size := 0;
+            else
+                if not (isAlnum(byte) or (byte = '-')) then
+                    return false;
+                end if;
+                if (byte = '-') and (label_size = 0) then
+                    return false;
+                end if;
+                label_size := label_size + 1;
+                if label_size > 63 then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return (label_size > 0) and (text[size - 1] /= '-');
+    end;
+
+    -- Whether byte may stand in the local part of an e-mail address.
+    function isMailByte(byte: Nat8): Bool is
+        if isAlnum(byte) or (byte = '.') then
+            return true;
+        end if;
+        let a: Bool := ((byte = '!') or (byte = '#')) or ((byte = '$') or (byte = '%'));
+        let b: Bool := ((byte = '&') or (byte = 39)) or ((byte = '*') or (byte = '+'));
+        let c: Bool := ((byte = '/') or (byte = '=')) or ((byte = '?') or (byte = '^'));
+        let d: Bool := ((byte = '_') or (byte = '`')) or ((byte = '{') or (byte = '|'));
+        let e: Bool := ((byte = '}') or (byte = '~')) or (byte = '-');
+        return (a or b) or ((c or d) or e);
+    end;
+
+    -- Whether text is an e-mail address of an autolink.
+    generic [S: Region]
+    function isMailText(text: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if not isMailByte(byte) then
+                if (byte = '@') and (i > 0) then
+                    return isDomainText(substring(text, i + 1, size));
+                end if;
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The index after the autolink <...> at pos, 0 for none.
+    generic [S: Region]
+    function autolinkEnd(raw: Span[Nat8, S], pos: Index): Index is
+        let size: Index := spanLength(raw);
+        var j: Index := pos + 1;
+        while (j < size) and (raw[j] /= '>') do
+            if ((raw[j] <= 32) or (raw[j] = '<')) or (raw[j] = 127) then
+                return 0;
+            end if;
+            j := j + 1;
+        end while;
+        if j >= size then
+            return 0;
+        end if;
+        let inner: Span[Nat8, S] := substring(raw, pos + 1, j);
+        if isUriText(inner) or isMailText(inner) then
+            return j + 1;
+        end if;
+        return 0;
+    end;
+
+    -- The first place at or after since where seq stands, no_index for none.
+    -- The memo entry key says from which place on none stands; a search
+    -- from there gives up at once, a failed one sets it.
+    generic [S: Region, M: Region]
+    function closerAfter(raw: Span[Nat8, S], since: Index, seq: Span[Nat8, Static], memo: &![Buffer[Index], M], key: Index): Index is
+        if since >= nthMut(&~memo, key) then
+            return no_index;
+        end if;
+        var at: Index := since;
+        while (at + spanLength(seq)) <= spanLength(raw) do
+            if startsAt(raw, at, seq) then
+                return at;
+            end if;
+            at := at + 1;
+        end while;
+        storeNth(&~memo, key, since);
+        return no_index;
+    end;
+
+    -- The first place at or after since where quote stands, as closerAfter.
+    generic [S: Region, M: Region]
+    function quoteAfter(raw: Span[Nat8, S], since: Index, quote: Nat8, memo: &![Buffer[Index], M], key: Index): Index is
+        if since >= nthMut(&~memo, key) then
+            return no_index;
+        end if;
+        var at: Index := since;
+        while at < spanLength(raw) do
+            if raw[at] = quote then
+                return at;
+            end if;
+            at := at + 1;
+        end while;
+        storeNth(&~memo, key, since);
+        return no_index;
+    end;
+
+    -- The index after blanks, tabs and line ends from i.
+    generic [S: Region]
+    function skipBlanks(raw: Span[Nat8, S], i: Index): Index is
+        var j: Index := i;
+        while (j < spanLength(raw)) and isBlankByte(raw[j]) do
+            j := j + 1;
+        end while;
+        return j;
+    end;
+
+    -- The index after the tag name from i: letters, digits and hyphens.
+    generic [S: Region]
+    function tagNameEnd(raw: Span[Nat8, S], i: Index): Index is
+        var j: Index := i;
+        while (j < spanLength(raw)) and (isAlnum(raw[j]) or (raw[j] = '-')) do
+            j := j + 1;
+        end while;
+        return j;
+    end;
+
+    -- Whether byte may start the name of an attribute.
+    function isAttrStart(byte: Nat8): Bool is
+        return (isAsciiLetter(byte) or (byte = '_')) or (byte = ':');
+    end;
+
+    -- Whether byte may stand in the name of an attribute.
+    function isAttrByte(byte: Nat8): Bool is
+        return (isAttrStart(byte) or isAsciiDigit(byte)) or ((byte = '.') or (byte = '-'));
+    end;
+
+    -- Whether byte ends an unquoted attribute value.
+    function endsValue(byte: Nat8): Bool is
+        let quote: Bool := ((byte = '"') or (byte = 39)) or (byte = '`');
+        let sign: Bool := ((byte = '=') or (byte = '<')) or (byte = '>');
+        return (isBlankByte(byte) or quote) or sign;
+    end;
+
+    -- The index after the attribute value that starts at v, 0 for none.
+    generic [S: Region, M: Region]
+    function valueEnd(raw: Span[Nat8, S], v: Index, memo: &![Buffer[Index], M]): Index is
+        let size: Index := spanLength(raw);
+        if v >= size then
+            return 0;
+        end if;
+        if raw[v] = '"' then
+            let at: Index := quoteAfter(raw, v + 1, '"', &~memo, m_double);
+            if at = no_index then
+                return 0;
+            end if;
+            return at + 1;
+        end if;
+        if raw[v] = 39 then
+            let at: Index := quoteAfter(raw, v + 1, 39, &~memo, m_single);
+            if at = no_index then
+                return 0;
+            end if;
+            return at + 1;
+        end if;
+        var n: Index := v;
+        while (n < size) and (not endsValue(raw[n])) do
+            n := n + 1;
+        end while;
+        if n = v then
+            return 0;
+        end if;
+        return n;
+    end;
+
+    -- The index after the open tag at pos, whose name starts at pos + 1;
+    -- 0 for none.
+    generic [S: Region, M: Region]
+    function openTagEnd(raw: Span[Nat8, S], pos: Index, memo: &![Buffer[Index], M]): Index is
+        let size: Index := spanLength(raw);
+        var j: Index := tagNameEnd(raw, pos + 1);
+        while true do
+            let w: Index := skipBlanks(raw, j);
+            if w >= size then
+                return 0;
+            end if;
+            if raw[w] = '>' then
+                return w + 1;
+            end if;
+            if raw[w] = '/' then
+                if ((w + 1) < size) and (raw[w + 1] = '>') then
+                    return w + 2;
+                end if;
+                return 0;
+            end if;
+            if (w = j) or (not isAttrStart(raw[w])) then
+                return 0;
+            end if;
+            var n: Index := w + 1;
+            while (n < size) and isAttrByte(raw[n]) do
+                n := n + 1;
+            end while;
+            j := n;
+            let eq: Index := skipBlanks(raw, n);
+            if eq < size then
+                if raw[eq] = '=' then
+                    let stop: Index := valueEnd(raw, skipBlanks(raw, eq + 1), &~memo);
+                    if stop = 0 then
+                        return 0;
+                    end if;
+                    j := stop;
+                end if;
+            end if;
+        end while;
+    end;
+
+    -- The index after the raw HTML at pos (CommonMark 6.6): an open or
+    -- closing tag, a comment, a processing instruction, a declaration or a
+    -- CDATA section; 0 for none.
+    generic [S: Region, M: Region]
+    function htmlEnd(raw: Span[Nat8, S], pos: Index, memo: &![Buffer[Index], M]): Index is
+        let size: Index := spanLength(raw);
+        if (pos + 2) >= size then
+            return 0;
+        end if;
+        let second: Nat8 := raw[pos + 1];
+        if isAsciiLetter(second) then
+            return openTagEnd(raw, pos, &~memo);
+        end if;
+        if second = '/' then
+            if not isAsciiLetter(raw[pos + 2]) then
+                return 0;
+            end if;
+            let w: Index := skipBlanks(raw, tagNameEnd(raw, pos + 2));
+            if (w < size) and (raw[w] = '>') then
+                return w + 1;
+            end if;
+            return 0;
+        end if;
+        if second = '?' then
+            let at: Index := closerAfter(raw, pos + 2, "?>", &~memo, m_instruction);
+            if at = no_index then
+                return 0;
+            end if;
+            return at + 2;
+        end if;
+        if second /= '!' then
+            return 0;
+        end if;
+        if startsAt(raw, pos, "<!--") then
+            if startsAt(raw, pos + 4, ">") then
+                return pos + 5;
+            end if;
+            if startsAt(raw, pos + 4, "->") then
+                return pos + 6;
+            end if;
+            let at: Index := closerAfter(raw, pos + 4, "-->", &~memo, m_comment);
+            if at = no_index then
+                return 0;
+            end if;
+            return at + 3;
+        end if;
+        if startsAt(raw, pos, "<![CDATA[") then
+            let at: Index := closerAfter(raw, pos + 9, "]]>", &~memo, m_cdata);
+            if at = no_index then
+                return 0;
+            end if;
+            return at + 3;
+        end if;
+        if isAsciiLetter(raw[pos + 2]) then
+            let at: Index := closerAfter(raw, pos + 2, ">", &~memo, m_declaration);
+            if at = no_index then
+                return 0;
+            end if;
+            return at + 1;
+        end if;
+        return 0;
+    end;
+
+    -- A < at pos: an autolink or raw HTML span.  The index after it.
+    generic [I: Region, M: Region, S: Region]
+    function angleAt(items: &![Buffer[Item], I], memo: &![Buffer[Index], M], raw: Span[Nat8, S], pos: Index): Index is
+        let link: Index := autolinkEnd(raw, pos);
+        if link > 0 then
+            ignore(addItem(&~items, k_autolink, pos, link, pos, link));
+            return link;
+        end if;
+        let tag: Index := htmlEnd(raw, pos, &~memo);
+        if tag > 0 then
+            ignore(addItem(&~items, k_html, pos, tag, pos, tag));
+            return tag;
+        end if;
+        return pos + 1;
+    end;
+
+    ---
+    --- Bare links (GFM extended autolinks)
+    ---
+
+    -- Whether raw[a, b) is a valid domain: segments of letters, digits, _
+    -- and -, none empty, at least one period, no _ in the last two.
+    generic [S: Region]
+    function isValidDomain(raw: Span[Nat8, S], a: Index, b: Index): Bool is
+        if b <= a then
+            return false;
+        end if;
+        var periods: Index := 0;
+        var segment: Index := 0;
+        var low_now: Bool := false;
+        var low_before: Bool := false;
+        var i: Index := a;
+        while i < b do
+            if raw[i] = '.' then
+                if segment = 0 then
+                    return false;
+                end if;
+                periods := periods + 1;
+                low_before := low_now;
+                low_now := false;
+                segment := 0;
+            else
+                segment := segment + 1;
+                if raw[i] = '_' then
+                    low_now := true;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return ((segment > 0) and (periods >= 1)) and ((not low_now) and (not low_before));
+    end;
+
+    -- Whether byte may stand in a domain.
+    function isDomainByte(byte: Nat8): Bool is
+        return (isAlnum(byte) or (byte = '_')) or ((byte = '-') or (byte = '.'));
+    end;
+
+    -- Whether byte is trailing punctuation that a bare link leaves out.
+    function isTrailByte(byte: Nat8): Bool is
+        let a: Bool := ((byte = '?') or (byte = '!')) or ((byte = '.') or (byte = ','));
+        let b: Bool := ((byte = ':') or (byte = '*')) or ((byte = '_') or (byte = '~'));
+        return a or b;
+    end;
+
+    -- The index after the bare link at pos, 0 for none: www., http:// or
+    -- https:// after the start, white space, *, _, ~ or (; a valid domain;
+    -- then all up to white space or <, without trailing punctuation, an
+    -- unbalanced ) and an entity-like &name; at the end.
+    generic [S: Region]
+    function bareLinkEnd(raw: Span[Nat8, S], pos: Index): Index is
+        let size: Index := spanLength(raw);
+        if pos > 0 then
+            let prev: Nat8 := raw[pos - 1];
+            let mark: Bool := ((prev = '*') or (prev = '_')) or ((prev = '~') or (prev = '('));
+            if not (isBlankByte(prev) or mark) then
+                return 0;
+            end if;
+        end if;
+        var d: Index := 0;
+        if startsAt(raw, pos, "www.") then
+            d := pos;
+        else
+            if startsAt(raw, pos, "http://") then
+                d := pos + 7;
+            else
+                if startsAt(raw, pos, "https://") then
+                    d := pos + 8;
+                else
+                    return 0;
+                end if;
+            end if;
+        end if;
+        var de: Index := d;
+        while (de < size) and isDomainByte(raw[de]) do
+            de := de + 1;
+        end while;
+        if de = d then
+            return 0;
+        end if;
+        var e: Index := de;
+        var opens: Index := 0;
+        var closes: Index := 0;
+        while (e < size) and (not (isBlankByte(raw[e]) or (raw[e] = '<'))) do
+            if raw[e] = '(' then
+                opens := opens + 1;
+            end if;
+            if raw[e] = ')' then
+                closes := closes + 1;
+            end if;
+            e := e + 1;
+        end while;
+        var trimming: Bool := true;
+        while trimming and (e > d) do
+            let last: Nat8 := raw[e - 1];
+            if isTrailByte(last) then
+                e := e - 1;
+            else
+                if (last = ')') and (closes > opens) then
+                    e := e - 1;
+                    closes := closes - 1;
+                else
+                    trimming := false;
+                    if (last = ';') and ((e - d) >= 3) then
+                        var k: Index := e - 2;
+                        while (k > d) and isAlnum(raw[k]) do
+                            k := k - 1;
+                        end while;
+                        if (raw[k] = '&') and (k < (e - 2)) then
+                            e := k;
+                            trimming := true;
+                        end if;
+                    end if;
+                end if;
+            end if;
+        end while;
+        var domain_end: Index := de;
+        if e < de then
+            domain_end := e;
+        end if;
+        if not isValidDomain(raw, d, domain_end) then
+            return 0;
+        end if;
+        return e;
+    end;
+
+    -- A w or h at pos, with no bracket open: a bare link span when one
+    -- starts there.  The index after what was read.
+    generic [I: Region, S: Region]
+    function bareAt(items: &![Buffer[Item], I], raw: Span[Nat8, S], pos: Index): Index is
+        let stop: Index := bareLinkEnd(raw, pos);
+        if stop = 0 then
+            return pos + 1;
+        end if;
+        ignore(addItem(&~items, k_bare, pos, stop, pos, stop));
+        return stop;
+    end;
+
+    ---
+    --- Links
+    ---
+
+    -- An open [ or ![: where it stands, whether it is an image, where its
+    -- text starts and the last run of delimiters before it.
+    record Bracket: Free is
+        pos: Index;
+        image: Bool;
+        start: Index;
+        base: Index;
+    end;
+
+    -- What a ] did: the index after the link it closed (its own index when
+    -- none), and whether it closed a link, not an image.
+    record Closed: Free is
+        stop: Index;
+        link: Bool;
+    end;
+
+    -- The index after white space from i: blanks and tabs, and one line end
+    -- with the blanks after it.
+    generic [S: Region]
+    function skipSpaceLine(raw: Span[Nat8, S], i: Index): Index is
+        let size: Index := spanLength(raw);
+        var j: Index := i;
+        while (j < size) and ((raw[j] = ' ') or (raw[j] = 9)) do
+            j := j + 1;
+        end while;
+        if (j < size) and (raw[j] = 10) then
+            j := j + 1;
+            while (j < size) and ((raw[j] = ' ') or (raw[j] = 9)) do
+                j := j + 1;
+            end while;
+        end if;
+        return j;
+    end;
+
+    -- Whether the line that starts at i of raw holds only blanks.
+    generic [S: Region]
+    function lineBlankAt(raw: Span[Nat8, S], i: Index): Bool is
+        var j: Index := i;
+        while (j < spanLength(raw)) and ((raw[j] = ' ') or (raw[j] = 9)) do
+            j := j + 1;
+        end while;
+        return (j >= spanLength(raw)) or (raw[j] = 10);
+    end;
+
+    -- The index after the title that opens at i of raw (", ' or a
+    -- parenthesis), 0 when none closes.
+    generic [S: Region]
+    function titleStop(raw: Span[Nat8, S], i: Index): Index is
+        let size: Index := spanLength(raw);
+        var close: Nat8 := raw[i];
+        if close = '(' then
+            close := ')';
+        end if;
+        var j: Index := i + 1;
+        while j < size do
+            let byte: Nat8 := raw[j];
+            if (byte = 92) and ((j + 1) < size) then
+                j := j + 2;
+            else
+                if byte = close then
+                    return j + 1;
+                end if;
+                if (byte = '(') and (close = ')') then
+                    return 0;
+                end if;
+                if (byte = 10) and lineBlankAt(raw, j + 1) then
+                    return 0;
+                end if;
+                j := j + 1;
+            end if;
+        end while;
+        return 0;
+    end;
+
+    -- The index after the inline link whose ( stands at p of raw:
+    -- (destination "title"); 0 for none.
+    generic [S: Region]
+    function inlineLinkEnd(raw: Span[Nat8, S], p: Index): Index is
+        let size: Index := spanLength(raw);
+        var i: Index := skipSpaceLine(raw, p + 1);
+        if (i < size) and (raw[i] = '<') then
+            var j: Index := i + 1;
+            var open: Bool := true;
+            while (j < size) and open do
+                let byte: Nat8 := raw[j];
+                if (byte = 10) or (byte = '<') then
+                    return 0;
+                end if;
+                if byte = '>' then
+                    open := false;
+                else
+                    if (byte = 92) and ((j + 1) < size) then
+                        j := j + 2;
+                    else
+                        j := j + 1;
+                    end if;
+                end if;
+            end while;
+            if open then
+                return 0;
+            end if;
+            i := j + 1;
+        else
+            var j: Index := i;
+            var depth: Index := 0;
+            var more: Bool := true;
+            while (j < size) and more do
+                let byte: Nat8 := raw[j];
+                if ((byte = 92) and ((j + 1) < size)) and isPunctByte(raw[j + 1]) then
+                    j := j + 2;
+                else
+                    if (byte <= 32) or (byte = 127) then
+                        more := false;
+                    else
+                        if byte = '(' then
+                            depth := depth + 1;
+                            if depth > 32 then
+                                return 0;
+                            end if;
+                            j := j + 1;
+                        else
+                            if byte = ')' then
+                                if depth = 0 then
+                                    more := false;
+                                else
+                                    depth := depth - 1;
+                                    j := j + 1;
+                                end if;
+                            else
+                                j := j + 1;
+                            end if;
+                        end if;
+                    end if;
+                end if;
+            end while;
+            if depth /= 0 then
+                return 0;
+            end if;
+            i := j;
+        end if;
+        let k: Index := skipSpaceLine(raw, i);
+        if k >= size then
+            return 0;
+        end if;
+        if raw[k] = ')' then
+            return k + 1;
+        end if;
+        if (k = i) or (((raw[k] /= '"') and (raw[k] /= 39)) and (raw[k] /= '(')) then
+            return 0;
+        end if;
+        let e: Index := titleStop(raw, k);
+        if e = 0 then
+            return 0;
+        end if;
+        let z: Index := skipSpaceLine(raw, e);
+        if (z >= size) or (raw[z] /= ')') then
+            return 0;
+        end if;
+        return z + 1;
+    end;
+
+    -- Whether raw[a, b) can be a link label: no bracket unless escaped, no
+    -- more than 999 bytes, something besides white space.
+    generic [S: Region]
+    function labelFits(raw: Span[Nat8, S], a: Index, b: Index): Bool is
+        if (b <= a) or ((b - a) > 999) then
+            return false;
+        end if;
+        var filled: Bool := false;
+        var i: Index := a;
+        while i < b do
+            let byte: Nat8 := raw[i];
+            if (byte = 92) and ((i + 1) < b) then
+                filled := true;
+                i := i + 2;
+            else
+                if (byte = '[') or (byte = ']') then
+                    return false;
+                end if;
+                if not isBlankByte(byte) then
+                    filled := true;
+                end if;
+                i := i + 1;
+            end if;
+        end while;
+        return filled;
+    end;
+
+    -- A label in its normal form: ASCII and Latin-1 capitals as small
+    -- letters, every run of white space one blank, none at the ends.
+    generic [S: Region]
+    function normalizedLabel(label: Span[Nat8, S]): String is
+        let n: Index := spanLength(label);
+        var out: Buffer[Nat8] := allocateEmpty();
+        var pending: Bool := false;
+        var i: Index := 0;
+        while i < n do
+            let byte: Nat8 := label[i];
+            if isBlankByte(byte) then
+                pending := true;
+                i := i + 1;
+            else
+                if pending and (length(&out) > 0) then
+                    insertBack(&!out, ' ');
+                end if;
+                pending := false;
+                if (byte >= 'A') and (byte <= 'Z') then
+                    insertBack(&!out, byteFor(valueOf(byte) + 32));
+                    i := i + 1;
+                else
+                    var folded: Bool := false;
+                    if (byte = 195) and ((i + 1) < n) then
+                        let follow: Nat8 := label[i + 1];
+                        if ((follow >= 128) and (follow <= 158)) and (follow /= 151) then
+                            insertBack(&!out, 195);
+                            insertBack(&!out, byteFor(valueOf(follow) + 32));
+                            i := i + 2;
+                            folded := true;
+                        end if;
+                    end if;
+                    if not folded then
+                        insertBack(&!out, byte);
+                        i := i + 1;
+                    end if;
+                end if;
+            end if;
+        end while;
+        return fromByteBuffer(out);
+    end;
+
+    -- A number that two equal labels share.
+    generic [S: Region]
+    function hashOf(label: Span[Nat8, S]): Index is
+        var h: Index := 5381;
+        var i: Index := 0;
+        while i < spanLength(label) do
+            h := (h * 33) + valueOf(label[i]);
+            h := h - ((h / 16777213) * 16777213);
+            i := i + 1;
+        end while;
+        return h;
+    end;
+
+    -- A place of the table of labels: the bytes start to stop of the
+    -- labels, used or free.
+    record Slot: Free is
+        start: Index;
+        stop: Index;
+        used: Bool;
+    end;
+
+    -- The end of the line of labels that starts at i, without a CR.
+    generic [L: Region]
+    function lineStop(labels: Span[Nat8, L], i: Index): Index is
+        var j: Index := i;
+        while (j < spanLength(labels)) and (labels[j] /= 10) do
+            j := j + 1;
+        end while;
+        return j;
+    end;
+
+    -- The table of the labels, open addressing, twice as many places as
+    -- labels and one more; empty for none.
+    generic [L: Region]
+    function buildTable(labels: Span[Nat8, L]): Buffer[Slot] is
+        let size: Index := spanLength(labels);
+        var count: Index := 0;
+        var i: Index := 0;
+        while i < size do
+            let j: Index := lineStop(labels, i);
+            if j > i then
+                count := count + 1;
+            end if;
+            i := j + 1;
+        end while;
+        if count = 0 then
+            let none: Buffer[Slot] := allocateEmpty();
+            return none;
+        end if;
+        let places: Index := (count * 2) + 1;
+        var table: Buffer[Slot] := initialize(places, Slot(start => 0, stop => 0, used => false));
+        i := 0;
+        while i < size do
+            let j: Index := lineStop(labels, i);
+            var b: Index := j;
+            if (b > i) and (labels[b - 1] = 13) then
+                b := b - 1;
+            end if;
+            if b > i then
+                let h: Index := hashOf(substring(labels, i, b));
+                var slot: Index := h - ((h / places) * places);
+                var taken: Slot := nth(&table, slot);
+                while taken.used do
+                    slot := slot + 1;
+                    if slot = places then
+                        slot := 0;
+                    end if;
+                    taken := nth(&table, slot);
+                end while;
+                storeNth(&!table, slot, Slot(start => i, stop => b, used => true));
+            end if;
+            i := j + 1;
+        end while;
+        return table;
+    end;
+
+    -- Whether the label raw[a, b), normalised, is among the labels.
+    generic [S: Region, L: Region, T: Region]
+    function knownLabel(raw: Span[Nat8, S], a: Index, b: Index, labels: Span[Nat8, L], table: &![Buffer[Slot], T]): Bool is
+        let places: Index := lengthMut(&~table);
+        if places = 0 then
+            return false;
+        end if;
+        let wanted: String := normalizedLabel(substring(raw, a, b));
+        let h: Index := hashOf(asSpan(&wanted));
+        var slot: Index := h - ((h / places) * places);
+        var found: Bool := false;
+        var going: Bool := true;
+        while going do
+            let s: Slot := nthMut(&~table, slot);
+            if not s.used then
+                going := false;
+            else
+                if equal(substring(labels, s.start, s.stop), asSpan(&wanted)) then
+                    found := true;
+                    going := false;
+                else
+                    slot := slot + 1;
+                    if slot = places then
+                        slot := 0;
+                    end if;
+                end if;
+            end if;
+        end while;
+        destroyString(wanted);
+        return found;
+    end;
+
+    -- The index after the footnote reference [^id] at pos, 0 for none: an
+    -- id of 1 to 999 bytes without blank or bracket, not followed by (.
+    generic [S: Region]
+    function footnoteEnd(raw: Span[Nat8, S], pos: Index): Index is
+        let size: Index := spanLength(raw);
+        var j: Index := pos + 2;
+        while ((j < size) and ((j - pos) < 1002)) and (not ((isBlankByte(raw[j]) or (raw[j] = '[')) or ((raw[j] = ']') or (raw[j] = 92)))) do
+            j := j + 1;
+        end while;
+        if ((j >= size) or (j = (pos + 2))) or (raw[j] /= ']') then
+            return 0;
+        end if;
+        if ((j + 1) < size) and (raw[j + 1] = '(') then
+            return 0;
+        end if;
+        return j + 1;
+    end;
+
+    -- A [ at pos: a footnote span, or an open bracket.  The index after it.
+    generic [I: Region, K: Region, D: Region, S: Region]
+    function openBracket(items: &![Buffer[Item], I], brackets: &![Buffer[Bracket], K], delims: &![Buffer[Delim], D], raw: Span[Nat8, S], pos: Index): Index is
+        if ((pos + 1) < spanLength(raw)) and (raw[pos + 1] = '^') then
+            let stop: Index := footnoteEnd(raw, pos);
+            if stop > 0 then
+                ignore(addItem(&~items, k_footnote, pos, stop, pos, stop));
+                return stop;
+            end if;
+        end if;
+        let base: Index := delimTail(&~delims);
+        insertBack(&~brackets, Bracket(pos => pos, image => false, start => pos + 1, base => base));
+        return pos + 1;
+    end;
+
+    -- A ![ at pos: an open bracket of an image.  The index after it.
+    generic [K: Region, D: Region]
+    function openImage(brackets: &![Buffer[Bracket], K], delims: &![Buffer[Delim], D], pos: Index): Index is
+        let base: Index := delimTail(&~delims);
+        insertBack(&~brackets, Bracket(pos => pos, image => true, start => pos + 2, base => base));
+        return pos + 2;
+    end;
+
+    -- The ] at pos: closes the last open bracket as a link or image when an
+    -- inline link, a full or collapsed reference or a shortcut reference
+    -- with a known label follows.  A [ below floor in the stack is no
+    -- longer active: a link was made after it.
+    generic [I: Region, D: Region, K: Region, T: Region, S: Region, L: Region]
+    function closeBracket(items: &![Buffer[Item], I], delims: &![Buffer[Delim], D], brackets: &![Buffer[Bracket], K], table: &![Buffer[Slot], T], raw: Span[Nat8, S], labels: Span[Nat8, L], pos: Index, floor: Index): Closed is
+        let open: Index := lengthMut(&~brackets);
+        if open = 0 then
+            return Closed(stop => pos, link => false);
+        end if;
+        let opener: Bracket := nthMut(&~brackets, open - 1);
+        if (not opener.image) and ((open - 1) < floor) then
+            let dropped: Bracket := removeLast(&~brackets);
+            return Closed(stop => pos, link => false);
+        end if;
+        let size: Index := spanLength(raw);
+        var made: Bool := false;
+        var stop: Index := pos + 1;
+        if ((pos + 1) < size) and (raw[pos + 1] = '(') then
+            let after: Index := inlineLinkEnd(raw, pos + 1);
+            if after > 0 then
+                made := true;
+                stop := after;
+            end if;
+        end if;
+        if not made then
+            var label_a: Index := opener.start;
+            var label_b: Index := pos;
+            if ((pos + 1) < size) and (raw[pos + 1] = '[') then
+                var j: Index := pos + 2;
+                while ((j < size) and (raw[j] /= ']')) and (raw[j] /= '[') do
+                    if (raw[j] = 92) and ((j + 1) < size) then
+                        j := j + 2;
+                    else
+                        j := j + 1;
+                    end if;
+                end while;
+                if (j < size) and (raw[j] = ']') then
+                    if j /= (pos + 2) then
+                        label_a := pos + 2;
+                        label_b := j;
+                    end if;
+                    stop := j + 1;
+                end if;
+            end if;
+            if labelFits(raw, label_a, label_b) then
+                if knownLabel(raw, label_a, label_b, labels, &~table) then
+                    made := true;
+                end if;
+            end if;
+        end if;
+        let dropped: Bracket := removeLast(&~brackets);
+        if not made then
+            return Closed(stop => pos, link => false);
+        end if;
+        processEmphasis(&~items, &~delims, opener.base);
+        var kind: Index := k_link;
+        if opener.image then
+            kind := k_image;
+        end if;
+        ignore(addItem(&~items, kind, opener.pos, stop, opener.start, pos));
+        return Closed(stop => stop, link => not opener.image);
+    end;
+
+    ---
+    --- The scan
+    ---
+
+    -- The spans of items in the order of their start, an
+    -- outer span before the spans inside it, each with its parent.  A span
+    -- is made after every span inside it, so among the spans that start at
+    -- one byte the one made last is the outermost.
+    generic [I: Region]
+    function ordered(items: &[Buffer[Item], I], size: Index): Spans is
+        let total: Index := length(items);
+        var heads: Buffer[Index] := initialize(size + 1, no_index);
+        var links: Buffer[Index] := initialize(total + 1, no_index);
+        var id: Index := 0;
+        while id < total do
+            let item: Item := nth(items, id);
+            storeNth(&!links, id, nth(&heads, item.start));
+            storeNth(&!heads, item.start, id);
+            id := id + 1;
+        end while;
+        var out: Buffer[Item] := allocateEmpty();
+        var stack: Buffer[Index] := allocateEmpty();
+        var at: Index := 0;
+        while at < size do
+            var x: Index := nth(&heads, at);
+            while x /= no_index do
+                let item: Item := nth(items, x);
+                var parent: Index := no_index;
+                var looking: Bool := true;
+                while looking do
+                    let depth: Index := length(&stack);
+                    if depth = 0 then
+                        looking := false;
+                    else
+                        let top: Index := nth(&stack, depth - 1);
+                        let outer: Item := nth(&out, top);
+                        if (outer.start <= item.start) and (item.stop <= outer.stop) then
+                            parent := top;
+                            looking := false;
+                        else
+                            let dropped: Index := removeLast(&!stack);
+                        end if;
+                    end if;
+                end while;
+                var placed: Item := item;
+                placed.parent := parent;
+                insertBack(&!out, placed);
+                insertBack(&!stack, length(&out) - 1);
+                x := nth(&links, x);
+            end while;
+            at := at + 1;
+        end while;
+        destroyFree(heads);
+        destroyFree(links);
+        destroyFree(stack);
+        return Spans(items => out);
+    end;
+
+    generic [R: Region, L: Region]
+    function scanSpans(text: Span[Nat8, R], labels: Span[Nat8, L]): Spans is
+        var size: Index := spanLength(text);
+        if size > mostSpanBytes() then
+            size := mostSpanBytes();
+        end if;
+        let raw: Span[Nat8, R] := substring(text, 0, size);
+        var items: Buffer[Item] := allocateEmpty();
+        var delims: Buffer[Delim] := allocateEmpty();
+        insertBack(&!delims, emptyDelim());
+        var brackets: Buffer[Bracket] := allocateEmpty();
+        var runs: Buffer[Run] := allocateEmpty();
+        let longest: Index := collectRuns(raw, &!runs);
+        var heads: Buffer[Index] := linkRuns(&!runs, longest);
+        var memo: Buffer[Index] := initialize(6, size + 1);
+        var table: Buffer[Slot] := buildTable(labels);
+        var rc: Index := 0;
+        var floor: Index := 0;
+        var pos: Index := 0;
+        while pos < size do
+            let byte: Nat8 := raw[pos];
+            var next: Index := pos + 1;
+            if byte = 92 then
+                next := escapeAt(&!items, raw, pos);
+            end if;
+            if byte = '`' then
+                rc := runAt(&!runs, rc, pos);
+                next := codeAt(&!items, &!runs, &!heads, rc, raw, pos);
+            end if;
+            if ((byte = '*') or (byte = '_')) or (byte = '~') then
+                next := runDelim(&!delims, raw, pos);
+            end if;
+            if byte = '[' then
+                next := openBracket(&!items, &!brackets, &!delims, raw, pos);
+            end if;
+            if (byte = '!') and ((pos + 1) < size) then
+                if raw[pos + 1] = '[' then
+                    next := openImage(&!brackets, &!delims, pos);
+                end if;
+            end if;
+            if byte = ']' then
+                let closed: Closed := closeBracket(&!items, &!delims, &!brackets, &!table, raw, labels, pos, floor);
+                let left: Index := length(&brackets);
+                if closed.link then
+                    floor := left;
+                else
+                    if left < floor then
+                        floor := left;
+                    end if;
+                end if;
+                if closed.stop > pos then
+                    next := closed.stop;
+                end if;
+            end if;
+            if byte = '<' then
+                next := angleAt(&!items, &!memo, raw, pos);
+            end if;
+            if byte = '&' then
+                next := entityAt(&!items, raw, pos);
+            end if;
+            if byte = ':' then
+                next := emojiAt(&!items, raw, pos);
+            end if;
+            if ((byte = 'w') or (byte = 'h')) and (length(&brackets) = 0) then
+                next := bareAt(&!items, raw, pos);
+            end if;
+            pos := next;
+        end while;
+        processEmphasis(&!items, &!delims, 0);
+        destroyFree(delims);
+        destroyFree(brackets);
+        destroyFree(runs);
+        destroyFree(heads);
+        destroyFree(memo);
+        destroyFree(table);
+        let spans: Spans := ordered(&items, size);
+        destroyFree(items);
+        return spans;
+    end;
+
+    function destroySpans(spans: Spans): Unit is
+        let { items: Buffer[Item] } := spans;
+        destroyFree(items);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function spanCount(spans: &[Spans, R]): Index is
+        return length(&(spans->items));
+    end;
+
+    generic [R: Region]
+    function itemAt(spans: &[Spans, R], i: Index): Item is
+        return nth(&(spans->items), i);
+    end;
+
+    function kindOf(kind: Index): SpanKind is
+        if kind = k_emphasis then
+            return EmphasisSpan();
+        end if;
+        if kind = k_strong then
+            return StrongSpan();
+        end if;
+        if kind = k_strike then
+            return StrikeSpan();
+        end if;
+        if kind = k_code then
+            return CodeSpan();
+        end if;
+        if kind = k_link then
+            return LinkSpan();
+        end if;
+        if kind = k_image then
+            return ImageSpan();
+        end if;
+        if kind = k_autolink then
+            return AutolinkSpan();
+        end if;
+        if kind = k_bare then
+            return BareLinkSpan();
+        end if;
+        if kind = k_html then
+            return HtmlSpan();
+        end if;
+        if kind = k_escape then
+            return EscapeSpan();
+        end if;
+        if kind = k_entity then
+            return EntitySpan();
+        end if;
+        if kind = k_footnote then
+            return FootnoteSpan();
+        end if;
+        return EmojiSpan();
+    end;
+
+    generic [R: Region]
+    function spanKind(spans: &[Spans, R], i: Index): SpanKind is
+        let item: Item := itemAt(spans, i);
+        return kindOf(item.kind);
+    end;
+
+    generic [R: Region]
+    function spanStart(spans: &[Spans, R], i: Index): Index is
+        let item: Item := itemAt(spans, i);
+        return item.start;
+    end;
+
+    generic [R: Region]
+    function spanStop(spans: &[Spans, R], i: Index): Index is
+        let item: Item := itemAt(spans, i);
+        return item.stop;
+    end;
+
+    generic [R: Region]
+    function innerStart(spans: &[Spans, R], i: Index): Index is
+        let item: Item := itemAt(spans, i);
+        return item.innerStart;
+    end;
+
+    generic [R: Region]
+    function innerStop(spans: &[Spans, R], i: Index): Index is
+        let item: Item := itemAt(spans, i);
+        return item.innerStop;
+    end;
+
+    generic [R: Region]
+    function spanParent(spans: &[Spans, R], i: Index): Index is
+        let item: Item := itemAt(spans, i);
+        if item.parent = no_index then
+            return spanCount(spans);
+        end if;
+        return item.parent;
+    end;
+
+    generic [R: Region]
+    function isRevealed(spans: &[Spans, R], i: Index, cursor: Index): Bool is
+        let item: Item := itemAt(spans, i);
+        return (item.start <= cursor) and (cursor <= item.stop);
+    end;
+
+    generic [R: Region]
+    function isRevealedBy(spans: &[Spans, R], i: Index, selection_start: Index, selection_stop: Index): Bool is
+        let item: Item := itemAt(spans, i);
+        return (item.start <= selection_stop) and (selection_start <= item.stop);
+    end;
+end module body.

@@ -1,0 +1,97 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Tokens for machines: a client sends Authorization: Bearer <token>, and
+the token names who it was given to.
+
+A token is 32 random bytes in hex, given out once by issueToken; the
+database keeps only its SHA-256, so a copy of the database opens nothing.
+A token is looked up by its digest: the time of the lookup depends on the
+digest, which tells nothing of the token.
+
+Hiawatha hands the Authorization header to the application only when the
+host says HTTPAuthToCGI = yes; without it every token is missing.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+import Standard.FcgiServer (
+    Request
+);
+
+module Wolly.Bearer is
+    """
+    The hex digits of a token: 64.
+    """
+    function tokenDigits(): Index
+        ensures result = 64;
+
+    """
+    Makes the table of tokens, if it is not there.  None when it exists
+    afterwards.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region]
+    function prepareTokens(db: &![Database[Writing], R]): Option[DbError];
+
+    """
+    A new token for name at now, kept as its digest.  Right Some holds the
+    token, to be handed over once and never stored by the caller; Right
+    None when name is not 1 to 64 bytes of a to z, 0 to 9, dot, hyphen
+    and underscore, or the random source fails.
+    """
+    generic [R: Region, N: Region]
+    function issueToken(db: &![Database[Writing], R], name: Span[Nat8, N], now: Int64): Either[DbError, Option[String]]
+        requires now >= 0;
+
+    """
+    The name the token was given to: Right None for a token that was never
+    given out, or was revoked.
+    No contract: the answer is the work of the database.
+    """
+    generic [M: Free, R: Region, T: Region]
+    function tokenOwner(db: &![Database[M], R], token: Span[Nat8, T]): Either[DbError, Option[String]];
+
+    """
+    Revokes every token of name.  Right true when there was one.
+    No contract: the answer is the work of the database.
+    """
+    generic [R: Region, N: Region]
+    function revokeTokens(db: &![Database[Writing], R], name: Span[Nat8, N]): Either[DbError, Bool];
+
+    """
+    The token of the Authorization header of request, when it says Bearer
+    in any case and a token after one or more spaces.
+    No contract: an Option read from the request.
+    """
+    generic [R: Region]
+    function bearerToken(request: &[Request, R]): Option[String];
+
+    """
+    The token in the value of an Authorization header: the scheme Bearer in
+    any case, one or more spaces, then the token, which is not empty.  None
+    for any other scheme, for no space after the scheme and for a header
+    with no token.
+    No contract: an Option read from text; None is its answer for a bad
+    header.
+    """
+    generic [H: Region]
+    function tokenIn(header: Span[Nat8, H]): Option[String];
+
+    """
+    The answer to a request without a token that opens anything: 401 with
+    WWW-Authenticate: Bearer, as the CGI output.
+    """
+    function unauthorized(): String
+        ensures length(&result) > 0;
+end module.

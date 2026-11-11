@@ -1,0 +1,30 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The certificate tool of Wolly: keys, certificates from an ACME
+server through http-01, and the question whether a certificate is due.
+
+    acme newkey KEYFILE
+    acme obtain DIRECTORY CAFILE ACCOUNTKEY DOMAINKEY WEBROOT NAMES OUT [private]
+    acme due CERTFILE
+
+newkey writes a new P-256 key, mode 0600, never over a file.  obtain asks
+the server at the https URL DIRECTORY for a certificate for the DNS names
+NAMES, separated by commas, and writes the chain to OUT (new, mode 0644);
+the last word, private, allows a server on a private address and is for
+tests.  due prints "due" when the certificate in CERTFILE should be renewed
+(it ends within 30 days, or is no certificate) and "not due" when it
+should not.  The tool prints one line, exits 0 on success and 1 on a
+failure or wrong arguments.
+"""
+module Wolly.Example.Acme is
+    """
+    The command of the arguments.
+    No contract: the outcome is the result of I/O.
+    """
+    function main(root: RootCapability): ExitCode;
+end module.

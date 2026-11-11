@@ -1,0 +1,596 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each kind of span with its exact ranges, nesting, the precedence of code
+-- spans, escapes, the flanking rules, unclosed markers, the reveal rule,
+-- UTF-8 around spans, and long inputs that must stay linear.
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    underValgrind
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Wolly.MarkdownSpans (
+    SpanKind,
+    Spans,
+    mostSpans,
+    mostSpanBytes,
+    scanSpans,
+    destroySpans,
+    spanCount,
+    spanKind,
+    spanStart,
+    spanStop,
+    innerStart,
+    innerStop,
+    spanParent,
+    isRevealed,
+    isRevealedBy
+);
+
+module body Wolly.MarkdownSpans.Test is
+    constant emphasis: Index := 0;
+    constant strong: Index := 1;
+    constant strike: Index := 2;
+    constant code: Index := 3;
+    constant link: Index := 4;
+    constant image: Index := 5;
+    constant autolink: Index := 6;
+    constant bare_link: Index := 7;
+    constant html: Index := 8;
+    constant escape: Index := 9;
+    constant entity: Index := 10;
+    constant footnote: Index := 11;
+    constant emoji: Index := 12;
+
+    -- The number of a kind, so that a test can compare kinds with =.
+    function kindNumber(kind: SpanKind): Index is
+        case kind of
+            when EmphasisSpan do
+                return 0;
+            when StrongSpan do
+                return 1;
+            when StrikeSpan do
+                return 2;
+            when CodeSpan do
+                return 3;
+            when LinkSpan do
+                return 4;
+            when ImageSpan do
+                return 5;
+            when AutolinkSpan do
+                return 6;
+            when BareLinkSpan do
+                return 7;
+            when HtmlSpan do
+                return 8;
+            when EscapeSpan do
+                return 9;
+            when EntitySpan do
+                return 10;
+            when FootnoteSpan do
+                return 11;
+            when EmojiSpan do
+                return 12;
+        end case;
+    end;
+
+    -- Whether span i is of kind, with the source start to stop and the
+    -- inner part a to b.
+    generic [R: Region]
+    function spanIs(spans: &[Spans, R], i: Index, kind: Index, start: Index, stop: Index, a: Index, b: Index): Bool is
+        if i >= spanCount(spans) then
+            return false;
+        end if;
+        let same_kind: Bool := kindNumber(spanKind(spans, i)) = kind;
+        let same_source: Bool := (spanStart(spans, i) = start) and (spanStop(spans, i) = stop);
+        let same_inner: Bool := (innerStart(spans, i) = a) and (innerStop(spans, i) = b);
+        return (same_kind and same_source) and same_inner;
+    end;
+
+    -- Whether the spans keep the promises of the interface: each inner part
+    -- inside its span, starts in order, each parent before its child and
+    -- holding it, spans of one start outer first.
+    generic [R: Region]
+    function wellFormed(spans: &[Spans, R]): Bool is
+        let count: Index := spanCount(spans);
+        var i: Index := 0;
+        while i < count do
+            let start: Index := spanStart(spans, i);
+            let stop: Index := spanStop(spans, i);
+            if start >= stop then
+                return false;
+            end if;
+            if ((innerStart(spans, i) < start) or (innerStop(spans, i) > stop)) or (innerStart(spans, i) > innerStop(spans, i)) then
+                return false;
+            end if;
+            if i > 0 then
+                if spanStart(spans, i - 1) > start then
+                    return false;
+                end if;
+            end if;
+            let parent: Index := spanParent(spans, i);
+            if parent /= count then
+                if parent >= i then
+                    return false;
+                end if;
+                if (spanStart(spans, parent) > start) or (spanStop(spans, parent) < stop) then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether text, with no labels, has exactly one span: of kind, start to
+    -- stop, inner part a to b.
+    function only(text: Span[Nat8, Static], kind: Index, start: Index, stop: Index, a: Index, b: Index): Bool is
+        let spans: Spans := scanSpans(text, "");
+        let good: Bool := (spanCount(&spans) = 1) and spanIs(&spans, 0, kind, start, stop, a, b);
+        destroySpans(spans);
+        return good;
+    end;
+
+    -- Whether text with labels has exactly one span: of kind, start to stop,
+    -- inner part a to b.
+    function onlyWith(text: Span[Nat8, Static], labels: Span[Nat8, Static], kind: Index, start: Index, stop: Index, a: Index, b: Index): Bool is
+        let spans: Spans := scanSpans(text, labels);
+        let good: Bool := (spanCount(&spans) = 1) and spanIs(&spans, 0, kind, start, stop, a, b);
+        destroySpans(spans);
+        return good;
+    end;
+
+    -- How many spans text has, with no labels.
+    function countIn(text: Span[Nat8, Static]): Index is
+        let spans: Spans := scanSpans(text, "");
+        let count: Index := spanCount(&spans);
+        destroySpans(spans);
+        return count;
+    end;
+
+    -- How many spans text has with labels.
+    function countWith(text: Span[Nat8, Static], labels: Span[Nat8, Static]): Index is
+        let spans: Spans := scanSpans(text, labels);
+        let count: Index := spanCount(&spans);
+        destroySpans(spans);
+        return count;
+    end;
+
+    -- piece, times times.
+    function repeated(piece: Span[Nat8, Static], times: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var k: Index := 0;
+        while k < times do
+            writeString(&!builder, piece);
+            k := k + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    function nanosNow(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as t: Nat64) do
+                return t;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Whether less than five seconds passed since start; under valgrind,
+    -- which runs the code many times slower, less than a minute.
+    function quick(start: Nat64): Bool is
+        var limit: Nat64 := 5000000000;
+        if underValgrind() then
+            limit := 60000000000;
+        end if;
+        return (nanosNow() - start) < limit;
+    end;
+
+    function testConstants(): Unit is
+        assertTrue(mostSpans() = 65536, "65536 spans at most");
+        assertTrue(mostSpanBytes() = 1048576, "1048576 bytes at most");
+        return nil;
+    end;
+
+    function testEmpty(): Unit is
+        assertTrue(countIn("") = 0, "the empty text has no span");
+        assertTrue(countIn("plain text, no markers") = 0, "plain text has none");
+        assertTrue(countIn("a\nb\n") = 0, "line breaks alone make none");
+        return nil;
+    end;
+
+    function testEmphasisKinds(): Unit is
+        assertTrue(only("a *b* c", emphasis, 2, 5, 3, 4), "emphasis with *");
+        assertTrue(only("_b_", emphasis, 0, 3, 1, 2), "emphasis with _");
+        assertTrue(only("**b**", strong, 0, 5, 2, 3), "strong with **");
+        assertTrue(only("__bc__", strong, 0, 6, 2, 4), "strong with __");
+        assertTrue(only("~~s~~", strike, 0, 5, 2, 3), "strikethrough with ~~");
+        assertTrue(only("x ~s~ y", strike, 2, 5, 3, 4), "strikethrough with one ~");
+        assertTrue(countIn("~~s~") = 0, "~~ is not closed by ~");
+        assertTrue(countIn("~~~s~~~") = 0, "three ~ are no delimiter");
+        assertTrue(only("*a\nb*", emphasis, 0, 5, 1, 4), "emphasis across a line break");
+        return nil;
+    end;
+
+    function testNesting(): Unit is
+        let a: Spans := scanSpans("**a *b* c**", "");
+        assertTrue(spanCount(&a) = 2, "strong and emphasis");
+        assertTrue(spanIs(&a, 0, strong, 0, 11, 2, 9), "the strong span first");
+        assertTrue(spanIs(&a, 1, emphasis, 4, 7, 5, 6), "the emphasis inside");
+        assertTrue(spanParent(&a, 0) = 2, "strong has no parent");
+        assertTrue(spanParent(&a, 1) = 0, "emphasis lies in strong");
+        assertTrue(wellFormed(&a), "well formed");
+        destroySpans(a);
+        let b: Spans := scanSpans("*[link](u)*", "");
+        assertTrue(spanCount(&b) = 2, "emphasis and link");
+        assertTrue(spanIs(&b, 0, emphasis, 0, 11, 1, 10), "the emphasis around");
+        assertTrue(spanIs(&b, 1, link, 1, 10, 2, 6), "the link inside");
+        assertTrue(spanParent(&b, 1) = 0, "the link lies in the emphasis");
+        destroySpans(b);
+        let c: Spans := scanSpans("***a***", "");
+        assertTrue(spanCount(&c) = 2, "three stars make two spans");
+        assertTrue(spanIs(&c, 0, emphasis, 0, 7, 1, 6), "emphasis outside");
+        assertTrue(spanIs(&c, 1, strong, 1, 6, 3, 4), "strong inside");
+        assertTrue(spanParent(&c, 1) = 0, "of one start, the outer first");
+        destroySpans(c);
+        let d: Spans := scanSpans("*foo**bar**baz*", "");
+        assertTrue(spanCount(&d) = 2, "spec example: strong inside emphasis");
+        assertTrue(spanIs(&d, 0, emphasis, 0, 15, 1, 14), "emphasis");
+        assertTrue(spanIs(&d, 1, strong, 4, 11, 6, 9), "strong");
+        destroySpans(d);
+        let e: Spans := scanSpans("~~a **b**~~", "");
+        assertTrue(spanCount(&e) = 2, "strikethrough holds strong");
+        assertTrue(spanIs(&e, 0, strike, 0, 11, 2, 9), "strikethrough");
+        assertTrue(spanIs(&e, 1, strong, 4, 9, 6, 7), "strong");
+        destroySpans(e);
+        return nil;
+    end;
+
+    function testCodeSpans(): Unit is
+        assertTrue(only("`a*b*c`", code, 0, 7, 1, 6), "a code span hides emphasis");
+        assertTrue(only("`` a ` b ``", code, 0, 11, 3, 8), "one blank stripped at either end");
+        assertTrue(only("`  `", code, 0, 4, 1, 3), "only blanks: nothing stripped");
+        assertTrue(only("`[a](u)`", code, 0, 8, 1, 7), "a code span hides a link");
+        assertFalse(only("*a `*` b*", emphasis, 0, 9, 1, 8), "two spans, not one");
+        let s: Spans := scanSpans("*a `*` b*", "");
+        assertTrue(spanCount(&s) = 2, "emphasis around a code span");
+        assertTrue(spanIs(&s, 0, emphasis, 0, 9, 1, 8), "the star in the code is no closer");
+        assertTrue(spanIs(&s, 1, code, 3, 6, 4, 5), "the code span");
+        destroySpans(s);
+        assertTrue(only("`a\nb`", code, 0, 5, 1, 4), "a code span across a line break");
+        assertTrue(countIn("`a") = 0, "an unclosed backtick");
+        assertTrue(countIn("``a`") = 0, "runs of other lengths do not close");
+        assertTrue(only("``a`b``", code, 0, 7, 2, 5), "a shorter run inside");
+        return nil;
+    end;
+
+    function testEscapes(): Unit is
+        let s: Spans := scanSpans("\\*a\\*", "");
+        assertTrue(spanCount(&s) = 2, "two escapes, no emphasis");
+        assertTrue(spanIs(&s, 0, escape, 0, 2, 1, 2), "the first escape");
+        assertTrue(spanIs(&s, 1, escape, 3, 5, 4, 5), "the second escape");
+        destroySpans(s);
+        assertTrue(countIn("\\a") = 0, "a backslash before a letter is no escape");
+        assertTrue(countIn("a\\") = 0, "a backslash at the end");
+        assertTrue(only("\\`a`", escape, 0, 2, 1, 2), "an escaped backtick opens no code span");
+        assertFalse(only("*\\**", emphasis, 0, 4, 1, 3), "an escape inside emphasis is a second span");
+        let t: Spans := scanSpans("*\\**", "");
+        assertTrue(spanCount(&t) = 2, "emphasis around an escaped star");
+        assertTrue(spanIs(&t, 0, emphasis, 0, 4, 1, 3), "the emphasis");
+        assertTrue(spanIs(&t, 1, escape, 1, 3, 2, 3), "the escape");
+        destroySpans(t);
+        return nil;
+    end;
+
+    function testFlanking(): Unit is
+        assertTrue(countIn("a * b") = 0, "a star between blanks");
+        assertTrue(countIn("a * b *") = 0, "stars between blanks never pair");
+        assertTrue(only("_foo_bar_", emphasis, 0, 9, 1, 8), "an intraword _ is ignored");
+        assertTrue(countIn("foo_bar_") = 0, "no emphasis with _ inside a word");
+        assertTrue(only("foo*bar*", emphasis, 3, 8, 4, 7), "intraword emphasis with *");
+        assertTrue(only("**foo*", emphasis, 1, 6, 2, 5), "**foo* leaves a star");
+        assertTrue(only("*foo**", emphasis, 0, 5, 1, 4), "*foo** leaves a star");
+        assertTrue(only("*foo**bar*", emphasis, 0, 10, 1, 9), "the rule of multiples of 3");
+        assertTrue(countIn("* a*") = 0, "a star before a blank does not open");
+        assertTrue(countIn("*a *") = 0, "a star after a blank does not close");
+        return nil;
+    end;
+
+    function testUnclosed(): Unit is
+        assertTrue(countIn("*a") = 0, "an unclosed star");
+        assertTrue(countIn("**a") = 0, "an unclosed double star");
+        assertTrue(countIn("_a") = 0, "an unclosed underscore");
+        assertTrue(countIn("~~a") = 0, "an unclosed tilde run");
+        assertTrue(countIn("[a") = 0, "an unclosed bracket");
+        assertTrue(countIn("[a](u") = 0, "an unclosed destination");
+        assertTrue(countIn("[a]") = 0, "a shortcut without its label");
+        assertTrue(countIn("<a") = 0, "an unclosed tag");
+        assertTrue(countIn("<!-- a") = 0, "an unclosed comment");
+        assertTrue(countIn("&amp") = 0, "an entity without its semicolon");
+        assertTrue(countIn("a:smile") = 0, "an emoji without its colon");
+        assertTrue(countIn("[^a") = 0, "an unclosed footnote");
+        return nil;
+    end;
+
+    function testLinks(): Unit is
+        assertTrue(only("[t](u)", link, 0, 6, 1, 2), "an inline link");
+        assertTrue(only("![i](u.png)", image, 0, 11, 2, 3), "an image");
+        assertTrue(only("[t](u \"x\")", link, 0, 10, 1, 2), "an inline link with a title");
+        assertTrue(only("[t](<a b>)", link, 0, 10, 1, 2), "a destination in angle brackets");
+        assertTrue(only("[t]()", link, 0, 5, 1, 2), "an empty destination");
+        assertTrue(onlyWith("[t][id]", "id\n", link, 0, 7, 1, 2), "a full reference");
+        assertTrue(countWith("[t][id]", "other") = 0, "a full reference with an unknown label");
+        assertTrue(onlyWith("[t][]", "t", link, 0, 5, 1, 2), "a collapsed reference");
+        assertTrue(onlyWith("[T]", "x\nt\n", link, 0, 3, 1, 2), "a shortcut reference, capitals folded");
+        assertTrue(onlyWith("[A \n b]", "a b", link, 0, 7, 1, 6), "white space collapsed in the label");
+        assertTrue(onlyWith("[\u{c4}]", "\u{e4}", link, 0, 4, 1, 3), "a Latin-1 capital folded");
+        assertTrue(countWith("[t]", "") = 0, "no labels, no shortcut");
+        let a: Spans := scanSpans("[a [b](c) d](e)", "");
+        assertTrue(spanCount(&a) = 1, "no link inside a link");
+        assertTrue(spanIs(&a, 0, link, 3, 9, 4, 5), "the inner one wins");
+        destroySpans(a);
+        let b: Spans := scanSpans("![a [b](c)](d)", "");
+        assertTrue(spanCount(&b) = 2, "a link inside an image");
+        assertTrue(spanIs(&b, 0, image, 0, 14, 2, 10), "the image");
+        assertTrue(spanIs(&b, 1, link, 4, 10, 5, 6), "the link inside");
+        assertTrue(spanParent(&b, 1) = 0, "the link lies in the image");
+        destroySpans(b);
+        assertTrue(only("*a [b*](c)", link, 3, 10, 4, 6), "emphasis does not cross a link");
+        assertTrue(only("[a\nb](u)", link, 0, 8, 1, 4), "a link across a line break");
+        let c: Spans := scanSpans("[*a*](u) `[x](y)`", "");
+        assertTrue(spanCount(&c) = 3, "link, emphasis, code");
+        assertTrue(spanIs(&c, 0, link, 0, 8, 1, 4), "the link");
+        assertTrue(spanIs(&c, 1, emphasis, 1, 4, 2, 3), "emphasis in the link text");
+        assertTrue(spanIs(&c, 2, code, 9, 17, 10, 16), "the code span hides the brackets");
+        assertTrue(wellFormed(&c), "well formed");
+        destroySpans(c);
+        return nil;
+    end;
+
+    function testAutolinksAndHtml(): Unit is
+        assertTrue(only("<https://x.y>", autolink, 0, 13, 0, 13), "an URI autolink");
+        assertTrue(only("a <a@b.c> b", autolink, 2, 9, 2, 9), "an e-mail autolink");
+        assertTrue(countIn("<https://x y>") = 0, "no blank in an autolink");
+        assertTrue(only("<u>", html, 0, 3, 0, 3), "an open tag");
+        assertTrue(only("</u>", html, 0, 4, 0, 4), "a closing tag");
+        assertTrue(only("<a href=\"x\">", html, 0, 12, 0, 12), "a tag with a quoted attribute");
+        assertTrue(only("<a b='x' c=d e/>", html, 0, 16, 0, 16), "attributes of every form");
+        assertTrue(only("<!-- c -->", html, 0, 10, 0, 10), "a comment");
+        assertTrue(only("<!-->", html, 0, 5, 0, 5), "the shortest comment");
+        assertTrue(only("<?php x ?>", html, 0, 10, 0, 10), "a processing instruction");
+        assertTrue(only("<![CDATA[x]]>", html, 0, 13, 0, 13), "a CDATA section");
+        assertTrue(only("<!DOCTYPE html>", html, 0, 15, 0, 15), "a declaration");
+        assertTrue(countIn("< a>") = 0, "a blank after <");
+        assertTrue(countIn("<a b=\"x>") = 0, "an unclosed quote");
+        assertTrue(countIn("<a b c=>") = 0, "an attribute without its value");
+        let s: Spans := scanSpans("<u>*a*</u>", "");
+        assertTrue(spanCount(&s) = 3, "tags around emphasis");
+        assertTrue(spanIs(&s, 0, html, 0, 3, 0, 3), "the open tag");
+        assertTrue(spanIs(&s, 1, emphasis, 3, 6, 4, 5), "the emphasis");
+        assertTrue(spanIs(&s, 2, html, 6, 10, 6, 10), "the closing tag");
+        destroySpans(s);
+        return nil;
+    end;
+
+    function testBareLinks(): Unit is
+        assertTrue(only("see www.x.y now", bare_link, 4, 11, 4, 11), "a www link");
+        assertTrue(only("https://x.y/p.", bare_link, 0, 13, 0, 13), "a trailing period is left out");
+        assertTrue(only("http://x.y/a_(b)", bare_link, 0, 16, 0, 16), "balanced parentheses stay");
+        assertTrue(only("(www.x.y)", bare_link, 1, 8, 1, 8), "an unbalanced ) is left out");
+        assertTrue(countIn("xwww.x.y") = 0, "not inside a word");
+        assertTrue(countIn("www.") = 0, "no domain");
+        assertTrue(countIn("www.a_b.c_d") = 0, "an underscore in the last two segments");
+        let e: Spans := scanSpans("www.x.y&amp;", "");
+        assertTrue(spanCount(&e) = 2, "a link and an entity");
+        assertTrue(spanIs(&e, 0, bare_link, 0, 7, 0, 7), "the entity is left out of the link");
+        assertTrue(spanIs(&e, 1, entity, 7, 12, 7, 12), "and is a span of its own");
+        destroySpans(e);
+        assertTrue(only("[www.x.y](u)", link, 0, 12, 1, 8), "no bare link inside a link");
+        assertTrue(only("[a www.x.y](u)", link, 0, 14, 1, 10), "no bare link inside link text");
+        assertTrue(countIn("[ www.x.y") = 0, "no bare link while a bracket is open");
+        assertTrue(only("`www.x.y`", code, 0, 9, 1, 8), "no bare link inside code");
+        let s: Spans := scanSpans("*www.x.y*", "");
+        assertTrue(spanCount(&s) = 2, "emphasis around a bare link");
+        assertTrue(spanIs(&s, 0, emphasis, 0, 9, 1, 8), "the emphasis");
+        assertTrue(spanIs(&s, 1, bare_link, 1, 8, 1, 8), "the trailing star is left out");
+        destroySpans(s);
+        return nil;
+    end;
+
+    function testEntitiesFootnotesEmoji(): Unit is
+        assertTrue(only("&amp;", entity, 0, 5, 0, 5), "a named entity");
+        assertTrue(only("a &#123; b", entity, 2, 8, 2, 8), "a decimal reference");
+        assertTrue(only("&#x1F600;", entity, 0, 9, 0, 9), "a hexadecimal reference");
+        assertTrue(countIn("&#;") = 0, "no digits");
+        assertTrue(countIn("&x;") = 0, "a name of one letter");
+        assertTrue(countIn("&#12345678;") = 0, "eight digits");
+        assertTrue(only("a[^1] b", footnote, 1, 5, 1, 5), "a footnote reference");
+        assertTrue(countIn("[^a b]") = 0, "no blank in a footnote label");
+        assertTrue(countIn("[^]") = 0, "an empty footnote label");
+        let s: Spans := scanSpans(":smile: :+1:", "");
+        assertTrue(spanCount(&s) = 2, "two emoji");
+        assertTrue(spanIs(&s, 0, emoji, 0, 7, 0, 7), "smile");
+        assertTrue(spanIs(&s, 1, emoji, 8, 12, 8, 12), "+1");
+        destroySpans(s);
+        assertTrue(countIn(":Smile:") = 0, "no capitals in an emoji name");
+        assertTrue(countIn("::") = 0, "an empty emoji name");
+        assertFalse(only("*:a_b:*", emphasis, 0, 7, 1, 6), "an emoji inside emphasis is a second span");
+        return nil;
+    end;
+
+    function testUtf8(): Unit is
+        let s: Spans := scanSpans("Gr\u{fc}\u{df}e *w\u{f6}rld* \u{6771}\u{4eac} **\u{65e5}\u{672c}** \u{1f600} ~~x~~", "");
+        assertTrue(spanCount(&s) = 3, "three spans among umlauts, CJK and an emoji");
+        assertTrue(spanIs(&s, 0, emphasis, 8, 16, 9, 15), "emphasis after umlauts, offsets in bytes");
+        assertTrue(spanIs(&s, 1, strong, 24, 34, 26, 32), "strong around ideographs");
+        assertTrue(spanIs(&s, 2, strike, 40, 45, 42, 43), "strikethrough after an emoji");
+        destroySpans(s);
+        assertTrue(only("\u{65e5}*\u{672c}*", emphasis, 3, 8, 4, 7), "intraword emphasis between ideographs");
+        assertTrue(only("\u{300c}*a*\u{300d}", emphasis, 3, 6, 4, 5), "Unicode punctuation around emphasis");
+        assertTrue(countIn("\u{fc}_a_") = 0, "an umlaut is a letter: no intraword _");
+        assertTrue(countIn("*\u{a0}a*") = 0, "a no-break space is white space");
+        assertTrue(only("**\u{e4}**", strong, 0, 6, 2, 4), "strong around an umlaut");
+        assertTrue(only("[\u{1f600}](u)", link, 0, 9, 1, 5), "a link around an emoji");
+        return nil;
+    end;
+
+    function testOrder(): Unit is
+        let s: Spans := scanSpans("`c` *e* [l](u) **a *b* c** <u> &amp; :x:", "");
+        assertTrue(spanCount(&s) = 8, "eight spans");
+        assertTrue(wellFormed(&s), "in order, parents before children");
+        assertTrue(kindNumber(spanKind(&s, 0)) = code, "the code span first");
+        assertTrue(kindNumber(spanKind(&s, 3)) = strong, "strong before its emphasis");
+        assertTrue(spanParent(&s, 4) = 3, "the emphasis lies in strong");
+        assertTrue(spanParent(&s, 2) = 8, "the link has no parent");
+        destroySpans(s);
+        return nil;
+    end;
+
+    function testReveal(): Unit is
+        let s: Spans := scanSpans("a **b** c", "");
+        assertTrue(spanIs(&s, 0, strong, 2, 7, 4, 5), "strong from 2 to 7");
+        assertFalse(isRevealed(&s, 0, 1), "a cursor before the span");
+        assertTrue(isRevealed(&s, 0, 2), "a cursor at the opening marker");
+        assertTrue(isRevealed(&s, 0, 4), "a cursor inside");
+        assertTrue(isRevealed(&s, 0, 7), "a cursor right after the closing marker");
+        assertFalse(isRevealed(&s, 0, 8), "a cursor after the span");
+        assertFalse(isRevealedBy(&s, 0, 0, 1), "a selection before the span");
+        assertTrue(isRevealedBy(&s, 0, 0, 2), "a selection that reaches the start");
+        assertTrue(isRevealedBy(&s, 0, 3, 5), "a selection inside");
+        assertTrue(isRevealedBy(&s, 0, 0, 9), "a selection around the span");
+        assertTrue(isRevealedBy(&s, 0, 7, 9), "a selection from the end");
+        assertFalse(isRevealedBy(&s, 0, 8, 9), "a selection after the span");
+        assertTrue(isRevealedBy(&s, 0, 4, 4) = isRevealed(&s, 0, 4), "an empty selection is a cursor");
+        destroySpans(s);
+        let n: Spans := scanSpans("**a *b* c**", "");
+        assertTrue(isRevealed(&n, 0, 5) and isRevealed(&n, 1, 5), "inside the inner span both show their source");
+        assertTrue(isRevealed(&n, 0, 1) and (not isRevealed(&n, 1, 1)), "inside the outer span only it shows");
+        assertTrue(isRevealed(&n, 0, 7) and isRevealed(&n, 1, 7), "right after the inner closer both");
+        assertTrue(isRevealed(&n, 0, 9) and (not isRevealed(&n, 1, 9)), "at c only the outer");
+        assertTrue(isRevealed(&n, 0, 11) and (not isRevealed(&n, 1, 11)), "after the outer closer only the outer");
+        assertTrue(isRevealedBy(&n, 1, 0, 4) and isRevealedBy(&n, 0, 0, 4), "a selection up to the inner span");
+        assertFalse(isRevealedBy(&n, 1, 8, 10), "a selection after the inner span");
+        destroySpans(n);
+        return nil;
+    end;
+
+    function testLongStars(): Unit is
+        let start: Nat64 := nanosNow();
+        let text: String := repeated("*", 100000);
+        let s: Spans := scanSpans(asSpan(&text), "");
+        assertTrue(spanCount(&s) = 0, "one run of stars between nothing is no span");
+        destroySpans(s);
+        destroyString(text);
+        let pairs: String := repeated("*a", 50000);
+        let p: Spans := scanSpans(asSpan(&pairs), "");
+        assertTrue(spanCount(&p) = 25000, "*a*a pairs up");
+        assertTrue(wellFormed(&p), "in order");
+        destroySpans(p);
+        destroyString(pairs);
+        let openers: String := repeated("*a ", 33334);
+        let o: Spans := scanSpans(asSpan(&openers), "");
+        assertTrue(spanCount(&o) = 0, "openers without closers");
+        destroySpans(o);
+        destroyString(openers);
+        assertTrue(quick(start), "under five seconds");
+        return nil;
+    end;
+
+    function testLongBrackets(): Unit is
+        let start: Nat64 := nanosNow();
+        let text: String := repeated("[", 100000);
+        let s: Spans := scanSpans(asSpan(&text), "");
+        assertTrue(spanCount(&s) = 0, "open brackets make no span");
+        destroySpans(s);
+        destroyString(text);
+        let closers: String := repeated("]", 100000);
+        let c: Spans := scanSpans(asSpan(&closers), "");
+        assertTrue(spanCount(&c) = 0, "closing brackets make none");
+        destroySpans(c);
+        destroyString(closers);
+        let nested: String := repeated("[a", 50000);
+        let n: Spans := scanSpans(asSpan(&nested), "a");
+        assertTrue(spanCount(&n) = 0, "brackets that never close, with a label");
+        destroySpans(n);
+        destroyString(nested);
+        let open: String := repeated("[a](b", 20000);
+        let o: Spans := scanSpans(asSpan(&open), "");
+        assertTrue(spanCount(&o) = 0, "destinations that never close");
+        destroySpans(o);
+        destroyString(open);
+        let pairs: String := repeated("[a](b) ", 15000);
+        let p: Spans := scanSpans(asSpan(&pairs), "");
+        assertTrue(spanCount(&p) = 15000, "many links");
+        destroySpans(p);
+        destroyString(pairs);
+        assertTrue(quick(start), "under five seconds");
+        return nil;
+    end;
+
+    function testLongOthers(): Unit is
+        let start: Nat64 := nanosNow();
+        let comments: String := repeated("<!--", 25000);
+        let c: Spans := scanSpans(asSpan(&comments), "");
+        assertTrue(spanCount(&c) = 0, "unclosed comments");
+        destroySpans(c);
+        destroyString(comments);
+        let quotes: String := repeated("<a b=\"", 20000);
+        let q: Spans := scanSpans(asSpan(&quotes), "");
+        assertTrue(spanCount(&q) = 0, "unclosed quotes");
+        destroySpans(q);
+        destroyString(quotes);
+        let ticks: String := repeated("``a`", 25000);
+        let t: Spans := scanSpans(asSpan(&ticks), "");
+        assertTrue(wellFormed(&t), "backtick runs in order");
+        destroySpans(t);
+        destroyString(ticks);
+        let under: String := repeated("_a_ ", 25000);
+        let u: Spans := scanSpans(asSpan(&under), "");
+        assertTrue(spanCount(&u) = 25000, "_a_ pairs up");
+        destroySpans(u);
+        destroyString(under);
+        assertTrue(quick(start), "under five seconds");
+        return nil;
+    end;
+
+    function testLimits(): Unit is
+        let many: String := repeated("*a* ", 70000);
+        let m: Spans := scanSpans(asSpan(&many), "");
+        assertTrue(spanCount(&m) = mostSpans(), "at most mostSpans spans");
+        assertTrue(wellFormed(&m), "in order");
+        destroySpans(m);
+        destroyString(many);
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, "*b*");
+        var k: Index := 0;
+        while k < 1048576 do
+            writeString(&!builder, "aaaaaaaaaaaaaaaa");
+            k := k + 16;
+        end while;
+        writeString(&!builder, "*c*");
+        let long: String := finalize(builder);
+        let l: Spans := scanSpans(asSpan(&long), "");
+        assertTrue(spanCount(&l) = 1, "the span after the cut is not read");
+        assertTrue(spanIs(&l, 0, emphasis, 0, 3, 1, 2), "the span before it is");
+        destroySpans(l);
+        destroyString(long);
+        return nil;
+    end;
+end module body.

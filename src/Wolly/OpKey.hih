@@ -1,0 +1,267 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The signing keys of an OpenID provider: a ring of keys of ML-DSA-44 and of
+the composite ML-DSA-44-Ed25519, the tokens they sign, the key set they
+publish, and their place in a vault.
+
+A key of ML-DSA-44 (FIPS 204, pure, empty context) is kept as its seed of
+32 bytes and read through Standard.X509.  A composite key is kept as the
+seed of its ML-DSA-44 half and the seed of its Ed25519 half, 64 bytes, and
+used through Standard.CompositeSig: both halves sign the message
+representative of the label of ML-DSA-44 with Ed25519 and SHA-512, the ML-DSA half
+with the label as its context, and the signature is the two one after the
+other.  The kid of either is the RFC 7638 thumbprint of its public key:
+members alg, kty, pub for kty "AKP", hashed with SHA-256, in base64url; pub
+of a composite key is the ML-DSA-44 key followed by the Ed25519 key.  A ring
+holds at most one active key of each family, and keys retired but still
+published, ordered by the time they were made.
+
+A token is a compact JWS whose header is alg, kid and typ in this order.
+The key set is the JWK set of every key of the ring, sorted by kid, a key as
+kty, alg, kid, use (sig) and pub.
+
+In a vault a key is one secret named prefix and the first 8 bytes of the
+SHA-256 of its kid in uppercase hex; its value is the JSON object alg, seed
+(base64url), created, and retired when it is not 0.  A value of another
+algorithm, such as an RSA key an older provider kept, is passed over when
+the ring is read and left in the vault when it is written.
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Vault (
+    Vault,
+    VaultError
+);
+
+import Standard.X509 (
+    PrivateKey
+);
+import Standard.CompositeSig (
+    CompositeKey
+);
+
+module Wolly.OpKey is
+    """
+    The families of keys: ML-DSA-44, and the composite of ML-DSA-44 and
+    Ed25519.  One key of a family may be active at a time.
+    """
+    union KeyFamily: Free is
+        case MlDsa;
+        case Composite;
+    end;
+
+    """
+    The private half of a ring key, made from its secret once, when the
+    ring key is made, so that a signature does not make it again.
+    """
+    union KeyMaterial: Linear is
+        case MlDsaMaterial is
+            privateKey: PrivateKey;
+        case CompositeMaterial is
+            compositeKey: CompositeKey;
+    end;
+
+    """
+    A key of the ring.  secret is the seed, 32 bytes for ML-DSA-44 and 64
+    for the composite; created and retired are seconds since 1970, retired 0
+    while the key signs; kid is the thumbprint of its public key.  publicKey
+    is the DER SubjectPublicKeyInfo for ML-DSA-44 and the raw key of 1344
+    bytes for the composite.
+    """
+    record RingKey: Linear is
+        family: KeyFamily;
+        secret: String;
+        created: Int64;
+        retired: Int64;
+        kid: String;
+        publicKey: String;
+        material: KeyMaterial;
+    end;
+
+    """
+    The name of the algorithm a key of family signs with: ML-DSA-44 or
+    ML-DSA-44-Ed25519.
+    """
+    function algorithmOf(family: KeyFamily): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    The family of the algorithm name alg, None for any other name.
+    No contract: an Option read from text.
+    """
+    generic [A: Region]
+    function familyOf(alg: Span[Nat8, A]): Option[KeyFamily];
+
+    """
+    The ring key of family from its secret, with its kid and public key.
+    None when the secret is no key of that family (a seed of another
+    length) or libcrypto fails.
+    """
+    generic [S: Region]
+    function makeRingKey(family: KeyFamily, secret: Span[Nat8, S], created: Int64, retired: Int64): Option[RingKey]
+        requires (created > 0) and (retired >= 0);
+
+    """
+    A new key of family made at now: a seed of random bytes, 32 or 64 as
+    the family has it.  None when the random source or libcrypto fails.
+    """
+    function newRingKey(family: KeyFamily, now: Int64): Option[RingKey]
+        requires now > 0;
+
+    """
+    Frees key.
+    No contract: it only frees.
+    """
+    function destroyRingKey(key: RingKey): Unit;
+
+    """
+    The value a vault keeps for key: alg, seed, created and retired
+    when it is not 0, as one JSON object.
+    """
+    generic [K: Region]
+    function keyEntry(key: &[RingKey, K]): String
+        ensures length(&result) > 0;
+
+    """
+    The ring key of a value keyEntry wrote.  None for text that is no such
+    object or holds no key.
+    No contract: an Option read from text.
+    """
+    generic [T: Region]
+    function readKeyEntry(entry: Span[Nat8, T]): Option[RingKey];
+
+    """
+    The name of the secret of the key kid in a vault: prefix, then the first
+    8 bytes of the SHA-256 of kid in uppercase hex.
+    """
+    generic [P: Region, K: Region]
+    function entryName(prefix: Span[Nat8, P], kid: Span[Nat8, K]): String
+        ensures length(&result) = (spanLength(prefix) + 16);
+
+    """
+    The compact JWS of payload signed with key, with typ in its header.  None
+    when libcrypto fails.  No ensures: the result of libcrypto.
+    """
+    generic [K: Region, T: Region, P: Region]
+    function signToken(key: &[RingKey, K], typ: Span[Nat8, T], payload: Span[Nat8, P]): Option[String]
+        requires spanLength(typ) > 0;
+
+    """
+    The JWK of the public key of key as the key set lists it: kty, alg, kid,
+    use and pub ("AKP").
+    """
+    generic [K: Region]
+    function publicJwk(key: &[RingKey, K]): String
+        ensures length(&result) > 0;
+
+    --- The ring
+
+    """
+    The position of the active key of family in ring: the last one not
+    retired.  None when there is none.
+    No contract: the key is found by a walk over the ring.
+    """
+    generic [R: Region]
+    function activeKey(ring: &[Buffer[RingKey], R], family: KeyFamily): Option[Index];
+
+    """
+    Whether ring holds a key of family, active or retired.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function hasFamily(ring: &[Buffer[RingKey], R], family: KeyFamily): Bool;
+
+    """
+    Whether the active key of family is every seconds old or older at now,
+    or there is none.
+    """
+    generic [R: Region]
+    function isDue(ring: &[Buffer[RingKey], R], family: KeyFamily, now: Int64, every: Int64): Bool
+        requires (now > 0) and (every > 0);
+
+    """
+    Makes a new key of family at now: the active one of that family is
+    retired at now, the new one goes into the ring after the keys made
+    before it.  Its kid, or None when no key could be made, and the ring is
+    then as it was.
+    """
+    generic [R: Region]
+    function rotate(ring: &![Buffer[RingKey], R], family: KeyFamily, now: Int64): Option[String]
+        requires now > 0;
+
+    """
+    Removes the keys retired more than keep seconds before now and gives
+    their kids.
+    """
+    generic [R: Region]
+    function prune(ring: &![Buffer[RingKey], R], now: Int64, keep: Int64): Buffer[String]
+        requires (now > 0) and (keep >= 0);
+
+    """
+    The JWK set of every key of ring, sorted by kid.
+    """
+    generic [R: Region]
+    function keySet(ring: &[Buffer[RingKey], R]): String
+        ensures length(&result) >= 11;
+
+    """
+    Frees ring.
+    No contract: it only frees.
+    """
+    function destroyRing(ring: Buffer[RingKey]): Unit;
+
+    """
+    What verify found in a token: the typ of its header (empty when it has
+    none) and its payload.
+    """
+    record Verified: Linear is
+        typ: String;
+        payload: String;
+    end;
+
+    """
+    Frees verified.
+    No contract: it only frees.
+    """
+    function destroyVerified(verified: Verified): Unit;
+
+    """
+    The typ and payload of the compact JWS token when its header is a JSON
+    object without crit, jwk, jku, x5u, x5c and b64, its alg names a family,
+    its kid names a key of ring of that family, and the signature holds under
+    that key; a composite signature holds only when both halves do.  None otherwise.
+    No contract: an Option over a signature.
+    """
+    generic [T: Region, R: Region]
+    function verify(token: Span[Nat8, T], ring: &[Buffer[RingKey], R]): Option[Verified];
+
+    --- The vault
+
+    """
+    The ring kept in vault under names that begin with prefix, ordered by
+    the time each key was made.  Left when the vault cannot be read; a value
+    that holds no key is a Left of Damaged as well, so that no key is lost
+    on the next save.
+    No contract: the answer is the work of the vault.
+    """
+    generic [V: Region, P: Region]
+    function loadRing(vault: &[Vault, V], prefix: Span[Nat8, P]): Either[VaultError, Buffer[RingKey]];
+
+    """
+    Writes every key of ring into vault under its name and removes the
+    secrets under prefix that name no key of ring.
+    No contract: the answer is the work of the vault.
+    """
+    generic [V: Region, P: Region, R: Region]
+    function saveRing(vault: &![Vault, V], prefix: Span[Nat8, P], ring: &[Buffer[RingKey], R]): Either[VaultError, Unit];
+end module.

@@ -1,0 +1,8 @@
+{
+ "title": "Shop & <More>",
+ "owner": "O'Brien",
+ "items": [
+  {"name": "pen", "price": 2},
+  {"name": "ink <blue>", "price": 11}
+ ]
+}

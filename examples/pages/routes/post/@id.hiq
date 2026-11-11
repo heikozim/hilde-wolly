@@ -1,0 +1,87 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    parseInt
+);
+import Standard.FcgiServer (
+    Request,
+    destroyRequest
+);
+import Wolly.Response (
+    makeResponse,
+    decimalText
+);
+import Wolly.Tree (
+    Page,
+    page
+);
+
+module body Wolly.Example.Pages.Site.Post.Id is
+    record Param: Free is
+        id: Int64;
+        invariant id > 0;
+    end;
+
+    -- Digits only, at most 18 so that the number fits an Int64: a sign or
+    -- a leading blank that parseInt might take is refused here.
+    generic [R: Region]
+    function digitsOnly(text: Span[Nat8, R]): Bool is
+        if (spanLength(text) = 0) or (spanLength(text) > 18) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] < '0') or (text[i] > '9') then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function parse(text: Span[Nat8, R]): Option[Param] is
+        if not digitsOnly(text) then
+            return None();
+        end if;
+        case parseInt(text) of
+            when Some(value as n: Int64) do
+                if n <= 0 then
+                    return None();
+                end if;
+                return Some(value => Param(id => n));
+            when None do
+                return None();
+        end case;
+    end;
+
+    function number(post: Param): Int64 is
+        return post.id;
+    end;
+
+    function get(request: Request, post: Param): Page is
+        destroyRequest(request);
+        var out: StringBuilder := makeStringBuilder();
+        let digits: String := decimalText(post.id);
+        writeString(&!out, "<h1>Post ");
+        writeString(&!out, asSpan(&digits));
+        writeString(&!out, "</h1>\n");
+        destroyString(digits);
+        return page(makeResponse(200, "text/html; charset=utf-8"), finalize(out));
+    end;
+end module body.

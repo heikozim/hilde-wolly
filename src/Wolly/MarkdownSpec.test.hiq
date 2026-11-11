@@ -1,0 +1,2052 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The examples of the CommonMark spec 0.31.2 and of the table extension of
+-- GFM (GitHub Flavored Markdown) within the scope of Wolly.Markdown, one
+-- function per section.  The expected HTML is the reference output in the
+-- form this module writes: no slash in a void element, rel="nofollow
+-- noopener" on every link, an apostrophe as &#39;, the alignment of a cell
+-- as a class, a task list item as a class.  The sections on HTML blocks and
+-- raw HTML go through markdownWithHtmlToHtml; their expected HTML is the
+-- reference output after the sanitizer with richPolicy (elements and
+-- attributes outside it, comments, declarations and processing
+-- instructions taken out, open elements closed).  Left out: the examples
+-- whose URL the module refuses (relative without a slash, empty, of
+-- another scheme); what the module gives there instead, and what it gives
+-- for raw HTML by default, is held by testDeviations.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Wolly.Markdown (
+    markdownToHtml,
+    markdownWithHtmlToHtml
+);
+
+module body Wolly.MarkdownSpec.Test is
+    generic [A: Region, B: Region]
+    function sameBytes(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function spec(text: Span[Nat8, Static], html: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownToHtml(text);
+        assertTrue(sameBytes(asSpan(&made), html), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    -- An example read with raw HTML; html is the reference output after the
+    -- sanitizer with richPolicy.
+    function specHtml(text: Span[Nat8, Static], html: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let made: String := markdownWithHtmlToHtml(text);
+        assertTrue(sameBytes(asSpan(&made), html), message);
+        destroyString(made);
+        return nil;
+    end;
+
+    -- Examples of the spec, or close to them, where the module gives another
+    -- output on purpose: a URL it refuses, a limit of its tables of names and
+    -- of case folding, and the parts of GFM it leaves out.
+    function testDeviations(): Unit is
+        spec("&nbsp; &amp; &copy; &AElig; &Dcaron;\n&frac34; &HilbertSpace; &DifferentialD;\n&ClockwiseContourIntegral; &ngE;\n",
+            "<p>\u{a0} &amp; \u{a9} \u{c6} \u{10e}\n\u{be} \u{210b} \u{2146}\n\u{2232} &amp;ngE;</p>\n",
+            "an entity outside the table of names, here one of two code points, stays text");
+        spec("[Foo bar]:\n<my url>\n'title'\n\n[Foo bar]\n",
+            "<p>[Foo bar]</p>\n",
+            "a definition with a space in its URL is read and gives no link");
+        spec("[foo]: /url\\bar\\*baz \"foo\\\"bar\\baz\"\n\n[foo]\n",
+            "<p>[foo]</p>\n",
+            "a definition with a backslash in its URL gives no link");
+        spec("[link](</my uri>)\n",
+            "<p>[link](&lt;/my uri&gt;)</p>\n",
+            "a URL with a space is no link");
+        spec("[\u{1e9e}]\n\n[SS]: /url\n",
+            "<p>[\u{1e9e}]</p>\n",
+            "labels fold case one code point to one, sharp s stays");
+        spec("[a](url)\n",
+            "<p>[a](url)</p>\n",
+            "a relative URL without a slash is no link");
+        spec("[link]()\n",
+            "<p>[link]()</p>\n",
+            "an empty URL is no link");
+        spec("[foo]()\n\n[foo]: /url1\n",
+            "<p>[foo]()</p>\n",
+            "an empty inline URL is no link, and the definition does not step in");
+        spec("<m:abc>\n",
+            "<p>&lt;m:abc&gt;</p>\n",
+            "an autolink of another scheme is text");
+        spec("<made-up-scheme://foo,bar>\n",
+            "<p>&lt;made-up-scheme://foo,bar&gt;</p>\n",
+            "an autolink of a made up scheme is text");
+        spec("<div>\n*hi*\n</div>\n",
+            "<p>&lt;div&gt;\n<em>hi</em>\n&lt;/div&gt;</p>\n",
+            "an HTML block is paragraph text");
+        spec("a <!-- c --> b\n",
+            "<p>a &lt;!-- c --&gt; b</p>\n",
+            "inline HTML is text");
+        spec("~~Hi~~ Hello, ~there~ world!\n",
+            "<p><del>Hi</del> Hello, ~there~ world!</p>\n",
+            "one tilde is no strikethrough, it is kept for subscript");
+        spec("www.example.com\n",
+            "<p>www.example.com</p>\n",
+            "no autolinks without angle brackets");
+        spec("[^1]\n\n[^1]: note\n",
+            "<p>[^1]</p>\n",
+            "no footnotes");
+        return nil;
+    end;
+
+    -- Tabs: 11 examples.
+    function testTabs(): Unit is
+        spec("\tfoo\tbaz\t\tbim\n",
+            "<pre><code>foo\tbaz\t\tbim\n</code></pre>\n",
+            "Tabs, case 1");
+        spec("  \tfoo\tbaz\t\tbim\n",
+            "<pre><code>foo\tbaz\t\tbim\n</code></pre>\n",
+            "Tabs, case 2");
+        spec("    a\ta\n    \u{1f50}\ta\n",
+            "<pre><code>a\ta\n\u{1f50}\ta\n</code></pre>\n",
+            "Tabs, case 3");
+        spec("  - foo\n\n\tbar\n",
+            "<ul>\n<li>\n<p>foo</p>\n<p>bar</p>\n</li>\n</ul>\n",
+            "Tabs, case 4");
+        spec("- foo\n\n\t\tbar\n",
+            "<ul>\n<li>\n<p>foo</p>\n<pre><code>  bar\n</code></pre>\n</li>\n</ul>\n",
+            "Tabs, case 5");
+        spec(">\t\tfoo\n",
+            "<blockquote>\n<pre><code>  foo\n</code></pre>\n</blockquote>\n",
+            "Tabs, case 6");
+        spec("-\t\tfoo\n",
+            "<ul>\n<li>\n<pre><code>  foo\n</code></pre>\n</li>\n</ul>\n",
+            "Tabs, case 7");
+        spec("    foo\n\tbar\n",
+            "<pre><code>foo\nbar\n</code></pre>\n",
+            "Tabs, case 8");
+        spec(" - foo\n   - bar\n\t - baz\n",
+            "<ul>\n<li>foo\n<ul>\n<li>bar\n<ul>\n<li>baz</li>\n</ul>\n</li>\n</ul>\n</li>\n</ul>\n",
+            "Tabs, case 9");
+        spec("#\tFoo\n",
+            "<h1>Foo</h1>\n",
+            "Tabs, case 10");
+        spec("*\t*\t*\t\n",
+            "<hr>\n",
+            "Tabs, case 11");
+        return nil;
+    end;
+
+    -- Backslash escapes: 11 examples.
+    function testBackslashEscapes(): Unit is
+        spec("\\!\\\"\\#\\$\\%\\&\\'\\(\\)\\*\\+\\,\\-\\.\\/\\:\\;\\<\\=\\>\\?\\@\\[\\\\\\]\\^\\_\\`\\{\\|\\}\\~\n",
+            "<p>!&quot;#$%&amp;&#39;()*+,-./:;&lt;=&gt;?@[\\]^_`{|}~</p>\n",
+            "Backslash escapes, case 1");
+        spec("\\\t\\A\\a\\ \\3\\\u{3c6}\\\u{ab}\n",
+            "<p>\\\t\\A\\a\\ \\3\\\u{3c6}\\\u{ab}</p>\n",
+            "Backslash escapes, case 2");
+        spec("\\*not emphasized*\n\\<br/> not a tag\n\\[not a link](/foo)\n\\`not code`\n1\\. not a list\n\\* not a list\n\\# not a heading\n\\[foo]: /url \"not a reference\"\n\\&ouml; not a character entity\n",
+            "<p>*not emphasized*\n&lt;br/&gt; not a tag\n[not a link](/foo)\n`not code`\n1. not a list\n* not a list\n# not a heading\n[foo]: /url &quot;not a reference&quot;\n&amp;ouml; not a character entity</p>\n",
+            "Backslash escapes, case 3");
+        spec("\\\\*emphasis*\n",
+            "<p>\\<em>emphasis</em></p>\n",
+            "Backslash escapes, case 4");
+        spec("foo\\\nbar\n",
+            "<p>foo<br>\nbar</p>\n",
+            "Backslash escapes, case 5");
+        spec("`` \\[\\` ``\n",
+            "<p><code>\\[\\`</code></p>\n",
+            "Backslash escapes, case 6");
+        spec("    \\[\\]\n",
+            "<pre><code>\\[\\]\n</code></pre>\n",
+            "Backslash escapes, case 7");
+        spec("~~~\n\\[\\]\n~~~\n",
+            "<pre><code>\\[\\]\n</code></pre>\n",
+            "Backslash escapes, case 8");
+        spec("[foo](/bar\\* \"ti\\*tle\")\n",
+            "<p><a href=\"/bar*\" title=\"ti*tle\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Backslash escapes, case 9");
+        spec("[foo]\n\n[foo]: /bar\\* \"ti\\*tle\"\n",
+            "<p><a href=\"/bar*\" title=\"ti*tle\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Backslash escapes, case 10");
+        spec("``` foo\\+bar\nfoo\n```\n",
+            "<pre><code class=\"language-foo+bar\">foo\n</code></pre>\n",
+            "Backslash escapes, case 11");
+        return nil;
+    end;
+
+    -- Entity and numeric character references: 14 examples.
+    function testEntityAndNumericCharacterReferences(): Unit is
+        spec("&#35; &#1234; &#992; &#0;\n",
+            "<p># \u{4d2} \u{3e0} \u{fffd}</p>\n",
+            "Entity and numeric character references, case 1");
+        spec("&#X22; &#XD06; &#xcab;\n",
+            "<p>&quot; \u{d06} \u{cab}</p>\n",
+            "Entity and numeric character references, case 2");
+        spec("&nbsp &x; &#; &#x;\n&#87654321;\n&#abcdef0;\n&ThisIsNotDefined; &hi?;\n",
+            "<p>&amp;nbsp &amp;x; &amp;#; &amp;#x;\n&amp;#87654321;\n&amp;#abcdef0;\n&amp;ThisIsNotDefined; &amp;hi?;</p>\n",
+            "Entity and numeric character references, case 3");
+        spec("&copy\n",
+            "<p>&amp;copy</p>\n",
+            "Entity and numeric character references, case 4");
+        spec("&MadeUpEntity;\n",
+            "<p>&amp;MadeUpEntity;</p>\n",
+            "Entity and numeric character references, case 5");
+        spec("[foo](/f&ouml;&ouml; \"f&ouml;&ouml;\")\n",
+            "<p><a href=\"/f%C3%B6%C3%B6\" title=\"f\u{f6}\u{f6}\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Entity and numeric character references, case 6");
+        spec("``` f&ouml;&ouml;\nfoo\n```\n",
+            "<pre><code class=\"language-f\u{f6}\u{f6}\">foo\n</code></pre>\n",
+            "Entity and numeric character references, case 7");
+        spec("`f&ouml;&ouml;`\n",
+            "<p><code>f&amp;ouml;&amp;ouml;</code></p>\n",
+            "Entity and numeric character references, case 8");
+        spec("    f&ouml;f&ouml;\n",
+            "<pre><code>f&amp;ouml;f&amp;ouml;\n</code></pre>\n",
+            "Entity and numeric character references, case 9");
+        spec("&#42;foo&#42;\n*foo*\n",
+            "<p>*foo*\n<em>foo</em></p>\n",
+            "Entity and numeric character references, case 10");
+        spec("&#42; foo\n\n* foo\n",
+            "<p>* foo</p>\n<ul>\n<li>foo</li>\n</ul>\n",
+            "Entity and numeric character references, case 11");
+        spec("foo&#10;&#10;bar\n",
+            "<p>foo\n\nbar</p>\n",
+            "Entity and numeric character references, case 12");
+        spec("&#9;foo\n",
+            "<p>\tfoo</p>\n",
+            "Entity and numeric character references, case 13");
+        spec("[a](url &quot;tit&quot;)\n",
+            "<p>[a](url &quot;tit&quot;)</p>\n",
+            "Entity and numeric character references, case 14");
+        return nil;
+    end;
+
+    -- Precedence: 1 examples.
+    function testPrecedence(): Unit is
+        spec("- `one\n- two`\n",
+            "<ul>\n<li>`one</li>\n<li>two`</li>\n</ul>\n",
+            "Precedence, case 1");
+        return nil;
+    end;
+
+    -- Thematic breaks: 19 examples.
+    function testThematicBreaks(): Unit is
+        spec("***\n---\n___\n",
+            "<hr>\n<hr>\n<hr>\n",
+            "Thematic breaks, case 1");
+        spec("+++\n",
+            "<p>+++</p>\n",
+            "Thematic breaks, case 2");
+        spec("===\n",
+            "<p>===</p>\n",
+            "Thematic breaks, case 3");
+        spec("--\n**\n__\n",
+            "<p>--\n**\n__</p>\n",
+            "Thematic breaks, case 4");
+        spec(" ***\n  ***\n   ***\n",
+            "<hr>\n<hr>\n<hr>\n",
+            "Thematic breaks, case 5");
+        spec("    ***\n",
+            "<pre><code>***\n</code></pre>\n",
+            "Thematic breaks, case 6");
+        spec("Foo\n    ***\n",
+            "<p>Foo\n***</p>\n",
+            "Thematic breaks, case 7");
+        spec("_____________________________________\n",
+            "<hr>\n",
+            "Thematic breaks, case 8");
+        spec(" - - -\n",
+            "<hr>\n",
+            "Thematic breaks, case 9");
+        spec(" **  * ** * ** * **\n",
+            "<hr>\n",
+            "Thematic breaks, case 10");
+        spec("-     -      -      -\n",
+            "<hr>\n",
+            "Thematic breaks, case 11");
+        spec("- - - -    \n",
+            "<hr>\n",
+            "Thematic breaks, case 12");
+        spec("_ _ _ _ a\n\na------\n\n---a---\n",
+            "<p>_ _ _ _ a</p>\n<p>a------</p>\n<p>---a---</p>\n",
+            "Thematic breaks, case 13");
+        spec(" *-*\n",
+            "<p><em>-</em></p>\n",
+            "Thematic breaks, case 14");
+        spec("- foo\n***\n- bar\n",
+            "<ul>\n<li>foo</li>\n</ul>\n<hr>\n<ul>\n<li>bar</li>\n</ul>\n",
+            "Thematic breaks, case 15");
+        spec("Foo\n***\nbar\n",
+            "<p>Foo</p>\n<hr>\n<p>bar</p>\n",
+            "Thematic breaks, case 16");
+        spec("Foo\n---\nbar\n",
+            "<h2>Foo</h2>\n<p>bar</p>\n",
+            "Thematic breaks, case 17");
+        spec("* Foo\n* * *\n* Bar\n",
+            "<ul>\n<li>Foo</li>\n</ul>\n<hr>\n<ul>\n<li>Bar</li>\n</ul>\n",
+            "Thematic breaks, case 18");
+        spec("- Foo\n- * * *\n",
+            "<ul>\n<li>Foo</li>\n<li>\n<hr>\n</li>\n</ul>\n",
+            "Thematic breaks, case 19");
+        return nil;
+    end;
+
+    -- ATX headings: 18 examples.
+    function testATXHeadings(): Unit is
+        spec("# foo\n## foo\n### foo\n#### foo\n##### foo\n###### foo\n",
+            "<h1>foo</h1>\n<h2>foo</h2>\n<h3>foo</h3>\n<h4>foo</h4>\n<h5>foo</h5>\n<h6>foo</h6>\n",
+            "ATX headings, case 1");
+        spec("####### foo\n",
+            "<p>####### foo</p>\n",
+            "ATX headings, case 2");
+        spec("#5 bolt\n\n#hashtag\n",
+            "<p>#5 bolt</p>\n<p>#hashtag</p>\n",
+            "ATX headings, case 3");
+        spec("\\## foo\n",
+            "<p>## foo</p>\n",
+            "ATX headings, case 4");
+        spec("# foo *bar* \\*baz\\*\n",
+            "<h1>foo <em>bar</em> *baz*</h1>\n",
+            "ATX headings, case 5");
+        spec("#                  foo                     \n",
+            "<h1>foo</h1>\n",
+            "ATX headings, case 6");
+        spec(" ### foo\n  ## foo\n   # foo\n",
+            "<h3>foo</h3>\n<h2>foo</h2>\n<h1>foo</h1>\n",
+            "ATX headings, case 7");
+        spec("    # foo\n",
+            "<pre><code># foo\n</code></pre>\n",
+            "ATX headings, case 8");
+        spec("foo\n    # bar\n",
+            "<p>foo\n# bar</p>\n",
+            "ATX headings, case 9");
+        spec("## foo ##\n  ###   bar    ###\n",
+            "<h2>foo</h2>\n<h3>bar</h3>\n",
+            "ATX headings, case 10");
+        spec("# foo ##################################\n##### foo ##\n",
+            "<h1>foo</h1>\n<h5>foo</h5>\n",
+            "ATX headings, case 11");
+        spec("### foo ###     \n",
+            "<h3>foo</h3>\n",
+            "ATX headings, case 12");
+        spec("### foo ### b\n",
+            "<h3>foo ### b</h3>\n",
+            "ATX headings, case 13");
+        spec("# foo#\n",
+            "<h1>foo#</h1>\n",
+            "ATX headings, case 14");
+        spec("### foo \\###\n## foo #\\##\n# foo \\#\n",
+            "<h3>foo ###</h3>\n<h2>foo ###</h2>\n<h1>foo #</h1>\n",
+            "ATX headings, case 15");
+        spec("****\n## foo\n****\n",
+            "<hr>\n<h2>foo</h2>\n<hr>\n",
+            "ATX headings, case 16");
+        spec("Foo bar\n# baz\nBar foo\n",
+            "<p>Foo bar</p>\n<h1>baz</h1>\n<p>Bar foo</p>\n",
+            "ATX headings, case 17");
+        spec("## \n#\n### ###\n",
+            "<h2></h2>\n<h1></h1>\n<h3></h3>\n",
+            "ATX headings, case 18");
+        return nil;
+    end;
+
+    -- Setext headings: 27 examples.
+    function testSetextHeadings(): Unit is
+        spec("Foo *bar*\n=========\n\nFoo *bar*\n---------\n",
+            "<h1>Foo <em>bar</em></h1>\n<h2>Foo <em>bar</em></h2>\n",
+            "Setext headings, case 1");
+        spec("Foo *bar\nbaz*\n====\n",
+            "<h1>Foo <em>bar\nbaz</em></h1>\n",
+            "Setext headings, case 2");
+        spec("  Foo *bar\nbaz*\t\n====\n",
+            "<h1>Foo <em>bar\nbaz</em></h1>\n",
+            "Setext headings, case 3");
+        spec("Foo\n-------------------------\n\nFoo\n=\n",
+            "<h2>Foo</h2>\n<h1>Foo</h1>\n",
+            "Setext headings, case 4");
+        spec("   Foo\n---\n\n  Foo\n-----\n\n  Foo\n  ===\n",
+            "<h2>Foo</h2>\n<h2>Foo</h2>\n<h1>Foo</h1>\n",
+            "Setext headings, case 5");
+        spec("    Foo\n    ---\n\n    Foo\n---\n",
+            "<pre><code>Foo\n---\n\nFoo\n</code></pre>\n<hr>\n",
+            "Setext headings, case 6");
+        spec("Foo\n   ----      \n",
+            "<h2>Foo</h2>\n",
+            "Setext headings, case 7");
+        spec("Foo\n    ---\n",
+            "<p>Foo\n---</p>\n",
+            "Setext headings, case 8");
+        spec("Foo\n= =\n\nFoo\n--- -\n",
+            "<p>Foo\n= =</p>\n<p>Foo</p>\n<hr>\n",
+            "Setext headings, case 9");
+        spec("Foo  \n-----\n",
+            "<h2>Foo</h2>\n",
+            "Setext headings, case 10");
+        spec("Foo\\\n----\n",
+            "<h2>Foo\\</h2>\n",
+            "Setext headings, case 11");
+        spec("`Foo\n----\n`\n\n<a title=\"a lot\n---\nof dashes\"/>\n",
+            "<h2>`Foo</h2>\n<p>`</p>\n<h2>&lt;a title=&quot;a lot</h2>\n<p>of dashes&quot;/&gt;</p>\n",
+            "Setext headings, case 12");
+        spec("> Foo\n---\n",
+            "<blockquote>\n<p>Foo</p>\n</blockquote>\n<hr>\n",
+            "Setext headings, case 13");
+        spec("> foo\nbar\n===\n",
+            "<blockquote>\n<p>foo\nbar\n===</p>\n</blockquote>\n",
+            "Setext headings, case 14");
+        spec("- Foo\n---\n",
+            "<ul>\n<li>Foo</li>\n</ul>\n<hr>\n",
+            "Setext headings, case 15");
+        spec("Foo\nBar\n---\n",
+            "<h2>Foo\nBar</h2>\n",
+            "Setext headings, case 16");
+        spec("---\nFoo\n---\nBar\n---\nBaz\n",
+            "<hr>\n<h2>Foo</h2>\n<h2>Bar</h2>\n<p>Baz</p>\n",
+            "Setext headings, case 17");
+        spec("\n====\n",
+            "<p>====</p>\n",
+            "Setext headings, case 18");
+        spec("---\n---\n",
+            "<hr>\n<hr>\n",
+            "Setext headings, case 19");
+        spec("- foo\n-----\n",
+            "<ul>\n<li>foo</li>\n</ul>\n<hr>\n",
+            "Setext headings, case 20");
+        spec("    foo\n---\n",
+            "<pre><code>foo\n</code></pre>\n<hr>\n",
+            "Setext headings, case 21");
+        spec("> foo\n-----\n",
+            "<blockquote>\n<p>foo</p>\n</blockquote>\n<hr>\n",
+            "Setext headings, case 22");
+        spec("\\> foo\n------\n",
+            "<h2>&gt; foo</h2>\n",
+            "Setext headings, case 23");
+        spec("Foo\n\nbar\n---\nbaz\n",
+            "<p>Foo</p>\n<h2>bar</h2>\n<p>baz</p>\n",
+            "Setext headings, case 24");
+        spec("Foo\nbar\n\n---\n\nbaz\n",
+            "<p>Foo\nbar</p>\n<hr>\n<p>baz</p>\n",
+            "Setext headings, case 25");
+        spec("Foo\nbar\n* * *\nbaz\n",
+            "<p>Foo\nbar</p>\n<hr>\n<p>baz</p>\n",
+            "Setext headings, case 26");
+        spec("Foo\nbar\n\\---\nbaz\n",
+            "<p>Foo\nbar\n---\nbaz</p>\n",
+            "Setext headings, case 27");
+        return nil;
+    end;
+
+    -- Indented code blocks: 12 examples.
+    function testIndentedCodeBlocks(): Unit is
+        spec("    a simple\n      indented code block\n",
+            "<pre><code>a simple\n  indented code block\n</code></pre>\n",
+            "Indented code blocks, case 1");
+        spec("  - foo\n\n    bar\n",
+            "<ul>\n<li>\n<p>foo</p>\n<p>bar</p>\n</li>\n</ul>\n",
+            "Indented code blocks, case 2");
+        spec("1.  foo\n\n    - bar\n",
+            "<ol>\n<li>\n<p>foo</p>\n<ul>\n<li>bar</li>\n</ul>\n</li>\n</ol>\n",
+            "Indented code blocks, case 3");
+        spec("    <a/>\n    *hi*\n\n    - one\n",
+            "<pre><code>&lt;a/&gt;\n*hi*\n\n- one\n</code></pre>\n",
+            "Indented code blocks, case 4");
+        spec("    chunk1\n\n    chunk2\n  \n \n \n    chunk3\n",
+            "<pre><code>chunk1\n\nchunk2\n\n\n\nchunk3\n</code></pre>\n",
+            "Indented code blocks, case 5");
+        spec("    chunk1\n      \n      chunk2\n",
+            "<pre><code>chunk1\n  \n  chunk2\n</code></pre>\n",
+            "Indented code blocks, case 6");
+        spec("Foo\n    bar\n",
+            "<p>Foo\nbar</p>\n",
+            "Indented code blocks, case 7");
+        spec("    foo\nbar\n",
+            "<pre><code>foo\n</code></pre>\n<p>bar</p>\n",
+            "Indented code blocks, case 8");
+        spec("# Heading\n    foo\nHeading\n------\n    foo\n----\n",
+            "<h1>Heading</h1>\n<pre><code>foo\n</code></pre>\n<h2>Heading</h2>\n<pre><code>foo\n</code></pre>\n<hr>\n",
+            "Indented code blocks, case 9");
+        spec("        foo\n    bar\n",
+            "<pre><code>    foo\nbar\n</code></pre>\n",
+            "Indented code blocks, case 10");
+        spec("\n    \n    foo\n    \n\n",
+            "<pre><code>foo\n</code></pre>\n",
+            "Indented code blocks, case 11");
+        spec("    foo  \n",
+            "<pre><code>foo  \n</code></pre>\n",
+            "Indented code blocks, case 12");
+        return nil;
+    end;
+
+    -- Fenced code blocks: 29 examples.
+    function testFencedCodeBlocks(): Unit is
+        spec("```\n<\n >\n```\n",
+            "<pre><code>&lt;\n &gt;\n</code></pre>\n",
+            "Fenced code blocks, case 1");
+        spec("~~~\n<\n >\n~~~\n",
+            "<pre><code>&lt;\n &gt;\n</code></pre>\n",
+            "Fenced code blocks, case 2");
+        spec("``\nfoo\n``\n",
+            "<p><code>foo</code></p>\n",
+            "Fenced code blocks, case 3");
+        spec("```\naaa\n~~~\n```\n",
+            "<pre><code>aaa\n~~~\n</code></pre>\n",
+            "Fenced code blocks, case 4");
+        spec("~~~\naaa\n```\n~~~\n",
+            "<pre><code>aaa\n```\n</code></pre>\n",
+            "Fenced code blocks, case 5");
+        spec("````\naaa\n```\n``````\n",
+            "<pre><code>aaa\n```\n</code></pre>\n",
+            "Fenced code blocks, case 6");
+        spec("~~~~\naaa\n~~~\n~~~~\n",
+            "<pre><code>aaa\n~~~\n</code></pre>\n",
+            "Fenced code blocks, case 7");
+        spec("```\n",
+            "<pre><code></code></pre>\n",
+            "Fenced code blocks, case 8");
+        spec("`````\n\n```\naaa\n",
+            "<pre><code>\n```\naaa\n</code></pre>\n",
+            "Fenced code blocks, case 9");
+        spec("> ```\n> aaa\n\nbbb\n",
+            "<blockquote>\n<pre><code>aaa\n</code></pre>\n</blockquote>\n<p>bbb</p>\n",
+            "Fenced code blocks, case 10");
+        spec("```\n\n  \n```\n",
+            "<pre><code>\n  \n</code></pre>\n",
+            "Fenced code blocks, case 11");
+        spec("```\n```\n",
+            "<pre><code></code></pre>\n",
+            "Fenced code blocks, case 12");
+        spec(" ```\n aaa\naaa\n```\n",
+            "<pre><code>aaa\naaa\n</code></pre>\n",
+            "Fenced code blocks, case 13");
+        spec("  ```\naaa\n  aaa\naaa\n  ```\n",
+            "<pre><code>aaa\naaa\naaa\n</code></pre>\n",
+            "Fenced code blocks, case 14");
+        spec("   ```\n   aaa\n    aaa\n  aaa\n   ```\n",
+            "<pre><code>aaa\n aaa\naaa\n</code></pre>\n",
+            "Fenced code blocks, case 15");
+        spec("    ```\n    aaa\n    ```\n",
+            "<pre><code>```\naaa\n```\n</code></pre>\n",
+            "Fenced code blocks, case 16");
+        spec("```\naaa\n  ```\n",
+            "<pre><code>aaa\n</code></pre>\n",
+            "Fenced code blocks, case 17");
+        spec("   ```\naaa\n  ```\n",
+            "<pre><code>aaa\n</code></pre>\n",
+            "Fenced code blocks, case 18");
+        spec("```\naaa\n    ```\n",
+            "<pre><code>aaa\n    ```\n</code></pre>\n",
+            "Fenced code blocks, case 19");
+        spec("``` ```\naaa\n",
+            "<p><code> </code>\naaa</p>\n",
+            "Fenced code blocks, case 20");
+        spec("~~~~~~\naaa\n~~~ ~~\n",
+            "<pre><code>aaa\n~~~ ~~\n</code></pre>\n",
+            "Fenced code blocks, case 21");
+        spec("foo\n```\nbar\n```\nbaz\n",
+            "<p>foo</p>\n<pre><code>bar\n</code></pre>\n<p>baz</p>\n",
+            "Fenced code blocks, case 22");
+        spec("foo\n---\n~~~\nbar\n~~~\n# baz\n",
+            "<h2>foo</h2>\n<pre><code>bar\n</code></pre>\n<h1>baz</h1>\n",
+            "Fenced code blocks, case 23");
+        spec("```ruby\ndef foo(x)\n  return 3\nend\n```\n",
+            "<pre><code class=\"language-ruby\">def foo(x)\n  return 3\nend\n</code></pre>\n",
+            "Fenced code blocks, case 24");
+        spec("~~~~    ruby startline=3 $%@#$\ndef foo(x)\n  return 3\nend\n~~~~~~~\n",
+            "<pre><code class=\"language-ruby\">def foo(x)\n  return 3\nend\n</code></pre>\n",
+            "Fenced code blocks, case 25");
+        spec("````;\n````\n",
+            "<pre><code class=\"language-;\"></code></pre>\n",
+            "Fenced code blocks, case 26");
+        spec("``` aa ```\nfoo\n",
+            "<p><code>aa</code>\nfoo</p>\n",
+            "Fenced code blocks, case 27");
+        spec("~~~ aa ``` ~~~\nfoo\n~~~\n",
+            "<pre><code class=\"language-aa\">foo\n</code></pre>\n",
+            "Fenced code blocks, case 28");
+        spec("```\n``` aaa\n```\n",
+            "<pre><code>``` aaa\n</code></pre>\n",
+            "Fenced code blocks, case 29");
+        return nil;
+    end;
+
+    -- Link reference definitions: 22 examples.
+    function testLinkReferenceDefinitions(): Unit is
+        spec("[foo]: /url \"title\"\n\n[foo]\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Link reference definitions, case 1");
+        spec("   [foo]: \n      /url  \n           'the title'  \n\n[foo]\n",
+            "<p><a href=\"/url\" title=\"the title\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Link reference definitions, case 2");
+        spec("[foo]: /url '\ntitle\nline1\nline2\n'\n\n[foo]\n",
+            "<p><a href=\"/url\" title=\"\ntitle\nline1\nline2\n\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Link reference definitions, case 3");
+        spec("[foo]: /url 'title\n\nwith blank line'\n\n[foo]\n",
+            "<p>[foo]: /url &#39;title</p>\n<p>with blank line&#39;</p>\n<p>[foo]</p>\n",
+            "Link reference definitions, case 4");
+        spec("[foo]:\n/url\n\n[foo]\n",
+            "<p><a href=\"/url\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Link reference definitions, case 5");
+        spec("[foo]:\n\n[foo]\n",
+            "<p>[foo]:</p>\n<p>[foo]</p>\n",
+            "Link reference definitions, case 6");
+        spec("[foo]\n\n[foo]: /url\n",
+            "<p><a href=\"/url\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Link reference definitions, case 7");
+        spec("[foo]\n\n[foo]: /first\n[foo]: /second\n",
+            "<p><a href=\"/first\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Link reference definitions, case 8");
+        spec("[FOO]: /url\n\n[Foo]\n",
+            "<p><a href=\"/url\" rel=\"nofollow noopener\">Foo</a></p>\n",
+            "Link reference definitions, case 9");
+        spec("[\u{391}\u{393}\u{3a9}]: /\u{3c6}\u{3bf}\u{3c5}\n\n[\u{3b1}\u{3b3}\u{3c9}]\n",
+            "<p><a href=\"/%CF%86%CE%BF%CF%85\" rel=\"nofollow noopener\">\u{3b1}\u{3b3}\u{3c9}</a></p>\n",
+            "Link reference definitions, case 10");
+        spec("[foo]: /url\n",
+            "",
+            "Link reference definitions, case 11");
+        spec("[\nfoo\n]: /url\nbar\n",
+            "<p>bar</p>\n",
+            "Link reference definitions, case 12");
+        spec("[foo]: /url \"title\" ok\n",
+            "<p>[foo]: /url &quot;title&quot; ok</p>\n",
+            "Link reference definitions, case 13");
+        spec("[foo]: /url\n\"title\" ok\n",
+            "<p>&quot;title&quot; ok</p>\n",
+            "Link reference definitions, case 14");
+        spec("    [foo]: /url \"title\"\n\n[foo]\n",
+            "<pre><code>[foo]: /url &quot;title&quot;\n</code></pre>\n<p>[foo]</p>\n",
+            "Link reference definitions, case 15");
+        spec("```\n[foo]: /url\n```\n\n[foo]\n",
+            "<pre><code>[foo]: /url\n</code></pre>\n<p>[foo]</p>\n",
+            "Link reference definitions, case 16");
+        spec("Foo\n[bar]: /baz\n\n[bar]\n",
+            "<p>Foo\n[bar]: /baz</p>\n<p>[bar]</p>\n",
+            "Link reference definitions, case 17");
+        spec("# [Foo]\n[foo]: /url\n> bar\n",
+            "<h1><a href=\"/url\" rel=\"nofollow noopener\">Foo</a></h1>\n<blockquote>\n<p>bar</p>\n</blockquote>\n",
+            "Link reference definitions, case 18");
+        spec("[foo]: /url\nbar\n===\n[foo]\n",
+            "<h1>bar</h1>\n<p><a href=\"/url\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Link reference definitions, case 19");
+        spec("[foo]: /url\n===\n[foo]\n",
+            "<p>===\n<a href=\"/url\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Link reference definitions, case 20");
+        spec("[foo]: /foo-url \"foo\"\n[bar]: /bar-url\n  \"bar\"\n[baz]: /baz-url\n\n[foo],\n[bar],\n[baz]\n",
+            "<p><a href=\"/foo-url\" title=\"foo\" rel=\"nofollow noopener\">foo</a>,\n<a href=\"/bar-url\" title=\"bar\" rel=\"nofollow noopener\">bar</a>,\n<a href=\"/baz-url\" rel=\"nofollow noopener\">baz</a></p>\n",
+            "Link reference definitions, case 21");
+        spec("[foo]\n\n> [foo]: /url\n",
+            "<p><a href=\"/url\" rel=\"nofollow noopener\">foo</a></p>\n<blockquote>\n</blockquote>\n",
+            "Link reference definitions, case 22");
+        return nil;
+    end;
+
+    -- Paragraphs: 8 examples.
+    function testParagraphs(): Unit is
+        spec("aaa\n\nbbb\n",
+            "<p>aaa</p>\n<p>bbb</p>\n",
+            "Paragraphs, case 1");
+        spec("aaa\nbbb\n\nccc\nddd\n",
+            "<p>aaa\nbbb</p>\n<p>ccc\nddd</p>\n",
+            "Paragraphs, case 2");
+        spec("aaa\n\n\nbbb\n",
+            "<p>aaa</p>\n<p>bbb</p>\n",
+            "Paragraphs, case 3");
+        spec("  aaa\n bbb\n",
+            "<p>aaa\nbbb</p>\n",
+            "Paragraphs, case 4");
+        spec("aaa\n             bbb\n                                       ccc\n",
+            "<p>aaa\nbbb\nccc</p>\n",
+            "Paragraphs, case 5");
+        spec("   aaa\nbbb\n",
+            "<p>aaa\nbbb</p>\n",
+            "Paragraphs, case 6");
+        spec("    aaa\nbbb\n",
+            "<pre><code>aaa\n</code></pre>\n<p>bbb</p>\n",
+            "Paragraphs, case 7");
+        spec("aaa     \nbbb     \n",
+            "<p>aaa<br>\nbbb</p>\n",
+            "Paragraphs, case 8");
+        return nil;
+    end;
+
+    -- Blank lines: 1 examples.
+    function testBlankLines(): Unit is
+        spec("  \n\naaa\n  \n\n# aaa\n\n  \n",
+            "<p>aaa</p>\n<h1>aaa</h1>\n",
+            "Blank lines, case 1");
+        return nil;
+    end;
+
+    -- Block quotes: 25 examples.
+    function testBlockQuotes(): Unit is
+        spec("> # Foo\n> bar\n> baz\n",
+            "<blockquote>\n<h1>Foo</h1>\n<p>bar\nbaz</p>\n</blockquote>\n",
+            "Block quotes, case 1");
+        spec("># Foo\n>bar\n> baz\n",
+            "<blockquote>\n<h1>Foo</h1>\n<p>bar\nbaz</p>\n</blockquote>\n",
+            "Block quotes, case 2");
+        spec("   > # Foo\n   > bar\n > baz\n",
+            "<blockquote>\n<h1>Foo</h1>\n<p>bar\nbaz</p>\n</blockquote>\n",
+            "Block quotes, case 3");
+        spec("    > # Foo\n    > bar\n    > baz\n",
+            "<pre><code>&gt; # Foo\n&gt; bar\n&gt; baz\n</code></pre>\n",
+            "Block quotes, case 4");
+        spec("> # Foo\n> bar\nbaz\n",
+            "<blockquote>\n<h1>Foo</h1>\n<p>bar\nbaz</p>\n</blockquote>\n",
+            "Block quotes, case 5");
+        spec("> bar\nbaz\n> foo\n",
+            "<blockquote>\n<p>bar\nbaz\nfoo</p>\n</blockquote>\n",
+            "Block quotes, case 6");
+        spec("> foo\n---\n",
+            "<blockquote>\n<p>foo</p>\n</blockquote>\n<hr>\n",
+            "Block quotes, case 7");
+        spec("> - foo\n- bar\n",
+            "<blockquote>\n<ul>\n<li>foo</li>\n</ul>\n</blockquote>\n<ul>\n<li>bar</li>\n</ul>\n",
+            "Block quotes, case 8");
+        spec(">     foo\n    bar\n",
+            "<blockquote>\n<pre><code>foo\n</code></pre>\n</blockquote>\n<pre><code>bar\n</code></pre>\n",
+            "Block quotes, case 9");
+        spec("> ```\nfoo\n```\n",
+            "<blockquote>\n<pre><code></code></pre>\n</blockquote>\n<p>foo</p>\n<pre><code></code></pre>\n",
+            "Block quotes, case 10");
+        spec("> foo\n    - bar\n",
+            "<blockquote>\n<p>foo\n- bar</p>\n</blockquote>\n",
+            "Block quotes, case 11");
+        spec(">\n",
+            "<blockquote>\n</blockquote>\n",
+            "Block quotes, case 12");
+        spec(">\n>  \n> \n",
+            "<blockquote>\n</blockquote>\n",
+            "Block quotes, case 13");
+        spec(">\n> foo\n>  \n",
+            "<blockquote>\n<p>foo</p>\n</blockquote>\n",
+            "Block quotes, case 14");
+        spec("> foo\n\n> bar\n",
+            "<blockquote>\n<p>foo</p>\n</blockquote>\n<blockquote>\n<p>bar</p>\n</blockquote>\n",
+            "Block quotes, case 15");
+        spec("> foo\n> bar\n",
+            "<blockquote>\n<p>foo\nbar</p>\n</blockquote>\n",
+            "Block quotes, case 16");
+        spec("> foo\n>\n> bar\n",
+            "<blockquote>\n<p>foo</p>\n<p>bar</p>\n</blockquote>\n",
+            "Block quotes, case 17");
+        spec("foo\n> bar\n",
+            "<p>foo</p>\n<blockquote>\n<p>bar</p>\n</blockquote>\n",
+            "Block quotes, case 18");
+        spec("> aaa\n***\n> bbb\n",
+            "<blockquote>\n<p>aaa</p>\n</blockquote>\n<hr>\n<blockquote>\n<p>bbb</p>\n</blockquote>\n",
+            "Block quotes, case 19");
+        spec("> bar\nbaz\n",
+            "<blockquote>\n<p>bar\nbaz</p>\n</blockquote>\n",
+            "Block quotes, case 20");
+        spec("> bar\n\nbaz\n",
+            "<blockquote>\n<p>bar</p>\n</blockquote>\n<p>baz</p>\n",
+            "Block quotes, case 21");
+        spec("> bar\n>\nbaz\n",
+            "<blockquote>\n<p>bar</p>\n</blockquote>\n<p>baz</p>\n",
+            "Block quotes, case 22");
+        spec("> > > foo\nbar\n",
+            "<blockquote>\n<blockquote>\n<blockquote>\n<p>foo\nbar</p>\n</blockquote>\n</blockquote>\n</blockquote>\n",
+            "Block quotes, case 23");
+        spec(">>> foo\n> bar\n>>baz\n",
+            "<blockquote>\n<blockquote>\n<blockquote>\n<p>foo\nbar\nbaz</p>\n</blockquote>\n</blockquote>\n</blockquote>\n",
+            "Block quotes, case 24");
+        spec(">     code\n\n>    not code\n",
+            "<blockquote>\n<pre><code>code\n</code></pre>\n</blockquote>\n<blockquote>\n<p>not code</p>\n</blockquote>\n",
+            "Block quotes, case 25");
+        return nil;
+    end;
+
+    -- List items: 40 examples.
+    function testListItems1(): Unit is
+        spec("A paragraph\nwith two lines.\n\n    indented code\n\n> A block quote.\n",
+            "<p>A paragraph\nwith two lines.</p>\n<pre><code>indented code\n</code></pre>\n<blockquote>\n<p>A block quote.</p>\n</blockquote>\n",
+            "List items, case 1");
+        spec("1.  A paragraph\n    with two lines.\n\n        indented code\n\n    > A block quote.\n",
+            "<ol>\n<li>\n<p>A paragraph\nwith two lines.</p>\n<pre><code>indented code\n</code></pre>\n<blockquote>\n<p>A block quote.</p>\n</blockquote>\n</li>\n</ol>\n",
+            "List items, case 2");
+        spec("- one\n\n two\n",
+            "<ul>\n<li>one</li>\n</ul>\n<p>two</p>\n",
+            "List items, case 3");
+        spec("- one\n\n  two\n",
+            "<ul>\n<li>\n<p>one</p>\n<p>two</p>\n</li>\n</ul>\n",
+            "List items, case 4");
+        spec(" -    one\n\n     two\n",
+            "<ul>\n<li>one</li>\n</ul>\n<pre><code> two\n</code></pre>\n",
+            "List items, case 5");
+        spec(" -    one\n\n      two\n",
+            "<ul>\n<li>\n<p>one</p>\n<p>two</p>\n</li>\n</ul>\n",
+            "List items, case 6");
+        spec("   > > 1.  one\n>>\n>>     two\n",
+            "<blockquote>\n<blockquote>\n<ol>\n<li>\n<p>one</p>\n<p>two</p>\n</li>\n</ol>\n</blockquote>\n</blockquote>\n",
+            "List items, case 7");
+        spec(">>- one\n>>\n  >  > two\n",
+            "<blockquote>\n<blockquote>\n<ul>\n<li>one</li>\n</ul>\n<p>two</p>\n</blockquote>\n</blockquote>\n",
+            "List items, case 8");
+        spec("-one\n\n2.two\n",
+            "<p>-one</p>\n<p>2.two</p>\n",
+            "List items, case 9");
+        spec("- foo\n\n\n  bar\n",
+            "<ul>\n<li>\n<p>foo</p>\n<p>bar</p>\n</li>\n</ul>\n",
+            "List items, case 10");
+        spec("1.  foo\n\n    ```\n    bar\n    ```\n\n    baz\n\n    > bam\n",
+            "<ol>\n<li>\n<p>foo</p>\n<pre><code>bar\n</code></pre>\n<p>baz</p>\n<blockquote>\n<p>bam</p>\n</blockquote>\n</li>\n</ol>\n",
+            "List items, case 11");
+        spec("- Foo\n\n      bar\n\n\n      baz\n",
+            "<ul>\n<li>\n<p>Foo</p>\n<pre><code>bar\n\n\nbaz\n</code></pre>\n</li>\n</ul>\n",
+            "List items, case 12");
+        spec("123456789. ok\n",
+            "<ol start=\"123456789\">\n<li>ok</li>\n</ol>\n",
+            "List items, case 13");
+        spec("1234567890. not ok\n",
+            "<p>1234567890. not ok</p>\n",
+            "List items, case 14");
+        spec("0. ok\n",
+            "<ol start=\"0\">\n<li>ok</li>\n</ol>\n",
+            "List items, case 15");
+        spec("003. ok\n",
+            "<ol start=\"3\">\n<li>ok</li>\n</ol>\n",
+            "List items, case 16");
+        spec("-1. not ok\n",
+            "<p>-1. not ok</p>\n",
+            "List items, case 17");
+        spec("- foo\n\n      bar\n",
+            "<ul>\n<li>\n<p>foo</p>\n<pre><code>bar\n</code></pre>\n</li>\n</ul>\n",
+            "List items, case 18");
+        spec("  10.  foo\n\n           bar\n",
+            "<ol start=\"10\">\n<li>\n<p>foo</p>\n<pre><code>bar\n</code></pre>\n</li>\n</ol>\n",
+            "List items, case 19");
+        spec("    indented code\n\nparagraph\n\n    more code\n",
+            "<pre><code>indented code\n</code></pre>\n<p>paragraph</p>\n<pre><code>more code\n</code></pre>\n",
+            "List items, case 20");
+        spec("1.     indented code\n\n   paragraph\n\n       more code\n",
+            "<ol>\n<li>\n<pre><code>indented code\n</code></pre>\n<p>paragraph</p>\n<pre><code>more code\n</code></pre>\n</li>\n</ol>\n",
+            "List items, case 21");
+        spec("1.      indented code\n\n   paragraph\n\n       more code\n",
+            "<ol>\n<li>\n<pre><code> indented code\n</code></pre>\n<p>paragraph</p>\n<pre><code>more code\n</code></pre>\n</li>\n</ol>\n",
+            "List items, case 22");
+        spec("   foo\n\nbar\n",
+            "<p>foo</p>\n<p>bar</p>\n",
+            "List items, case 23");
+        spec("-    foo\n\n  bar\n",
+            "<ul>\n<li>foo</li>\n</ul>\n<p>bar</p>\n",
+            "List items, case 24");
+        spec("-  foo\n\n   bar\n",
+            "<ul>\n<li>\n<p>foo</p>\n<p>bar</p>\n</li>\n</ul>\n",
+            "List items, case 25");
+        spec("-\n  foo\n-\n  ```\n  bar\n  ```\n-\n      baz\n",
+            "<ul>\n<li>foo</li>\n<li>\n<pre><code>bar\n</code></pre>\n</li>\n<li>\n<pre><code>baz\n</code></pre>\n</li>\n</ul>\n",
+            "List items, case 26");
+        spec("-   \n  foo\n",
+            "<ul>\n<li>foo</li>\n</ul>\n",
+            "List items, case 27");
+        spec("-\n\n  foo\n",
+            "<ul>\n<li></li>\n</ul>\n<p>foo</p>\n",
+            "List items, case 28");
+        spec("- foo\n-\n- bar\n",
+            "<ul>\n<li>foo</li>\n<li></li>\n<li>bar</li>\n</ul>\n",
+            "List items, case 29");
+        spec("- foo\n-   \n- bar\n",
+            "<ul>\n<li>foo</li>\n<li></li>\n<li>bar</li>\n</ul>\n",
+            "List items, case 30");
+        spec("1. foo\n2.\n3. bar\n",
+            "<ol>\n<li>foo</li>\n<li></li>\n<li>bar</li>\n</ol>\n",
+            "List items, case 31");
+        spec("*\n",
+            "<ul>\n<li></li>\n</ul>\n",
+            "List items, case 32");
+        spec("foo\n*\n\nfoo\n1.\n",
+            "<p>foo\n*</p>\n<p>foo\n1.</p>\n",
+            "List items, case 33");
+        spec(" 1.  A paragraph\n     with two lines.\n\n         indented code\n\n     > A block quote.\n",
+            "<ol>\n<li>\n<p>A paragraph\nwith two lines.</p>\n<pre><code>indented code\n</code></pre>\n<blockquote>\n<p>A block quote.</p>\n</blockquote>\n</li>\n</ol>\n",
+            "List items, case 34");
+        spec("    1.  A paragraph\n        with two lines.\n\n            indented code\n\n        > A block quote.\n",
+            "<pre><code>1.  A paragraph\n    with two lines.\n\n        indented code\n\n    &gt; A block quote.\n</code></pre>\n",
+            "List items, case 35");
+        spec("  1.  A paragraph\nwith two lines.\n\n          indented code\n\n      > A block quote.\n",
+            "<ol>\n<li>\n<p>A paragraph\nwith two lines.</p>\n<pre><code>indented code\n</code></pre>\n<blockquote>\n<p>A block quote.</p>\n</blockquote>\n</li>\n</ol>\n",
+            "List items, case 36");
+        spec("  1.  A paragraph\n    with two lines.\n",
+            "<ol>\n<li>A paragraph\nwith two lines.</li>\n</ol>\n",
+            "List items, case 37");
+        spec("> 1. > Blockquote\ncontinued here.\n",
+            "<blockquote>\n<ol>\n<li>\n<blockquote>\n<p>Blockquote\ncontinued here.</p>\n</blockquote>\n</li>\n</ol>\n</blockquote>\n",
+            "List items, case 38");
+        spec("> 1. > Blockquote\n> continued here.\n",
+            "<blockquote>\n<ol>\n<li>\n<blockquote>\n<p>Blockquote\ncontinued here.</p>\n</blockquote>\n</li>\n</ol>\n</blockquote>\n",
+            "List items, case 39");
+        spec("- foo\n  - bar\n    - baz\n      - boo\n",
+            "<ul>\n<li>foo\n<ul>\n<li>bar\n<ul>\n<li>baz\n<ul>\n<li>boo</li>\n</ul>\n</li>\n</ul>\n</li>\n</ul>\n</li>\n</ul>\n",
+            "List items, case 40");
+        return nil;
+    end;
+
+    -- List items: 6 examples.
+    function testListItems2(): Unit is
+        spec("- foo\n - bar\n  - baz\n   - boo\n",
+            "<ul>\n<li>foo</li>\n<li>bar</li>\n<li>baz</li>\n<li>boo</li>\n</ul>\n",
+            "List items, case 41");
+        spec("10) foo\n    - bar\n",
+            "<ol start=\"10\">\n<li>foo\n<ul>\n<li>bar</li>\n</ul>\n</li>\n</ol>\n",
+            "List items, case 42");
+        spec("10) foo\n   - bar\n",
+            "<ol start=\"10\">\n<li>foo</li>\n</ol>\n<ul>\n<li>bar</li>\n</ul>\n",
+            "List items, case 43");
+        spec("- - foo\n",
+            "<ul>\n<li>\n<ul>\n<li>foo</li>\n</ul>\n</li>\n</ul>\n",
+            "List items, case 44");
+        spec("1. - 2. foo\n",
+            "<ol>\n<li>\n<ul>\n<li>\n<ol start=\"2\">\n<li>foo</li>\n</ol>\n</li>\n</ul>\n</li>\n</ol>\n",
+            "List items, case 45");
+        spec("- # Foo\n- Bar\n  ---\n  baz\n",
+            "<ul>\n<li>\n<h1>Foo</h1>\n</li>\n<li>\n<h2>Bar</h2>\nbaz</li>\n</ul>\n",
+            "List items, case 46");
+        return nil;
+    end;
+
+    -- Lists: 24 examples.
+    function testLists(): Unit is
+        spec("- foo\n- bar\n+ baz\n",
+            "<ul>\n<li>foo</li>\n<li>bar</li>\n</ul>\n<ul>\n<li>baz</li>\n</ul>\n",
+            "Lists, case 1");
+        spec("1. foo\n2. bar\n3) baz\n",
+            "<ol>\n<li>foo</li>\n<li>bar</li>\n</ol>\n<ol start=\"3\">\n<li>baz</li>\n</ol>\n",
+            "Lists, case 2");
+        spec("Foo\n- bar\n- baz\n",
+            "<p>Foo</p>\n<ul>\n<li>bar</li>\n<li>baz</li>\n</ul>\n",
+            "Lists, case 3");
+        spec("The number of windows in my house is\n14.  The number of doors is 6.\n",
+            "<p>The number of windows in my house is\n14.  The number of doors is 6.</p>\n",
+            "Lists, case 4");
+        spec("The number of windows in my house is\n1.  The number of doors is 6.\n",
+            "<p>The number of windows in my house is</p>\n<ol>\n<li>The number of doors is 6.</li>\n</ol>\n",
+            "Lists, case 5");
+        spec("- foo\n\n- bar\n\n\n- baz\n",
+            "<ul>\n<li>\n<p>foo</p>\n</li>\n<li>\n<p>bar</p>\n</li>\n<li>\n<p>baz</p>\n</li>\n</ul>\n",
+            "Lists, case 6");
+        spec("- foo\n  - bar\n    - baz\n\n\n      bim\n",
+            "<ul>\n<li>foo\n<ul>\n<li>bar\n<ul>\n<li>\n<p>baz</p>\n<p>bim</p>\n</li>\n</ul>\n</li>\n</ul>\n</li>\n</ul>\n",
+            "Lists, case 7");
+        spec("- a\n - b\n  - c\n   - d\n  - e\n - f\n- g\n",
+            "<ul>\n<li>a</li>\n<li>b</li>\n<li>c</li>\n<li>d</li>\n<li>e</li>\n<li>f</li>\n<li>g</li>\n</ul>\n",
+            "Lists, case 8");
+        spec("1. a\n\n  2. b\n\n   3. c\n",
+            "<ol>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n<li>\n<p>c</p>\n</li>\n</ol>\n",
+            "Lists, case 9");
+        spec("- a\n - b\n  - c\n   - d\n    - e\n",
+            "<ul>\n<li>a</li>\n<li>b</li>\n<li>c</li>\n<li>d\n- e</li>\n</ul>\n",
+            "Lists, case 10");
+        spec("1. a\n\n  2. b\n\n    3. c\n",
+            "<ol>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n</ol>\n<pre><code>3. c\n</code></pre>\n",
+            "Lists, case 11");
+        spec("- a\n- b\n\n- c\n",
+            "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n<li>\n<p>c</p>\n</li>\n</ul>\n",
+            "Lists, case 12");
+        spec("* a\n*\n\n* c\n",
+            "<ul>\n<li>\n<p>a</p>\n</li>\n<li></li>\n<li>\n<p>c</p>\n</li>\n</ul>\n",
+            "Lists, case 13");
+        spec("- a\n- b\n\n  c\n- d\n",
+            "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n<p>c</p>\n</li>\n<li>\n<p>d</p>\n</li>\n</ul>\n",
+            "Lists, case 14");
+        spec("- a\n- b\n\n  [ref]: /url\n- d\n",
+            "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n<li>\n<p>d</p>\n</li>\n</ul>\n",
+            "Lists, case 15");
+        spec("- a\n- ```\n  b\n\n\n  ```\n- c\n",
+            "<ul>\n<li>a</li>\n<li>\n<pre><code>b\n\n\n</code></pre>\n</li>\n<li>c</li>\n</ul>\n",
+            "Lists, case 16");
+        spec("- a\n  - b\n\n    c\n- d\n",
+            "<ul>\n<li>a\n<ul>\n<li>\n<p>b</p>\n<p>c</p>\n</li>\n</ul>\n</li>\n<li>d</li>\n</ul>\n",
+            "Lists, case 17");
+        spec("* a\n  > b\n  >\n* c\n",
+            "<ul>\n<li>a\n<blockquote>\n<p>b</p>\n</blockquote>\n</li>\n<li>c</li>\n</ul>\n",
+            "Lists, case 18");
+        spec("- a\n  > b\n  ```\n  c\n  ```\n- d\n",
+            "<ul>\n<li>a\n<blockquote>\n<p>b</p>\n</blockquote>\n<pre><code>c\n</code></pre>\n</li>\n<li>d</li>\n</ul>\n",
+            "Lists, case 19");
+        spec("- a\n",
+            "<ul>\n<li>a</li>\n</ul>\n",
+            "Lists, case 20");
+        spec("- a\n  - b\n",
+            "<ul>\n<li>a\n<ul>\n<li>b</li>\n</ul>\n</li>\n</ul>\n",
+            "Lists, case 21");
+        spec("1. ```\n   foo\n   ```\n\n   bar\n",
+            "<ol>\n<li>\n<pre><code>foo\n</code></pre>\n<p>bar</p>\n</li>\n</ol>\n",
+            "Lists, case 22");
+        spec("* foo\n  * bar\n\n  baz\n",
+            "<ul>\n<li>\n<p>foo</p>\n<ul>\n<li>bar</li>\n</ul>\n<p>baz</p>\n</li>\n</ul>\n",
+            "Lists, case 23");
+        spec("- a\n  - b\n  - c\n\n- d\n  - e\n  - f\n",
+            "<ul>\n<li>\n<p>a</p>\n<ul>\n<li>b</li>\n<li>c</li>\n</ul>\n</li>\n<li>\n<p>d</p>\n<ul>\n<li>e</li>\n<li>f</li>\n</ul>\n</li>\n</ul>\n",
+            "Lists, case 24");
+        return nil;
+    end;
+
+    -- Code spans: 19 examples.
+    function testCodeSpans(): Unit is
+        spec("`foo`\n",
+            "<p><code>foo</code></p>\n",
+            "Code spans, case 1");
+        spec("`` foo ` bar ``\n",
+            "<p><code>foo ` bar</code></p>\n",
+            "Code spans, case 2");
+        spec("` `` `\n",
+            "<p><code>``</code></p>\n",
+            "Code spans, case 3");
+        spec("`  ``  `\n",
+            "<p><code> `` </code></p>\n",
+            "Code spans, case 4");
+        spec("` a`\n",
+            "<p><code> a</code></p>\n",
+            "Code spans, case 5");
+        spec("`\u{a0}b\u{a0}`\n",
+            "<p><code>\u{a0}b\u{a0}</code></p>\n",
+            "Code spans, case 6");
+        spec("` `\n`  `\n",
+            "<p><code> </code>\n<code>  </code></p>\n",
+            "Code spans, case 7");
+        spec("``\nfoo\nbar  \nbaz\n``\n",
+            "<p><code>foo bar   baz</code></p>\n",
+            "Code spans, case 8");
+        spec("``\nfoo \n``\n",
+            "<p><code>foo </code></p>\n",
+            "Code spans, case 9");
+        spec("`foo   bar \nbaz`\n",
+            "<p><code>foo   bar  baz</code></p>\n",
+            "Code spans, case 10");
+        spec("`foo\\`bar`\n",
+            "<p><code>foo\\</code>bar`</p>\n",
+            "Code spans, case 11");
+        spec("``foo`bar``\n",
+            "<p><code>foo`bar</code></p>\n",
+            "Code spans, case 12");
+        spec("` foo `` bar `\n",
+            "<p><code>foo `` bar</code></p>\n",
+            "Code spans, case 13");
+        spec("*foo`*`\n",
+            "<p>*foo<code>*</code></p>\n",
+            "Code spans, case 14");
+        spec("[not a `link](/foo`)\n",
+            "<p>[not a <code>link](/foo</code>)</p>\n",
+            "Code spans, case 15");
+        spec("`<http://foo.bar.`baz>`\n",
+            "<p><code>&lt;http://foo.bar.</code>baz&gt;`</p>\n",
+            "Code spans, case 16");
+        spec("```foo``\n",
+            "<p>```foo``</p>\n",
+            "Code spans, case 17");
+        spec("`foo\n",
+            "<p>`foo</p>\n",
+            "Code spans, case 18");
+        spec("`foo``bar``\n",
+            "<p>`foo<code>bar</code></p>\n",
+            "Code spans, case 19");
+        return nil;
+    end;
+
+    -- Emphasis and strong emphasis: 40 examples.
+    function testEmphasisAndStrongEmphasis1(): Unit is
+        spec("*foo bar*\n",
+            "<p><em>foo bar</em></p>\n",
+            "Emphasis and strong emphasis, case 1");
+        spec("a * foo bar*\n",
+            "<p>a * foo bar*</p>\n",
+            "Emphasis and strong emphasis, case 2");
+        spec("a*\"foo\"*\n",
+            "<p>a*&quot;foo&quot;*</p>\n",
+            "Emphasis and strong emphasis, case 3");
+        spec("foo*bar*\n",
+            "<p>foo<em>bar</em></p>\n",
+            "Emphasis and strong emphasis, case 4");
+        spec("5*6*78\n",
+            "<p>5<em>6</em>78</p>\n",
+            "Emphasis and strong emphasis, case 5");
+        spec("_foo bar_\n",
+            "<p><em>foo bar</em></p>\n",
+            "Emphasis and strong emphasis, case 6");
+        spec("_ foo bar_\n",
+            "<p>_ foo bar_</p>\n",
+            "Emphasis and strong emphasis, case 7");
+        spec("a_\"foo\"_\n",
+            "<p>a_&quot;foo&quot;_</p>\n",
+            "Emphasis and strong emphasis, case 8");
+        spec("foo_bar_\n",
+            "<p>foo_bar_</p>\n",
+            "Emphasis and strong emphasis, case 9");
+        spec("5_6_78\n",
+            "<p>5_6_78</p>\n",
+            "Emphasis and strong emphasis, case 10");
+        spec("\u{43f}\u{440}\u{438}\u{441}\u{442}\u{430}\u{43d}\u{44f}\u{43c}_\u{441}\u{442}\u{440}\u{435}\u{43c}\u{44f}\u{442}\u{441}\u{44f}_\n",
+            "<p>\u{43f}\u{440}\u{438}\u{441}\u{442}\u{430}\u{43d}\u{44f}\u{43c}_\u{441}\u{442}\u{440}\u{435}\u{43c}\u{44f}\u{442}\u{441}\u{44f}_</p>\n",
+            "Emphasis and strong emphasis, case 11");
+        spec("aa_\"bb\"_cc\n",
+            "<p>aa_&quot;bb&quot;_cc</p>\n",
+            "Emphasis and strong emphasis, case 12");
+        spec("foo-_(bar)_\n",
+            "<p>foo-<em>(bar)</em></p>\n",
+            "Emphasis and strong emphasis, case 13");
+        spec("_foo*\n",
+            "<p>_foo*</p>\n",
+            "Emphasis and strong emphasis, case 14");
+        spec("*foo bar *\n",
+            "<p>*foo bar *</p>\n",
+            "Emphasis and strong emphasis, case 15");
+        spec("*(*foo)\n",
+            "<p>*(*foo)</p>\n",
+            "Emphasis and strong emphasis, case 16");
+        spec("*(*foo*)*\n",
+            "<p><em>(<em>foo</em>)</em></p>\n",
+            "Emphasis and strong emphasis, case 17");
+        spec("*foo*bar\n",
+            "<p><em>foo</em>bar</p>\n",
+            "Emphasis and strong emphasis, case 18");
+        spec("_foo bar _\n",
+            "<p>_foo bar _</p>\n",
+            "Emphasis and strong emphasis, case 19");
+        spec("_(_foo)\n",
+            "<p>_(_foo)</p>\n",
+            "Emphasis and strong emphasis, case 20");
+        spec("_(_foo_)_\n",
+            "<p><em>(<em>foo</em>)</em></p>\n",
+            "Emphasis and strong emphasis, case 21");
+        spec("_foo_bar\n",
+            "<p>_foo_bar</p>\n",
+            "Emphasis and strong emphasis, case 22");
+        spec("_\u{43f}\u{440}\u{438}\u{441}\u{442}\u{430}\u{43d}\u{44f}\u{43c}_\u{441}\u{442}\u{440}\u{435}\u{43c}\u{44f}\u{442}\u{441}\u{44f}\n",
+            "<p>_\u{43f}\u{440}\u{438}\u{441}\u{442}\u{430}\u{43d}\u{44f}\u{43c}_\u{441}\u{442}\u{440}\u{435}\u{43c}\u{44f}\u{442}\u{441}\u{44f}</p>\n",
+            "Emphasis and strong emphasis, case 23");
+        spec("_foo_bar_baz_\n",
+            "<p><em>foo_bar_baz</em></p>\n",
+            "Emphasis and strong emphasis, case 24");
+        spec("_(bar)_.\n",
+            "<p><em>(bar)</em>.</p>\n",
+            "Emphasis and strong emphasis, case 25");
+        spec("**foo bar**\n",
+            "<p><strong>foo bar</strong></p>\n",
+            "Emphasis and strong emphasis, case 26");
+        spec("** foo bar**\n",
+            "<p>** foo bar**</p>\n",
+            "Emphasis and strong emphasis, case 27");
+        spec("a**\"foo\"**\n",
+            "<p>a**&quot;foo&quot;**</p>\n",
+            "Emphasis and strong emphasis, case 28");
+        spec("foo**bar**\n",
+            "<p>foo<strong>bar</strong></p>\n",
+            "Emphasis and strong emphasis, case 29");
+        spec("__foo bar__\n",
+            "<p><strong>foo bar</strong></p>\n",
+            "Emphasis and strong emphasis, case 30");
+        spec("__ foo bar__\n",
+            "<p>__ foo bar__</p>\n",
+            "Emphasis and strong emphasis, case 31");
+        spec("foo__bar__\n",
+            "<p>foo__bar__</p>\n",
+            "Emphasis and strong emphasis, case 32");
+        spec("5__6__78\n",
+            "<p>5__6__78</p>\n",
+            "Emphasis and strong emphasis, case 33");
+        spec("__foo, __bar__, baz__\n",
+            "<p><strong>foo, <strong>bar</strong>, baz</strong></p>\n",
+            "Emphasis and strong emphasis, case 34");
+        spec("foo-__(bar)__\n",
+            "<p>foo-<strong>(bar)</strong></p>\n",
+            "Emphasis and strong emphasis, case 35");
+        spec("**foo bar **\n",
+            "<p>**foo bar **</p>\n",
+            "Emphasis and strong emphasis, case 36");
+        spec("**(**foo)\n",
+            "<p>**(**foo)</p>\n",
+            "Emphasis and strong emphasis, case 37");
+        spec("*(**foo**)*\n",
+            "<p><em>(<strong>foo</strong>)</em></p>\n",
+            "Emphasis and strong emphasis, case 38");
+        spec("**foo \"*bar*\" foo**\n",
+            "<p><strong>foo &quot;<em>bar</em>&quot; foo</strong></p>\n",
+            "Emphasis and strong emphasis, case 39");
+        spec("**foo**bar\n",
+            "<p><strong>foo</strong>bar</p>\n",
+            "Emphasis and strong emphasis, case 40");
+        return nil;
+    end;
+
+    -- Emphasis and strong emphasis: 40 examples.
+    function testEmphasisAndStrongEmphasis2(): Unit is
+        spec("__foo bar __\n",
+            "<p>__foo bar __</p>\n",
+            "Emphasis and strong emphasis, case 41");
+        spec("__(__foo)\n",
+            "<p>__(__foo)</p>\n",
+            "Emphasis and strong emphasis, case 42");
+        spec("_(__foo__)_\n",
+            "<p><em>(<strong>foo</strong>)</em></p>\n",
+            "Emphasis and strong emphasis, case 43");
+        spec("__foo__bar\n",
+            "<p>__foo__bar</p>\n",
+            "Emphasis and strong emphasis, case 44");
+        spec("__foo__bar__baz__\n",
+            "<p><strong>foo__bar__baz</strong></p>\n",
+            "Emphasis and strong emphasis, case 45");
+        spec("__(bar)__.\n",
+            "<p><strong>(bar)</strong>.</p>\n",
+            "Emphasis and strong emphasis, case 46");
+        spec("*foo [bar](/url)*\n",
+            "<p><em>foo <a href=\"/url\" rel=\"nofollow noopener\">bar</a></em></p>\n",
+            "Emphasis and strong emphasis, case 47");
+        spec("*foo\nbar*\n",
+            "<p><em>foo\nbar</em></p>\n",
+            "Emphasis and strong emphasis, case 48");
+        spec("_foo __bar__ baz_\n",
+            "<p><em>foo <strong>bar</strong> baz</em></p>\n",
+            "Emphasis and strong emphasis, case 49");
+        spec("_foo _bar_ baz_\n",
+            "<p><em>foo <em>bar</em> baz</em></p>\n",
+            "Emphasis and strong emphasis, case 50");
+        spec("__foo_ bar_\n",
+            "<p><em><em>foo</em> bar</em></p>\n",
+            "Emphasis and strong emphasis, case 51");
+        spec("*foo *bar**\n",
+            "<p><em>foo <em>bar</em></em></p>\n",
+            "Emphasis and strong emphasis, case 52");
+        spec("*foo **bar** baz*\n",
+            "<p><em>foo <strong>bar</strong> baz</em></p>\n",
+            "Emphasis and strong emphasis, case 53");
+        spec("*foo**bar**baz*\n",
+            "<p><em>foo<strong>bar</strong>baz</em></p>\n",
+            "Emphasis and strong emphasis, case 54");
+        spec("*foo**bar*\n",
+            "<p><em>foo**bar</em></p>\n",
+            "Emphasis and strong emphasis, case 55");
+        spec("***foo** bar*\n",
+            "<p><em><strong>foo</strong> bar</em></p>\n",
+            "Emphasis and strong emphasis, case 56");
+        spec("*foo **bar***\n",
+            "<p><em>foo <strong>bar</strong></em></p>\n",
+            "Emphasis and strong emphasis, case 57");
+        spec("*foo**bar***\n",
+            "<p><em>foo<strong>bar</strong></em></p>\n",
+            "Emphasis and strong emphasis, case 58");
+        spec("foo***bar***baz\n",
+            "<p>foo<em><strong>bar</strong></em>baz</p>\n",
+            "Emphasis and strong emphasis, case 59");
+        spec("foo******bar*********baz\n",
+            "<p>foo<strong><strong><strong>bar</strong></strong></strong>***baz</p>\n",
+            "Emphasis and strong emphasis, case 60");
+        spec("*foo **bar *baz* bim** bop*\n",
+            "<p><em>foo <strong>bar <em>baz</em> bim</strong> bop</em></p>\n",
+            "Emphasis and strong emphasis, case 61");
+        spec("*foo [*bar*](/url)*\n",
+            "<p><em>foo <a href=\"/url\" rel=\"nofollow noopener\"><em>bar</em></a></em></p>\n",
+            "Emphasis and strong emphasis, case 62");
+        spec("** is not an empty emphasis\n",
+            "<p>** is not an empty emphasis</p>\n",
+            "Emphasis and strong emphasis, case 63");
+        spec("**** is not an empty strong emphasis\n",
+            "<p>**** is not an empty strong emphasis</p>\n",
+            "Emphasis and strong emphasis, case 64");
+        spec("**foo [bar](/url)**\n",
+            "<p><strong>foo <a href=\"/url\" rel=\"nofollow noopener\">bar</a></strong></p>\n",
+            "Emphasis and strong emphasis, case 65");
+        spec("**foo\nbar**\n",
+            "<p><strong>foo\nbar</strong></p>\n",
+            "Emphasis and strong emphasis, case 66");
+        spec("__foo _bar_ baz__\n",
+            "<p><strong>foo <em>bar</em> baz</strong></p>\n",
+            "Emphasis and strong emphasis, case 67");
+        spec("__foo __bar__ baz__\n",
+            "<p><strong>foo <strong>bar</strong> baz</strong></p>\n",
+            "Emphasis and strong emphasis, case 68");
+        spec("____foo__ bar__\n",
+            "<p><strong><strong>foo</strong> bar</strong></p>\n",
+            "Emphasis and strong emphasis, case 69");
+        spec("**foo **bar****\n",
+            "<p><strong>foo <strong>bar</strong></strong></p>\n",
+            "Emphasis and strong emphasis, case 70");
+        spec("**foo *bar* baz**\n",
+            "<p><strong>foo <em>bar</em> baz</strong></p>\n",
+            "Emphasis and strong emphasis, case 71");
+        spec("**foo*bar*baz**\n",
+            "<p><strong>foo<em>bar</em>baz</strong></p>\n",
+            "Emphasis and strong emphasis, case 72");
+        spec("***foo* bar**\n",
+            "<p><strong><em>foo</em> bar</strong></p>\n",
+            "Emphasis and strong emphasis, case 73");
+        spec("**foo *bar***\n",
+            "<p><strong>foo <em>bar</em></strong></p>\n",
+            "Emphasis and strong emphasis, case 74");
+        spec("**foo *bar **baz**\nbim* bop**\n",
+            "<p><strong>foo <em>bar <strong>baz</strong>\nbim</em> bop</strong></p>\n",
+            "Emphasis and strong emphasis, case 75");
+        spec("**foo [*bar*](/url)**\n",
+            "<p><strong>foo <a href=\"/url\" rel=\"nofollow noopener\"><em>bar</em></a></strong></p>\n",
+            "Emphasis and strong emphasis, case 76");
+        spec("__ is not an empty emphasis\n",
+            "<p>__ is not an empty emphasis</p>\n",
+            "Emphasis and strong emphasis, case 77");
+        spec("foo ***\n",
+            "<p>foo ***</p>\n",
+            "Emphasis and strong emphasis, case 78");
+        spec("foo *\\**\n",
+            "<p>foo <em>*</em></p>\n",
+            "Emphasis and strong emphasis, case 79");
+        spec("foo *_*\n",
+            "<p>foo <em>_</em></p>\n",
+            "Emphasis and strong emphasis, case 80");
+        return nil;
+    end;
+
+    -- Emphasis and strong emphasis: 40 examples.
+    function testEmphasisAndStrongEmphasis3(): Unit is
+        spec("foo *****\n",
+            "<p>foo *****</p>\n",
+            "Emphasis and strong emphasis, case 81");
+        spec("foo **\\***\n",
+            "<p>foo <strong>*</strong></p>\n",
+            "Emphasis and strong emphasis, case 82");
+        spec("foo **_**\n",
+            "<p>foo <strong>_</strong></p>\n",
+            "Emphasis and strong emphasis, case 83");
+        spec("**foo*\n",
+            "<p>*<em>foo</em></p>\n",
+            "Emphasis and strong emphasis, case 84");
+        spec("*foo**\n",
+            "<p><em>foo</em>*</p>\n",
+            "Emphasis and strong emphasis, case 85");
+        spec("***foo**\n",
+            "<p>*<strong>foo</strong></p>\n",
+            "Emphasis and strong emphasis, case 86");
+        spec("****foo*\n",
+            "<p>***<em>foo</em></p>\n",
+            "Emphasis and strong emphasis, case 87");
+        spec("**foo***\n",
+            "<p><strong>foo</strong>*</p>\n",
+            "Emphasis and strong emphasis, case 88");
+        spec("*foo****\n",
+            "<p><em>foo</em>***</p>\n",
+            "Emphasis and strong emphasis, case 89");
+        spec("foo ___\n",
+            "<p>foo ___</p>\n",
+            "Emphasis and strong emphasis, case 90");
+        spec("foo _\\__\n",
+            "<p>foo <em>_</em></p>\n",
+            "Emphasis and strong emphasis, case 91");
+        spec("foo _*_\n",
+            "<p>foo <em>*</em></p>\n",
+            "Emphasis and strong emphasis, case 92");
+        spec("foo __\\___\n",
+            "<p>foo <strong>_</strong></p>\n",
+            "Emphasis and strong emphasis, case 93");
+        spec("__foo_\n",
+            "<p>_<em>foo</em></p>\n",
+            "Emphasis and strong emphasis, case 94");
+        spec("_foo__\n",
+            "<p><em>foo</em>_</p>\n",
+            "Emphasis and strong emphasis, case 95");
+        spec("___foo__\n",
+            "<p>_<strong>foo</strong></p>\n",
+            "Emphasis and strong emphasis, case 96");
+        spec("____foo_\n",
+            "<p>___<em>foo</em></p>\n",
+            "Emphasis and strong emphasis, case 97");
+        spec("__foo___\n",
+            "<p><strong>foo</strong>_</p>\n",
+            "Emphasis and strong emphasis, case 98");
+        spec("_foo____\n",
+            "<p><em>foo</em>___</p>\n",
+            "Emphasis and strong emphasis, case 99");
+        spec("**foo**\n",
+            "<p><strong>foo</strong></p>\n",
+            "Emphasis and strong emphasis, case 100");
+        spec("*_foo_*\n",
+            "<p><em><em>foo</em></em></p>\n",
+            "Emphasis and strong emphasis, case 101");
+        spec("__foo__\n",
+            "<p><strong>foo</strong></p>\n",
+            "Emphasis and strong emphasis, case 102");
+        spec("_*foo*_\n",
+            "<p><em><em>foo</em></em></p>\n",
+            "Emphasis and strong emphasis, case 103");
+        spec("****foo****\n",
+            "<p><strong><strong>foo</strong></strong></p>\n",
+            "Emphasis and strong emphasis, case 104");
+        spec("____foo____\n",
+            "<p><strong><strong>foo</strong></strong></p>\n",
+            "Emphasis and strong emphasis, case 105");
+        spec("******foo******\n",
+            "<p><strong><strong><strong>foo</strong></strong></strong></p>\n",
+            "Emphasis and strong emphasis, case 106");
+        spec("***foo***\n",
+            "<p><em><strong>foo</strong></em></p>\n",
+            "Emphasis and strong emphasis, case 107");
+        spec("_____foo_____\n",
+            "<p><em><strong><strong>foo</strong></strong></em></p>\n",
+            "Emphasis and strong emphasis, case 108");
+        spec("*foo _bar* baz_\n",
+            "<p><em>foo _bar</em> baz_</p>\n",
+            "Emphasis and strong emphasis, case 109");
+        spec("*foo __bar *baz bim__ bam*\n",
+            "<p><em>foo <strong>bar *baz bim</strong> bam</em></p>\n",
+            "Emphasis and strong emphasis, case 110");
+        spec("**foo **bar baz**\n",
+            "<p>**foo <strong>bar baz</strong></p>\n",
+            "Emphasis and strong emphasis, case 111");
+        spec("*foo *bar baz*\n",
+            "<p>*foo <em>bar baz</em></p>\n",
+            "Emphasis and strong emphasis, case 112");
+        spec("*[bar*](/url)\n",
+            "<p>*<a href=\"/url\" rel=\"nofollow noopener\">bar*</a></p>\n",
+            "Emphasis and strong emphasis, case 113");
+        spec("_foo [bar_](/url)\n",
+            "<p>_foo <a href=\"/url\" rel=\"nofollow noopener\">bar_</a></p>\n",
+            "Emphasis and strong emphasis, case 114");
+        spec("**a<http://foo.bar/?q=**>\n",
+            "<p>**a<a href=\"http://foo.bar/?q=**\" rel=\"nofollow noopener\">http://foo.bar/?q=**</a></p>\n",
+            "Emphasis and strong emphasis, case 115");
+        spec("__a<http://foo.bar/?q=__>\n",
+            "<p>__a<a href=\"http://foo.bar/?q=__\" rel=\"nofollow noopener\">http://foo.bar/?q=__</a></p>\n",
+            "Emphasis and strong emphasis, case 116");
+        spec("*a `*`*\n",
+            "<p><em>a <code>*</code></em></p>\n",
+            "Emphasis and strong emphasis, case 117");
+        spec("_a `_`_\n",
+            "<p><em>a <code>_</code></em></p>\n",
+            "Emphasis and strong emphasis, case 118");
+        spec("* a *\n",
+            "<ul>\n<li>a *</li>\n</ul>\n",
+            "Emphasis and strong emphasis, case 119");
+        spec("*foo\nbar*\n",
+            "<p><em>foo\nbar</em></p>\n",
+            "Emphasis and strong emphasis, case 120");
+        return nil;
+    end;
+
+    -- Links: 40 examples.
+    function testLinks1(): Unit is
+        spec("[link](/uri \"title\")\n",
+            "<p><a href=\"/uri\" title=\"title\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 1");
+        spec("[link](/uri)\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 2");
+        spec("[link](/my uri)\n",
+            "<p>[link](/my uri)</p>\n",
+            "Links, case 3");
+        spec("[link](/foo(and(bar)))\n",
+            "<p><a href=\"/foo(and(bar))\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 4");
+        spec("[link](/foo(and(bar))\n",
+            "<p>[link](/foo(and(bar))</p>\n",
+            "Links, case 5");
+        spec("[link](/foo\\(and\\(bar\\))\n",
+            "<p><a href=\"/foo(and(bar)\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 6");
+        spec("[link](</foo(and(bar)>)\n",
+            "<p><a href=\"/foo(and(bar)\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 7");
+        spec("[link](/foo\\)\\:)\n",
+            "<p><a href=\"/foo):\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 8");
+        spec("[link](#fragment)\n",
+            "<p><a href=\"#fragment\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 9");
+        spec("[link](http://example.com#fragment)\n",
+            "<p><a href=\"http://example.com#fragment\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 10");
+        spec("[link](http://example.com?foo=3#frag)\n",
+            "<p><a href=\"http://example.com?foo=3#frag\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 11");
+        spec("[link](/url \"title\")\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 12");
+        spec("[link](/url 'title')\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 13");
+        spec("[link](/url (title))\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 14");
+        spec("[link](/url \"title \\\"&quot;\")\n",
+            "<p><a href=\"/url\" title=\"title &quot;&quot;\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 15");
+        spec("[link](/url \"title \"and\" title\")\n",
+            "<p>[link](/url &quot;title &quot;and&quot; title&quot;)</p>\n",
+            "Links, case 16");
+        spec("[link](/url 'title \"and\" title')\n",
+            "<p><a href=\"/url\" title=\"title &quot;and&quot; title\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 17");
+        spec("[link](   /uri\n  \"title\"  )\n",
+            "<p><a href=\"/uri\" title=\"title\" rel=\"nofollow noopener\">link</a></p>\n",
+            "Links, case 18");
+        spec("[link] (/uri)\n",
+            "<p>[link] (/uri)</p>\n",
+            "Links, case 19");
+        spec("[link [foo [bar]]](/uri)\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\">link [foo [bar]]</a></p>\n",
+            "Links, case 20");
+        spec("[link] bar](/uri)\n",
+            "<p>[link] bar](/uri)</p>\n",
+            "Links, case 21");
+        spec("[link [bar](/uri)\n",
+            "<p>[link <a href=\"/uri\" rel=\"nofollow noopener\">bar</a></p>\n",
+            "Links, case 22");
+        spec("[link \\[bar](/uri)\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\">link [bar</a></p>\n",
+            "Links, case 23");
+        spec("[link *foo **bar** `#`*](/uri)\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\">link <em>foo <strong>bar</strong> <code>#</code></em></a></p>\n",
+            "Links, case 24");
+        spec("[![moon](/moon.jpg)](/uri)\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\"><img src=\"/moon.jpg\" alt=\"moon\"></a></p>\n",
+            "Links, case 25");
+        spec("[foo [bar](/uri)](/uri)\n",
+            "<p>[foo <a href=\"/uri\" rel=\"nofollow noopener\">bar</a>](/uri)</p>\n",
+            "Links, case 26");
+        spec("[foo *[bar [baz](/uri)](/uri)*](/uri)\n",
+            "<p>[foo <em>[bar <a href=\"/uri\" rel=\"nofollow noopener\">baz</a>](/uri)</em>](/uri)</p>\n",
+            "Links, case 27");
+        spec("*[foo*](/uri)\n",
+            "<p>*<a href=\"/uri\" rel=\"nofollow noopener\">foo*</a></p>\n",
+            "Links, case 28");
+        spec("[foo *bar](/uri)*\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\">foo *bar</a>*</p>\n",
+            "Links, case 29");
+        spec("[foo`](/uri)`\n",
+            "<p>[foo<code>](/uri)</code></p>\n",
+            "Links, case 30");
+        spec("[foo][bar]\n\n[bar]: /url \"title\"\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Links, case 31");
+        spec("[link [foo [bar]]][ref]\n\n[ref]: /uri\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\">link [foo [bar]]</a></p>\n",
+            "Links, case 32");
+        spec("[link \\[bar][ref]\n\n[ref]: /uri\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\">link [bar</a></p>\n",
+            "Links, case 33");
+        spec("[foo [bar](/uri)][ref]\n\n[ref]: /uri\n",
+            "<p>[foo <a href=\"/uri\" rel=\"nofollow noopener\">bar</a>]<a href=\"/uri\" rel=\"nofollow noopener\">ref</a></p>\n",
+            "Links, case 34");
+        spec("*[foo*][ref]\n\n[ref]: /uri\n",
+            "<p>*<a href=\"/uri\" rel=\"nofollow noopener\">foo*</a></p>\n",
+            "Links, case 35");
+        spec("[foo`][ref]`\n\n[ref]: /uri\n",
+            "<p>[foo<code>][ref]</code></p>\n",
+            "Links, case 36");
+        spec("[foo][BaR]\n\n[bar]: /url \"title\"\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Links, case 37");
+        spec("[Foo\n  bar]: /url\n\n[Baz][Foo bar]\n",
+            "<p><a href=\"/url\" rel=\"nofollow noopener\">Baz</a></p>\n",
+            "Links, case 38");
+        spec("[foo] [bar]\n\n[bar]: /url \"title\"\n",
+            "<p>[foo] <a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">bar</a></p>\n",
+            "Links, case 39");
+        spec("[foo]: /url1\n\n[foo]: /url2\n\n[bar][foo]\n",
+            "<p><a href=\"/url1\" rel=\"nofollow noopener\">bar</a></p>\n",
+            "Links, case 40");
+        return nil;
+    end;
+
+    -- Links: 20 examples.
+    function testLinks2(): Unit is
+        spec("[bar][foo\\!]\n\n[foo!]: /url\n",
+            "<p>[bar][foo!]</p>\n",
+            "Links, case 41");
+        spec("[foo][ref[]\n\n[ref[]: /uri\n",
+            "<p>[foo][ref[]</p>\n<p>[ref[]: /uri</p>\n",
+            "Links, case 42");
+        spec("[foo][ref\\[]\n\n[ref\\[]: /uri\n",
+            "<p><a href=\"/uri\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Links, case 43");
+        spec("[]\n\n[]: /uri\n",
+            "<p>[]</p>\n<p>[]: /uri</p>\n",
+            "Links, case 44");
+        spec("[foo][]\n\n[foo]: /url \"title\"\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Links, case 45");
+        spec("[*foo* bar][]\n\n[*foo* bar]: /url \"title\"\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\"><em>foo</em> bar</a></p>\n",
+            "Links, case 46");
+        spec("[Foo][]\n\n[foo]: /url \"title\"\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">Foo</a></p>\n",
+            "Links, case 47");
+        spec("[foo] \n[]\n\n[foo]: /url \"title\"\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">foo</a>\n[]</p>\n",
+            "Links, case 48");
+        spec("[foo]\n\n[foo]: /url \"title\"\n",
+            "<p><a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Links, case 49");
+        spec("[[*foo* bar]]\n\n[*foo* bar]: /url \"title\"\n",
+            "<p>[<a href=\"/url\" title=\"title\" rel=\"nofollow noopener\"><em>foo</em> bar</a>]</p>\n",
+            "Links, case 50");
+        spec("[[bar [foo]\n\n[foo]: /url\n",
+            "<p>[[bar <a href=\"/url\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Links, case 51");
+        spec("[foo] bar\n\n[foo]: /url\n",
+            "<p><a href=\"/url\" rel=\"nofollow noopener\">foo</a> bar</p>\n",
+            "Links, case 52");
+        spec("\\[foo]\n\n[foo]: /url \"title\"\n",
+            "<p>[foo]</p>\n",
+            "Links, case 53");
+        spec("[foo*]: /url\n\n*[foo*]\n",
+            "<p>*<a href=\"/url\" rel=\"nofollow noopener\">foo*</a></p>\n",
+            "Links, case 54");
+        spec("[foo][bar]\n\n[foo]: /url1\n[bar]: /url2\n",
+            "<p><a href=\"/url2\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Links, case 55");
+        spec("[foo][]\n\n[foo]: /url1\n",
+            "<p><a href=\"/url1\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Links, case 56");
+        spec("[foo](not a link)\n\n[foo]: /url1\n",
+            "<p><a href=\"/url1\" rel=\"nofollow noopener\">foo</a>(not a link)</p>\n",
+            "Links, case 57");
+        spec("[foo][bar][baz]\n\n[baz]: /url\n",
+            "<p>[foo]<a href=\"/url\" rel=\"nofollow noopener\">bar</a></p>\n",
+            "Links, case 58");
+        spec("[foo][bar][baz]\n\n[baz]: /url1\n[bar]: /url2\n",
+            "<p><a href=\"/url2\" rel=\"nofollow noopener\">foo</a><a href=\"/url1\" rel=\"nofollow noopener\">baz</a></p>\n",
+            "Links, case 59");
+        spec("[foo][bar][baz]\n\n[baz]: /url1\n[foo]: /url2\n",
+            "<p>[foo]<a href=\"/url1\" rel=\"nofollow noopener\">bar</a></p>\n",
+            "Links, case 60");
+        return nil;
+    end;
+
+    -- Images: 15 examples.
+    function testImages(): Unit is
+        spec("![foo](/url \"title\")\n",
+            "<p><img src=\"/url\" alt=\"foo\" title=\"title\"></p>\n",
+            "Images, case 1");
+        spec("![foo ![bar](/url)](/url2)\n",
+            "<p><img src=\"/url2\" alt=\"foo bar\"></p>\n",
+            "Images, case 2");
+        spec("![foo [bar](/url)](/url2)\n",
+            "<p><img src=\"/url2\" alt=\"foo bar\"></p>\n",
+            "Images, case 3");
+        spec("![foo *bar*][foobar]\n\n[FOOBAR]: /train.jpg \"train & tracks\"\n",
+            "<p><img src=\"/train.jpg\" alt=\"foo bar\" title=\"train &amp; tracks\"></p>\n",
+            "Images, case 4");
+        spec("My ![foo bar](/path/to/train.jpg  \"title\"   )\n",
+            "<p>My <img src=\"/path/to/train.jpg\" alt=\"foo bar\" title=\"title\"></p>\n",
+            "Images, case 5");
+        spec("![foo](</url>)\n",
+            "<p><img src=\"/url\" alt=\"foo\"></p>\n",
+            "Images, case 6");
+        spec("![foo][bar]\n\n[bar]: /url\n",
+            "<p><img src=\"/url\" alt=\"foo\"></p>\n",
+            "Images, case 7");
+        spec("![foo][]\n\n[foo]: /url \"title\"\n",
+            "<p><img src=\"/url\" alt=\"foo\" title=\"title\"></p>\n",
+            "Images, case 8");
+        spec("![*foo* bar][]\n\n[*foo* bar]: /url \"title\"\n",
+            "<p><img src=\"/url\" alt=\"foo bar\" title=\"title\"></p>\n",
+            "Images, case 9");
+        spec("![Foo][]\n\n[foo]: /url \"title\"\n",
+            "<p><img src=\"/url\" alt=\"Foo\" title=\"title\"></p>\n",
+            "Images, case 10");
+        spec("![foo]\n\n[foo]: /url \"title\"\n",
+            "<p><img src=\"/url\" alt=\"foo\" title=\"title\"></p>\n",
+            "Images, case 11");
+        spec("![[foo]]\n\n[[foo]]: /url \"title\"\n",
+            "<p>![[foo]]</p>\n<p>[[foo]]: /url &quot;title&quot;</p>\n",
+            "Images, case 12");
+        spec("![Foo]\n\n[foo]: /url \"title\"\n",
+            "<p><img src=\"/url\" alt=\"Foo\" title=\"title\"></p>\n",
+            "Images, case 13");
+        spec("!\\[foo]\n\n[foo]: /url \"title\"\n",
+            "<p>![foo]</p>\n",
+            "Images, case 14");
+        spec("\\![foo]\n\n[foo]: /url \"title\"\n",
+            "<p>!<a href=\"/url\" title=\"title\" rel=\"nofollow noopener\">foo</a></p>\n",
+            "Images, case 15");
+        return nil;
+    end;
+
+    -- Autolinks: 11 examples.
+    function testAutolinks(): Unit is
+        spec("<http://foo.bar.baz>\n",
+            "<p><a href=\"http://foo.bar.baz\" rel=\"nofollow noopener\">http://foo.bar.baz</a></p>\n",
+            "Autolinks, case 1");
+        spec("<https://foo.bar.baz/test?q=hello&id=22&boolean>\n",
+            "<p><a href=\"https://foo.bar.baz/test?q=hello&amp;id=22&amp;boolean\" rel=\"nofollow noopener\">https://foo.bar.baz/test?q=hello&amp;id=22&amp;boolean</a></p>\n",
+            "Autolinks, case 2");
+        spec("<https://foo.bar/baz bim>\n",
+            "<p>&lt;https://foo.bar/baz bim&gt;</p>\n",
+            "Autolinks, case 3");
+        spec("<foo@bar.example.com>\n",
+            "<p><a href=\"mailto:foo@bar.example.com\" rel=\"nofollow noopener\">foo@bar.example.com</a></p>\n",
+            "Autolinks, case 4");
+        spec("<foo+special@Bar.baz-bar0.com>\n",
+            "<p><a href=\"mailto:foo+special@Bar.baz-bar0.com\" rel=\"nofollow noopener\">foo+special@Bar.baz-bar0.com</a></p>\n",
+            "Autolinks, case 5");
+        spec("<foo\\+@bar.example.com>\n",
+            "<p>&lt;foo+@bar.example.com&gt;</p>\n",
+            "Autolinks, case 6");
+        spec("<>\n",
+            "<p>&lt;&gt;</p>\n",
+            "Autolinks, case 7");
+        spec("< https://foo.bar >\n",
+            "<p>&lt; https://foo.bar &gt;</p>\n",
+            "Autolinks, case 8");
+        spec("<foo.bar.baz>\n",
+            "<p>&lt;foo.bar.baz&gt;</p>\n",
+            "Autolinks, case 9");
+        spec("https://example.com\n",
+            "<p>https://example.com</p>\n",
+            "Autolinks, case 10");
+        spec("foo@bar.example.com\n",
+            "<p>foo@bar.example.com</p>\n",
+            "Autolinks, case 11");
+        return nil;
+    end;
+
+    -- Hard line breaks: 13 examples.
+    function testHardLineBreaks(): Unit is
+        spec("foo  \nbaz\n",
+            "<p>foo<br>\nbaz</p>\n",
+            "Hard line breaks, case 1");
+        spec("foo\\\nbaz\n",
+            "<p>foo<br>\nbaz</p>\n",
+            "Hard line breaks, case 2");
+        spec("foo       \nbaz\n",
+            "<p>foo<br>\nbaz</p>\n",
+            "Hard line breaks, case 3");
+        spec("foo  \n     bar\n",
+            "<p>foo<br>\nbar</p>\n",
+            "Hard line breaks, case 4");
+        spec("foo\\\n     bar\n",
+            "<p>foo<br>\nbar</p>\n",
+            "Hard line breaks, case 5");
+        spec("*foo  \nbar*\n",
+            "<p><em>foo<br>\nbar</em></p>\n",
+            "Hard line breaks, case 6");
+        spec("*foo\\\nbar*\n",
+            "<p><em>foo<br>\nbar</em></p>\n",
+            "Hard line breaks, case 7");
+        spec("`code  \nspan`\n",
+            "<p><code>code   span</code></p>\n",
+            "Hard line breaks, case 8");
+        spec("`code\\\nspan`\n",
+            "<p><code>code\\ span</code></p>\n",
+            "Hard line breaks, case 9");
+        spec("foo\\\n",
+            "<p>foo\\</p>\n",
+            "Hard line breaks, case 10");
+        spec("foo  \n",
+            "<p>foo</p>\n",
+            "Hard line breaks, case 11");
+        spec("### foo\\\n",
+            "<h3>foo\\</h3>\n",
+            "Hard line breaks, case 12");
+        spec("### foo  \n",
+            "<h3>foo</h3>\n",
+            "Hard line breaks, case 13");
+        return nil;
+    end;
+
+    -- Soft line breaks: 2 examples.
+    function testSoftLineBreaks(): Unit is
+        spec("foo\nbaz\n",
+            "<p>foo\nbaz</p>\n",
+            "Soft line breaks, case 1");
+        spec("foo \n baz\n",
+            "<p>foo\nbaz</p>\n",
+            "Soft line breaks, case 2");
+        return nil;
+    end;
+
+    -- Textual content: 3 examples.
+    function testTextualContent(): Unit is
+        spec("hello $.;'there\n",
+            "<p>hello $.;&#39;there</p>\n",
+            "Textual content, case 1");
+        spec("Foo \u{3c7}\u{3c1}\u{1fc6}\u{3bd}\n",
+            "<p>Foo \u{3c7}\u{3c1}\u{1fc6}\u{3bd}</p>\n",
+            "Textual content, case 2");
+        spec("Multiple     spaces\n",
+            "<p>Multiple     spaces</p>\n",
+            "Textual content, case 3");
+        return nil;
+    end;
+
+    -- Tables (GFM extension): 8 examples.
+    function testTables(): Unit is
+        spec("| foo | bar |\n| --- | --- |\n| baz | bim |\n",
+            "<table>\n<thead>\n<tr>\n<th>foo</th>\n<th>bar</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>baz</td>\n<td>bim</td>\n</tr>\n</tbody>\n</table>\n",
+            "Tables (GFM extension), case 1");
+        spec("| abc | defghi |\n:-: | -----------:\nbar | baz\n",
+            "<table>\n<thead>\n<tr>\n<th class=\"text-center\">abc</th>\n<th class=\"text-right\">defghi</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td class=\"text-center\">bar</td>\n<td class=\"text-right\">baz</td>\n</tr>\n</tbody>\n</table>\n",
+            "Tables (GFM extension), case 2");
+        spec("| f\\|oo  |\n| ------ |\n| b `\\|` az |\n| b **\\|** im |\n",
+            "<table>\n<thead>\n<tr>\n<th>f|oo</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>b <code>|</code> az</td>\n</tr>\n<tr>\n<td>b <strong>|</strong> im</td>\n</tr>\n</tbody>\n</table>\n",
+            "Tables (GFM extension), case 3");
+        spec("| abc | def |\n| --- | --- |\n| bar | baz |\n> bar\n",
+            "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>bar</td>\n<td>baz</td>\n</tr>\n</tbody>\n</table>\n<blockquote>\n<p>bar</p>\n</blockquote>\n",
+            "Tables (GFM extension), case 4");
+        spec("| abc | def |\n| --- | --- |\n| bar | baz |\nbar\n\nbar\n",
+            "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>bar</td>\n<td>baz</td>\n</tr>\n<tr>\n<td>bar</td>\n<td></td>\n</tr>\n</tbody>\n</table>\n<p>bar</p>\n",
+            "Tables (GFM extension), case 5");
+        spec("| abc | def |\n| --- |\n| bar |\n",
+            "<p>| abc | def |\n| --- |\n| bar |</p>\n",
+            "Tables (GFM extension), case 6");
+        spec("| abc | def |\n| --- | --- |\n| bar |\n| bar | baz | boo |\n",
+            "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>bar</td>\n<td></td>\n</tr>\n<tr>\n<td>bar</td>\n<td>baz</td>\n</tr>\n</tbody>\n</table>\n",
+            "Tables (GFM extension), case 7");
+        spec("| abc | def |\n| --- | --- |\n",
+            "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n</table>\n",
+            "Tables (GFM extension), case 8");
+        return nil;
+    end;
+
+    -- HTML blocks: 44 examples in two functions, read with raw HTML.
+    function testHTMLBlocks1(): Unit is
+        specHtml("<table><tr><td>\n<pre>\n**Hello**,\n\n_world_.\n</pre>\n</td></tr></table>\n",
+            "<table><tr><td>\n<pre>\n**Hello**,\n<p><em>world</em>.\n</p></pre>\n</td></tr></table>\n",
+            "HTML blocks, case 1");
+        specHtml("<table>\n  <tr>\n    <td>\n           hi\n    </td>\n  </tr>\n</table>\n\nokay.\n",
+            "<table>\n  <tr>\n    <td>\n           hi\n    </td>\n  </tr>\n</table>\n<p>okay.</p>\n",
+            "HTML blocks, case 2");
+        specHtml(" <div>\n  *hello*\n         <foo><a>\n",
+            " <div>\n  *hello*\n         <a rel=\"nofollow noopener\">\n</a></div>",
+            "HTML blocks, case 3");
+        specHtml("</div>\n*foo*\n",
+            "\n*foo*\n",
+            "HTML blocks, case 4");
+        specHtml("<DIV CLASS=\"foo\">\n\n*Markdown*\n\n</DIV>\n",
+            "<div class=\"foo\">\n<p><em>Markdown</em></p>\n</div>\n",
+            "HTML blocks, case 5");
+        specHtml("<div id=\"foo\"\n  class=\"bar\">\n</div>\n",
+            "<div class=\"bar\">\n</div>\n",
+            "HTML blocks, case 6");
+        specHtml("<div id=\"foo\" class=\"bar\n  baz\">\n</div>\n",
+            "<div class=\"bar\n  baz\">\n</div>\n",
+            "HTML blocks, case 7");
+        specHtml("<div>\n*foo*\n\n*bar*\n",
+            "<div>\n*foo*\n<p><em>bar</em></p>\n</div>",
+            "HTML blocks, case 8");
+        specHtml("<div id=\"foo\"\n*hi*\n",
+            "",
+            "HTML blocks, case 9");
+        specHtml("<div class\nfoo\n",
+            "",
+            "HTML blocks, case 10");
+        specHtml("<div *???-&&&-<---\n*foo*\n",
+            "",
+            "HTML blocks, case 11");
+        specHtml("<div><a href=\"bar\">*foo*</a></div>\n",
+            "<div><a href=\"bar\" rel=\"nofollow noopener\">*foo*</a></div>\n",
+            "HTML blocks, case 12");
+        specHtml("<table><tr><td>\nfoo\n</td></tr></table>\n",
+            "<table><tr><td>\nfoo\n</td></tr></table>\n",
+            "HTML blocks, case 13");
+        specHtml("<div></div>\n``` c\nint x = 33;\n```\n",
+            "<div></div>\n``` c\nint x = 33;\n```\n",
+            "HTML blocks, case 14");
+        specHtml("<a href=\"foo\">\n*bar*\n</a>\n",
+            "<a href=\"foo\" rel=\"nofollow noopener\">\n*bar*\n</a>\n",
+            "HTML blocks, case 15");
+        specHtml("<Warning>\n*bar*\n</Warning>\n",
+            "\n*bar*\n\n",
+            "HTML blocks, case 16");
+        specHtml("<i class=\"foo\">\n*bar*\n</i>\n",
+            "\n*bar*\n\n",
+            "HTML blocks, case 17");
+        specHtml("</ins>\n*bar*\n",
+            "\n*bar*\n",
+            "HTML blocks, case 18");
+        specHtml("<del>\n*foo*\n</del>\n",
+            "<del>\n*foo*\n</del>\n",
+            "HTML blocks, case 19");
+        specHtml("<del>\n\n*foo*\n\n</del>\n",
+            "<del>\n<p><em>foo</em></p>\n</del>\n",
+            "HTML blocks, case 20");
+        specHtml("<del>*foo*</del>\n",
+            "<p><del><em>foo</em></del></p>\n",
+            "HTML blocks, case 21");
+        specHtml("<pre language=\"haskell\"><code>\nimport Text.HTML.TagSoup\n\nmain :: IO ()\nmain = print $ parseTags tags\n</code></pre>\nokay\n",
+            "<pre><code>\nimport Text.HTML.TagSoup\n\nmain :: IO ()\nmain = print $ parseTags tags\n</code></pre>\n<p>okay</p>\n",
+            "HTML blocks, case 22");
+        return nil;
+    end;
+
+    function testHTMLBlocks2(): Unit is
+        specHtml("<script type=\"text/javascript\">\n// JavaScript example\n\ndocument.getElementById(\"demo\").innerHTML = \"Hello JavaScript!\";\n</script>\nokay\n",
+            "\n<p>okay</p>\n",
+            "HTML blocks, case 23");
+        specHtml("<textarea>\n\n*foo*\n\n_bar_\n\n</textarea>\n",
+            "\n",
+            "HTML blocks, case 24");
+        specHtml("<style\n  type=\"text/css\">\nh1 {color:red;}\n\np {color:blue;}\n</style>\nokay\n",
+            "\n<p>okay</p>\n",
+            "HTML blocks, case 25");
+        specHtml("<style\n  type=\"text/css\">\n\nfoo\n",
+            "",
+            "HTML blocks, case 26");
+        specHtml("> <div>\n> foo\n\nbar\n",
+            "<blockquote>\n<div>\nfoo\n</div></blockquote>\n<p>bar</p>\n",
+            "HTML blocks, case 27");
+        specHtml("- <div>\n- foo\n",
+            "<ul>\n<li>\n<div>\n</div></li>\n<li>foo</li>\n</ul>\n",
+            "HTML blocks, case 28");
+        specHtml("<style>p{color:red;}</style>\n*foo*\n",
+            "\n<p><em>foo</em></p>\n",
+            "HTML blocks, case 29");
+        specHtml("<!-- foo -->*bar*\n*baz*\n",
+            "*bar*\n<p><em>baz</em></p>\n",
+            "HTML blocks, case 30");
+        specHtml("<script>\nfoo\n</script>1. *bar*\n",
+            "1. *bar*\n",
+            "HTML blocks, case 31");
+        specHtml("<!-- Foo\n\nbar\n   baz -->\nokay\n",
+            "\n<p>okay</p>\n",
+            "HTML blocks, case 32");
+        specHtml("<?php\n\n  echo '>';\n\n?>\nokay\n",
+            "&#39;;\n\n?&gt;\n<p>okay</p>\n",
+            "HTML blocks, case 33 (the sanitizer ends a processing instruction at the first >)");
+        specHtml("<!DOCTYPE html>\n",
+            "\n",
+            "HTML blocks, case 34");
+        specHtml("<![CDATA[\nfunction matchwo(a,b)\n{\n  if (a < b && a < 0) then {\n    return 1;\n\n  } else {\n\n    return 0;\n  }\n}\n]]>\nokay\n",
+            "\n<p>okay</p>\n",
+            "HTML blocks, case 35");
+        specHtml("  <!-- foo -->\n\n    <!-- foo -->\n",
+            "  \n<pre><code>&lt;!-- foo --&gt;\n</code></pre>\n",
+            "HTML blocks, case 36");
+        specHtml("  <div>\n\n    <div>\n",
+            "  <div>\n<pre><code>&lt;div&gt;\n</code></pre>\n</div>",
+            "HTML blocks, case 37");
+        specHtml("Foo\n<div>\nbar\n</div>\n",
+            "<p>Foo</p>\n<div>\nbar\n</div>\n",
+            "HTML blocks, case 38");
+        specHtml("<div>\nbar\n</div>\n*foo*\n",
+            "<div>\nbar\n</div>\n*foo*\n",
+            "HTML blocks, case 39");
+        specHtml("Foo\n<a href=\"bar\">\nbaz\n",
+            "<p>Foo\n<a href=\"bar\" rel=\"nofollow noopener\">\nbaz</a></p>\n",
+            "HTML blocks, case 40");
+        specHtml("<div>\n\n*Emphasized* text.\n\n</div>\n",
+            "<div>\n<p><em>Emphasized</em> text.</p>\n</div>\n",
+            "HTML blocks, case 41");
+        specHtml("<div>\n*Emphasized* text.\n</div>\n",
+            "<div>\n*Emphasized* text.\n</div>\n",
+            "HTML blocks, case 42");
+        specHtml("<table>\n\n<tr>\n\n<td>\nHi\n</td>\n\n</tr>\n\n</table>\n",
+            "<table>\n<tr>\n<td>\nHi\n</td>\n</tr>\n</table>\n",
+            "HTML blocks, case 43");
+        specHtml("<table>\n\n  <tr>\n\n    <td>\n      Hi\n    </td>\n\n  </tr>\n\n</table>\n",
+            "<table>\n  <tr>\n<pre><code>&lt;td&gt;\n  Hi\n&lt;/td&gt;\n</code></pre>\n  </tr>\n</table>\n",
+            "HTML blocks, case 44");
+        return nil;
+    end;
+
+    -- Raw HTML: 20 examples, read with raw HTML.
+    function testRawHTML(): Unit is
+        specHtml("<a><bab><c2c>\n",
+            "<p><a rel=\"nofollow noopener\"></a></p>\n",
+            "Raw HTML, case 1");
+        specHtml("<a/><b2/>\n",
+            "<p><a rel=\"nofollow noopener\"></a></p>\n",
+            "Raw HTML, case 2");
+        specHtml("<a  /><b2\ndata=\"foo\" >\n",
+            "<p><a rel=\"nofollow noopener\"></a></p>\n",
+            "Raw HTML, case 3");
+        specHtml("<a foo=\"bar\" bam = 'baz <em>\"</em>'\n_boolean zoop:33=zoop:33 />\n",
+            "<p><a rel=\"nofollow noopener\"></a></p>\n",
+            "Raw HTML, case 4");
+        specHtml("Foo <responsive-image src=\"foo.jpg\" />\n",
+            "<p>Foo </p>\n",
+            "Raw HTML, case 5");
+        specHtml("<33> <__>\n",
+            "<p>&lt;33&gt; &lt;__&gt;</p>\n",
+            "Raw HTML, case 6");
+        specHtml("<a h*#ref=\"hi\">\n",
+            "<p>&lt;a h*#ref=&quot;hi&quot;&gt;</p>\n",
+            "Raw HTML, case 7");
+        specHtml("<a href=\"hi'> <a href=hi'>\n",
+            "<p>&lt;a href=&quot;hi&#39;&gt; &lt;a href=hi&#39;&gt;</p>\n",
+            "Raw HTML, case 8");
+        specHtml("< a><\nfoo><bar/ >\n<foo bar=baz\nbim!bop />\n",
+            "<p>&lt; a&gt;&lt;\nfoo&gt;&lt;bar/ &gt;\n&lt;foo bar=baz\nbim!bop /&gt;</p>\n",
+            "Raw HTML, case 9");
+        specHtml("<a href='bar'title=title>\n",
+            "<p>&lt;a href=&#39;bar&#39;title=title&gt;</p>\n",
+            "Raw HTML, case 10");
+        specHtml("</a></foo >\n",
+            "<p></p>\n",
+            "Raw HTML, case 11");
+        specHtml("</a href=\"foo\">\n",
+            "<p>&lt;/a href=&quot;foo&quot;&gt;</p>\n",
+            "Raw HTML, case 12");
+        specHtml("foo <!-- this is a --\ncomment - with hyphens -->\n",
+            "<p>foo </p>\n",
+            "Raw HTML, case 13");
+        specHtml("foo <!--> foo -->\n\nfoo <!---> foo -->\n",
+            "<p>foo  foo --&gt;</p>\n",
+            "Raw HTML, case 14 (the sanitizer reads <!--> as the start of a comment to the next -->)");
+        specHtml("foo <?php echo $a; ?>\n",
+            "<p>foo </p>\n",
+            "Raw HTML, case 15");
+        specHtml("foo <!ELEMENT br EMPTY>\n",
+            "<p>foo </p>\n",
+            "Raw HTML, case 16");
+        specHtml("foo <![CDATA[>&<]]>\n",
+            "<p>foo &amp;&lt;]]&gt;</p>\n",
+            "Raw HTML, case 17 (the sanitizer ends a CDATA section at the first >)");
+        specHtml("foo <a href=\"&ouml;\">\n",
+            "<p>foo <a href=\"&amp;ouml;\" rel=\"nofollow noopener\"></a></p>\n",
+            "Raw HTML, case 18 (the sanitizer knows six named references, not &ouml;)");
+        specHtml("foo <a href=\"\\*\">\n",
+            "<p>foo <a href=\"\\*\" rel=\"nofollow noopener\"></a></p>\n",
+            "Raw HTML, case 19");
+        specHtml("<a href=\"\\\"\">\n",
+            "<p>&lt;a href=&quot;&quot;&quot;&gt;</p>\n",
+            "Raw HTML, case 20");
+        return nil;
+    end;
+
+    -- Strikethrough (GFM extension): 2 examples; the first of the GFM spec,
+    -- with one tilde, is in testDeviations.  The third case is the former
+    -- deviation, now struck through.
+    function testStrikethrough(): Unit is
+        spec("This ~~has a\n\nnew paragraph~~.\n",
+            "<p>This ~~has a</p>\n<p>new paragraph~~.</p>\n",
+            "Strikethrough (GFM extension), case 1");
+        spec("This will ~~~not~~~ strike.\n",
+            "<p>This will ~~~not~~~ strike.</p>\n",
+            "Strikethrough (GFM extension), case 2");
+        spec("~~x~~\n",
+            "<p><del>x</del></p>\n",
+            "Strikethrough (GFM extension), two tildes");
+        return nil;
+    end;
+
+    -- Task list items (GFM extension): 2 examples, the checkbox written as
+    -- the class of the item (the sanitizer drops input elements) and the
+    -- marker with the blank after it out of the text.  The third case is
+    -- the former deviation, now a task.
+    function testTaskListItems(): Unit is
+        spec("- [ ] foo\n- [x] bar\n",
+            "<ul>\n<li class=\"task\">foo</li>\n<li class=\"task done\">bar</li>\n</ul>\n",
+            "Task list items (GFM extension), case 1");
+        spec("- [x] foo\n  - [ ] bar\n  - [x] baz\n- [ ] bim\n",
+            "<ul>\n<li class=\"task done\">foo\n<ul>\n<li class=\"task\">bar</li>\n<li class=\"task done\">baz</li>\n</ul>\n</li>\n<li class=\"task\">bim</li>\n</ul>\n",
+            "Task list items (GFM extension), case 2");
+        spec("- [ ] task\n",
+            "<ul>\n<li class=\"task\">task</li>\n</ul>\n",
+            "Task list items (GFM extension), one open task");
+        return nil;
+    end;
+end module body.

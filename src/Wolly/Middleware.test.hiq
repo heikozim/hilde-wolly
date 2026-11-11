@@ -1,0 +1,361 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.Text (
+    contains,
+    countOf,
+    startsWith,
+    indexOf,
+    substring,
+    hexDigitValue,
+    constantTimeEqual
+);
+import Standard.File (
+    FileDescriptor,
+    environmentValue,
+    openRead,
+    readAll,
+    closeFile,
+    removeFileIfThere
+);
+import Standard.Log (
+    Log,
+    Info,
+    JsonLines,
+    logToFile,
+    closeLog
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    destroyRequest
+);
+import Wolly.Request (
+    requestPath
+);
+import Wolly.Response (
+    makeResponse,
+    addHeader,
+    finish,
+    withHeader
+);
+import Wolly.Router (
+    Route
+);
+import Wolly.Middleware (
+    Step,
+    Next,
+    Answer,
+    dispatchWith,
+    dispatchLogged,
+    knownMethods,
+    securityHeaders
+);
+
+module body Wolly.Middleware.Test is
+    generic [R: Region, S: Region]
+    function addPair(out: &![StringBuilder, R], name: Span[Nat8, Static], content: Span[Nat8, S]): Unit is
+        case makePair(name, content) of
+            when Some(value as pair: String) do
+                writeString(&~out, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                assertTrue(false, "a pair of the test could not be made");
+        end case;
+        return nil;
+    end;
+
+    function fakeRequest(verb: Span[Nat8, Static], uri: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        if spanLength(verb) > 0 then
+            addPair(&!params, "REQUEST_METHOD", verb);
+        end if;
+        addPair(&!params, "REQUEST_URI", uri);
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(""));
+    end;
+
+    -- A request as the web server hands it on for client at uri.
+    function fakeVisit(verb: Span[Nat8, Static], uri: Span[Nat8, Static], client: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        if spanLength(verb) > 0 then
+            addPair(&!params, "REQUEST_METHOD", verb);
+        end if;
+        addPair(&!params, "REQUEST_URI", uri);
+        addPair(&!params, "REMOTE_ADDR", client);
+        let block: String := finalize(params);
+        return makeRequest(block, fromSpan(""));
+    end;
+
+    function answerX(request: Request): String is
+        destroyRequest(request);
+        return finish(makeResponse(200, "text/plain"), "x");
+    end;
+
+    function answerFramed(request: Request): String is
+        destroyRequest(request);
+        return finish(addHeader(makeResponse(200, "text/plain"), "X-Frame-Options", "SAMEORIGIN"), "framed");
+    end;
+
+    -- A step before for some paths only: /admin and below answer 403.
+    function blockAdmin(request: Request): Step is
+        var blocked: Bool := false;
+        case requestPath(&request) of
+            when Some(value as path: String) do
+                blocked := startsWith(asSpan(&path), "/admin");
+                destroyString(path);
+            when None do
+                skip;
+        end case;
+        if blocked then
+            destroyRequest(request);
+            return Answer(output => finish(makeResponse(403, "text/plain"), "forbidden"));
+        else
+            return Next(request => request);
+        end if;
+    end;
+
+    function tagFirst(output: String): String is
+        return withHeader(output, "X-Order", "first");
+    end;
+
+    function tagSecond(output: String): String is
+        return withHeader(output, "X-Order", "second");
+    end;
+
+    function run(verb: Span[Nat8, Static], uri: Span[Nat8, Static]): String is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/x", handler => answerX));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/framed", handler => answerFramed));
+        insertBack(&!routes, Route(verb => "GET", pattern => "/admin/x", handler => answerX));
+        var befores: Buffer[Fn[Request, Step]] := allocateEmpty();
+        insertBack(&!befores, knownMethods);
+        insertBack(&!befores, blockAdmin);
+        var afters: Buffer[Fn[String, String]] := allocateEmpty();
+        insertBack(&!afters, securityHeaders);
+        insertBack(&!afters, tagFirst);
+        insertBack(&!afters, tagSecond);
+        let output: String := dispatchWith(fakeRequest(verb, uri), &routes, &befores, &afters);
+        destroyFree(routes);
+        destroyFree(befores);
+        destroyFree(afters);
+        return output;
+    end;
+
+    generic [L: Region]
+    function runLogged(verb: Span[Nat8, Static], uri: Span[Nat8, Static], log: &![Log, L]): String is
+        var routes: Buffer[Route] := allocateEmpty();
+        insertBack(&!routes, Route(verb => "GET", pattern => "/x", handler => answerX));
+        var befores: Buffer[Fn[Request, Step]] := allocateEmpty();
+        insertBack(&!befores, knownMethods);
+        var afters: Buffer[Fn[String, String]] := allocateEmpty();
+        insertBack(&!afters, securityHeaders);
+        let output: String := dispatchLogged(fakeVisit(verb, uri, "10.0.0.9"), &routes, &befores, &afters, log);
+        destroyFree(routes);
+        destroyFree(befores);
+        destroyFree(afters);
+        return output;
+    end;
+
+    -- Whether every byte of text is a hex digit.
+    generic [T: Region]
+    function allHex(text: Span[Nat8, T]): Bool is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            case hexDigitValue(text[i]) of
+                when Some(value as digit: Nat8) do
+                    skip;
+                when None do
+                    return false;
+            end case;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The 32 bytes after the X-Request-Id header name of an answer, empty
+    -- when the answer has no such header or it is too short.
+    generic [O: Region]
+    function requestIdOf(output: Span[Nat8, O]): Span[Nat8, O] is
+        case indexOf(output, "\r\nX-Request-Id: ") of
+            when Some(value as at: Index) do
+                let start: Index := at + 16;
+                if (start + 32) <= spanLength(output) then
+                    return substring(output, start, start + 32);
+                else
+                    return substring(output, 0, 0);
+                end if;
+            when None do
+                return substring(output, 0, 0);
+        end case;
+    end;
+
+    -- The answers first and last carry ids of 32 hex digits, not the same
+    -- one, and the log text has a line with each.
+    generic [F: Region, L: Region, T: Region]
+    function checkIds(first: Span[Nat8, F], last: Span[Nat8, L], text: Span[Nat8, T]): Unit is
+        let one: Span[Nat8, F] := requestIdOf(first);
+        let two: Span[Nat8, L] := requestIdOf(last);
+        assertTrue((spanLength(one) = 32) and allHex(one), "an answer carries an id of 32 hex digits");
+        assertTrue((spanLength(two) = 32) and allHex(two), "the next answer too");
+        assertFalse(constantTimeEqual(one, two), "two requests have two ids");
+        var needle: StringBuilder := makeStringBuilder();
+        writeString(&!needle, "\"request_id\":\"");
+        writeString(&!needle, one);
+        writeString(&!needle, "\"");
+        let line: String := finalize(needle);
+        assertTrue(contains(text, asSpan(&line)), "the log has the id of the answer");
+        destroyString(line);
+        return nil;
+    end;
+
+    function logPath(): String is
+        var path: StringBuilder := makeStringBuilder();
+        case environmentValue("TMPDIR") of
+            when Some(value as dir: String) do
+                writeString(&!path, asSpan(&dir));
+                writeString(&!path, "/");
+                destroyString(dir);
+            when None do
+                skip;
+        end case;
+        writeString(&!path, "wolly-middleware-access.log");
+        return finalize(path);
+    end;
+
+    generic [P: Region]
+    function fileText(path: Span[Nat8, P]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readAll(&!file) of
+                    when Some(value as text: String) do
+                        let closed: Bool := closeFile(file);
+                        return text;
+                    when None do
+                        let closed: Bool := closeFile(file);
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    function answers(output: String, status: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let good: Bool := startsWith(asSpan(&output), status) and contains(asSpan(&output), part);
+        if not good then
+            printLn(asSpan(&output));
+        end if;
+        destroyString(output);
+        assertTrue(good, message);
+        return nil;
+    end;
+
+    function testChain(): Unit is
+        answers(run("GET", "/x"), "Status: 200 ", "\r\n\r\nx", "the control: through to the route");
+        answers(run("GET", "/x"), "Status: 200 ", "\r\nX-Content-Type-Options: nosniff\r\n", "nosniff after the route");
+        answers(run("GET", "/x"), "Status: 200 ", "\r\nX-Frame-Options: DENY\r\n", "no framing after the route");
+        answers(run("GET", "/x"), "Status: 200 ", "\r\nReferrer-Policy: same-origin\r\n", "the referrer policy after the route");
+        answers(run("TRACE", "/x"), "Status: 405 ", "\r\nAllow: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS\r\n", "TRACE ends before the route");
+        answers(run("TRACE", "/x"), "Status: 405 ", "\r\nX-Frame-Options: DENY\r\n", "the steps after see an answer of a step before");
+        answers(run("", "/x"), "Status: 400 ", "bad request", "no method");
+        answers(run("GET", "/admin/x"), "Status: 403 ", "forbidden", "a step for some paths answers");
+        answers(run("TRACE", "/admin/x"), "Status: 405 ", "method not allowed", "the steps before run in their order");
+        answers(run("GET", "/admin"), "Status: 403 ", "forbidden", "a path no route has is still blocked first");
+        answers(run("GET", "/nowhere"), "Status: 404 ", "\r\nX-Content-Type-Options: nosniff\r\n", "a 404 of the router gets the headers too");
+        answers(run("GET", "/x"), "Status: 200 ", "\r\nX-Order: first\r\n", "the steps after run in their order");
+        return nil;
+    end;
+
+    function testHeadersOnce(): Unit is
+        let framed: String := run("GET", "/framed");
+        assertTrue(contains(asSpan(&framed), "\r\nX-Frame-Options: SAMEORIGIN\r\n"), "the handler's own header stays");
+        assertTrue(countOf(asSpan(&framed), "X-Frame-Options") = 1, "and is not doubled");
+        assertTrue(countOf(asSpan(&framed), "X-Order") = 1, "a header two steps add is there once");
+        destroyString(framed);
+        return nil;
+    end;
+
+    function testWithHeader(): Unit is
+        let plain: String := finish(makeResponse(200, "text/plain"), "body text");
+        let added: String := withHeader(plain, "X-A", "1");
+        assertTrue(startsWith(asSpan(&added), "Status: 200 OK\r\nContent-Type: text/plain\r\nX-A: 1\r\n\r\nbody text"), "before the empty line");
+        let again: String := withHeader(added, "x-a", "2");
+        assertTrue(countOf(asSpan(&again), "1\r\n") = 1, "a name in another case counts as there");
+        assertFalse(contains(asSpan(&again), "x-a: 2"), "and nothing is added");
+        destroyString(again);
+        let crlf: String := withHeader(finish(makeResponse(200, "text/plain"), "secret"), "X-A", "a\r\nSet-Cookie: x=1");
+        assertTrue(startsWith(asSpan(&crlf), "Status: 500 "), "CR LF in a value gives 500");
+        assertFalse(contains(asSpan(&crlf), "secret"), "and not the body");
+        destroyString(crlf);
+        let status: String := withHeader(finish(makeResponse(200, "text/plain"), "x"), "Status", "302");
+        assertTrue(startsWith(asSpan(&status), "Status: 500 "), "a second Status gives 500");
+        destroyString(status);
+        let broken: String := withHeader(fromSpan("Status: 200 OK\r\nno empty line"), "X-A", "1");
+        assertTrue(startsWith(asSpan(&broken), "Status: 500 "), "an output without an empty line gives 500");
+        destroyString(broken);
+        return nil;
+    end;
+
+    function testAccessLog(): Unit is
+        let path: String := logPath();
+        let cleared: Bool := removeFileIfThere(asSpan(&path));
+        case logToFile(asSpan(&path), Info(), JsonLines()) of
+            when Some(value as opened: Log) do
+                var log: Log := opened;
+                let first: String := runLogged("GET", "/x?token=s3cr3t", &!log);
+                destroyString(runLogged("TRACE", "/x", &!log));
+                destroyString(runLogged("", "/x", &!log));
+                let last: String := runLogged("GET", "/nowhere", &!log);
+                let closed: Bool := closeLog(log);
+                assertTrue(closed, "the log closes");
+                let logged: String := fileText(asSpan(&path));
+                checkIds(asSpan(&first), asSpan(&last), asSpan(&logged));
+                destroyString(logged);
+                destroyString(first);
+                destroyString(last);
+            when None do
+                assertTrue(false, "the log of the test could not be opened");
+        end case;
+        let text: String := fileText(asSpan(&path));
+        assertTrue(countOf(asSpan(&text), "\"msg\":\"request\"") = 4, "one line for each request");
+        assertTrue(countOf(asSpan(&text), "\"request_id\":\"") = 4, "each line has its request id");
+        assertTrue(contains(asSpan(&text), "\"method\":\"GET\",\"path\":\"/x\",\"client\":\"10.0.0.9\",\"status\":200"), "method, path, client and status of a route");
+        assertTrue(contains(asSpan(&text), "\"method\":\"TRACE\",\"path\":\"/x\",\"client\":\"10.0.0.9\",\"status\":405"), "the status of a step before");
+        assertTrue(contains(asSpan(&text), "\"method\":\"-\",\"path\":\"/x\",\"client\":\"10.0.0.9\",\"status\":400"), "no method is a dash");
+        assertTrue(contains(asSpan(&text), "\"path\":\"/nowhere\",\"client\":\"10.0.0.9\",\"status\":404"), "the 404 of the router");
+        assertFalse(contains(asSpan(&text), "s3cr3t"), "the query stays out of the log");
+        destroyString(text);
+        let removed: Bool := removeFileIfThere(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+end module body.

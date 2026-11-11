@@ -1,0 +1,43 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String
+);
+import Standard.FcgiServer (
+    Request
+);
+import Wolly.Tree (
+    Page,
+    isWrapped
+);
+
+module Wolly.Example.Pages.Site.Post.Id is
+    """
+    The number of a post, from 1 up.
+    """
+    type Param: Free;
+
+    """
+    The post whose number text is, decimal digits without a sign, or None
+    for anything else, 0 and a number above an Int64 included.
+    No contract: an Option, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function parse(text: Span[Nat8, R]): Option[Param];
+
+    """
+    The number of post.
+    """
+    function number(post: Param): Int64
+        ensures result > 0;
+
+    """
+    GET /post/:id: the post with its number.
+    """
+    function get(request: Request, post: Param): Page
+        ensures isWrapped(&result);
+end module.

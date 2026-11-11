@@ -1,0 +1,21 @@
+--
+-- Part of Wolly, a web framework in Hilde.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+One asset of an application, for the check that a missing file does not
+compile.
+"""
+import Wolly.Bundle (
+    Asset
+);
+
+module Wolly.BundleProbe is
+    """
+    The style sheet of the application.  No contract: the asset is the
+    one Wolly.Bundle.asset gives.
+    """
+    function appCss(): Asset;
+end module.

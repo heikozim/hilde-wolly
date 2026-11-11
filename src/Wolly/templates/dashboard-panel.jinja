@@ -1,0 +1,16 @@
+{#
+Part of Wolly, a web framework in Hilde.
+
+SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+One panel of Wolly.Dashboard, a fragment of its own: the page puts it
+in, and an application may send it alone.  figure is the SVG of
+Wolly.Svg, escaped there; empty when there is no sample yet.  With a url
+(livePanelFragment) htmx asks for url every every seconds and puts the
+answer, the same section, in its place.
+-#}
+<section class="wolly-panel wolly-{{ kind }}" id="panel-{{ name }}"{% if url %} hx-get="{{ url }}" hx-trigger="every {{ every }}s" hx-swap="outerHTML"{% endif %}>
+<h2>{{ title }}</h2>
+{% if figure %}{{ figure|safe }}{% else %}<p class="wolly-note">no sample yet</p>{% endif %}
+</section>
